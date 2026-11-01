@@ -39,3 +39,7 @@ TS-253Beの実RAM/QTS、既存JD2の設定とAPI、Chromiumサンドボックス
 - QDK導入済みの開発マシンで `bash scripts/build-qpkg.sh x86_64 dist`。起動時にnpm build等は実行しません。
 
 テスト: `python3 -m unittest discover -s tests -v`、`python3 -m py_compile webapp.py storage.py updater.py self_update.py durability.py qpkg/shared/downloader_pid.py`、`node --check web/app.js`、`sh -n qpkg/shared/downloader.sh qpkg/shared/python3-path`。追加のセキュリティ/ダウンロード本体機能は後続PRで検証します。
+
+## JDownloader 2の独立更新と推奨設定の再適用
+
+**JDownloader 2はJD2標準のアップデーターで単独更新**します。HubのQPKG自己更新はJD2のファイルやプラグインを入れ替えません。JD2更新後に一般設定・Packagizer・LinkGrabber・自動解凍が変化した場合はHubの「推奨設定を確認して再適用」で差分確認・復旧できる設計です。**現v0.1.0ではJD2の認証済みAPIアダプタがまだなく、JD2更新ボタンと再適用ボタンは無効**です。正式なJD2接続/設定読書きができるまで有効化しません。手順: [JD2独立更新と再適用](docs/jd2-independent-updates.md)。
