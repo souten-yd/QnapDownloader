@@ -82,7 +82,8 @@ class TransferTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             store.begin_send(record["id"])
         try:
-            jd2_transfer.transfer(FakeJD2(fail=True), url, str(self.target))
+            self.api.fail = True
+            jd2_transfer.transfer(self.api, url, str(self.target))
         except Exception:
             store.finish_send(record["id"], "uncertain")
         self.assertEqual(store.links()[0]["state"], "uncertain")
