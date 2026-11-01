@@ -32,6 +32,12 @@ class StorageTests(unittest.TestCase):
         finally:
             again.close()
 
+    def test_short_lived_sqlite_connections_are_closed(self):
+        with self.s.connect() as db:
+            self.assertEqual(db.execute("PRAGMA quick_check").fetchone()[0], "ok")
+        with self.assertRaises(sqlite3.ProgrammingError):
+            db.execute("SELECT 1")
+
     def test_link_intents_are_inert_deduplicated(self):
         a = self.s.add_link("https://rapidgator.net/file/abc")
         b = self.s.add_link("https://rapidgator.net/file/abc")
