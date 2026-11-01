@@ -1,5 +1,6 @@
 """Durable state for QnapDownloader. No progress polling writes."""
 import hashlib
+from contextlib import closing, contextmanager
 import hmac
 import json
 import os
@@ -59,17 +60,30 @@ class Store:
             marker.write_text("v1\n", encoding="utf-8")
             os.chmod(marker, 0o600)
         # Keep one connection alive to avoid avoidable WAL/SHM create/remove churn.
-        self._keeper = self.connect()
+        self._keeper = self._open_connection()
         self._keeper.execute("PRAGMA query_only=ON")
 
-    def connect(self, initial=False):
+    def _open_connection(self, initial=False):
         db = sqlite3.connect(self.path, timeout=5, isolation_level="DEFERRED")
-        db.execute("PRAGMA busy_timeout=5000")
-        db.execute("PRAGMA foreign_keys=ON")
-        if initial:
-            db.execute("PRAGMA journal_mode=WAL")
-        db.execute("PRAGMA synchronous=FULL")
-        return db
+        try:
+            db.execute("PRAGMA busy_timeout=5000")
+            db.execute("PRAGMA foreign_keys=ON")
+            if initial:
+                db.execute("PRAGMA journal_mode=WAL")
+            db.execute("PRAGMA synchronous=FULL")
+            return db
+        except Exception:
+            db.close()
+            raise
+
+    @contextmanager
+    def connect(self, initial=False):
+        # sqlite3.Connection.__exit__ only commits/rolls back; it DOES NOT
+        # close the connection. Close it for every short-lived API operation
+        # to avoid FD accumulation under the threaded QNAP HTTP server.
+        with closing(self._open_connection(initial=initial)) as db:
+            with db:
+                yield db
 
     def close(self):
         self._keeper.close()
