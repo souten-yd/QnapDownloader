@@ -17,7 +17,7 @@ REPO = "souten-yd/QnapDownloader"
 API = f"https://api.github.com/repos/{REPO}/releases/latest"
 API_RC = f"https://api.github.com/repos/{REPO}/releases?per_page=30"
 RELEASE_BYTES_MAX = 4 * 1024 * 1024
-VERSION = re.compile(r"^v?(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$")
+VERSION = re.compile(r"^v?(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-rc([1-9]\d*))?$")
 ARCH = re.compile(r"^[A-Za-z0-9_-]+$")
 MAX_BYTES = 512 * 1024 * 1024
 
