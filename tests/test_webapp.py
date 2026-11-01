@@ -81,6 +81,11 @@ class HttpTests(unittest.TestCase):
         self.assertTrue(webapp.public_host_allowed("[::1]:17864"))
         self.assertFalse(webapp.public_host_allowed("8.8.8.8:17864"))
         self.assertFalse(webapp.public_host_allowed("evil.example:17864"))
+        for malformed in ("[::1", "localhost:notaport", "localhost:99999",
+                          "localhost:bad", "foo@localhost", "localhost/path",
+                          "", "example.com#localhost", "abc def"):
+            with self.subTest(host=malformed):
+                self.assertFalse(webapp.public_host_allowed(malformed))
 
     def test_setup_login_csrf_and_private_api(self):
         self.assertEqual(self.req("/api/settings")[0], 401)
