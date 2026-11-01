@@ -170,7 +170,7 @@ class UpdateManager:
 def backup_data(data_root, job):
     source = Path(data_root) / 'data/downloader.sqlite3'
     if not source.is_file():
-        raise ValueError('測定DBが見つからないため更新を中止しました')
+        raise ValueError('設定DBが見つからないため更新を中止しました')
     backup = job / 'backup'
     backup.mkdir(mode=0o700)
     snapshot(source, backup / source.name)
@@ -224,7 +224,7 @@ def run_job(job, lock_fd):
                 raise ValueError('更新用の空き容量が不足しています')
         phase('downloading', 'QPKGを取得してSHA-256を検証しています')
         package = updater.stage(asset, job)
-        phase('backup', '更新前の測定DBと設定をバックアップしています')
+        phase('backup', '更新前の設定DBと構成をバックアップしています')
         backup = backup_data(request['data_root'], job)
         check_environment(request['install_root'], request['current'])
         phase('installing', 'QPKGを適用しています。Web接続が一時的に切れます', backup=backup)
