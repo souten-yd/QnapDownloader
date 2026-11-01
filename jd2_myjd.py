@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import stat
+import sys
 
 # These two keys are documented by JD2; all other settings remain unsupported
 # until their exact AdvancedConfig metadata is observed on the real device.
@@ -62,6 +63,11 @@ class MyJDAdapter:
             return self._device
         try:
             if self._factory is None:
+                # Vendor dependencies are installed at QPKG build time.
+                # Never run pip, npm, or network installs at server startup.
+                packaged = Path(__file__).resolve().parent / "vendor"
+                if packaged.is_dir() and str(packaged) not in sys.path:
+                    sys.path.insert(0, str(packaged))
                 import myjdapi
                 self._factory = myjdapi.myjdapi
             client = self._factory()
