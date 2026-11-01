@@ -45,6 +45,23 @@ def load_configuration(data_root):
     return options
 
 
+def configuration_status(data_root):
+    """Admin-only public metadata: never return password/email/secret keys."""
+    try:
+        config = load_configuration(data_root)
+    except (OSError, ValueError, MyJDUnavailable, json.JSONDecodeError):
+        return {"configured": False, "invalid": True,
+                "reason": "MyJD設定ファイルの内容または権限を確認してください"}
+    if config is None:
+        return {"configured": False, "invalid": False,
+                "reason": "MyJDownloader認証情報は未設定です"}
+    return {"configured": True, "invalid": False,
+            "device_name": config["device_name"],
+            "can_update": config.get("allow_jd2_update") is True,
+            "can_send": config.get("allow_link_submit") is True,
+            "packagizer_acknowledged": config.get("allow_unverified_packagizer") is True}
+
+
 class MyJDAdapter:
     """Compatible with myjdapi 1.1.x, uses remote authenticated MyJD only."""
     def __init__(self, options, api_factory=None):
