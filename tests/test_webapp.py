@@ -102,6 +102,8 @@ class HttpTests(unittest.TestCase):
         self.assertEqual(code, 201)
         self.assertEqual(body["state"], "staged")
         self.assertEqual(self.req("/api/links")[1]["items"][0]["state"], "staged")
+        self.assertEqual(self.req("/api/links/send", {"id": body["id"]})[0], 400)
+        self.assertEqual(self.req("/api/links")[1]["items"][0]["state"], "staged")
         self.assertEqual(self.req("/api/logout", {})[0], 200)
         self.assertEqual(self.req("/api/settings")[0], 401)
 
