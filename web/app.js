@@ -1,5 +1,5 @@
 "use strict";
-let csrf="", selectedVersion="";
+let csrf="", selectedVersion="", rapidgatorSnapshot=null;
 const $=id=>document.getElementById(id);
 function visible(id,on){$(id).classList.toggle("hidden",!on)}
 function flash(message){$("notice").textContent=message;visible("notice",true)}
@@ -139,6 +139,35 @@ document.addEventListener("DOMContentLoaded",()=>{
  document.querySelectorAll("nav button").forEach(b=>b.addEventListener("click",()=>activeTab(b.dataset.tab)));
  $("queueAdd").addEventListener("click",()=>perform(async()=>{
   await api("/api/links",{url:$("queueUrl").value.trim()});$("queueUrl").value="";await refresh("queue");
+ }));
+ $("rapidgatorText").addEventListener("input",()=>{
+  rapidgatorSnapshot=null;
+  $("rapidgatorStage").disabled=true;
+  $("rapidgatorResult").replaceChildren();
+ });
+ $("rapidgatorPreview").addEventListener("click",()=>perform(async()=>{
+  const content=$("rapidgatorText").value;
+  const preview=await api("/api/rapidgator/extract",{content,limit:20,commit:false});
+  rapidgatorSnapshot={content,digest:preview.digest,limit:20,count:preview.count};
+  $("rapidgatorStage").disabled=preview.count===0;
+  const list=$("rapidgatorResult");list.replaceChildren();
+  list.appendChild(element("p","Rapidgatorリンク: "+preview.count+"件（未保存・未送信）"));
+  for(const url of preview.items)list.appendChild(element("div",url,"item"));
+ }));
+ $("rapidgatorStage").addEventListener("click",()=>perform(async()=>{
+  const snapshot=rapidgatorSnapshot;
+  if(!snapshot||$("rapidgatorText").value!==snapshot.content){
+    flash("貼り付け内容が変化しました。再抽出してください");return;
+  }
+  if(!confirm(snapshot.count+"件のリンクをHubの保留キューに保存します。JD2への送信・ダウンロードは開始しません。よろしいですか？"))return;
+  $("rapidgatorStage").disabled=true;
+  rapidgatorSnapshot=null;
+  const staged=await api("/api/rapidgator/extract",
+     {content:snapshot.content,limit:snapshot.limit,digest:snapshot.digest,commit:true});
+  $("rapidgatorResult").replaceChildren(element("p",
+    "保留キューへ新規 "+staged.staged+"件を登録しました。JD2へは未送信です。"));
+  await refresh("queue");
+  flash("保存完了。必要なら保留キューから個別にJD2へ送ってください");
  }));
  $("bookmarkAdd").addEventListener("click",()=>perform(async()=>{
   await api("/api/bookmarks",{title:$("bookmarkName").value,url:$("bookmarkUrl").value.trim()});
