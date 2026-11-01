@@ -30,8 +30,8 @@ TS-253Beの実RAM/QTS、既存JD2の設定とAPI、Chromiumサンドボックス
 
 ## 初期実装の起動・注意事項
 
-- Python 3.8+、標準ライブラリ。NASが起動して共有フォルダをマウントしてから、`python3 -B webapp.py --data-dir /share/Container/QnapDownloader --lan --port 17864` で起動します（ルート権限と公開範囲に注意）。外部ネットワークへポート転送しないでください。
-- 最初のアクセスで、NASの管理者が `/share/Container/QnapDownloader/config/bootstrap-token` をSSH等で読んでWebに入力し、管理者パスワード（12文字以上）を登録します。トークンは完了後に削除されます。
+- Python 3.8+、標準ライブラリ。NASが起動してボリュームをマウントしてから、開発環境では `python3 -B webapp.py --data-dir ./runtime --port 17864` でループバック起動します（ルート権限と公開範囲に注意）。外部ネットワークへポート転送しないでください。
+- 最初のアクセスで、NASの管理者が後述のSSHコマンドで永続データ領域の `config/bootstrap-token` を読み、Webに入力して管理者パスワード（12文字以上）を登録します。トークンは完了後に削除されます。
 - **QPKGの既定待受は127.0.0.1:17864のみ**で、`--secure-cookie`を使用します。QTSのHTTPSリバースプロキシ（ループバックポート17864を転送）から利用してください。明示的にLAN公開が必要なら`DOWNLOADER_LAN_ENABLED=1`の管理者設定を使用し、Tailscale等の暗号化された接続に限定してください。HTTPポートをインターネットへ公開しないでください。プロキシ用ホスト名を使う場合は`DOWNLOADER_ALLOWED_HOSTS`で明示的に許可します。
 - 保存先ピッカーの表示ルートは既定`/share/Download`。許可対象を変える場合は`DOWNLOADER_ALLOWED_ROOTS`で絶対パスをコロン区切り指定します（管理者のみ編集）。
 - ブックマーク、設定、保留キューはDBに保存。**保留キューはJD2へは送信されない**ため、まだ実際にダウンロードしません。
@@ -43,3 +43,17 @@ TS-253Beの実RAM/QTS、既存JD2の設定とAPI、Chromiumサンドボックス
 ## JDownloader 2の独立更新と推奨設定の再適用
 
 **JDownloader 2はJD2標準のアップデーターで単独更新**します。HubのQPKG自己更新はJD2のファイルやプラグインを入れ替えません。JD2更新後に一般設定・Packagizer・LinkGrabber・自動解凍が変化した場合はHubの「推奨設定を確認して再適用」で差分確認・復旧できる設計です。**現v0.1.0ではJD2の認証済みAPIアダプタがまだなく、JD2更新ボタンと再適用ボタンは無効**です。正式なJD2接続/設定読書きができるまで有効化しません。手順: [JD2独立更新と再適用](docs/jd2-independent-updates.md)。
+
+
+### Docker不要の永続データ保存
+
+QPKGの標準保存先は **QPKGインストール場所の親ディレクトリにある `QnapDownloader-data`** です（例: `/share/CACHEDEV1_DATA/.qpkg/QnapDownloader-data`）。本体インストール先とは別なのでQPKG更新時にデータを上書きせず、`/share/Container`共有フォルダ・Container Station・Dockerを必須としません。起動時に利用可能な別の共有フォルダへ自動フォールバックしたり、既存データを勝手に移動しません。
+
+初期設定トークンをSSHで確認する例:
+
+```sh
+INSTALL=$(/sbin/getcfg QnapDownloader Install_Path -f /etc/config/qpkg.conf)
+cat "$(dirname "$INSTALL")/QnapDownloader-data/config/bootstrap-token"
+```
+
+別のデータ領域を使う場合は、初回起動前にQPKGサービスへ管理者が`DOWNLOADER_DATA_DIR`を明示設定してください。後から変更する場合は既存データの移行を計画し、サービス停止中にバックアップ・復旧確認してから変更してください。
