@@ -59,6 +59,7 @@
   <h3>QnapDownloader Hubの更新</h3><p>QnapSelfCare方式：Hubの新しい正式QPKGを検出し、SHA-256検証・DBバックアップ・QPKG適用・起動検証を実施します。JDownloader 2本体の更新には影響しません。</p>
   <button id="updateCheck">更新を確認</button><p id="updateResult"></p><button id="updateApply" class="hidden">検証して更新する</button>
   <div id="updateStatus" class="muted"></div>
+  <button id="updateLogButton" class="secondary">更新ログを表示</button><pre id="updateLog" class="update-log hidden"></pre>
   <p class="muted">QNAPにQPKGとしてインストールされた環境のみ適用できます。公開Releaseがない場合は更新できません。</p>
   <hr><h3>JDownloader 2の単独更新と推奨設定</h3>
   <p>JD2は公式の更新機能を使用し、Hubとは独立してCore/ホストプラグインを更新します。設定が変わった場合はHub側で差分を確認し、推奨設定を再適用します。</p>
