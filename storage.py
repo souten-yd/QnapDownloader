@@ -168,6 +168,22 @@ class Store:
             row = db.execute("SELECT id,state FROM link_intents WHERE url=?", (url,)).fetchone()
             return dict(id=row[0], state=row[1])
 
+    def add_links(self, urls):
+        # All-or-nothing staging of manually previewed URLs. Never sends to JD2.
+        if not isinstance(urls, list) or len(urls) > 100:
+            raise ValueError("リンク登録件数が上限を超えています")
+        normalized = [self.validate_url(value) for value in urls]
+        with self._guard, self.connect() as db:
+            count = 0
+            for url in normalized:
+                cur = db.execute(
+                    "INSERT OR IGNORE INTO link_intents(url,created_at) VALUES(?,?)",
+                    (url, time.time()))
+                count += cur.rowcount
+            if count:
+                db.execute("UPDATE meta SET value=value+1 WHERE key='revision'")
+            return count
+
     def begin_send(self, identifier):
         if type(identifier) is not int or identifier <= 0:
             raise ValueError("リンクIDが不正です")
