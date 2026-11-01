@@ -54,6 +54,9 @@ class FakeAPI:
             raise ValueError("wrong device")
         return self
 
+    def disable_direct_connection(self):
+        self.calls.append("disable_direct_connection")
+
 
 class MyJDTests(unittest.TestCase):
     def opts(self):
@@ -80,7 +83,7 @@ class MyJDTests(unittest.TestCase):
         api = FakeAPI()
         adapter = jd.MyJDAdapter(self.opts(), api_factory=lambda: api)
         self.assertEqual(adapter.core_revision(), 123456)
-        self.assertEqual(api.calls, ["connect", "update_devices"])
+        self.assertEqual(api.calls, ["connect", "update_devices", "disable_direct_connection"])
         self.assertTrue(adapter.is_update_available())
         data = adapter.inspect_preset()
         self.assertEqual(data["jd_revision"], 123456)
@@ -90,6 +93,25 @@ class MyJDTests(unittest.TestCase):
         # Unverified settings cannot be mutated
         with self.assertRaises(jd.MyJDUnavailable):
             adapter.update_preset("packagizer.package_subfolders", False)
+
+    def test_missing_secure_transport_capability_refuses_device(self):
+        api = FakeAPI()
+        api.disable_direct_connection = None
+        adapter = jd.MyJDAdapter(self.opts(), api_factory=lambda: api)
+        with self.assertRaises(jd.MyJDUnavailable):
+            adapter.core_revision()
+        self.assertIsNone(adapter._device)
+
+    def test_direct_transport_is_disabled_before_any_jd_action(self):
+        api = FakeAPI()
+        def revision():
+            if "disable_direct_connection" not in api.calls:
+                raise AssertionError("Tried JD2 call while direct LAN was enabled")
+            return 123456
+        api.jd = type("JD", (), {"get_core_revision": lambda _: revision()})()
+        adapter = jd.MyJDAdapter(self.opts(), api_factory=lambda: api)
+        self.assertEqual(adapter.core_revision(), 123456)
+        self.assertIn("disable_direct_connection", api.calls)
 
     def test_explicit_consent_required_for_jd2_updates(self):
         api = FakeAPI()
