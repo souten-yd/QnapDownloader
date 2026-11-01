@@ -65,3 +65,7 @@ MyJDownloader認証済みアダプタを追加しました。QPKGへライブラ
 ## 手動LinkGrabber転送（開発段階）
 
 保留リンクを1件ずつJD2へ手動送信するAPIと画面を追加しました。既存Dockerの保存先とNASのパスの対応は自動推測しません。管理者による明示設定と、自動確定/自動開始OFFの検証が必須です。Packagizerルール未検証時は追加opt-inを要求します。送信結果不明時は自動再送しません。詳細は[MyJD接続設定](docs/myjd-setup.md)。
+
+## Rapidgator URLのオフライン抽出（v0.1.2）
+
+コピーしたサイトのテキスト/HTMLを貼り付け、最大20件のHTTPSファイルリンク候補をプレビューできます。利用者が明示的に承認した場合だけ保留キューに登録し、**ページ取得・スクリプト実行・JD2への自動送信は行いません**。詳細: [Rapidgatorオフライン抽出](docs/rapidgator-manual-extract.md)。
