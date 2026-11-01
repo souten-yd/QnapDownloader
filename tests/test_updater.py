@@ -27,6 +27,20 @@ class UpdaterTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             updater.select(release, "1.2.2", "../x86_64")
 
+    def test_no_release_is_not_an_installable_update(self):
+        import urllib.error
+        with patch.object(updater.urllib.request, "urlopen",
+                          side_effect=urllib.error.HTTPError(updater.API, 404,
+                           "No release", None, None)):
+            self.assertIsNone(updater.latest("0.1.0", "x86_64"))
+        for code in (403, 429, 500):
+            with self.subTest(http_status=code):
+                with patch.object(updater.urllib.request, "urlopen",
+                                  side_effect=urllib.error.HTTPError(updater.API, code,
+                                   "API failure", None, None)):
+                    with self.assertRaises(urllib.error.HTTPError):
+                        updater.latest("0.1.0", "x86_64")
+
     def test_download_verifies_bytes_and_never_overwrites(self):
         contents = b"verified qpkg"
         release = {"tag_name": "v1.2.3", "assets": [self.asset(contents)]}
