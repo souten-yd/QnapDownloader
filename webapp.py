@@ -244,6 +244,10 @@ class Handler(BaseHTTPRequestHandler):
                       "writable": os.access(selected, os.W_OK)})
             if path == "/api/update/status":
                 return self.send_data(200, self.server.updates.status())
+            if path == "/api/update/log":
+                # Admin-authenticated, bounded tail; never expose an arbitrary
+                # caller-provided file path or the updater's internal directory.
+                return self.send_data(200, {"log": self.server.updates.log_tail()})
             if path == "/api/update/check":
                 release = updater.latest(VERSION, "x86_64")
                 return self.send_data(200, {"available": release is not None,
