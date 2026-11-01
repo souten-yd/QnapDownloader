@@ -117,13 +117,52 @@ class HttpTests(unittest.TestCase):
         self.assertEqual(self.req("/api/folders")[0], 200)
         self.assertEqual(self.req("/api/folders?path="+str(self.allowed))[0], 200)
 
+    def test_rapidgator_preview_and_digest_confirmed_staging(self):
+        content=("https://rapidgator.net/file/1234?utm=1 "
+                 "https://rg.to/file/1234 "
+                 "https://rg.to/file/5678")
+        self.assertEqual(self.req("/api/rapidgator/extract",
+                                  {"content": content})[0], 401)
+        self.login()
+        self.assertEqual(self.req("/api/rapidgator/extract",
+                                  {"content": content}, csrf=False)[0], 403)
+        code, preview = self.req("/api/rapidgator/extract",
+                                 {"content": content, "limit": 20})
+        self.assertEqual(code, 200)
+        self.assertEqual(preview["count"], 2)
+        self.assertFalse(preview["saved"])
+        self.assertEqual(self.req("/api/links")[1]["items"], [])
+        self.assertEqual(self.req("/api/rapidgator/extract",
+             {"content": content+"changed", "digest": preview["digest"],
+              "commit": True})[0], 400)
+        code, result = self.req("/api/rapidgator/extract",
+             {"content": content, "digest": preview["digest"], "commit": True})
+        self.assertEqual(code, 200)
+        self.assertEqual(result["staged"], 2)
+        self.assertTrue(result["saved"])
+        self.assertEqual(len(self.req("/api/links")[1]["items"]), 2)
+        code, repeated = self.req("/api/rapidgator/extract",
+             {"content": content, "digest": preview["digest"], "commit": True})
+        self.assertEqual(code, 200)
+        self.assertEqual(repeated["staged"], 0)
+
+    def test_rapidgator_large_paste_does_not_allow_unbounded_body(self):
+        self.login()
+        content="https://rapidgator.net/file/1234 " + "a" * 18000
+        code, value = self.req("/api/rapidgator/extract", {"content": content})
+        self.assertEqual(code, 200)
+        self.assertEqual(value["count"], 1)
+        oversized="a"*68000
+        self.assertEqual(self.req("/api/rapidgator/extract",
+                                 {"content": oversized})[0], 400)
+
     def test_update_apply_fails_closed_when_not_qpkg(self):
         self.login()
         info = self.req("/api/update/status")[1]
         self.assertFalse(info["supported"])
-        code, _ = self.req("/api/update/apply", {"version": "v0.1.1"})
+        code, _ = self.req("/api/update/apply", {"version": "v0.1.2"})
         self.assertEqual(code, 400)
-        self.assertEqual(self.req("/api/health")[1]["version"], "0.1.1")
+        self.assertEqual(self.req("/api/health")[1]["version"], "0.1.2")
         self.assertFalse(self.req("/api/jd2/status")[1]["connected"])
         self.assertEqual(self.req("/api/jd2/update/apply", {"confirmed": True})[0], 400)
         self.assertEqual(self.req("/api/jd2/preset/apply", {"confirmed": True})[0], 400)
