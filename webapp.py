@@ -22,7 +22,7 @@ import browser_safety
 import jd2_myjd
 import updater
 
-VERSION = "0.1.6"
+VERSION = "0.1.7"
 PORT = 17864
 ROOT = Path(__file__).resolve().parent
 FILES = {"/": ("web/index.html", "text/html; charset=utf-8"),
@@ -243,6 +243,15 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_data(200, jd2_myjd.configuration_status(self.store.root))
             if path == "/api/jd2/status":
                 return self.send_data(200, self.server.jd2.status())
+            if path == "/api/jd2/downloads":
+                # Explicit manual refresh only. No scheduled poll of remote JD2
+                # and no raw JD2 response or secret fields go to the browser.
+                query = parse_qs(urlsplit(self.path).query)
+                page_text = query.get("page", ["0"])[0]
+                if not page_text.isdecimal() or len(page_text) > 2:
+                    raise ValueError("表示ページが不正です")
+                page = int(page_text)
+                return self.send_data(200, self.server.jd2.downloads_snapshot(page))
             if path == "/api/jd2/preset/preview":
                 return self.send_data(200, self.server.jd2.preset_preview())
             if path == "/api/bookmarks":

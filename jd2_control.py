@@ -32,6 +32,11 @@ class JD2Controller:
                 return {"connected": False, "reason": str(error),
                         "can_update": False, "can_preset": False}
 
+    def downloads_snapshot(self, page=0):
+        """Read-only; never triggers JD2 updates, queue mutations or downloads."""
+        with self.lock:
+            return self._require().list_downloads(page)
+
     def connection_test(self):
         """Explicit read-only probe; never starts an update/download."""
         with self.lock:

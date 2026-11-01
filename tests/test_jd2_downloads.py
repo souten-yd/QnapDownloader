@@ -1,0 +1,86 @@
+import unittest
+from unittest.mock import Mock
+import jd2_downloads as view
+import jd2_myjd
+
+
+class DownloadViewTests(unittest.TestCase):
+    def test_readonly_query_fields_exclude_urls_passwords_and_paths(self):
+        self.assertFalse({"url", "password", "downloadPassword", "saveTo",
+                          "comment"}.intersection(view.LINK_FIELDS))
+        self.assertFalse({"saveTo", "password"}.intersection(view.PACKAGE_FIELDS))
+        options = view.query_options(view.LINK_FIELDS, 2)
+        self.assertEqual(options[0]["startAt"], 60)
+        self.assertEqual(options[0]["maxResults"], 30)
+        self.assertNotIn("url", options[0])
+        with self.assertRaises(ValueError):
+            view.query_options(view.LINK_FIELDS, 21)
+        with self.assertRaises(ValueError):
+            view.query_options(view.LINK_FIELDS, True)
+
+    def test_normalize_progress_and_ignore_extra_secrets(self):
+        payload = view.snapshot([{
+            "name": "Archive", "bytesLoaded": 500, "bytesTotal": 1000,
+            "speed": 250, "running": True, "childCount": 2,
+            "saveTo": "/share/private", "password": "super-secret"
+        }], [{
+            "name": "video.zip", "host": "rapidgator.net", "bytesLoaded": 99,
+            "bytesTotal": 100, "speed": 2, "eta": 5, "finished": False,
+            "url": "https://example.com/private", "password": "super-secret",
+            "internalPath": "/share/private"
+        }], 0)
+        self.assertEqual(payload["packages"][0]["progress"], 50.0)
+        self.assertEqual(payload["links"][0]["progress"], 99.0)
+        self.assertEqual(payload["packages"][0]["child_count"], 2)
+        self.assertEqual(payload["links"][0]["host"], "rapidgator.net")
+        self.assertEqual(payload["links"][0]["eta_seconds"], 5)
+        self.assertEqual(payload["source"], "myjd-remote-readonly")
+        self.assertNotIn("super-secret", str(payload))
+        self.assertNotIn("/share/private", str(payload))
+        self.assertNotIn("example.com/private", str(payload))
+
+    def test_unknown_and_invalid_values_are_not_guessed(self):
+        snap = view.snapshot([], [{
+            "name": "", "speed": -1, "bytesLoaded": 400,
+            "bytesTotal": 200, "running": "yes", "finished": 1, "eta": True
+        }], 0)
+        item = snap["links"][0]
+        self.assertEqual(item["progress"], 100)
+        self.assertIsNone(item["speed_bytes"])
+        self.assertIsNone(item["running"])
+        self.assertIsNone(item["finished"])
+        self.assertIsNone(item["eta_seconds"])
+        self.assertIn("名称不明", item["name"])
+        self.assertIsNone(view.snapshot([], [{"name":"a"}],0)["links"][0]["progress"])
+
+    def test_oversized_or_malformed_response_rejected(self):
+        with self.assertRaises(ValueError):
+            view.snapshot([{}] * 31, [], 0)
+        with self.assertRaises(ValueError):
+            view.snapshot({}, [], 0)
+        with self.assertRaises(ValueError):
+            view.snapshot([], [None], 0)
+
+    def test_adapter_uses_actual_query_methods_without_mutations(self):
+        packages = Mock(return_value=[{"name":"Pictures","bytesTotal": 50}])
+        links = Mock(return_value=[{"name":"a.zip","bytesLoaded":5,"bytesTotal":10}])
+        device = Mock()
+        device.downloads.query_packages = packages
+        device.downloads.query_links = links
+        adapter = jd2_myjd.MyJDAdapter({
+            "email": "example@domain.tld", "password": "secret",
+            "device_name": "NAS"}, api_factory=lambda: None)
+        adapter._device = device
+        result = adapter.list_downloads(0)
+        self.assertEqual(result["packages"][0]["name"],"Pictures")
+        self.assertEqual(result["links"][0]["progress"],50)
+        self.assertNotIn("password",str(packages.call_args))
+        self.assertNotIn("url",str(links.call_args))
+        self.assertEqual(packages.call_count,1)
+        self.assertEqual(links.call_count,1)
+        device.downloadcontroller.assert_not_called()
+        device.update.assert_not_called()
+
+
+if __name__ == "__main__":
+    unittest.main()

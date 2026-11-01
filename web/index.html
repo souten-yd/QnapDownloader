@@ -15,7 +15,7 @@
 <script src="/app.js" defer></script>
 </head>
 <body>
-<header><div class="brand"><img src="/icon.svg" width="36" height="36" alt="" loading="eager"> QnapDownloader <small>0.1.6</small></div><button id="logout" class="secondary hidden">ログアウト</button></header>
+<header><div class="brand"><img src="/icon.svg" width="36" height="36" alt="" loading="eager"> QnapDownloader <small>0.1.7</small></div><button id="logout" class="secondary hidden">ログアウト</button></header>
 <main>
 <div id="lanSecurityWarning" class="notice hidden" role="note">この画面はHTTP接続です。パスワード保護はありますが通信は暗号化されません。信頼できる家庭内LANのみで利用し、外部公開しないでください。遠隔アクセスにはHTTPSリバースプロキシ／VPNを使用してください。</div>
 <section id="setup" class="panel hidden">
@@ -32,10 +32,37 @@
 </section>
 <section id="app" class="hidden">
  <div class="notice">初期開発版：Hub単体のダウンロードエンジン・フル機能ブラウザ・自動ダウンロードは未実装です。リンクは保留キューに保存されます。認証済みJD2接続・管理者の明示許可・保存先確認後に限り、個別の「JD2に手動で送る」からLinkGrabberへ送信できます。</div>
- <nav><button data-tab="dashboard" class="active">概要</button><button data-tab="queue">リンク保留</button><button data-tab="browser">安全ブラウザ</button><button data-tab="bookmarks">ブックマーク</button><button data-tab="settings">設定</button><button data-tab="updates">アップデート</button></nav>
+ <nav aria-label="メインメニュー"><button data-tab="dashboard" class="active">概要</button><button data-tab="downloads">ダウンロード</button><button data-tab="queue">リンク保留</button><button data-tab="browser">安全ブラウザ</button><button data-tab="bookmarks">ブックマーク</button><button data-tab="settings">設定</button><button data-tab="updates">更新</button></nav>
  <section id="dashboard" class="panel tab">
-  <h2>ダッシュボード</h2><div id="status"></div>
+  <h2>ダッシュボード</h2>
+  <p class="muted">QnapDownloaderでリンクとJD2の状態を確認できます。ダウンロード一覧は実際のJD2に接続した場合だけ表示されます。</p>
+  <div id="status" aria-live="polite"></div>
+  <h3>よく使う操作</h3>
+  <div class="quick-actions">
+    <button class="secondary" data-go="downloads">ダウンロード状況を見る</button>
+    <button class="secondary" data-go="queue">リンクを登録する</button>
+    <button class="secondary" data-go="settings">接続・保存先を設定する</button>
+  </div>
   <p class="muted">Rapidgator貼り付け抽出と認証済みMyJDownloader接続は対応済みです。サイト自動巡回は未実装です。隔離型の軽量Web閲覧プレビューには対応していますが、埋め込み禁止サイトはSafariを利用してください。実機でのJD2操作検証は継続中です。</p>
+ </section>
+ <section id="downloads" class="panel tab hidden">
+  <h2>ダウンロード管理</h2>
+  <p class="muted">JDownloader 2の実際の状態を読み取り専用で表示します。開始・停止・削除ボタンは安全な実機検証後に実装します。</p>
+  <div class="download-actions">
+    <button id="downloadsRefresh">最新の状態を取得</button>
+    <button class="secondary" data-go="settings">JD2接続設定</button>
+  </div>
+  <p id="downloadsMessage" class="muted" role="status" aria-live="polite">「最新の状態を取得」を押してください。自動更新は行いません。</p>
+  <div id="downloadsSummary" class="summary-metrics"></div>
+  <h3>ダウンロード中・待機中のパッケージ</h3>
+  <div id="downloadPackages" class="items"></div>
+  <h3>ファイル一覧</h3>
+  <div id="downloadLinks" class="items"></div>
+  <div class="download-actions">
+    <button class="secondary" id="downloadsPrev" disabled>前の30件</button>
+    <span id="downloadsPage" class="muted">1ページ目</span>
+    <button class="secondary" id="downloadsNext" disabled>次の30件</button>
+  </div>
  </section>
  <section id="queue" class="panel tab hidden">
   <h2>リンクの保留登録</h2><p>明示的に追加したHTTPSリンクを重複なく保存します。自動で取得・実行しません。</p>

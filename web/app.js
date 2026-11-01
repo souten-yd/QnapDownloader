@@ -1,6 +1,7 @@
 "use strict";
 let csrf="", selectedVersion="", selectedChannel="rc", rapidgatorSnapshot=null;
 let browserHistory=[], browserIndex=-1, browserCurrent="";
+let downloadsPage=0, downloadsBusy=false;
 const $=id=>document.getElementById(id);
 function visible(id,on){$(id).classList.toggle("hidden",!on)}
 function flash(message){$("notice").textContent=message;visible("notice",true)}
@@ -29,7 +30,8 @@ async function go(){
  }catch(e){flash(e.message)}
 }
 async function perform(fn){
- try{await fn();visible("notice",false)}catch(e){flash(e.message)}
+ visible("notice",false);
+ try{await fn()}catch(e){flash(e.message)}
 }
 function element(tag,text,className){
  const n=document.createElement(tag); if(text!==undefined)n.textContent=String(text);
@@ -41,6 +43,82 @@ function itemLine(container,first,second){
  const div=element("div",first,"item");
  if(second)div.appendChild(element("span",second));
  container.appendChild(div);
+}
+function readableSize(bytes){
+ if(typeof bytes!=="number"||!Number.isFinite(bytes)||bytes<0)return "不明";
+ if(bytes===0)return "0 B";
+ const exp=Math.min(4,Math.floor(Math.log(bytes)/Math.log(1024)));
+ const num=bytes/Math.pow(1024,exp);
+ return (num>=10?num.toFixed(0):num.toFixed(1))+" "+["B","KiB","MiB","GiB","TiB"][exp];
+}
+function readableEta(seconds){
+ if(typeof seconds!=="number"||!Number.isFinite(seconds)||seconds<0)return "不明";
+ const minutes=Math.ceil(seconds/60);
+ return minutes<1?"1分未満":minutes<60?minutes+"分":Math.floor(minutes/60)+"時間"+(minutes%60)+"分";
+}
+function downloadCard(item,packageItem){
+ const card=element("article",undefined,"download-card");
+ card.appendChild(element("strong",item.name,"download-title"));
+ const parts=[];
+ if(!packageItem&&item.host)parts.push("ホスト: "+item.host);
+ if(packageItem&&item.child_count!==null)parts.push("ファイル: "+item.child_count+"件");
+ const state=item.finished===true?"完了":item.running===true?"ダウンロード中":
+   item.enabled===false?"無効":"待機/確認中";
+ parts.push(state);
+ if(item.status)parts.push(item.status);
+ card.appendChild(element("p",parts.join(" / "),"download-detail"));
+ if(item.progress!==null){
+  const track=element("div",undefined,"progress-track");
+  track.setAttribute("role","progressbar");
+  track.setAttribute("aria-valuemin","0");
+  track.setAttribute("aria-valuemax","100");
+  track.setAttribute("aria-valuenow",String(item.progress));
+  track.setAttribute("aria-label",item.name+" 進捗");
+  const fill=element("div",undefined,"progress-fill");
+  fill.style.width=item.progress+"%";
+  track.appendChild(fill);card.appendChild(track);
+ }
+ const loaded=readableSize(item.bytes_loaded);
+ const total=readableSize(item.bytes_total);
+ const details="転送: "+loaded+" / "+total+
+  " · 速度: "+readableSize(item.speed_bytes)+"/秒"+
+  " · 残り: "+readableEta(item.eta_seconds);
+ card.appendChild(element("p",details,"download-detail"));
+ return card;
+}
+async function loadDownloads(page){
+ if(downloadsBusy)return;
+ downloadsBusy=true;
+ $("downloadsRefresh").disabled=true;
+ $("downloadsMessage").textContent="JD2から状態を取得中… ダウンロード操作は実行しません。";
+ try{
+  const state=await api("/api/jd2/downloads?page="+page);
+  downloadsPage=state.page;
+  const packages=$("downloadPackages"),links=$("downloadLinks");
+  packages.replaceChildren();links.replaceChildren();
+  for(const item of state.packages)packages.appendChild(downloadCard(item,true));
+  for(const item of state.links)links.appendChild(downloadCard(item,false));
+  if(!state.packages.length)packages.appendChild(element("p","パッケージが見つかりません。","empty-state"));
+  if(!state.links.length)links.appendChild(element("p","ファイルが見つかりません。","empty-state"));
+  const running=state.links.filter(x=>x.running===true).length;
+  const finished=state.links.filter(x=>x.finished===true).length;
+  const metrics=$("downloadsSummary");metrics.replaceChildren();
+  for(const [title,value] of [["表示ファイル",state.links.length+"件"],["実行中",running+"件"],["完了",finished+"件"]]){
+   const box=element("div",undefined,"metric");
+   box.appendChild(element("span",title));box.appendChild(element("strong",value));metrics.appendChild(box);
+  }
+  $("downloadsMessage").textContent=
+    "JD2から取得しました（読み取り専用）。一覧は最大30件ずつ表示します。";
+  $("downloadsPage").textContent=(state.page+1)+"ページ目";
+  $("downloadsPrev").disabled=state.page===0;
+  $("downloadsNext").disabled=!state.has_more||state.page>=20;
+ }catch(error){
+  $("downloadsMessage").textContent="取得できませんでした: "+error.message+
+     "。設定でMyJDownloader接続を確認してください。";
+  $("downloadsPrev").disabled=true;$("downloadsNext").disabled=true;
+ }finally{
+  downloadsBusy=false;$("downloadsRefresh").disabled=false;
+ }
 }
 async function refresh(tab){
  if(tab==="dashboard"){
@@ -97,7 +175,12 @@ async function refresh(tab){
 }
 function activeTab(id){
  document.querySelectorAll(".tab").forEach(n=>n.classList.toggle("hidden",n.id!==id));
- document.querySelectorAll("nav button").forEach(n=>n.classList.toggle("active",n.dataset.tab===id));
+ document.querySelectorAll("nav button").forEach(n=>{
+   const current=n.dataset.tab===id;
+   n.classList.toggle("active",current);
+   if(current)n.setAttribute("aria-current","page");
+   else n.removeAttribute("aria-current");
+ });
  perform(()=>refresh(id));
 }
 async function folders(path){
@@ -262,6 +345,11 @@ document.addEventListener("DOMContentLoaded",()=>{
     $("jd2TestResult").textContent="接続できませんでした: "+err.message;
   }
  }));
+ document.querySelectorAll("[data-go]").forEach(button=>
+   button.addEventListener("click",()=>activeTab(button.dataset.go)));
+ $("downloadsRefresh").addEventListener("click",()=>loadDownloads(downloadsPage));
+ $("downloadsPrev").addEventListener("click",()=>loadDownloads(downloadsPage-1));
+ $("downloadsNext").addEventListener("click",()=>loadDownloads(downloadsPage+1));
  $("folderRoots").addEventListener("click",()=>perform(()=>folders("")));
  $("updateLogButton").addEventListener("click",()=>perform(async()=>{
   const result=await api("/api/update/log");
