@@ -21,7 +21,7 @@ import rapidgator_extract
 import jd2_myjd
 import updater
 
-VERSION = "0.1.3"
+VERSION = "0.1.4"
 PORT = 17864
 ROOT = Path(__file__).resolve().parent
 FILES = {"/": ("web/index.html", "text/html; charset=utf-8"),
@@ -222,7 +222,7 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/health":
             return self.send_data(200, {"version": VERSION,
                          "settings_revision": self.store.revision()})
-        if path == "/api/bootstrap/status":
+        if path == "/api/setup/status":
             return self.send_data(200, {"configured": self.store.has_admin()})
         if path == "/api/session":
             data = self.session()
@@ -289,16 +289,15 @@ class Handler(BaseHTTPRequestHandler):
         path = urlsplit(self.path).path
         try:
             body = self.body()
-            if path == "/api/bootstrap":
+            if path == "/api/setup":
+                # Initial setup is first-claim-only on a private LAN.
+                # The account INSERT is protected by the Store lock and
+                # single-row database constraint, including concurrent POSTs.
+                # No one-time SSH token is read, sent or generated.
                 if self.store.has_admin():
                     return self.reject("管理者は登録済みです", 403)
-                candidate = body.get("token", "")
-                if not isinstance(candidate, str) or not hmac.compare_digest(candidate, self.server.bootstrap_token):
-                    return self.reject("初期設定トークンが一致しません", 403)
                 self.store.create_admin(body.get("password"))
-                (self.store.root / "config" / "bootstrap-token").unlink(missing_ok=True)
-                self.server.bootstrap_token = ""
-                return self.send_data(200, {"ok": True})
+                return self.send_data(201, {"ok": True})
             if path == "/api/login":
                 address = self.client_address[0]
                 with SESSION_LOCK:
@@ -397,19 +396,18 @@ class Handler(BaseHTTPRequestHandler):
         self.reject("APIが存在しません", 404)
 
 
-def bootstrap(data):
-    conf = data / "config"
-    conf.mkdir(parents=True, exist_ok=True, mode=0o700)
-    path = conf / "bootstrap-token"
-    if path.exists():
-        return path.read_text(encoding="utf-8").strip()
-    token = secrets.token_urlsafe(30)
-    with path.open("x", encoding="utf-8") as f:
-        os.chmod(path, 0o600)
-        f.write(token + "\n")
-        f.flush()
-        os.fsync(f.fileno())
-    return token
+
+def remove_legacy_setup_token(data):
+    """Remove only obsolete one-time setup token on upgrade.
+
+    Not used as an authentication factor. Unlink does not follow symlinks;
+    failures do not prevent the Hub from starting.
+    """
+    try:
+        (Path(data) / "config" / "bootstrap-token").unlink(missing_ok=True)
+        return True
+    except OSError:
+        return False
 
 
 def main():
@@ -425,7 +423,7 @@ def main():
     server = ThreadingHTTPServer(("0.0.0.0" if args.lan else "127.0.0.1", args.port), Handler)
     server.store = store
     server.secure_cookies = args.secure_cookie
-    server.bootstrap_token = "" if store.has_admin() else bootstrap(data)
+    remove_legacy_setup_token(data)
     server.updates = self_update.UpdateManager(data, ROOT, VERSION, "x86_64", args.port)
     server.jd2 = jd2_control.JD2Controller(jd2_myjd.configured_adapter(data))
     try:

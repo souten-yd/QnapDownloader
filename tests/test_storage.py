@@ -66,6 +66,22 @@ class StorageTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.s.create_admin("different password")
 
+    def test_first_password_ownership_is_atomic_without_token(self):
+        import concurrent.futures
+        candidates = ["correct horse battery 123", "another long password 456"]
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            futures = [pool.submit(self.s.create_admin, x) for x in candidates]
+            results = []
+            for future in futures:
+                try:
+                    future.result()
+                    results.append(True)
+                except ValueError:
+                    results.append(False)
+        self.assertEqual(results.count(True), 1)
+        self.assertEqual(sum(self.s.check_password(x) for x in candidates), 1)
+        self.assertTrue(self.s.has_admin())
+
     def test_reject_missing_database_after_initialization(self):
         self.s.close()
         for p in self.root.joinpath("data").glob("downloader.sqlite3*"):

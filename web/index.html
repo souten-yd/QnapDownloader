@@ -15,13 +15,13 @@
 <script src="/app.js" defer></script>
 </head>
 <body>
-<header><div class="brand"><img src="/icon.svg" width="36" height="36" alt="" loading="eager"> QnapDownloader <small>0.1.3</small></div><button id="logout" class="secondary hidden">ログアウト</button></header>
+<header><div class="brand"><img src="/icon.svg" width="36" height="36" alt="" loading="eager"> QnapDownloader <small>0.1.4</small></div><button id="logout" class="secondary hidden">ログアウト</button></header>
 <main>
 <div id="lanSecurityWarning" class="notice hidden" role="note">この画面はHTTP接続です。パスワード保護はありますが通信は暗号化されません。信頼できる家庭内LANのみで利用し、外部公開しないでください。遠隔アクセスにはHTTPSリバースプロキシ／VPNを使用してください。</div>
 <section id="setup" class="panel hidden">
   <h2>初期管理者設定</h2>
-  <p>NASのSSHから <code>&lt;QPKGインストール親ディレクトリ&gt;/QnapDownloader-data/config/bootstrap-token</code> の内容を確認し、ここで一度だけ設定します。パスワードは12文字以上。</p>
-  <label>初期設定トークン<input id="bootstrapToken" type="password" autocomplete="off"></label>
+  <p>初回のみ、管理者パスワード（12文字以上）を登録してください。SSHトークンの確認は不要です。</p>
+  <p class="muted">最初に登録した利用者が管理者になります。信頼できる家庭内LANから、インストール直後に設定してください。通信を暗号化したい場合はHTTPSまたはVPNを使用してください。</p>
   <label>新しい管理者パスワード<input id="setupPassword" type="password" autocomplete="new-password"></label>
   <button id="setupButton">管理者を登録</button>
 </section>

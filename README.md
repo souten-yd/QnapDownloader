@@ -2,7 +2,7 @@
 
 QNAP TS-253Be (QTS 5.x, x86_64)向け **JDownloader 2 + 安全なWebブラウザ／リンク収集／ダウンロード管理** 統合QPKGの設計リポジトリ。Rapidgatorリンク検出・ボタン化、Click'n'Load互換取り込み、サイト別の明示許可付き自動収集、ブックマーク、NAS側保存先選択を目指します。
 
-**現在の状態: v0.1.3 Web起動・LANアクセス修正とiOS/QNAPアイコン対応**。管理者ログイン、NAS共有フォルダ選択/永続化、手動リンク保留、ブックマーク、更新確認とQPKG自己更新ワーカー、Web管理画面、QDKビルド定義を追加しました。**JD2接続アダプタと手動LinkGrabber転送は実装済みですが、JD2実機接続・実ダウンロードは未検証です。内蔵ブラウザ、Rapidgator自動検出、広告遮断は未実装**であり、完了したとは表示しません。QDKでのx86_64 QPKG自動ビルド・テストは実施済みですが、QNAP実機でのインストール・起動・JD2接続は未検証です。既存Docker版JDownloader 2や別QPKGは変更しません。
+**現在の状態: v0.1.4 初回トークン不要の管理者登録・LAN Web UI・iOS/QNAPアイコン対応**。管理者ログイン、NAS共有フォルダ選択/永続化、手動リンク保留、ブックマーク、更新確認とQPKG自己更新ワーカー、Web管理画面、QDKビルド定義を追加しました。**JD2接続アダプタと手動LinkGrabber転送は実装済みですが、JD2実機接続・実ダウンロードは未検証です。内蔵ブラウザ、Rapidgator自動検出、広告遮断は未実装**であり、完了したとは表示しません。QDKでのx86_64 QPKG自動ビルド・テストは実施済みですが、QNAP実機でのインストール・起動・JD2接続は未検証です。既存Docker版JDownloader 2や別QPKGは変更しません。
 
 ## 仕様・開発ルール
 
@@ -31,7 +31,7 @@ TS-253Beの実RAM/QTS、既存JD2の設定とAPI、Chromiumサンドボックス
 ## 初期実装の起動・注意事項
 
 - Python 3.8+、標準ライブラリ。NASが起動してボリュームをマウントしてから、開発環境では `python3 -B webapp.py --data-dir ./runtime --port 17864` でループバック起動します（ルート権限と公開範囲に注意）。外部ネットワークへポート転送しないでください。
-- 最初のアクセスで、NASの管理者が後述のSSHコマンドで永続データ領域の `config/bootstrap-token` を読み、Webに入力して管理者パスワード（12文字以上）を登録します。トークンは完了後に削除されます。
+- 初回のWebアクセスでは**SSH認証トークンは不要**です。管理画面で12〜256文字の管理者パスワードを1回だけ登録します。最初に登録した端末が管理者を確定できるため、インストール直後に信頼できる家庭内LAN上で設定し、公開Wi-Fi・外部公開ポートを使用しないでください。登録済みアカウントはアップデート後も維持され、初回登録画面を再表示しません。
 - **v0.1.3以降のQPKGは家庭内LANからのWebアクセスを初期状態で許可**します。例: http://192.168.68.57:17864/ 。サーバーはRFC1918/ループバック/プライベートVPN以外の接続元を拒否し、Host検証・ログイン・CSRF保護を維持します。ただしLAN HTTPは暗号化されません。信頼できるLANでのみ利用し、17864をインターネットにポート開放しないでください。遠隔操作にはHTTPSリバースプロキシやVPNを使ってください。保存データのconfig/network-modeにloopbackを書いて再起動すればNAS自身からのアクセスだけに戻せます（lanでLAN待受）。DOWNLOADER_LAN_ENABLED=0|1で一時上書きできます。
 - 保存先ピッカーの表示ルートは既定`/share/Download`。許可対象を変える場合は`DOWNLOADER_ALLOWED_ROOTS`で絶対パスをコロン区切り指定します（管理者のみ編集）。
 - ブックマーク、設定、保留キューはDBに保存。**保留キューはJD2へは送信されない**ため、まだ実際にダウンロードしません。
@@ -49,12 +49,7 @@ TS-253Beの実RAM/QTS、既存JD2の設定とAPI、Chromiumサンドボックス
 
 QPKGの標準保存先は **QPKGインストール場所の親ディレクトリにある `QnapDownloader-data`** です（例: `/share/CACHEDEV1_DATA/.qpkg/QnapDownloader-data`）。本体インストール先とは別なのでQPKG更新時にデータを上書きせず、`/share/Container`共有フォルダ・Container Station・Dockerを必須としません。起動時に利用可能な別の共有フォルダへ自動フォールバックしたり、既存データを勝手に移動しません。
 
-初期設定トークンをSSHで確認する例:
-
-```sh
-INSTALL=$(/sbin/getcfg QnapDownloader Install_Path -f /etc/config/qpkg.conf)
-cat "$(dirname "$INSTALL")/QnapDownloader-data/config/bootstrap-token"
-```
+旧版のbootstrap-tokenファイルはv0.1.4への更新後、起動時に参照せず削除します。トークンの再発行やSSHでの確認は不要です。
 
 別のデータ領域を使う場合は、初回起動前にQPKGサービスへ管理者が`DOWNLOADER_DATA_DIR`を明示設定してください。後から変更する場合は既存データの移行を計画し、サービス停止中にバックアップ・復旧確認してから変更してください。
 
@@ -94,3 +89,9 @@ netstat -tnl | grep 17864
 ## iPhoneホーム画面・QNAP App Centerのアイコン
 
 共通の図案（シールド・下向き矢印・NAS）を使用。Safariホーム画面用は/apple-touch-icon.png（180px）、QNAP App Center用はQDK icons/のQnapDownloader.png・QnapDownloader_80.png・QnapDownloader_gray.pngです。開発時のSVGからQPKGビルド中に生成するため、NAS起動時のpip/npmビルドは不要です。
+
+## 初回登録のトークン廃止 (v0.1.4)
+
+`http://<NAS-IP>:17864/`で初回のみ管理者パスワードを登録します。既存の管理者がある環境では、従来のパスワードでログインしてください。再インストール/更新時にデータベースを初期化したり、既存パスワードを上書きしたりしません。
+
+初回登録API `POST /api/setup` は、管理者未登録の場合だけパスワードを受け付けます。登録済みなら403で拒否します。Host/送信元private-IP/Originチェックを維持し、一般APIの認証・CSRFは変更しません。**トークンをなくす代わりに、最初の管理者登録をLAN上の別端末が先取りするリスクがあります**。初回設定は信頼できるネットワークで速やかに実施してください。
