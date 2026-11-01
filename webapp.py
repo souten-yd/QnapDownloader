@@ -396,6 +396,20 @@ class Handler(BaseHTTPRequestHandler):
         self.reject("APIが存在しません", 404)
 
 
+
+def remove_legacy_setup_token(data):
+    """Remove only obsolete one-time setup token on upgrade.
+
+    Not used as an authentication factor. Unlink does not follow symlinks;
+    failures do not prevent the Hub from starting.
+    """
+    try:
+        (Path(data) / "config" / "bootstrap-token").unlink(missing_ok=True)
+        return True
+    except OSError:
+        return False
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", type=int, default=PORT)
@@ -409,12 +423,7 @@ def main():
     server = ThreadingHTTPServer(("0.0.0.0" if args.lan else "127.0.0.1", args.port), Handler)
     server.store = store
     server.secure_cookies = args.secure_cookie
-    # One-time cleanup of legacy, now-unused first-run token. Never read
-    # token content and never create a replacement.
-    try:
-        (data / "config" / "bootstrap-token").unlink(missing_ok=True)
-    except OSError:
-        pass
+    remove_legacy_setup_token(data)
     server.updates = self_update.UpdateManager(data, ROOT, VERSION, "x86_64", args.port)
     server.jd2 = jd2_control.JD2Controller(jd2_myjd.configured_adapter(data))
     try:
