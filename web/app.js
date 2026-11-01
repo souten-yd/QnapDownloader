@@ -21,7 +21,7 @@ async function go(){
    await refresh("dashboard");
  }else{
    visible("app",false);visible("logout",false);
-   const boot=await api("/api/bootstrap/status");
+   const boot=await api("/api/setup/status");
    visible("setup",!boot.configured);visible("login",boot.configured);
  }
  }catch(e){flash(e.message)}
@@ -132,7 +132,7 @@ document.addEventListener("DOMContentLoaded",()=>{
    !["localhost","127.0.0.1","::1","[::1]"].includes(location.hostname);
  visible("lanSecurityWarning",plainLan);
  $("setupButton").addEventListener("click",()=>perform(async()=>{
-  await api("/api/bootstrap",{token:$("bootstrapToken").value,password:$("setupPassword").value});await go();
+  await api("/api/setup",{password:$("setupPassword").value});await go();
  }));
  $("loginButton").addEventListener("click",()=>perform(async()=>{
   const r=await api("/api/login",{password:$("password").value});
