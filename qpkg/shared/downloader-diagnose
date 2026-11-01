@@ -1,0 +1,62 @@
+#!/bin/sh
+# Read-only QNAP diagnostic; does not start, stop, update or mutate the service.
+set -u
+name=QnapDownloader
+config=/etc/config/qpkg.conf
+get_value() {
+  if [ -x /sbin/getcfg ]; then
+    /sbin/getcfg "$name" "$1" -d "$2" -f "$config" 2>/dev/null
+  else
+    printf '%s\n' "$2"
+  fi
+}
+root=$(get_value Install_Path '')
+enabled=$(get_value Enable UNKNOWN)
+echo "=== QnapDownloader Web UI diagnostics ==="
+echo "Installed: ${root:+yes}"
+echo "App Center enabled: $enabled"
+echo "Expected LAN URL: http://<NAS-LAN-IP>:17864/"
+if [ -z "$root" ] || [ ! -d "$root" ]; then
+  echo "RESULT: QPKG install path absent: check App Center installation."
+  exit 1
+fi
+data_dir=${DOWNLOADER_DATA_DIR:-"$(dirname "$root")/QnapDownloader-data"}
+echo "Install root: $root"
+echo "Persistent data: $data_dir"
+echo "Web entry: $(if [ -f "$root/webapp.py" ]; then echo present; else echo MISSING; fi)"
+mode=lan
+if [ -f "$data_dir/config/network-mode" ]; then
+  IFS= read -r mode < "$data_dir/config/network-mode" || :
+fi
+echo "Network mode config: $mode"
+echo "Shell override DOWNLOADER_LAN_ENABLED: ${DOWNLOADER_LAN_ENABLED:-unset}"
+if python=$(/bin/sh "$root/python3-path" 2>/dev/null); then
+  echo "Python: $python"
+  "$python" --version 2>&1
+  if "$python" -B "$root/downloader_pid.py" status "$root" "$data_dir" "$root/downloader.pid" >/dev/null 2>&1; then
+    echo "Owned service PID: verified"
+  else
+    echo "Owned service PID: not running / PID verification failed"
+  fi
+else
+  echo "Python: NOT FOUND (install QNAP Python3 or configure DOWNLOADER_PYTHON)"
+fi
+if command -v netstat >/dev/null 2>&1; then
+  echo "--- TCP port 17864 listeners ---"
+  netstat -tnl 2>/dev/null | grep -E '[.:]17864[[:space:]]' || echo "No TCP listener found"
+fi
+echo "--- localhost health ---"
+if command -v curl >/dev/null 2>&1; then
+  curl --noproxy '*' --fail --silent --show-error --max-time 4 \
+    http://127.0.0.1:17864/api/health || echo "Local HTTP health unavailable"
+  echo
+else
+  echo "curl missing: cannot probe HTTP health"
+fi
+if [ -f "$data_dir/logs/downloader.log" ]; then
+  echo "Web startup log exists ($data_dir/logs/downloader.log)"
+  echo "Read only AFTER removing secrets before sharing logs."
+else
+  echo "Web startup log is absent: service may have failed before Web launch"
+fi
+echo "This diagnostic makes no changes to the service or to JD2."

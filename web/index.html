@@ -5,12 +5,19 @@
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <meta name="color-scheme" content="dark light">
 <title>QnapDownloader</title>
+<meta name="theme-color" content="#071a2d">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="Downloader">
+<link rel="icon" type="image/svg+xml" href="/icon.svg">
+<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+<link rel="icon" type="image/png" sizes="192x192" href="/icon-192.png">
 <link rel="stylesheet" href="/style.css">
 <script src="/app.js" defer></script>
 </head>
 <body>
-<header><div class="brand">◈ QnapDownloader <small>0.1.2</small></div><button id="logout" class="secondary hidden">ログアウト</button></header>
+<header><div class="brand"><img src="/icon.svg" width="36" height="36" alt="" loading="eager"> QnapDownloader <small>0.1.3</small></div><button id="logout" class="secondary hidden">ログアウト</button></header>
 <main>
+<div id="lanSecurityWarning" class="notice hidden" role="note">この画面はHTTP接続です。パスワード保護はありますが通信は暗号化されません。信頼できる家庭内LANのみで利用し、外部公開しないでください。遠隔アクセスにはHTTPSリバースプロキシ／VPNを使用してください。</div>
 <section id="setup" class="panel hidden">
   <h2>初期管理者設定</h2>
   <p>NASのSSHから <code>&lt;QPKGインストール親ディレクトリ&gt;/QnapDownloader-data/config/bootstrap-token</code> の内容を確認し、ここで一度だけ設定します。パスワードは12文字以上。</p>

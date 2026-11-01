@@ -87,6 +87,31 @@ class HttpTests(unittest.TestCase):
             with self.subTest(host=malformed):
                 self.assertFalse(webapp.public_host_allowed(malformed))
 
+    def test_private_lan_peers_and_public_wan_are_distinguished(self):
+        for address in ("127.0.0.1", "192.168.68.57", "10.3.4.5",
+                        "172.23.2.4", "100.64.1.5", "::1", "fd00::5"):
+            with self.subTest(address=address):
+                self.assertTrue(webapp.private_peer_allowed(address))
+        for address in ("8.8.8.8", "203.0.113.1", "169.254.1.1",
+                        "2001:4860:4860::8888", "not-an-ip"):
+            with self.subTest(address=address):
+                self.assertFalse(webapp.private_peer_allowed(address))
+
+    def test_icons_and_private_ip_host_are_served_without_login(self):
+        request = urllib.request.Request(self.url + "/api/health",
+                                         headers={"Host": "192.168.68.57:17864"})
+        with self.client.open(request, timeout=4) as response:
+            self.assertEqual(response.status, 200)
+            self.assertEqual(json.load(response)["version"], "0.1.3")
+        with self.client.open(self.url + "/icon.svg", timeout=4) as response:
+            self.assertEqual(response.status, 200)
+            self.assertEqual(response.headers.get_content_type(), "image/svg+xml")
+            self.assertIn(b"<svg", response.read())
+        with self.client.open(self.url, timeout=4) as response:
+            html = response.read()
+            self.assertIn(b"apple-touch-icon.png", html)
+            self.assertIn(b"QnapDownloader", html)
+
     def test_setup_login_csrf_and_private_api(self):
         self.assertEqual(self.req("/api/settings")[0], 401)
         self.assertEqual(self.req("/api/update/log")[0], 401)
@@ -160,9 +185,9 @@ class HttpTests(unittest.TestCase):
         self.login()
         info = self.req("/api/update/status")[1]
         self.assertFalse(info["supported"])
-        code, _ = self.req("/api/update/apply", {"version": "v0.1.2"})
+        code, _ = self.req("/api/update/apply", {"version": "v0.1.3"})
         self.assertEqual(code, 400)
-        self.assertEqual(self.req("/api/health")[1]["version"], "0.1.2")
+        self.assertEqual(self.req("/api/health")[1]["version"], "0.1.3")
         self.assertFalse(self.req("/api/jd2/status")[1]["connected"])
         self.assertEqual(self.req("/api/jd2/update/apply", {"confirmed": True})[0], 400)
         self.assertEqual(self.req("/api/jd2/preset/apply", {"confirmed": True})[0], 400)

@@ -2,3 +2,5 @@
 .update-log{white-space:pre-wrap;overflow-wrap:anywhere;max-height:260px;overflow-y:auto;padding:12px;border:1px solid #304158;background:#081520;border-radius:8px;font-size:12px;line-height:1.5}
 
 textarea{display:block;background:#081520;border:1px solid #496079;color:#eef7ff;border-radius:8px;padding:11px;width:100%;font:inherit;resize:vertical;min-height:100px;max-height:400px}
+
+.brand{display:flex;align-items:center;gap:10px}.brand img{width:36px;height:36px;border-radius:8px;flex:none}#lanSecurityWarning{border-left-color:#d9a64b;background:#3a321e;color:#fce8ae;font-size:13px}

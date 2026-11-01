@@ -33,17 +33,42 @@ class QpkgContractTests(unittest.TestCase):
         self.assertNotIn("docker run", script)
         self.assertNotIn("npm build", script)
 
+    def test_qts_app_center_private_lan_default_and_override(self):
+        launch = (ROOT / "qpkg/shared/downloader.sh").read_text()
+        self.assertIn("network_mode=lan", launch)
+        self.assertIn('config/network-mode', launch)
+        self.assertIn('DOWNLOADER_LAN_ENABLED', launch)
+        self.assertIn('if [ "$network_mode" = lan ]; then', launch)
+        self.assertIn('--lan --port 17864', launch)
+        self.assertIn('network_mode=loopback', launch)
+        self.assertIn('--secure-cookie --port 17864', launch)
+        self.assertNotIn("docker restart", launch)
+
+    def test_icons_source_and_build_contract(self):
+        build = (ROOT / "scripts/build-qpkg.sh").read_text()
+        renderer = (ROOT / "scripts/render-icons.py").read_text()
+        html = (ROOT / "web/index.html").read_text()
+        self.assertIn('scripts/render-icons.py', build)
+        self.assertIn('"$WORK/icons"', build)
+        self.assertIn('apple-touch-icon.png', renderer)
+        self.assertIn('QnapDownloader_80.png', renderer)
+        self.assertIn('QnapDownloader_gray.png', renderer)
+        self.assertIn('href="/apple-touch-icon.png"', html)
+        self.assertIn('href="/icon.svg"', html)
+        self.assertTrue((ROOT / "web/icon.svg").exists())
+        self.assertIn('downloader-diagnose', build)
+
     def test_all_imported_modules_are_packaged(self):
         script = (ROOT / "scripts/build-qpkg.sh").read_text()
         for name in ("webapp.py", "storage.py", "durability.py",
                      "updater.py", "self_update.py", "jd2_policy.py",
-                     "jd2_control.py", "jd2_myjd.py", "jd2_transfer.py", "rapidgator_extract.py", "downloader_pid.py", "python3-path"):
+                     "jd2_control.py", "jd2_myjd.py", "jd2_transfer.py", "rapidgator_extract.py", "downloader_pid.py", "python3-path", "downloader-diagnose"):
             with self.subTest(name=name):
                 self.assertIn(name, script)
         self.assertIn('cp -R "$ROOT/web"', script)
 
     def test_scripts_are_syntactically_valid(self):
-        for name in ("qpkg/shared/downloader.sh", "qpkg/shared/python3-path"):
+        for name in ("qpkg/shared/downloader.sh", "qpkg/shared/python3-path", "qpkg/shared/downloader-diagnose"):
             with self.subTest(path=name):
                 subprocess.run(["/bin/sh", "-n", str(ROOT / name)], check=True)
 

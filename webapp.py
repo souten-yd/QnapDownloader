@@ -1,4 +1,4 @@
-"""QnapDownloader v0.1.0: authenticated, safe management shell (no JD2 execution yet)."""
+"""QnapDownloader: authenticated QNAP downloader management and link staging."""
 import argparse
 import hmac
 import http.cookies
@@ -21,12 +21,15 @@ import rapidgator_extract
 import jd2_myjd
 import updater
 
-VERSION = "0.1.2"
+VERSION = "0.1.3"
 PORT = 17864
 ROOT = Path(__file__).resolve().parent
 FILES = {"/": ("web/index.html", "text/html; charset=utf-8"),
          "/app.js": ("web/app.js", "text/javascript; charset=utf-8"),
-         "/style.css": ("web/style.css", "text/css; charset=utf-8")}
+         "/style.css": ("web/style.css", "text/css; charset=utf-8"),
+         "/icon.svg": ("web/icon.svg", "image/svg+xml"),
+         "/apple-touch-icon.png": ("web/apple-touch-icon.png", "image/png"),
+         "/icon-192.png": ("web/icon-192.png", "image/png")}
 SESSIONS = {}
 FAILED = {}
 SESSION_LOCK = threading.RLock()
@@ -100,6 +103,24 @@ def public_host_allowed(host):
         return hostname in {item.strip().lower() for item in configured.split(",") if item.strip()}
 
 
+# Only RFC1918, loopback and explicitly recognized private VPN peer addresses
+# can access an HTTP-only LAN listener. No external/WAN address is accepted,
+# even if it forges an allowed Host header.
+PRIVATE_PEERS = tuple(ipaddress.ip_network(value) for value in (
+    "127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",
+    "100.64.0.0/10", "::1/128", "fc00::/7"))
+
+
+def private_peer_allowed(value):
+    try:
+        peer = ipaddress.ip_address(value)
+        if isinstance(peer, ipaddress.IPv6Address) and peer.ipv4_mapped:
+            peer = peer.ipv4_mapped
+        return any(peer in network for network in PRIVATE_PEERS)
+    except (ValueError, TypeError):
+        return False
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "QnapDownloader"
     sys_version = ""
@@ -135,7 +156,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def check_host(self):
         host = self.headers.get("Host", "")
-        return bool(host) and public_host_allowed(host)
+        return (private_peer_allowed(self.client_address[0]) and
+                bool(host) and public_host_allowed(host))
 
     def origin_ok(self):
         origin = self.headers.get("Origin")
@@ -393,7 +415,7 @@ def bootstrap(data):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", type=int, default=PORT)
-    parser.add_argument("--lan", action="store_true", help="Expose over LAN; use trusted VPN/HTTPS reverse proxy")
+    parser.add_argument("--lan", action="store_true", help="Serve private LAN IPs; never port-forward to the Internet")
     parser.add_argument("--secure-cookie", action="store_true", help="For TLS reverse proxy deployments")
     parser.add_argument("--data-dir", default=os.environ.get("DOWNLOADER_DATA_DIR", "./runtime"))
     args = parser.parse_args()

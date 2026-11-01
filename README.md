@@ -2,7 +2,7 @@
 
 QNAP TS-253Be (QTS 5.x, x86_64)向け **JDownloader 2 + 安全なWebブラウザ／リンク収集／ダウンロード管理** 統合QPKGの設計リポジトリ。Rapidgatorリンク検出・ボタン化、Click'n'Load互換取り込み、サイト別の明示許可付き自動収集、ブックマーク、NAS側保存先選択を目指します。
 
-**現在の状態: v0.1.2 Rapidgator貼付抽出機能（PRレビュー中）**。管理者ログイン、NAS共有フォルダ選択/永続化、手動リンク保留、ブックマーク、更新確認とQPKG自己更新ワーカー、Web管理画面、QDKビルド定義を追加しました。**JD2接続アダプタと手動LinkGrabber転送は実装済みですが、JD2実機接続・実ダウンロードは未検証です。内蔵ブラウザ、Rapidgator自動検出、広告遮断は未実装**であり、完了したとは表示しません。QPKGビルド・QNAP実機試験も未実施です。既存Docker版JDownloader 2や別QPKGは変更しません。
+**現在の状態: v0.1.3 Web起動・LANアクセス修正とiOS/QNAPアイコン対応**。管理者ログイン、NAS共有フォルダ選択/永続化、手動リンク保留、ブックマーク、更新確認とQPKG自己更新ワーカー、Web管理画面、QDKビルド定義を追加しました。**JD2接続アダプタと手動LinkGrabber転送は実装済みですが、JD2実機接続・実ダウンロードは未検証です。内蔵ブラウザ、Rapidgator自動検出、広告遮断は未実装**であり、完了したとは表示しません。QDKでのx86_64 QPKG自動ビルド・テストは実施済みですが、QNAP実機でのインストール・起動・JD2接続は未検証です。既存Docker版JDownloader 2や別QPKGは変更しません。
 
 ## 仕様・開発ルール
 
@@ -32,7 +32,7 @@ TS-253Beの実RAM/QTS、既存JD2の設定とAPI、Chromiumサンドボックス
 
 - Python 3.8+、標準ライブラリ。NASが起動してボリュームをマウントしてから、開発環境では `python3 -B webapp.py --data-dir ./runtime --port 17864` でループバック起動します（ルート権限と公開範囲に注意）。外部ネットワークへポート転送しないでください。
 - 最初のアクセスで、NASの管理者が後述のSSHコマンドで永続データ領域の `config/bootstrap-token` を読み、Webに入力して管理者パスワード（12文字以上）を登録します。トークンは完了後に削除されます。
-- **QPKGの既定待受は127.0.0.1:17864のみ**で、`--secure-cookie`を使用します。QTSのHTTPSリバースプロキシ（ループバックポート17864を転送）から利用してください。明示的にLAN公開が必要なら`DOWNLOADER_LAN_ENABLED=1`の管理者設定を使用し、Tailscale等の暗号化された接続に限定してください。HTTPポートをインターネットへ公開しないでください。プロキシ用ホスト名を使う場合は`DOWNLOADER_ALLOWED_HOSTS`で明示的に許可します。
+- **v0.1.3以降のQPKGは家庭内LANからのWebアクセスを初期状態で許可**します。例: http://192.168.68.57:17864/ 。サーバーはRFC1918/ループバック/プライベートVPN以外の接続元を拒否し、Host検証・ログイン・CSRF保護を維持します。ただしLAN HTTPは暗号化されません。信頼できるLANでのみ利用し、17864をインターネットにポート開放しないでください。遠隔操作にはHTTPSリバースプロキシやVPNを使ってください。保存データのconfig/network-modeにloopbackを書いて再起動すればNAS自身からのアクセスだけに戻せます（lanでLAN待受）。DOWNLOADER_LAN_ENABLED=0|1で一時上書きできます。
 - 保存先ピッカーの表示ルートは既定`/share/Download`。許可対象を変える場合は`DOWNLOADER_ALLOWED_ROOTS`で絶対パスをコロン区切り指定します（管理者のみ編集）。
 - ブックマーク、設定、保留キューはDBに保存。**保留キューはJD2へは送信されない**ため、まだ実際にダウンロードしません。
 - GitHub Releaseの更新確認は既存の正式Releaseが存在する場合のみ成功します。更新適用は正規QPKGインストール状態でのみサポート。ダウンロードしたQPKGのSHA-256、更新前SQLiteバックアップ、更新後ヘルスチェックを要求します。
@@ -42,7 +42,7 @@ TS-253Beの実RAM/QTS、既存JD2の設定とAPI、Chromiumサンドボックス
 
 ## JDownloader 2の独立更新と推奨設定の再適用
 
-**JDownloader 2はJD2標準のアップデーターで単独更新**します。HubのQPKG自己更新はJD2のファイルやプラグインを入れ替えません。JD2更新後に一般設定・Packagizer・LinkGrabber・自動解凍が変化した場合はHubの「推奨設定を確認して再適用」で差分確認・復旧できる設計です。**現v0.1.0ではJD2の認証済みAPIアダプタがまだなく、JD2更新ボタンと再適用ボタンは無効**です。正式なJD2接続/設定読書きができるまで有効化しません。手順: [JD2独立更新と再適用](docs/jd2-independent-updates.md)。
+**JDownloader 2はJD2標準のアップデーターで単独更新**します。HubのQPKG自己更新はJD2のファイルやプラグインを入れ替えません。JD2更新後に一般設定・Packagizer・LinkGrabber・自動解凍が変化した場合はHubの「推奨設定を確認して再適用」で差分確認・復旧できる設計です。**現在は認証済みMyJDアダプタが実装されていますが、全必須設定キーの実機検証が終わるまで推奨設定一括再適用ボタンは無効**です。正式なJD2接続/設定読書きができるまで有効化しません。手順: [JD2独立更新と再適用](docs/jd2-independent-updates.md)。
 
 
 ### Docker不要の永続データ保存
@@ -69,3 +69,28 @@ MyJDownloader認証済みアダプタを追加しました。QPKGへライブラ
 ## Rapidgator URLのオフライン抽出（v0.1.2）
 
 コピーしたサイトのテキスト/HTMLを貼り付け、最大20件のHTTPSファイルリンク候補をプレビューできます。利用者が明示的に承認した場合だけ保留キューに登録し、**ページ取得・スクリプト実行・JD2への自動送信は行いません**。詳細: [Rapidgatorオフライン抽出](docs/rapidgator-manual-extract.md)。
+
+## Web画面が開かないとき
+
+最初のv0.1.0-rc1 QPKGにもWeb画面は含まれます。ただしNASの127.0.0.1だけで待受する初期設定のため、iPhoneからNASのLAN-IP:17864へアクセスできません。v0.1.3でLAN待受を初期値としました。プレリリースは自動更新対象外なのでQPKGをApp Centerで手動上書きしてください。
+
+更新後、SSHの読取専用診断を実行できます（サービスは停止・更新しません）。
+
+```sh
+ROOT=$(/sbin/getcfg QnapDownloader Install_Path -d '' -f /etc/config/qpkg.conf)
+sh "$ROOT/downloader-diagnose"
+```
+
+最初のQPKGには診断スクリプトがないので、代わりに以下で切り分けます。
+
+```sh
+curl --noproxy '*' -sS --max-time 4 http://127.0.0.1:17864/api/health
+netstat -tnl | grep 17864
+```
+
+- 127.0.0.1が応答するのにLAN-IPだけ失敗した場合は、旧版のlocalhost限定待受の可能性が高いです。
+- localhostも失敗する場合はQPKG起動、Python3、マウント、起動ログを確認してください。
+
+## iPhoneホーム画面・QNAP App Centerのアイコン
+
+共通の図案（シールド・下向き矢印・NAS）を使用。Safariホーム画面用は/apple-touch-icon.png（180px）、QNAP App Center用はQDK icons/のQnapDownloader.png・QnapDownloader_80.png・QnapDownloader_gray.pngです。開発時のSVGからQPKGビルド中に生成するため、NAS起動時のpip/npmビルドは不要です。

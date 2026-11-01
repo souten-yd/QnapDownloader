@@ -65,17 +65,42 @@ case "${1:-}" in
             [ "$result" -eq 10 ] || exit 1
         fi
         rm -f "$root/admin-token"
-        # -B avoids .pyc filesystem writes. A fixed cwd avoids QTS temp dirs.
-        # Secure default: loopback-only. QTS HTTPS reverse proxy/VPN is preferred.
-        # Explicit LAN HTTP exposure requires DOWNLOADER_LAN_ENABLED=1.
-        if [ "${DOWNLOADER_LAN_ENABLED:-0}" = "1" ]; then
+        # -B avoids .pyc writes. Default QTS App Center URL must work
+        # from another device in the private LAN. WAN/public peer addresses
+        # are refused by the Web server. Do not forward this port to Internet.
+        # An admin may opt out persistently using config/network-mode=loopback
+        # or temporarily override with DOWNLOADER_LAN_ENABLED=0|1.
+        network_mode=lan
+        if [ -f "$data_dir/config/network-mode" ]; then
+            IFS= read -r network_mode < "$data_dir/config/network-mode" || :
+        fi
+        case "$network_mode" in lan|loopback) ;; *)
+            echo "Invalid QnapDownloader network-mode: expected lan or loopback" >&2; exit 1 ;;
+        esac
+        case "${DOWNLOADER_LAN_ENABLED:-}" in
+            1) network_mode=lan ;;
+            0) network_mode=loopback ;;
+            '') ;;
+            *) echo "DOWNLOADER_LAN_ENABLED must be 1 or 0" >&2; exit 1 ;;
+        esac
+        if [ "$network_mode" = lan ]; then
             (cd "$root" && exec "$python" -B "$root/webapp.py" --lan --port 17864 --data-dir "$data_dir") < /dev/null > "$logfile" 2>&1 &
         else
             (cd "$root" && exec "$python" -B "$root/webapp.py" --secure-cookie --port 17864 --data-dir "$data_dir") < /dev/null > "$logfile" 2>&1 &
         fi
         echo $! > "$pidfile"
-        sleep 1
-        check_owned || { rm -f "$pidfile"; echo "Web UI failed to start with verified PID; check $logfile" >&2; exit 1; }
+        # SQLite initialization and QTS filesystem warm-up may take longer
+        # than 1s. Keep the exact PID ownership verification; do not treat
+        # merely opening the port as proof this is our process.
+        attempts=0
+        while ! check_owned; do
+            attempts=$((attempts + 1))
+            if [ "$attempts" -ge 15 ]; then
+                echo "Web UI failed to start with verified PID; check $logfile" >&2
+                exit 1
+            fi
+            sleep 1
+        done
         ;;
     stop)
         python=$(resolve_python) || exit 1
