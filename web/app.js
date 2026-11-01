@@ -102,6 +102,12 @@ async function updateStatus(){
  const s=await api("/api/update/status");
  $("updateStatus").textContent="更新状態: "+s.phase+" — "+(s.message||s.unsupported_reason||"待機中");
  $("updateApply").disabled=Boolean(s.busy)||!s.supported;
+ const jd=await api("/api/jd2/status");
+ $("jd2Status").textContent=jd.connected ?
+   "JD2接続中 / Core revision: "+(jd.revision||"不明")+" / 更新: "+(jd.update_available?"あり":"なし") :
+   "JD2未接続: "+(jd.reason||"接続アダプタの構成待ち");
+ $("jd2Update").disabled=!jd.connected||!jd.can_update||!jd.update_available;
+ $("jd2Preset").disabled=!jd.connected||!jd.can_preset;
 }
 document.addEventListener("DOMContentLoaded",()=>{
  $("setupButton").addEventListener("click",()=>perform(async()=>{
@@ -127,6 +133,23 @@ document.addEventListener("DOMContentLoaded",()=>{
   $("updateResult").textContent=u.available?"更新あり: "+u.release.version:"現在の正式リリースが最新です";
   visible("updateApply",Boolean(u.available));
   await updateStatus();
+ }));
+ $("jd2Update").addEventListener("click",()=>perform(async()=>{
+  if(!confirm("JDownloader 2本体だけを更新します。JD2のダウンロードは一時中断される場合があります。よろしいですか？"))return;
+  await api("/api/jd2/update/apply",{confirmed:true});await updateStatus();
+ }));
+ $("jd2Preset").addEventListener("click",()=>perform(async()=>{
+  const preview=await api("/api/jd2/preset/preview");
+  if(!preview.applicable){
+    const missing=(preview.missing||[]).join(", ");
+    flash("一部のJD2設定を特定できないため適用を停止しました: "+missing);
+    return;
+  }
+  const changed=preview.entries.filter(x=>x.change);
+  if(!changed.length){flash("推奨設定からの変更はありません");return}
+  if(!confirm("次のJD2設定をOFFに変更します（既存キューは変更しません）。\n"+changed.map(x=>"・"+x.label).join("\n")+"\n適用しますか？"))return;
+  await api("/api/jd2/preset/apply",{confirmed:true});await updateStatus();
+  flash("推奨設定を再適用し、再読込で確認しました");
  }));
  $("updateApply").addEventListener("click",()=>perform(async()=>{
   if(!selectedVersion||!confirm(selectedVersion+" にQPKGを更新します。サービスが再起動されます。続けますか？"))return;
