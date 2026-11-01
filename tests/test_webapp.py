@@ -101,7 +101,7 @@ class HttpTests(unittest.TestCase):
                                          headers={"Host": "192.168.68.57:17864"})
         with self.client.open(request, timeout=4) as response:
             self.assertEqual(response.status, 200)
-            self.assertEqual(json.load(response)["version"], "0.1.6")
+            self.assertEqual(json.load(response)["version"], "0.1.7")
         with self.client.open(self.url + "/icon.svg", timeout=4) as response:
             self.assertEqual(response.status, 200)
             self.assertEqual(response.headers.get_content_type(), "image/svg+xml")
@@ -292,13 +292,44 @@ class HttpTests(unittest.TestCase):
         self.assertEqual(self.req("/api/update/apply",
             {"version":"v0.1.7-rc1","channel":"rc"})[0],400)
 
+    def test_downloads_page_is_auth_only_and_readonly(self):
+        self.assertEqual(self.req("/api/jd2/downloads")[0], 401)
+        self.login()
+        self.assertEqual(self.req("/api/jd2/downloads")[0], 400)
+        calls = []
+        class ReadOnly:
+            def list_downloads(self, page):
+                calls.append(page)
+                return {"source":"myjd-remote-readonly","page":page,
+                        "page_size":30,"packages":[],"links":[{
+                            "name":"filename.zip","host":"rapidgator.net",
+                            "progress":25,"status":"待機",
+                            "bytes_loaded":5,"bytes_total":20,
+                            "speed_bytes":0,"eta_seconds":None,
+                            "running":False,"finished":False,"enabled":True}],
+                        "has_more":False,"notice":"readonly"}
+        self.server.jd2 = jd2_control.JD2Controller(ReadOnly())
+        code,result = self.req("/api/jd2/downloads?page=2")
+        self.assertEqual(code,200)
+        self.assertEqual(calls,[2])
+        self.assertEqual(result["links"][0]["progress"],25)
+        self.assertNotIn("password",str(result))
+        self.assertEqual(self.req("/api/jd2/downloads?page=999")[0],400)
+        self.assertEqual(self.req("/api/jd2/downloads?page=-1")[0],400)
+        self.assertEqual(calls,[2])
+        with self.client.open(self.url,timeout=4) as response:
+            html=response.read().decode()
+        self.assertIn('data-tab="downloads"',html)
+        self.assertIn('id="downloadsRefresh"',html)
+        self.assertIn('id="downloadPackages"',html)
+
     def test_update_apply_fails_closed_when_not_qpkg(self):
         self.login()
         info = self.req("/api/update/status")[1]
         self.assertFalse(info["supported"])
-        code, _ = self.req("/api/update/apply", {"version": "v0.1.6"})
+        code, _ = self.req("/api/update/apply", {"version": "v0.1.7"})
         self.assertEqual(code, 400)
-        self.assertEqual(self.req("/api/health")[1]["version"], "0.1.6")
+        self.assertEqual(self.req("/api/health")[1]["version"], "0.1.7")
         self.assertFalse(self.req("/api/jd2/status")[1]["connected"])
         self.assertEqual(self.req("/api/jd2/update/apply", {"confirmed": True})[0], 400)
         self.assertEqual(self.req("/api/jd2/preset/apply", {"confirmed": True})[0], 400)
