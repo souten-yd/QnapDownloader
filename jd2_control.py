@@ -26,7 +26,7 @@ class JD2Controller:
         with self.lock:
             try:
                 adapter = self._require()
-                return {"connected": True, "can_update": True, "can_preset": True,
+                return {"connected": True, "can_update": getattr(adapter, "allow_update", True), "can_preset": True,
                         "revision": adapter.core_revision(),
                         "update_available": adapter.is_update_available()}
             except Exception as error:
