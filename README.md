@@ -61,3 +61,7 @@ cat "$(dirname "$INSTALL")/QnapDownloader-data/config/bootstrap-token"
 ## JD2への認証済み接続（任意）
 
 MyJDownloader認証済みアダプタを追加しました。QPKGへライブラリを同梱した場合、管理者がconfig/myjd.jsonを0600で設定することでJD2更新状態を照会できます。JD2本体の更新は明示的opt-inです。推奨設定の全項目再適用は、実機で設定キーと既存Packagizerルールの安全性を確認するまで無効です。詳細: [MyJD接続設定](docs/myjd-setup.md)。
+
+## 手動LinkGrabber転送（開発段階）
+
+保留リンクを1件ずつJD2へ手動送信するAPIと画面を追加しました。既存Dockerの保存先とNASのパスの対応は自動推測しません。管理者による明示設定と、自動確定/自動開始OFFの検証が必須です。Packagizerルール未検証時は追加opt-inを要求します。送信結果不明時は自動再送しません。詳細は[MyJD接続設定](docs/myjd-setup.md)。
