@@ -13,6 +13,7 @@ from unittest.mock import patch
 
 import self_update
 import storage
+import jd2_control
 import webapp
 
 
@@ -30,6 +31,7 @@ class HttpTests(unittest.TestCase):
         self.addCleanup(self.store.close)
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), webapp.Handler)
         self.server.store = self.store
+        self.server.jd2 = jd2_control.JD2Controller()
         self.server.secure_cookies = False
         self.server.bootstrap_token = "unit-test-bootstrap"
         self.server.updates = self_update.UpdateManager(self.root, webapp.ROOT,
@@ -107,6 +109,9 @@ class HttpTests(unittest.TestCase):
         code, _ = self.req("/api/update/apply", {"version": "v0.1.1"})
         self.assertEqual(code, 400)
         self.assertEqual(self.req("/api/health")[1]["version"], "0.1.0")
+        self.assertFalse(self.req("/api/jd2/status")[1]["connected"])
+        self.assertEqual(self.req("/api/jd2/update/apply", {"confirmed": True})[0], 400)
+        self.assertEqual(self.req("/api/jd2/preset/apply", {"confirmed": True})[0], 400)
 
 
 if __name__ == "__main__":
