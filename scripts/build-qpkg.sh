@@ -13,14 +13,15 @@ mkdir -p "$WORK/shared" "$OUTPUT"
 cp "$ROOT/qpkg/qpkg.cfg" "$WORK/qpkg.cfg"
 cp "$ROOT/qpkg/package_routines" "$WORK/package_routines"
 cp "$ROOT"/{webapp.py,storage.py,updater.py,self_update.py,durability.py,jd2_policy.py,jd2_control.py,jd2_myjd.py,jd2_transfer.py,rapidgator_extract.py,README.md} "$WORK/shared/"
-cp "$ROOT"/qpkg/shared/{downloader.sh,downloader_pid.py,python3-path} "$WORK/shared/"
+cp "$ROOT"/qpkg/shared/{downloader.sh,downloader_pid.py,python3-path,downloader-diagnose} "$WORK/shared/"
 cp -R "$ROOT/web" "$WORK/shared/web"
+python3 "$ROOT/scripts/render-icons.py" "$WORK/shared/web" "$WORK/icons"
 # Native x86_64 dependencies must be prepared on the build machine.
 # No pip/npm operation happens at NAS app startup.
 if [ -d "$ROOT/vendor" ]; then
   cp -R "$ROOT/vendor" "$WORK/shared/vendor"
 fi
-chmod 755 "$WORK/shared/downloader.sh" "$WORK/shared/python3-path"
+chmod 755 "$WORK/shared/downloader.sh" "$WORK/shared/python3-path" "$WORK/shared/downloader-diagnose"
 . "$WORK/qpkg.cfg"
 qbuild --root "$WORK" --build-arch x86_64 --build-dir "$WORK/build"
 count=$(find "$WORK/build" -maxdepth 1 -type f -name '*.qpkg' | wc -l)
