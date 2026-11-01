@@ -57,3 +57,7 @@ cat "$(dirname "$INSTALL")/QnapDownloader-data/config/bootstrap-token"
 ```
 
 別のデータ領域を使う場合は、初回起動前にQPKGサービスへ管理者が`DOWNLOADER_DATA_DIR`を明示設定してください。後から変更する場合は既存データの移行を計画し、サービス停止中にバックアップ・復旧確認してから変更してください。
+
+## JD2への認証済み接続（任意）
+
+MyJDownloader認証済みアダプタを追加しました。QPKGへライブラリを同梱した場合、管理者がconfig/myjd.jsonを0600で設定することでJD2更新状態を照会できます。JD2本体の更新は明示的opt-inです。推奨設定の全項目再適用は、実機で設定キーと既存Packagizerルールの安全性を確認するまで無効です。詳細: [MyJD接続設定](docs/myjd-setup.md)。
