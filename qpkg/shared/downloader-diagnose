@@ -15,6 +15,14 @@ enabled=$(get_value Enable UNKNOWN)
 echo "=== QnapDownloader Web UI diagnostics ==="
 echo "Installed: ${root:+yes}"
 echo "App Center enabled: $enabled"
+echo "--- QTS App Center launch registration (read only) ---"
+for key in WebUI Web_Port Web_SSL_Port Desktop_App Service_Port; do
+  val=$(get_value "$key" "<not-registered>")
+  echo "$key: $val"
+done
+echo "QDK build expects WebUI=/, Web_Port=17864, Web_SSL_Port=-2, Desktop_App=0"
+echo "App Center should open a NEW browser tab; the app blocks iframe embedding."
+
 echo "Expected LAN URL: http://<NAS-LAN-IP>:17864/"
 if [ -z "$root" ] || [ ! -d "$root" ]; then
   echo "RESULT: QPKG install path absent: check App Center installation."
