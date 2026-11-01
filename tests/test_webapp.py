@@ -158,6 +158,27 @@ class HttpTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(info, {"configured": True})
 
+    def test_legacy_token_file_is_deleted_not_read(self):
+        config = self.root / "config"
+        config.mkdir()
+        old = config / "bootstrap-token"
+        old.write_text("obsolete legacy credential\n", encoding="utf-8")
+        self.assertTrue(webapp.remove_legacy_setup_token(self.root))
+        self.assertFalse(old.exists())
+        self.assertTrue(webapp.remove_legacy_setup_token(self.root))
+        self.assertEqual(self.req("/api/setup/status"), (200, {"configured": False}))
+
+    def test_tokenless_setup_works_with_private_lan_host_header(self):
+        host = self.host
+        request = urllib.request.Request(self.url + "/api/setup",
+            data=json.dumps({"password": "correct horse staple 123"}).encode(),
+            headers={"Host": "192.168.68.57:17864",
+                     "Origin": "http://192.168.68.57:17864",
+                     "Content-Type": "application/json"})
+        with self.client.open(request, timeout=4) as response:
+            self.assertEqual(response.status, 201)
+        self.assertTrue(self.store.has_admin())
+
     def test_folder_picker_persists_allowed_path_only(self):
         folder = self.allowed / "subdir"
         folder.mkdir()
