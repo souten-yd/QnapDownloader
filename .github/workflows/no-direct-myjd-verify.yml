@@ -1,0 +1,26 @@
+name: Verify no direct LAN MyJD transport
+on:
+  push:
+    branches: [security/myjd-encrypted-transport-only]
+concurrency:
+  group: qnap-myjd-transport
+  cancel-in-progress: true
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: bash scripts/verify.sh
+      - name: Validate direct-connection opt-out in actual wheel
+        run: |
+          python3 -m pip install --disable-pip-version-check --only-binary=:all: --target vendor -r requirements-jd2-build.txt
+          PYTHONPATH=vendor python3 -c "from myjdapi.myjdapi import Jddevice; assert callable(getattr(Jddevice, 'disable_direct_connection', None)); print('Verified direct LAN opt-out in pinned myjdapi')"
