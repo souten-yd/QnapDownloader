@@ -62,6 +62,37 @@ class Jd2PolicyTests(unittest.TestCase):
             p.apply_preset(engine, preview)
         self.assertEqual(engine.calls, [])
 
+    def test_missing_jd_revision_rejects_preset(self):
+        engine = FakeJD2()
+        engine.version = None
+        with self.assertRaises(p.PresetUnavailable):
+            p.build_preview(engine)
+
+    def test_partial_write_then_exception_is_rolled_back(self):
+        engine = FakeJD2()
+        original = engine.update_preset
+        def partially_write_then_fail(key, value):
+            original(key, value)
+            if key == p.REQUIRED[1] and value is False:
+                raise RuntimeError("write succeeded but response failed")
+        engine.update_preset = partially_write_then_fail
+        with self.assertRaises(RuntimeError):
+            p.apply_preset(engine, p.build_preview(engine))
+        self.assertTrue(all(value is True for value in engine.values.values()))
+
+    def test_unverified_rollback_reports_failure(self):
+        engine = FakeJD2()
+        original = engine.update_preset
+        def rollback_lies(key, value):
+            if value is True:
+                return  # API acknowledges but value was not restored
+            original(key, value)
+            if key == p.REQUIRED[0]:
+                raise RuntimeError("failed after changing JD2")
+        engine.update_preset = rollback_lies
+        with self.assertRaisesRegex(p.PresetChanged, "元の状態を確認できません"):
+            p.apply_preset(engine, p.build_preview(engine))
+
     def test_apply_failure_rolls_back(self):
         engine = FakeJD2()
         original = engine.update_preset
