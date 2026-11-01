@@ -12,7 +12,7 @@ trap 'rm -rf "$WORK"' EXIT
 mkdir -p "$WORK/shared" "$OUTPUT"
 cp "$ROOT/qpkg/qpkg.cfg" "$WORK/qpkg.cfg"
 cp "$ROOT/qpkg/package_routines" "$WORK/package_routines"
-cp "$ROOT"/{webapp.py,storage.py,updater.py,self_update.py,durability.py,jd2_policy.py,README.md} "$WORK/shared/"
+cp "$ROOT"/{webapp.py,storage.py,updater.py,self_update.py,durability.py,jd2_policy.py,jd2_control.py,README.md} "$WORK/shared/"
 cp "$ROOT"/qpkg/shared/{downloader.sh,downloader_pid.py,python3-path} "$WORK/shared/"
 cp -R "$ROOT/web" "$WORK/shared/web"
 chmod 755 "$WORK/shared/downloader.sh" "$WORK/shared/python3-path"
