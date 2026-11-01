@@ -54,6 +54,15 @@ class QpkgContractTests(unittest.TestCase):
         self.assertIn('--secure-cookie --port 17864', launch)
         self.assertNotIn("docker restart", launch)
 
+    def test_default_logging_never_appends_to_hdd(self):
+        script = (ROOT / "qpkg/shared/downloader.sh").read_text()
+        self.assertIn('DOWNLOADER_LOG_MODE:-memory', script)
+        self.assertIn('memory) log_output=/dev/null', script)
+        self.assertIn('disk) log_output="$logfile"', script)
+        self.assertIn('> "$log_output" 2>&1 &', script)
+        self.assertNotIn('> "$logfile" 2>&1 &', script)
+        self.assertIn('DOWNLOADER_LOG_MODE must be memory or disk', script)
+
     def test_icons_source_and_build_contract(self):
         build = (ROOT / "scripts/build-qpkg.sh").read_text()
         renderer = (ROOT / "scripts/render-icons.py").read_text()
