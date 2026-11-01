@@ -26,3 +26,7 @@ X-Frame-Options/CSP frame-ancestorsを設定するサイトはiframeを拒否し
 - 不正URL拒否、/api/browser/validateの管理者認証必須、サーバー側ネットワーク呼び出しゼロ
 - iframe DOMの同一オリジン権限禁止、ポップアップ・ダウンロード・親画面遷移禁止
 - JD2への自動投入/実行なし。DB書込は既存の明示リンク保留操作だけ
+
+## v0.1.9 の更新（マルチタブ）
+
+プレビューはブラウザ型シェルの「Webタブ」（最大6枚）として動作します。タブごとに独立したiframe・履歴・隔離モードを持ち、sandbox方針と上記の禁止事項は変わりません。詳細は [browser-shell-ui.md](browser-shell-ui.md) を参照してください。
