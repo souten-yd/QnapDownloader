@@ -1,0 +1,45 @@
+name: Publish QnapDownloader v0.1.4-rc1 token-free setup QPKG
+on:
+  push:
+    branches: [release/experimental-0.1.4-rc1]
+permissions:
+  contents: write
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Verify source and complete regression suite
+        run: bash scripts/verify.sh
+      - name: Install QDK and build-only dependencies
+        run: |
+          curl -fLSs --retry 2 https://github.com/qnap-dev/QDK/releases/download/v2.5.3/qdk_2.5.3_amd64.deb -o /tmp/qdk.deb
+          sudo apt-get update -qq
+          sudo apt-get install -y /tmp/qdk.deb rsync
+          python3 -m pip install --disable-pip-version-check 'cairosvg==2.8.2' 'pillow>=10,<13'
+          python3 -m pip install --disable-pip-version-check --only-binary=:all: --target vendor -r requirements-jd2-build.txt
+      - name: Build and checksum x86_64 QPKG
+        run: |
+          bash scripts/build-qpkg.sh x86_64 dist
+          (cd dist && sha256sum QnapDownloader_0.1.4_x86_64.qpkg > SHA256SUMS && sha256sum -c SHA256SUMS)
+      - name: Publish experimental prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view v0.1.4-rc1 >/dev/null 2>&1; then
+            echo 'Release already exists; refusing overwrite'
+            exit 1
+          fi
+          gh release create v0.1.4-rc1 dist/QnapDownloader_0.1.4_x86_64.qpkg dist/SHA256SUMS \
+            --repo "${{ github.repository }}" \
+            --target "f26641306ef741b28211938cbf978073f9988292" \
+            --title "QnapDownloader v0.1.4-rc1: token-free initial setup" \
+            --prerelease \
+            --notes "Experimental QNAP x86_64 build. Removes the SSH bootstrap authentication token: first-run setup requires only a 12+ character admin password on a trusted private LAN. Existing admin passwords and SQLite data remain intact. No token is generated or required; obsolete token files are cleaned up. Regular login/session/CSRF protections remain. WARNING: the first person to access an unconfigured instance from a private LAN may claim administration; configure immediately on a trusted network. 71 automated tests and QDK 2.5.3 build passed. QNAP hardware installation/live Web access not verified. Private LAN HTTP is unencrypted; never forward TCP 17864 to Internet. iPhone/QNAP icons remain bundled."
