@@ -323,6 +323,25 @@ class HttpTests(unittest.TestCase):
         self.assertIn('id="downloadsRefresh"',html)
         self.assertIn('id="downloadPackages"',html)
 
+    def test_low_io_and_local_jd2_preflight_are_login_protected(self):
+        self.assertEqual(self.req("/api/diagnostics/io")[0], 401)
+        self.assertEqual(self.req("/api/jd2/local-preflight")[0], 401)
+        self.login()
+        status, data = self.req("/api/diagnostics/io")
+        self.assertEqual(status, 200)
+        self.assertIn("process_io", data)
+        self.assertIn("events", data)
+        self.assertTrue(data["local_only"])
+        self.assertFalse(data["log_persistence"])
+        with patch.object(webapp.runtime_diagnostics, "local_jd2_preflight",
+                          return_value={"tcp_reachable": True,
+                                        "operations_enabled": False}) as probe:
+            status, result = self.req("/api/jd2/local-preflight")
+        self.assertEqual(status, 200)
+        self.assertTrue(result["tcp_reachable"])
+        self.assertFalse(result["operations_enabled"])
+        probe.assert_called_once_with()
+
     def test_update_apply_fails_closed_when_not_qpkg(self):
         self.login()
         info = self.req("/api/update/status")[1]
