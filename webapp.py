@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import secrets
+import sqlite3
 import threading
 import time
 from urllib.parse import parse_qs, urlsplit
@@ -218,7 +219,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_data(200, {"available": release is not None,
                   "release": {"version": release["version"], "size": release["size"]}
                             if release else None, "current": VERSION})
-        except (OSError, ValueError, RuntimeError, KeyError) as exc:
+        except (OSError, ValueError, RuntimeError, KeyError, sqlite3.Error) as exc:
             return self.reject(str(exc))
         self.reject("APIが存在しません", 404)
 
@@ -285,7 +286,7 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/jd2/preset/apply":
                 return self.send_data(200, self.server.jd2.preset_reapply(
                     confirmed=body.get("confirmed") is True))
-        except (OSError, ValueError, KeyError, RuntimeError, json.JSONDecodeError) as exc:
+        except (OSError, ValueError, KeyError, RuntimeError, json.JSONDecodeError, sqlite3.Error) as exc:
             return self.reject(str(exc))
         self.reject("APIが存在しません", 404)
 
