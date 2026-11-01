@@ -1,0 +1,43 @@
+name: Publish QnapDownloader v0.1.11-rc1 one-click JD2 engine setup
+on:
+  push:
+    branches: [release/experimental-0.1.11-rc1]
+permissions:
+  contents: write
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Full unit, web, shell and safety verification
+        run: bash scripts/verify.sh
+      - name: Install QDK 2.5.3 and build-only dependencies
+        run: |
+          curl -fLSs --retry 2 https://github.com/qnap-dev/QDK/releases/download/v2.5.3/qdk_2.5.3_amd64.deb -o /tmp/qdk.deb
+          sudo apt-get update -qq
+          sudo apt-get install -y /tmp/qdk.deb rsync
+          python3 -m pip install --disable-pip-version-check 'cairosvg==2.8.2' 'pillow>=10,<13'
+      - name: Build and checksum x86_64 QPKG
+        run: |
+          bash scripts/build-qpkg.sh x86_64 dist
+          (cd dist && sha256sum QnapDownloader_0.1.11_x86_64.qpkg > SHA256SUMS && sha256sum -c SHA256SUMS)
+      - name: Publish as prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view v0.1.11-rc1 >/dev/null 2>&1; then
+            echo 'Existing tag; refusing to overwrite'
+            exit 1
+          fi
+          gh release create v0.1.11-rc1 dist/QnapDownloader_0.1.11_x86_64.qpkg dist/SHA256SUMS \
+            --repo "${{ github.repository }}" --target "df24039be8ee9400169293cd0a83c9d9183d320e" \
+            --title "QnapDownloader v0.1.11-rc1: One-click JD2 engine setup, MyJD removed" \
+            --prerelease \
+            --notes "Experimental QNAP x86_64 build. Removes MyJDownloader integration. Settings > Engine adds a one-click setup that, only on explicit admin action, downloads the official Eclipse Temurin 21 JRE and JDownloader.jar from fixed URLs, verifies pinned SHA-256 and size, places them in the persistent data folder, performs JD2 first-run updates, starts a Hub-supervised headless JD2 with a loopback-only local API (listener address and owning process checked on every call) and applies the safe preset. Downloads never auto-start. Real JD2 behaviour on QTS is not yet verified on hardware; setup shows a RAM-only log for diagnosis. Existing Docker JD2 and config/myjd.json are untouched."
