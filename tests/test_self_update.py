@@ -21,15 +21,15 @@ class QpkgSelfUpdateTests(unittest.TestCase):
         self.root = Path(self.tmp.name)
         self.store = storage.Store(self.root)
         self.addCleanup(self.store.close)
-        self.manager = update.UpdateManager(self.root, self.root, "0.1.6", "x86_64")
+        self.manager = update.UpdateManager(self.root, self.root, "0.1.7", "x86_64")
         self.job = self.manager.directory / ("a" * 32)
         self.job.mkdir()
         update.write_json(self.job / "request.json", {
-            "id": self.job.name, "current": "0.1.6", "target": "v0.1.7-rc1",
+            "id": self.job.name, "current": "0.1.7", "target": "v0.1.8-rc1",
             "arch": "x86_64", "channel": "rc", "data_root": str(self.root),
             "install_root": str(self.root), "port": 17864})
         update.write_json(self.manager.state_file, {
-            "id": self.job.name, "phase": "queued", "target": "v0.1.7-rc1"})
+            "id": self.job.name, "phase": "queued", "target": "v0.1.8-rc1"})
 
     def test_sqlite_online_backup_captures_settings(self):
         self.store.set_download_dir("/share/Download")
@@ -52,11 +52,11 @@ class QpkgSelfUpdateTests(unittest.TestCase):
     def test_corrupt_download_never_stops_nas_service(self):
         good_payload = b"#!/bin/sh\nexit 0\n"
         asset = {
-            "version": "v0.1.7-rc1", "name": "QnapDownloader_0.1.7_x86_64.qpkg",
+            "version": "v0.1.8-rc1", "name": "QnapDownloader_0.1.8_x86_64.qpkg",
             "size": len(good_payload),
             "sha256": hashlib.sha256(good_payload).hexdigest(),
             "url": "https://github.com/souten-yd/QnapDownloader/releases/download/"
-                   "v0.1.7-rc1/QnapDownloader_0.1.7_x86_64.qpkg"}
+                   "v0.1.8-rc1/QnapDownloader_0.1.8_x86_64.qpkg"}
         fd = self.manager.lock()
         try:
             with patch.object(update, "check_environment"), \
@@ -67,7 +67,7 @@ class QpkgSelfUpdateTests(unittest.TestCase):
                  patch.object(update.subprocess, "Popen") as install:
                 code = update.run_job(self.job, fd)
             self.assertEqual(code, 1)
-            choose.assert_called_once_with("0.1.6", "x86_64", "rc")
+            choose.assert_called_once_with("0.1.7", "x86_64", "rc")
             stop.assert_not_called()
             install.assert_not_called()
             self.assertEqual(update.read_json(self.manager.state_file)["phase"], "failed")
@@ -101,18 +101,18 @@ class QpkgSelfUpdateTests(unittest.TestCase):
     def test_reject_non_qpkg_environment_and_downgrade(self):
         with patch.object(update.os, "geteuid", return_value=1000):
             with self.assertRaises(ValueError):
-                self.manager.apply("v0.1.7-rc1")
-        for version in ("v0.1.6", "v0.0.9", "javascript:123", None):
+                self.manager.apply("v0.1.8-rc1")
+        for version in ("v0.1.7", "v0.0.9", "javascript:123", None):
             with self.subTest(version=version), self.assertRaises(ValueError):
                 self.manager.apply(version)
 
     def test_post_install_health_requires_matching_qpkg_and_web(self):
-        good = io.BytesIO(b'{"version":"0.1.7","settings_revision":1}')
+        good = io.BytesIO(b'{"version":"0.1.8","settings_revision":1}')
         client = Mock()
         client.open.return_value = good
-        with patch.object(update, "getcfg", return_value="0.1.7"), \
+        with patch.object(update, "getcfg", return_value="0.1.8"), \
              patch.object(update.urllib.request, "build_opener", return_value=client):
-            update.wait_for_version("v0.1.7-rc1", 17864)
+            update.wait_for_version("v0.1.8-rc1", 17864)
         self.assertEqual(client.open.call_args.args[0],
                          "http://127.0.0.1:17864/api/health")
 
