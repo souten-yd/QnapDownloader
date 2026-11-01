@@ -33,7 +33,7 @@ def jd2_destination(selected, options):
     return str(PurePosixPath(target_base).joinpath(*offset.parts))
 
 
-def transfer(adapter, url, nas_directory):
+def prepare_transfer(adapter, nas_directory):
     options = getattr(adapter, "_options", {})
     if options.get("allow_link_submit") is not True:
         raise TransferBlocked("JD2リンク転送が管理者に許可されていません")
@@ -50,6 +50,12 @@ def transfer(adapter, url, nas_directory):
     # with pre-existing custom rules. This does not change those rules.
     if options.get("allow_unverified_packagizer") is not True:
         raise TransferBlocked("Packagizer未検証のため転送を停止しました。JD2側のルールを確認してください")
+    return destination
+
+
+def transfer(adapter, url, nas_directory):
+    # Check preflight again in case the real JD2 settings changed.
+    destination = prepare_transfer(adapter, nas_directory)
     result = adapter.add_link(url, destination)
     if result is False:
         raise TransferBlocked("JD2がリンク登録を拒否しました。JD2の状態を確認してください")
