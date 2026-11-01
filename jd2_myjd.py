@@ -69,7 +69,10 @@ class MyJDAdapter:
                 if packaged.is_dir() and str(packaged) not in sys.path:
                     sys.path.insert(0, str(packaged))
                 import myjdapi
-                self._factory = myjdapi.myjdapi
+                # myjdapi 1.1.11 exposes the class as Myjdapi.
+                # Using lower-case myjdapi here silently passed mock-only
+                # tests but breaks real QNAP MyJD login.
+                self._factory = myjdapi.Myjdapi
             client = self._factory()
             # Only encrypted authenticated MyJDownloader; NEVER direct_connect.
             client.connect(self._options["email"], self._options["password"])
