@@ -32,6 +32,34 @@ class StorageTests(unittest.TestCase):
         finally:
             again.close()
 
+    def test_delete_link_only_staged_and_delete_bookmark(self):
+        keep = self.s.add_link("https://example.com/keep")["id"]
+        gone = self.s.add_link("https://example.com/gone")["id"]
+        before = self.s.revision()
+        self.s.delete_link(gone)
+        self.assertEqual([x["id"] for x in self.s.links()], [keep])
+        self.assertGreater(self.s.revision(), before)
+        self.s.begin_send(keep)
+        for state in ("sending",):
+            with self.assertRaises(ValueError):
+                self.s.delete_link(keep)
+        self.s.finish_send(keep, "uncertain")
+        with self.assertRaises(ValueError):
+            self.s.delete_link(keep)
+        with self.assertRaises(ValueError):
+            self.s.delete_link(gone)
+        with self.assertRaises(ValueError):
+            self.s.delete_link("1")
+        # A URL can be added again after deleting its staged row.
+        self.assertEqual(self.s.add_link("https://example.com/gone")["state"], "staged")
+        mark = self.s.add_bookmark("Ex", "https://example.com/")
+        self.s.delete_bookmark(mark)
+        self.assertEqual(self.s.bookmarks(), [])
+        with self.assertRaises(ValueError):
+            self.s.delete_bookmark(mark)
+        with self.assertRaises(ValueError):
+            self.s.delete_bookmark(True)
+
     def test_short_lived_sqlite_connections_are_closed(self):
         with self.s.connect() as db:
             self.assertEqual(db.execute("PRAGMA quick_check").fetchone()[0], "ok")

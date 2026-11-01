@@ -119,9 +119,9 @@ if (bad.length) { console.error("mismatch: " + bad.join(",")); process.exit(1); 
         self.assertIn('window.open(tab.current, "_blank", "noopener,noreferrer")', self.js)
 
     def test_engine_section_and_alias(self):
-        for ident in ("engineSetup", "engineStart", "engineStop", "engineTest", "engineAutostart",
-                      "engineSteps", "engineLog", "homeEngineSetup", "downloadsEngineNotice",
-                      "linksEngineNotice"):
+        for ident in ("engineSetup", "engineStart", "engineStop", "engineAutostart",
+                      "engineSteps", "engineLog", "homeEngineSetup", "downloadsEngineAction",
+                      "engineTestResult"):
             self.assertIn('id="%s"' % ident, self.html)
         self.assertIn('data-section="engine"', self.html)
         self.assertNotIn('data-section="jd2"', self.html)
@@ -133,6 +133,43 @@ if (bad.length) { console.error("mismatch: " + bad.join(",")); process.exit(1); 
         for needle in ("installer.jdownloader.org", "github.com/adoptium", "自動開始しません"):
             self.assertIn(needle, self.js)
         self.assertIn("JD2エンジンが起動していません", self.html)
+
+    def test_v0112_removed_controls_and_copy(self):
+        # Removed ids: auto-refresh switch, manual connection test, home quick actions.
+        for ident in ("downloadsAuto", "engineTest", "homeEngine", "homeOpenWeb", "downloadsEngineNotice",
+                      "linksEngineNotice", "queueUrl", "queueAdd", "rapidgatorText", "folderRoots",
+                      "engineLogButton", "updateLogButton"):
+            with self.subTest(ident=ident):
+                self.assertNotIn('id="%s"' % ident, self.html)
+        self.assertNotIn("downloadsAuto", self.js)
+        # The v0.1.11 localStorage key is only ever removed, never written or read.
+        self.assertIn("removeLocal(LEGACY_AUTO_KEY)", self.js)
+        self.assertNotIn("writeLocal(LEGACY_AUTO_KEY", self.js)
+        self.assertNotIn("readLocal(LEGACY_AUTO_KEY", self.js)
+        # Home has no quick-action row / "よく使う操作" / dev-preview notice.
+        home = re.search(r'<section id="view-home".*?</section>\s*\n\s*<section id="view-downloads"',
+                         self.html, re.S).group(0)
+        self.assertNotIn("よく使う操作", home)
+        self.assertNotIn("初期開発版", home)
+        self.assertIsNone(re.search(r'class="actions"', home))
+        self.assertIsNone(re.search(r'href="#/(downloads|links)"[^>]*class="btn', home))
+        self.assertIn("URLを入力または貼り付け", self.html)
+        # The old queue name is gone from every shipped file.
+        for path in text_files():
+            with self.subTest(file=path.name):
+                self.assertNotIn("保留キュー", path.read_text(encoding="utf-8"))
+        self.assertIn("追加したリンク", self.html)
+
+    def test_settings_order_and_auto_refresh_interval(self):
+        order = re.findall(r'<a href="#/settings/(\w+)" data-section', self.html)
+        self.assertEqual(order, ["engine", "storage", "bookmarks", "updates", "diagnostics", "about"])
+        self.assertRegex(self.js, r"AUTO_REFRESH_MS\s*=\s*5000\b")
+        self.assertRegex(self.js, r"BADGE_REFRESH_MS\s*=\s*30000\b")
+        self.assertRegex(self.js, r"PASTE_DEBOUNCE_MS\s*=\s*400\b")
+        # Delete APIs are wired, and sending to JD2 still asks for confirmation.
+        self.assertIn("/api/links/delete", self.js)
+        self.assertIn("/api/bookmarks/delete", self.js)
+        self.assertIn("confirm(many", self.js)
 
     def test_icons_use_symbol_sprite(self):
         self.assertIn("<symbol", self.html)

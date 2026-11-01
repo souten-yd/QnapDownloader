@@ -15,6 +15,7 @@ import self_update
 import storage
 import engine_supervisor
 import jd2_control
+import jd2_local
 import webapp
 
 
@@ -103,7 +104,7 @@ class HttpTests(unittest.TestCase):
                                          headers={"Host": "192.168.68.57:17864"})
         with self.client.open(request, timeout=4) as response:
             self.assertEqual(response.status, 200)
-            self.assertEqual(json.load(response)["version"], "0.1.11")
+            self.assertEqual(json.load(response)["version"], "0.1.12")
         with self.client.open(self.url + "/icon.svg", timeout=4) as response:
             self.assertEqual(response.status, 200)
             self.assertEqual(response.headers.get_content_type(), "image/svg+xml")
@@ -201,6 +202,38 @@ class HttpTests(unittest.TestCase):
         self.assertFalse(status["connected"])
         self.assertIn("エンジン未起動/未導入", status["reason"])
         self.assertFalse(status["can_send"])
+
+    def test_tailnet_peer_helper_and_session_flag(self):
+        for addr in ("100.64.0.1", "100.127.255.254", "fd7a:115c:a1e0::1",
+                     "::ffff:100.100.1.2"):
+            self.assertTrue(webapp.tailnet_peer(addr), addr)
+        for addr in ("100.63.0.1", "100.128.0.1", "192.168.0.5", "127.0.0.1",
+                     "fd7b::1", "garbage", None):
+            self.assertFalse(webapp.tailnet_peer(addr), addr)
+        self.assertFalse(self.req("/api/session")[1]["tailnet"])
+        with patch.object(webapp, "tailnet_peer", return_value=True):
+            self.assertTrue(self.req("/api/session")[1]["tailnet"])
+
+    def test_config_keys_requires_auth_and_running_engine(self):
+        self.assertEqual(self.req("/api/engine/config-keys")[0], 401)
+        self.login()
+        self.assertEqual(self.req("/api/engine/config-keys")[0], 400)
+        entries = [
+            {"interfaceName": "a.LinkgrabberSettings", "key": "AutoConfirm", "type": "BOOLEAN", "value": True},
+            {"interfaceName": "a.GeneralSettings", "key": "DefaultDownloadFolder", "type": "STRING", "value": "/share/x"},
+            {"interfaceName": "a.Foo", "key": "ProxyPassword", "type": "STRING", "value": "x"},
+            {"interfaceName": "a.Extraction", "key": "ExtractPath", "type": "STRING", "value": "short"},
+        ] + [{"interfaceName": "a.Foo", "key": "Extract%d" % i, "type": "INT", "value": i}
+             for i in range(300)]
+        with patch("jd2_local.LocalAdapter.config_keys",
+                   lambda self: jd2_local.filter_config_keys(entries)):
+            code, body = self.req("/api/engine/config-keys")
+        self.assertEqual(code, 200)
+        items = body["items"]
+        self.assertEqual(len(items), 200)
+        self.assertEqual(items[0]["value"], True)
+        self.assertIsNone(items[1]["value"])
+        self.assertFalse(any("password" in i["key"].lower() for i in items))
 
     def test_engine_api_auth_csrf_origin_and_confirmation(self):
         self.assertEqual(self.req("/api/engine/status")[0], 401)
@@ -392,7 +425,37 @@ class HttpTests(unittest.TestCase):
             html=response.read().decode()
         self.assertIn('data-tab="downloads"',html)
         self.assertIn('id="downloadsRefresh"',html)
-        self.assertIn('id="downloadPackages"',html)
+        self.assertIn('id="downloadList"',html)
+
+    def test_delete_apis_require_auth_csrf_and_only_staged_links(self):
+        link = {"id": 1}
+        self.assertEqual(self.req("/api/links/delete", link)[0], 401)
+        self.assertEqual(self.req("/api/bookmarks/delete", link)[0], 401)
+        self.login()
+        added = self.req("/api/links", {"url": "https://example.com/a"})[1]
+        sent = self.req("/api/links", {"url": "https://example.com/b"})[1]
+        mark = self.req("/api/bookmarks", {"title": "Ex", "url": "https://example.com/"})[1]
+        # CSRF and Origin are enforced.
+        self.assertEqual(self.req("/api/links/delete", {"id": added["id"]}, csrf=False)[0], 403)
+        self.assertEqual(self.req("/api/links/delete", {"id": added["id"]}, origin=False)[0], 403)
+        self.assertEqual(self.req("/api/bookmarks/delete", {"id": mark["id"]}, csrf=False)[0], 403)
+        self.assertEqual(len(self.req("/api/links")[1]["items"]), 2)
+        # Rows that left the "staged" state are never deleted.
+        self.store.begin_send(sent["id"])
+        self.assertEqual(self.req("/api/links/delete", {"id": sent["id"]})[0], 400)
+        self.store.finish_send(sent["id"], "sent")
+        self.assertEqual(self.req("/api/links/delete", {"id": sent["id"]})[0], 400)
+        # Invalid ids are refused.
+        for bad in (0, -1, "1", True, None, 999):
+            self.assertEqual(self.req("/api/links/delete", {"id": bad})[0], 400, bad)
+            self.assertEqual(self.req("/api/bookmarks/delete", {"id": bad})[0], 400, bad)
+        before = self.req("/api/health")[1]["settings_revision"]
+        self.assertEqual(self.req("/api/links/delete", {"id": added["id"]})[0], 200)
+        self.assertGreater(self.req("/api/health")[1]["settings_revision"], before)
+        self.assertEqual([i["id"] for i in self.req("/api/links")[1]["items"]], [sent["id"]])
+        self.assertEqual(self.req("/api/bookmarks/delete", {"id": mark["id"]})[0], 200)
+        self.assertEqual(self.req("/api/bookmarks")[1]["items"], [])
+        self.assertEqual(self.req("/api/bookmarks/delete", {"id": mark["id"]})[0], 400)
 
     def test_low_io_and_local_jd2_preflight_are_login_protected(self):
         self.assertEqual(self.req("/api/diagnostics/io")[0], 401)
@@ -419,7 +482,7 @@ class HttpTests(unittest.TestCase):
         self.assertFalse(info["supported"])
         code, _ = self.req("/api/update/apply", {"version": "v0.1.8"})
         self.assertEqual(code, 400)
-        self.assertEqual(self.req("/api/health")[1]["version"], "0.1.11")
+        self.assertEqual(self.req("/api/health")[1]["version"], "0.1.12")
         self.assertFalse(self.req("/api/jd2/status")[1]["connected"])
         self.assertEqual(self.req("/api/jd2/update/apply", {"confirmed": True})[0], 400)
         self.assertEqual(self.req("/api/jd2/preset/apply", {"confirmed": True})[0], 400)

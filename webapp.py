@@ -24,7 +24,7 @@ import runtime_diagnostics
 import engine_supervisor
 import updater
 
-VERSION = "0.1.11"
+VERSION = "0.1.12"
 PORT = 17864
 ROOT = Path(__file__).resolve().parent
 FILES = {"/": ("web/index.html", "text/html; charset=utf-8"),
@@ -120,6 +120,22 @@ def private_peer_allowed(value):
         if isinstance(peer, ipaddress.IPv6Address) and peer.ipv4_mapped:
             peer = peer.ipv4_mapped
         return any(peer in network for network in PRIVATE_PEERS)
+    except (ValueError, TypeError):
+        return False
+
+
+TAILNET_PEERS = (ipaddress.ip_network("100.64.0.0/10"),
+                 ipaddress.ip_network("fd7a:115c:a1e0::/48"))
+
+
+def tailnet_peer(value):
+    """True when the TCP peer is a Tailscale address (WireGuard-encrypted)."""
+    try:
+        peer = ipaddress.ip_address(value)
+        if isinstance(peer, ipaddress.IPv6Address) and peer.ipv4_mapped:
+            peer = peer.ipv4_mapped
+        return any(peer in network for network in TAILNET_PEERS
+                   if network.version == peer.version)
     except (ValueError, TypeError):
         return False
 
@@ -246,7 +262,8 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/session":
             data = self.session()
             return self.send_data(200, {"authenticated": bool(data),
-                             "csrf": data["csrf"] if data else None})
+                             "csrf": data["csrf"] if data else None,
+                             "tailnet": tailnet_peer(self.client_address[0])})
         if not self.authorize():
             return
         try:
@@ -267,6 +284,11 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_data(200, runtime_diagnostics.local_jd2_preflight())
             if path == "/api/engine/status":
                 return self.send_data(200, self.server.engine.status())
+            if path == "/api/engine/config-keys":
+                # Read-only diagnostic; requires a running, listener-verified engine.
+                with self.server.jd2.lock:
+                    return self.send_data(200, {
+                        "items": self.server.jd2._require().config_keys()})
             if path == "/api/engine/log":
                 # RAM ring only; secrets are scrubbed when lines are recorded.
                 return self.send_data(200, {"lines": self.server.engine.log_lines()})
@@ -287,7 +309,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_data(200, {"items": self.store.bookmarks()})
             if path == "/api/links":
                 return self.send_data(200, {"items": self.store.links(),
-                           "notice": "登録済みリンクは保留中です。JD2にはまだ送信されません"})
+                           "notice": "追加したリンクは未送信です。JD2へは手動で送ります"})
             if path == "/api/folders":
                 query = parse_qs(urlsplit(self.path).query)
                 roots = allowed_roots()
@@ -395,8 +417,14 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/bookmarks":
                 identifier = self.store.add_bookmark(body.get("title"), body.get("url"))
                 return self.send_data(201, {"id": identifier})
+            if path == "/api/bookmarks/delete":
+                self.store.delete_bookmark(body.get("id"))
+                return self.send_data(200, {"deleted": True})
             if path == "/api/links":
                 return self.send_data(201, self.store.add_link(body.get("url")))
+            if path == "/api/links/delete":
+                self.store.delete_link(body.get("id"))
+                return self.send_data(200, {"deleted": True})
             if path == "/api/rapidgator/extract":
                 pasted = body.get("content")
                 limit = body.get("limit", rapidgator_extract.DEFAULT_LIMIT)
@@ -411,7 +439,7 @@ class Handler(BaseHTTPRequestHandler):
                     return self.send_data(200, {
                         "count": len(found), "staged": stored, "saved": True,
                         "digest": evidence,
-                        "note": "Hubの保留キューに保存しました。JD2には送信していません"})
+                        "note": "追加したリンクに保存しました。JD2には送信していません"})
                 return self.send_data(200, {
                     "items": found, "count": len(found), "digest": evidence,
                     "saved": False, "limit": limit})

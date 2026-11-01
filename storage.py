@@ -159,6 +159,27 @@ class Store:
                 db.execute("UPDATE meta SET value=value+1 WHERE key='revision'")
             return row[0]
 
+    def delete_bookmark(self, identifier):
+        if type(identifier) is not int or identifier <= 0:
+            raise ValueError("ブックマークIDが不正です")
+        with self._guard, self.connect() as db:
+            deleted = db.execute("DELETE FROM bookmarks WHERE id=?", (identifier,))
+            if deleted.rowcount != 1:
+                raise ValueError("ブックマークが見つかりません")
+            db.execute("UPDATE meta SET value=value+1 WHERE key='revision'")
+
+    def delete_link(self, identifier):
+        # Only never-sent rows may be removed. sending/sent/uncertain rows are
+        # evidence of a JD2 handoff and stay until JD2 itself is checked.
+        if type(identifier) is not int or identifier <= 0:
+            raise ValueError("リンクIDが不正です")
+        with self._guard, self.connect() as db:
+            deleted = db.execute("DELETE FROM link_intents WHERE id=? AND state='staged'",
+                                 (identifier,))
+            if deleted.rowcount != 1:
+                raise ValueError("削除できるのは未送信のリンクだけです")
+            db.execute("UPDATE meta SET value=value+1 WHERE key='revision'")
+
     def add_link(self, url):
         # Link intents are inert in v0.1: no automatic URL fetch or JD2 execution.
         url = self.validate_url(url)

@@ -140,6 +140,38 @@ def encode_call(namespace, method, args):
     return path
 
 
+KEY_INCLUDE = ("autostart", "autoconfirm", "confirm", "extract", "subfolder",
+               "folder", "packagizer", "startdownload")
+KEY_EXCLUDE = ("password", "account", "cookie", "token", "captcha", "proxy",
+               "auth", "email")
+KEY_LIMIT = 200
+
+
+def filter_config_keys(entries):
+    result = []
+    for entry in entries:
+        interface = entry.get("interfaceName") or entry.get("configInterface")
+        key = entry.get("key")
+        if not isinstance(interface, str) or not isinstance(key, str):
+            continue
+        name = (interface + " " + key).lower()
+        if any(word in name for word in KEY_EXCLUDE):
+            continue
+        if not any(word in name for word in KEY_INCLUDE):
+            continue
+        value = entry.get("value")
+        if not (isinstance(value, (bool, int)) or
+                (isinstance(value, str) and len(value) <= 64 and "/" not in value)):
+            value = None
+        kind = entry.get("type")
+        result.append({"interface": interface[:200], "key": key[:100],
+                       "type": kind[:60] if isinstance(kind, str) else None,
+                       "value": value})
+        if len(result) >= KEY_LIMIT:
+            break
+    return result
+
+
 class LocalAdapter:
     """Same interface the old remote adapter had; talks to 127.0.0.1 only.
 
@@ -223,10 +255,21 @@ class LocalAdapter:
         self._handles = {}
 
     def _config_entries(self):
-        raw = self._call("config", "list")
+        # ConfigInterface.list(pattern, returnDescription, returnValues,
+        # returnDefaultValues, returnEnumInfo): values only come back when asked.
+        try:
+            raw = self._call("config", "list", ".*", False, True, False, True)
+        except ListenerError:
+            raise
+        except LocalUnavailable:
+            raw = self._call("config", "list")
         if not isinstance(raw, list) or len(raw) > 50000:
             raise LocalUnavailable("JD2設定一覧の形式が不正です")
         return [entry for entry in raw if isinstance(entry, dict)]
+
+    def config_keys(self):
+        """Read-only, filtered key listing so real JD2 names can be discovered."""
+        return filter_config_keys(self._config_entries())
 
     def inspect_preset(self):
         revision = self.core_revision()
