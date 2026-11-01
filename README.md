@@ -32,7 +32,7 @@ TS-253Beの実RAM/QTS、既存JD2の設定とAPI、Chromiumサンドボックス
 
 - Python 3.8+、標準ライブラリ。NASが起動して共有フォルダをマウントしてから、`python3 -B webapp.py --data-dir /share/Container/QnapDownloader --lan --port 17864` で起動します（ルート権限と公開範囲に注意）。外部ネットワークへポート転送しないでください。
 - 最初のアクセスで、NASの管理者が `/share/Container/QnapDownloader/config/bootstrap-token` をSSH等で読んでWebに入力し、管理者パスワード（12文字以上）を登録します。トークンは完了後に削除されます。
-- 管理画面は`http://<NAS-IP>:17864/`。HTTPのLAN公開は盗聴リスクがあるため、Tailscale等の保護された接続かHTTPSリバースプロキシを利用し、HTTPSプロキシ時は `--secure-cookie` を追加してください。
+- **QPKGの既定待受は127.0.0.1:17864のみ**で、`--secure-cookie`を使用します。QTSのHTTPSリバースプロキシ（ループバックポート17864を転送）から利用してください。明示的にLAN公開が必要なら`DOWNLOADER_LAN_ENABLED=1`の管理者設定を使用し、Tailscale等の暗号化された接続に限定してください。HTTPポートをインターネットへ公開しないでください。プロキシ用ホスト名を使う場合は`DOWNLOADER_ALLOWED_HOSTS`で明示的に許可します。
 - 保存先ピッカーの表示ルートは既定`/share/Download`。許可対象を変える場合は`DOWNLOADER_ALLOWED_ROOTS`で絶対パスをコロン区切り指定します（管理者のみ編集）。
 - ブックマーク、設定、保留キューはDBに保存。**保留キューはJD2へは送信されない**ため、まだ実際にダウンロードしません。
 - GitHub Releaseの更新確認は既存の正式Releaseが存在する場合のみ成功します。更新適用は正規QPKGインストール状態でのみサポート。ダウンロードしたQPKGのSHA-256、更新前SQLiteバックアップ、更新後ヘルスチェックを要求します。
