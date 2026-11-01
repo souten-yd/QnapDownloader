@@ -9,6 +9,7 @@ import re
 import sys
 import tempfile
 import time
+import urllib.error
 import urllib.request
 
 
@@ -56,8 +57,15 @@ def select(release, current, arch):
 def latest(current, arch):
     request = urllib.request.Request(API, headers={
         "Accept": "application/vnd.github+json", "User-Agent": "QnapDownloader-updater/0.1"})
-    with urllib.request.urlopen(request, timeout=15) as response:
-        release = json.load(response)
+    try:
+        with urllib.request.urlopen(request, timeout=15) as response:
+            release = json.load(response)
+    except urllib.error.HTTPError as error:
+        # GitHub returns 404 until a repository has its first stable Release.
+        # Other HTTP failures (rate limit, 5xx, permissions) remain visible.
+        if error.code == 404:
+            return None
+        raise
     return select(release, current, arch)
 
 
