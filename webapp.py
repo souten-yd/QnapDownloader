@@ -325,20 +325,20 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_data(201, self.store.add_link(body.get("url")))
             if path == "/api/links/send":
                 chosen = checked_directory(self.store.settings().get("download_dir"))
-                adapter = self.server.jd2._require()
-                # Ensure authorization, destination mapping and JD2 safety
-                # before mutating the durable intent.
-                jd2_transfer.prepare_transfer(adapter, str(chosen))
                 ident = body.get("id")
-                url = self.store.begin_send(ident)
-                try:
-                    outcome = jd2_transfer.transfer(adapter, url, str(chosen))
-                except Exception:
-                    # A network timeout may occur after JD2 accepted the link.
-                    # Never retry automatically, to avoid duplicate downloads.
-                    self.store.finish_send(ident, "uncertain")
-                    raise ValueError("JD2への送信結果が不明です。JD2で確認してください") from None
-                self.store.finish_send(ident, "sent")
+                # Serialize with JD2 independent update and preset reapply.
+                # The read-only preflight runs before the intent is marked
+                # sending; there is no automatic retry after uncertain sends.
+                with self.server.jd2.lock:
+                    adapter = self.server.jd2._require()
+                    jd2_transfer.prepare_transfer(adapter, str(chosen))
+                    url = self.store.begin_send(ident)
+                    try:
+                        outcome = jd2_transfer.transfer(adapter, url, str(chosen))
+                    except Exception:
+                        self.store.finish_send(ident, "uncertain")
+                        raise ValueError("JD2への送信結果が不明です。JD2で確認してください") from None
+                    self.store.finish_send(ident, "sent")
                 return self.send_data(200, outcome)
             if path == "/api/update/apply":
                 return self.send_data(202, self.server.updates.apply(body.get("version")))
