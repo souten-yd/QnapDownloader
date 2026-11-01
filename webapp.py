@@ -48,14 +48,22 @@ def checked_directory(path, roots=None):
 
 
 def public_host_allowed(host):
-    host = host.split(":", 1)[0].strip("[]").lower()
-    if host in ("localhost", "127.0.0.1", "::1"):
-        return True
     try:
-        return ipaddress.ip_address(host).is_private or ipaddress.ip_address(host).is_loopback
+        hostname = urlsplit("http://" + host).hostname
+        if not hostname:
+            return False
+        hostname = hostname.lower()
+        if hostname == "localhost":
+            return True
+        address = ipaddress.ip_address(hostname)
+        # RFC6598 shared-address space is used by Tailscale and is not
+        # reported as is_private by Python's ipaddress module.
+        return (address.is_private or address.is_loopback or
+                address in ipaddress.ip_network("100.64.0.0/10"))
     except ValueError:
         configured = os.environ.get("DOWNLOADER_ALLOWED_HOSTS", "")
-        return host in [x.strip().lower() for x in configured.split(",") if x.strip()]
+        return bool(hostname) and hostname in {
+            x.strip().lower() for x in configured.split(",") if x.strip()}
 
 
 class Handler(BaseHTTPRequestHandler):
