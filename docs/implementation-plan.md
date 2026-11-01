@@ -1,3 +1,5 @@
+> 現在の開発順序の正本は [docs/roadmap.md](roadmap.md) です。本書はその背景資料で、矛盾する場合はロードマップを優先します。
+
 # Implementation roadmap and verification
 
 **Status:** design only. The identifiers PR-1 ... PR-5 below are planning milestones, NOT existing GitHub PR numbers.
