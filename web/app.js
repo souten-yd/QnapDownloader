@@ -335,6 +335,22 @@ document.addEventListener("DOMContentLoaded",()=>{
   await api("/api/bookmarks",{title:$("bookmarkName").value,url:$("bookmarkUrl").value.trim()});
   $("bookmarkName").value="";$("bookmarkUrl").value="";await refresh("bookmarks");
  }));
+ $("diagnosticIo").addEventListener("click",()=>perform(async()=>{
+  const result=await api("/api/diagnostics/io");
+  const io=result.process_io;
+  $("diagnosticResult").textContent=io.available?
+    "Hub起動後の物理読込: "+readableSize(io.read_bytes)+
+    " / 書込: "+readableSize(io.write_bytes)+
+    " / 書込取消: "+readableSize(io.cancelled_write_bytes)+
+    "。これは累積値です。JD2や他QPKGのI/Oは含みません。":
+    "この環境では/proc/self/ioを読み取れません。";
+ }));
+ $("diagnosticJd2").addEventListener("click",()=>perform(async()=>{
+  const data=await api("/api/jd2/local-preflight");
+  $("diagnosticResult").textContent=(data.tcp_reachable?
+    "NASの127.0.0.1:3128にTCP接続できました。":"NASの127.0.0.1:3128に接続できません。")+
+    " JD2本体の確認・LAN隔離検証・操作の許可はまだ行っていません。";
+ }));
  $("jd2TestConnection").addEventListener("click",()=>perform(async()=>{
   $("jd2TestResult").textContent="JD2の認証済み接続を確認しています。操作や更新は行いません。";
   try {
