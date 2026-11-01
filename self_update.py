@@ -186,7 +186,7 @@ def wait_for_version(target, port, timeout=VERIFY_TIMEOUT):
     while time.monotonic() < deadline:
         try:
             if updater.version(getcfg('Version')) == updater.version(target):
-                with client.open(f'http://127.0.0.1:{port}/api/status', timeout=3) as response:
+                with client.open(f'http://127.0.0.1:{port}/api/health', timeout=3) as response:
                     status = json.load(response)
                 if updater.version(status.get('version', '')) == updater.version(target) and isinstance(status.get('settings_revision'), int):
                     return
