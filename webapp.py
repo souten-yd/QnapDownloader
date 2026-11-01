@@ -38,17 +38,21 @@ def allowed_roots():
     result = []
     values = os.environ.get("DOWNLOADER_ALLOWED_ROOTS", "/share/Download").split(":")
     for value in values:
-        if not value or not value.startswith("/share/"):
+        # Roots from the environment are trusted administrator configuration,
+        # not client-supplied folder names. Reject obvious system roots.
+        if not value or not value.startswith("/"):
             continue
         original = Path(value)
         if ".." in original.parts:
             continue
         try:
             resolved = original.resolve(strict=True)
-            if (resolved.is_dir() and
-                    (str(resolved).startswith("/share/") or
-                     str(resolved).startswith("/mnt/") and original.is_symlink()) and
-                    resolved not in result):
+            system_roots = ("/etc", "/root", "/proc", "/sys", "/dev",
+                            "/usr", "/bin", "/sbin", "/boot", "/run", "/var", "/lib")
+            if any(resolved == Path(p) or Path(p) in resolved.parents
+                   for p in system_roots):
+                continue
+            if resolved.is_dir() and resolved != Path("/") and resolved not in result:
                 result.append(resolved)
         except (ValueError, OSError):
             continue
