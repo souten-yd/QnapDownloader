@@ -43,6 +43,12 @@ class StorageTests(unittest.TestCase):
             with self.subTest(invalid=invalid), self.assertRaises(ValueError):
                 self.s.add_link(invalid)
 
+    def test_bookmark_duplicate_is_idempotent(self):
+        a = self.s.add_bookmark("Example", "https://example.com")
+        b = self.s.add_bookmark("Example again", "https://example.com")
+        self.assertEqual(a, b)
+        self.assertEqual(len(self.s.bookmarks()), 1)
+
     def test_admin_password_has_hash_and_no_plaintext(self):
         self.s.create_admin("correct horse staple 123")
         self.assertTrue(self.s.check_password("correct horse staple 123"))
