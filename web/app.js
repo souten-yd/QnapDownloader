@@ -127,6 +127,11 @@ document.addEventListener("DOMContentLoaded",()=>{
   $("bookmarkName").value="";$("bookmarkUrl").value="";await refresh("bookmarks");
  }));
  $("folderRoots").addEventListener("click",()=>perform(()=>folders("")));
+ $("updateLogButton").addEventListener("click",()=>perform(async()=>{
+  const result=await api("/api/update/log");
+  $("updateLog").textContent=result.log||"まだ更新ログはありません";
+  visible("updateLog",true);
+ }));
  $("updateCheck").addEventListener("click",()=>perform(async()=>{
   const u=await api("/api/update/check");
   selectedVersion=u.available?u.release.version:"";
