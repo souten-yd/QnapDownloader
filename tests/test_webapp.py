@@ -33,7 +33,6 @@ class HttpTests(unittest.TestCase):
         self.server.store = self.store
         self.server.jd2 = jd2_control.JD2Controller()
         self.server.secure_cookies = False
-        self.server.bootstrap_token = "unit-test-bootstrap"
         self.server.updates = self_update.UpdateManager(self.root, webapp.ROOT,
                                                        webapp.VERSION, "x86_64", self.server.server_port)
         self.port = self.server.server_port
@@ -69,8 +68,8 @@ class HttpTests(unittest.TestCase):
             return error.code, json.load(error)
 
     def login(self):
-        self.assertEqual(self.req("/api/bootstrap", {
-            "token": "unit-test-bootstrap", "password": "correct horse staple 123"})[0], 200)
+        self.assertEqual(self.req("/api/setup", {
+            "password": "correct horse staple 123"})[0], 201)
         code, body = self.req("/api/login", {"password": "correct horse staple 123"})
         self.assertEqual(code, 200)
         self.csrf = body["csrf"]
@@ -102,7 +101,7 @@ class HttpTests(unittest.TestCase):
                                          headers={"Host": "192.168.68.57:17864"})
         with self.client.open(request, timeout=4) as response:
             self.assertEqual(response.status, 200)
-            self.assertEqual(json.load(response)["version"], "0.1.3")
+            self.assertEqual(json.load(response)["version"], "0.1.4")
         with self.client.open(self.url + "/icon.svg", timeout=4) as response:
             self.assertEqual(response.status, 200)
             self.assertEqual(response.headers.get_content_type(), "image/svg+xml")
@@ -115,8 +114,6 @@ class HttpTests(unittest.TestCase):
     def test_setup_login_csrf_and_private_api(self):
         self.assertEqual(self.req("/api/settings")[0], 401)
         self.assertEqual(self.req("/api/update/log")[0], 401)
-        self.assertEqual(self.req("/api/bootstrap", {
-            "token": "wrong", "password": "correct horse staple 123"})[0], 403)
         self.login()
         self.assertEqual(self.req("/api/settings")[1]["auto_start"], False)
         self.assertEqual(self.req("/api/links", {"url": "https://rapidgator.net/file/1"},
@@ -131,6 +128,35 @@ class HttpTests(unittest.TestCase):
         self.assertEqual(self.req("/api/links")[1]["items"][0]["state"], "staged")
         self.assertEqual(self.req("/api/logout", {})[0], 200)
         self.assertEqual(self.req("/api/settings")[0], 401)
+
+    def test_tokenless_first_run_and_existing_admin_is_not_replaced(self):
+        status, info = self.req("/api/setup/status")
+        self.assertEqual(status, 200)
+        self.assertFalse(info["configured"])
+        self.assertEqual(self.req("/api/setup", {
+            "password": "too-short"})[0], 400)
+        self.assertFalse(self.store.has_admin())
+        self.assertEqual(self.req("/api/setup", {
+            "password": "correct horse staple 123"}, origin=False)[0], 403)
+        status, info = self.req("/api/setup", {
+            "password": "correct horse staple 123"})
+        self.assertEqual(status, 201)
+        self.assertTrue(info["ok"])
+        self.assertTrue(self.req("/api/setup/status")[1]["configured"])
+        self.assertEqual(self.req("/api/setup", {
+            "password": "another strong password 987"})[0], 403)
+        self.assertTrue(self.store.check_password("correct horse staple 123"))
+        self.assertFalse(self.store.check_password("another strong password 987"))
+        self.assertEqual(self.req("/api/bootstrap", {
+            "token": "legacy-token", "password": "another strong password 987"})[0], 401)
+        self.assertEqual(self.req("/api/settings")[0], 401)
+
+    def test_no_admin_token_or_password_leaks_in_setup_status(self):
+        self.assertEqual(self.req("/api/setup/status"), (200, {"configured": False}))
+        self.login()
+        status, info = self.req("/api/setup/status")
+        self.assertEqual(status, 200)
+        self.assertEqual(info, {"configured": True})
 
     def test_folder_picker_persists_allowed_path_only(self):
         folder = self.allowed / "subdir"
@@ -185,9 +211,9 @@ class HttpTests(unittest.TestCase):
         self.login()
         info = self.req("/api/update/status")[1]
         self.assertFalse(info["supported"])
-        code, _ = self.req("/api/update/apply", {"version": "v0.1.3"})
+        code, _ = self.req("/api/update/apply", {"version": "v0.1.4"})
         self.assertEqual(code, 400)
-        self.assertEqual(self.req("/api/health")[1]["version"], "0.1.3")
+        self.assertEqual(self.req("/api/health")[1]["version"], "0.1.4")
         self.assertFalse(self.req("/api/jd2/status")[1]["connected"])
         self.assertEqual(self.req("/api/jd2/update/apply", {"confirmed": True})[0], 400)
         self.assertEqual(self.req("/api/jd2/preset/apply", {"confirmed": True})[0], 400)
