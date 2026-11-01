@@ -9,7 +9,10 @@ else
 fi
 [ -n "$root" ] || { echo 'QPKG installation path missing' >&2; exit 1; }
 pidfile="$root/downloader.pid"
-data_dir=${DOWNLOADER_DATA_DIR:-/share/Container/QnapDownloader}
+# Persistent sibling of the QPKG installation, NOT a directory replaced
+# when QDK updates the package. Requires no Container Station/Docker share.
+# Never auto-switch data directories based on shares appearing at boot.
+data_dir=${DOWNLOADER_DATA_DIR:-"$(dirname "$root")/QnapDownloader-data"}
 logfile="$data_dir/logs/downloader.log"
 
 resolve_python() {
@@ -26,9 +29,9 @@ case "${1:-}" in
             [ "$enabled" = TRUE ] || { echo "$name is disabled" >&2; exit 1; }
         fi
         umask 077
-        # QTS can start QPKGs before storage volumes, shared-folder aliases
-        # and the Python QPKG have finished initializing after a NAS reboot.
-        # Never create /share/Container on an unmounted backing volume.
+        # QTS may start QPKGs before their volume and Python3 are ready.
+        # The default data dir shares the QPKG volume but is outside the
+        # replaceable installation root. Do not silently fall back on errors.
         startup_wait=${DOWNLOADER_STARTUP_WAIT_SECONDS:-90}
         case "$startup_wait" in *[!0-9]*|'') startup_wait=90;; esac
         [ "$startup_wait" -le 180 ] || startup_wait=180
@@ -47,7 +50,7 @@ case "${1:-}" in
                 fi
             fi
             if [ "$elapsed" -ge "$startup_wait" ]; then
-                echo "QnapDownloader startup timed out after ${elapsed}s waiting for Container share and Python; check QTS volume and Python3 QPKG" >&2
+                echo "QnapDownloader startup timed out after ${elapsed}s waiting for data volume and Python; check QTS volume, free space and Python3 QPKG" >&2
                 exit 1
             fi
             sleep 2
