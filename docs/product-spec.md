@@ -335,3 +335,8 @@ QNAP再起動/停電復元、RAM 2/4/8GB条件、ストレージ負荷、広告/
 詳細: storage-and-presets.md、security.md、implementation-plan.md、../DEVELOPMENT_WORKFLOW.md、github-protection.md。
 
 ※現時点は仕様策定のみ。QPKG、動作するブラウザ、NAS実機検証は未実装。
+
+
+## 17. JD2単独更新と設定復旧（追加確定要件）
+
+JDownloader 2はJD2の標準更新経路で単独更新し、QnapDownloader Hubの自己更新とは独立させる。JD2のCore/プラグイン更新後、Hubの推奨設定ボタンから設定の実際の差分を確認して再適用可能とする。適用時は一般設定とPackagizer、LinkGrabber自動開始・確定、自動解凍を独立に確認し、既存キューや完了ファイルを変更しない。詳細: [JD2独立更新と再適用](jd2-independent-updates.md)。認証済みJD2接続がまだ未実装なので現MVPのボタンは無効とする。
