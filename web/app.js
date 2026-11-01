@@ -135,7 +135,7 @@ document.addEventListener("DOMContentLoaded",()=>{
  $("updateCheck").addEventListener("click",()=>perform(async()=>{
   const u=await api("/api/update/check");
   selectedVersion=u.available?u.release.version:"";
-  $("updateResult").textContent=u.available?"更新あり: "+u.release.version:"現在の正式リリースが最新です";
+  $("updateResult").textContent=u.available?"更新あり: "+u.release.version:"現在利用できる新しい正式QPKGリリースはありません";
   visible("updateApply",Boolean(u.available));
   await updateStatus();
  }));
