@@ -101,7 +101,7 @@ class HttpTests(unittest.TestCase):
                                          headers={"Host": "192.168.68.57:17864"})
         with self.client.open(request, timeout=4) as response:
             self.assertEqual(response.status, 200)
-            self.assertEqual(json.load(response)["version"], "0.1.9")
+            self.assertEqual(json.load(response)["version"], "0.1.10")
         with self.client.open(self.url + "/icon.svg", timeout=4) as response:
             self.assertEqual(response.status, 200)
             self.assertEqual(response.headers.get_content_type(), "image/svg+xml")
@@ -275,6 +275,32 @@ class HttpTests(unittest.TestCase):
         self.assertNotIn("allow-same-origin",html)
         self.assertNotIn("allow-downloads",html)
 
+    def test_browser_validate_rejects_hub_own_host_and_tailnet_names(self):
+        import urllib.parse
+        self.login()
+        with patch.dict(os.environ, {"DOWNLOADER_ALLOWED_HOSTS": "hub.example.com"}):
+            def check(url, host):
+                path = "/api/browser/validate?url=" + urllib.parse.quote(url, safe="")
+                request = urllib.request.Request(self.url + path, headers={"Host": host})
+                try:
+                    with self.client.open(request, timeout=4) as response:
+                        return response.status, json.load(response)
+                except urllib.error.HTTPError as error:
+                    return error.code, json.load(error)
+            # Hub's own hostname (case-insensitive, any port) is refused.
+            for host in ("hub.example.com:17864", "HUB.Example.com"):
+                with self.subTest(host=host):
+                    code, data = check("https://hub.example.com/page", host)
+                    self.assertEqual(code, 400)
+                    self.assertIn("Hub", data["error"])
+            # Another public name is still fine for the same Host.
+            code, data = check("https://rapidgator.net/file/1", "hub.example.com:17864")
+            self.assertEqual(code, 200)
+            # Tailscale MagicDNS names are always refused.
+            code, data = check("https://myhub.tail1234.ts.net/", "hub.example.com")
+            self.assertEqual(code, 400)
+            self.assertIn("Tailscale", data["error"])
+
     def test_update_channel_select_rc_releases_without_installer_execution(self):
         self.assertEqual(self.req("/api/update/check?channel=rc")[0],401)
         self.login()
@@ -351,7 +377,7 @@ class HttpTests(unittest.TestCase):
         self.assertFalse(info["supported"])
         code, _ = self.req("/api/update/apply", {"version": "v0.1.8"})
         self.assertEqual(code, 400)
-        self.assertEqual(self.req("/api/health")[1]["version"], "0.1.9")
+        self.assertEqual(self.req("/api/health")[1]["version"], "0.1.10")
         self.assertFalse(self.req("/api/jd2/status")[1]["connected"])
         self.assertEqual(self.req("/api/jd2/update/apply", {"confirmed": True})[0], 400)
         self.assertEqual(self.req("/api/jd2/preset/apply", {"confirmed": True})[0], 400)

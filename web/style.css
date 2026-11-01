@@ -1,4 +1,4 @@
-/* QnapDownloader browser-style shell (v0.1.9). Tokens first; light + dark. */
+/* QnapDownloader browser-style shell (v0.1.10). Tokens first; light + dark. */
 :root{
   --font:system-ui,-apple-system,"Hiragino Sans","Noto Sans JP","Segoe UI",sans-serif;
   --strip:#dee1e6; --strip-hover:#cfd3d9; --surface:#ffffff; --surface-2:#f3f5f7; --page:#f7f8fa;
@@ -190,6 +190,10 @@ a.status-card:hover{border-color:var(--accent)}
 .web-status:empty{display:none}
 .mode-badge{padding:1px 8px;border-radius:10px;background:var(--ok-soft);color:var(--ok);font-weight:700}
 .mode-badge.interactive{background:var(--danger-soft);color:var(--danger)}
+.mode-badge.compat{background:var(--accent-soft);color:var(--accent)}
+.cf-hint{display:flex;flex-wrap:wrap;align-items:center;gap:6px 8px;padding:3px 12px;background:var(--accent-soft);border-bottom:1px solid var(--border);font-size:12px;color:var(--text)}
+.btn.small{min-height:28px;padding:2px 10px;font-size:12px;font-weight:600}
+.cf-hint .icon-btn.small{margin-left:auto}
 .frames{flex:1;min-height:0;position:relative}
 .web-frame{position:absolute;inset:0;width:100%;height:100%;margin:0;border:0;background:#fff}
 
@@ -197,6 +201,9 @@ a.status-card:hover{border-color:var(--accent)}
 .toasts{position:fixed;right:14px;bottom:14px;z-index:60;display:flex;flex-direction:column;gap:8px;max-width:min(420px,calc(100vw - 28px));pointer-events:none}
 .toast{display:flex;align-items:flex-start;gap:10px;padding:11px 13px;border-radius:10px;background:var(--surface);color:var(--text);border:1px solid var(--border);border-left:4px solid var(--ok);box-shadow:var(--shadow);pointer-events:auto;overflow-wrap:anywhere;animation:rise .18s ease-out}
 .toast.error{border-left-color:var(--danger)}
+.toast.info,.toast.progress{border-left-color:var(--accent)}
+.toast.sticky{flex-wrap:wrap}
+.toast-action{min-height:30px;padding:3px 12px;font-size:13px}
 .toast-text{flex:1}
 .toast-close{display:grid;place-items:center;width:28px;height:28px;margin:-4px -6px -4px 0;border:0;border-radius:50%;background:none;color:inherit;cursor:pointer;flex:none}
 .toast-close:hover{background:var(--surface-2)}
@@ -234,6 +241,7 @@ a.status-card:hover{border-color:var(--accent)}
   .settings-nav a{white-space:nowrap;min-height:var(--touch);display:flex;align-items:center}
   .settings-body{padding:16px 14px 28px}
   .btn,.chip{min-height:var(--touch)}
+  .btn.small{min-height:36px}
   .menu button{min-height:var(--touch)}
   .toasts{left:12px;right:12px;bottom:calc(var(--touch) + 22px + env(safe-area-inset-bottom));max-width:none}
   .mobile-bar{position:fixed;left:0;right:0;bottom:0;z-index:40;display:grid;grid-template-columns:repeat(4,1fr);background:var(--surface);border-top:1px solid var(--border);padding-bottom:env(safe-area-inset-bottom)}
@@ -245,6 +253,15 @@ a.status-card:hover{border-color:var(--accent)}
   .tab-label{display:none}
   .pinned-tab{padding:0 10px}
 }
+/* ---- v0.1.10 smoothness: reserved heights, cheap long lists, short view fade ---- */
+#status{min-height:96px}
+#downloadsSummary{min-height:64px}
+#speedDial{min-height:64px}
+#queueItems:empty,#bookmarkItems:empty,#downloadPackages:empty,#downloadLinks:empty{min-height:72px;border-radius:10px;background:var(--surface-2)}
+.download-card,.items>.item{content-visibility:auto;contain-intrinsic-size:auto 84px}
+.view:not(.view-web):not([hidden]){animation:viewfade .12s ease-out}
+@keyframes viewfade{from{opacity:0}to{opacity:1}}
 @media (prefers-reduced-motion:reduce){
+  .view:not(.view-web):not([hidden]){animation:none}
   *,*::before,*::after{animation:none!important;transition:none!important}
 }

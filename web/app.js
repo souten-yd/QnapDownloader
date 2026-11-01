@@ -1,27 +1,52 @@
 "use strict";
 /*
- * QnapDownloader browser-style shell (v0.1.9).
+ * QnapDownloader browser-style shell (v0.1.10).
  * Spec: docs/browser-shell-ui.md. Single file, no build step.
  *
  * Security notes (see "Security invariants" in the spec):
  *  - DOM is built only with createElement/createElementNS + textContent.
- *  - External pages live in per-tab iframes whose sandbox is either empty or
- *    exactly SANDBOX_INTERACTIVE. The src is only ever set to a URL that
- *    /api/browser/validate returned (see mountFrame).
- *  - Storage keeps only {id, url history, index, mode} (session) and one
- *    boolean preference (local). Never tokens, passwords or cookies.
+ *  - External pages live in per-tab iframes whose sandbox is one of exactly
+ *    three constants (SANDBOX_STRICT / _INTERACTIVE / _COMPAT, see below). The
+ *    src is only ever set to a URL that /api/browser/validate returned
+ *    (see mountFrame).
+ *  - Storage keeps only {id, url history, index, mode} and the last route
+ *    (session), one boolean preference and hostname->mode pairs (local).
+ *    Never tokens, passwords or cookies.
  */
 
 // ---------------------------------------------------------------- constants
 const MAX_WEB_TABS = 6;
+// iOS kills the WebContent process (and reloads the home-screen app) under
+// memory pressure, so keep few live external iframes. Others re-load lazily.
+const MAX_LIVE_FRAMES_NARROW = 1;
+const MAX_LIVE_FRAMES_WIDE = 3;
+const SWR_TTL_MS = 10000;
+const MAX_HOST_MODES = 100;
+const UPDATE_POLL_MS = 2000;
+const UPDATE_WATCH_MS = 5 * 60 * 1000;
+const STALE_CHECK_MS = 30000;
 const MAX_CLOSED_TABS = 10;
 const MAX_HISTORY = 50;
 const AUTO_REFRESH_MS = 15000;
 const FRAME_LOAD_TIMEOUT_MS = 12000;
 const PAGE_SIZE = 30;
-// Remote pages never get same-origin rights, popups, downloads or top navigation.
+// Remote pages never get popups, downloads, modals or top navigation.
 const SANDBOX_STRICT = "";
 const SANDBOX_INTERACTIVE = "allow-scripts allow-forms";
+// Compatibility mode (per tab, explicit confirm). SAFETY ARGUMENT: a sandboxed
+// frame without the origin-sharing flag gets an opaque origin, so it has no
+// cookies/storage and e.g. a Cloudflare check cannot complete. With the flag,
+// the page keeps its OWN origin. External pages are always https on a public
+// DNS name (browser_safety.validate), and the Hub is served from an http
+// LAN/VPN address or a reverse-proxy host, so the two origins can never be
+// equal; the backend (/api/browser/validate) additionally rejects the Hub's own
+// hostname and *.ts.net. The page therefore gets only its own origin's
+// cookies/storage and cannot reach the Hub's session or storage.
+const SANDBOX_COMPAT = "allow-scripts allow-forms allow-same-origin";
+const MODES = ["strict", "interactive", "compat"];
+const MODE_LABELS = {strict: "強い制限", interactive: "限定操作", compat: "互換"};
+const SHELL_KEY = "qnapdl.shell.v1";
+const HOST_MODE_KEY = "qnapdl.hostmodes.v1";
 const TAB_STORAGE_KEY = "qnapdl.webtabs.v1";
 const AUTO_STORAGE_KEY = "qnapdl.downloads.auto";
 const SETTINGS_SECTIONS = ["storage", "jd2", "bookmarks", "updates", "diagnostics", "about"];
@@ -37,6 +62,8 @@ const state = {
   filter: "all", query: "", autoRefresh: false, autoTimer: null,
   rapidgatorSnapshot: null, selectedVersion: "", selectedChannel: "rc",
   menuReturnFocus: null,
+  snapshotJson: "", downloadsSig: "", folderPath: "",
+  bootVersion: "", statusCheckedAt: 0, updateWatching: false,
 };
 
 // ------------------------------------------------------------------ helpers
@@ -81,6 +108,19 @@ function hostOf(url) {
   catch (e) { return String(url).slice(0, 40); }
 }
 
+// Tailscale traffic is WireGuard-encrypted, so plain http:// to a tailnet host
+// is not "unencrypted". Matches 100.64.0.0/10, *.ts.net and fd7a:115c:a1e0::/48.
+function isTailscaleHost(hostname) {
+  const host = String(hostname || "").toLowerCase().replace(/^\[|\]$/g, "").replace(/\.$/, "");
+  if (host === "ts.net" || host.endsWith(".ts.net")) return true;
+  const v4 = host.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+  if (v4) {
+    const parts = v4.slice(1).map(Number);
+    return parts.every(n => n <= 255) && parts[0] === 100 && parts[1] >= 64 && parts[1] <= 127;
+  }
+  return /^fd7a:115c:a1e0(:|$)/.test(host);
+}
+
 // Storage wrappers: every access is guarded; the UI works without storage.
 function readSession(key) {
   try { return sessionStorage.getItem(key); } catch (e) { return null; }
@@ -96,6 +136,82 @@ function readLocal(key) {
 }
 function writeLocal(key, value) {
   try { localStorage.setItem(key, value); } catch (e) { /* ignore */ }
+}
+
+function normalizeMode(mode) { return MODES.includes(mode) ? mode : "strict"; }
+
+function sandboxFor(mode) {
+  if (mode === "compat") return SANDBOX_COMPAT;
+  return mode === "interactive" ? SANDBOX_INTERACTIVE : SANDBOX_STRICT;
+}
+
+// Remembered mode per hostname: [[host, mode], ...] only, newest last, capped.
+function readHostModes() {
+  try {
+    const data = JSON.parse(readLocal(HOST_MODE_KEY) || "[]");
+    if (!Array.isArray(data)) return [];
+    return data.filter(e => Array.isArray(e) && typeof e[0] === "string" && e[0].length <= 253 &&
+      MODES.includes(e[1]) && e[1] !== "strict").slice(-MAX_HOST_MODES);
+  } catch (e) { return []; }
+}
+
+function rememberHostMode(host, mode) {
+  if (!host) return;
+  const list = readHostModes().filter(e => e[0] !== host);
+  if (mode !== "strict") list.push([host, mode]);   // strict is the default: store nothing
+  writeLocal(HOST_MODE_KEY, JSON.stringify(list.slice(-MAX_HOST_MODES)));
+}
+
+function rememberedMode(host) {
+  const hit = readHostModes().find(e => e[0] === host);
+  return hit ? hit[1] : null;
+}
+
+// ------------------------------------------------- stale-while-revalidate
+// Views paint cached data immediately, refresh in the background when the
+// entry is older than SWR_TTL_MS, never clear before new data arrives and
+// touch the DOM only when the JSON actually changed.
+const swrCache = new Map(), swrPainted = new Map(), swrPending = new Map();
+let swrEpoch = 0;
+
+function swrPaint(key, entry, render, slot) {
+  const sig = key + "\n" + entry.json;
+  if (swrPainted.get(slot) === sig) return;
+  render(entry.data);
+  swrPainted.set(slot, sig);
+}
+
+async function swr(key, path, render, opts = {}) {
+  const slot = opts.slot || key;
+  const hit = swrCache.get(key);
+  if (hit) {
+    swrPaint(key, hit, render, slot);
+    if (!opts.force && Date.now() - hit.at < SWR_TTL_MS) return hit.data;
+  }
+  const epoch = swrEpoch;
+  let pending = swrPending.get(key);
+  if (!pending) {
+    pending = api(path).then(data => {
+      const entry = {data, json: JSON.stringify(data), at: Date.now()};
+      if (epoch === swrEpoch) {
+        swrCache.set(key, entry);
+        while (swrCache.size > 60) swrCache.delete(swrCache.keys().next().value);
+      }
+      return entry;
+    }).finally(() => swrPending.delete(key));
+    swrPending.set(key, pending);
+  }
+  const entry = await pending;
+  if (epoch === swrEpoch) swrPaint(key, entry, render, slot);
+  return entry.data;
+}
+
+// After a write: forget the cache (the DOM stays until fresh data replaces it).
+function swrDrop(...keys) { for (const key of keys) swrCache.delete(key); }
+
+function swrReset() {
+  swrEpoch++;
+  swrCache.clear(); swrPainted.clear(); swrPending.clear();
 }
 
 // ---------------------------------------------------------------------- API
@@ -126,6 +242,11 @@ async function perform(fn) {
 }
 
 // ------------------------------------------------------------------- toasts
+function pruneToasts(box) {
+  const normal = Array.from(box.children).filter(n => !n.dataset.sticky);
+  while (normal.length > 4) normal.shift().remove();
+}
+
 function toast(message, kind = "success") {
   const box = $("notice");
   for (const old of Array.from(box.children)) {
@@ -145,9 +266,28 @@ function toast(message, kind = "success") {
     setTimeout(() => node.remove(), 6000);
   }
   box.appendChild(node);
-  while (box.children.length > 4) box.firstChild.remove();
+  pruneToasts(box);
 }
 function flash(message) { toast(message, "success"); }
+
+// Persistent toast (no close button, no timeout) replaced by key. `actions`
+// is [{label, run}]. Used for the update progress and stale-page notices.
+function stickyToast(key, message, kind, actions = []) {
+  const box = $("notice");
+  for (const old of Array.from(box.children)) {
+    if (old.dataset.sticky === key) old.remove();
+  }
+  const node = element("div", undefined, "toast sticky " + kind);
+  node.dataset.sticky = key;
+  node.appendChild(element("span", message, "toast-text"));
+  for (const action of actions) {
+    const btn = element("button", action.label, "btn toast-action");
+    btn.type = "button";
+    btn.addEventListener("click", action.run);
+    node.appendChild(btn);
+  }
+  box.appendChild(node);
+}
 
 // ------------------------------------------------------------------ routing
 function parseRoute() {
@@ -203,18 +343,20 @@ function applyRoute() {
   renderWebTabs();
   updateChrome();
   syncAutoRefresh();
+  // Last route (a hash, never a secret) lets a reloaded iOS web app resume.
+  writeSession(SHELL_KEY, JSON.stringify({v: 1, hash: location.hash || "#/home"}));
   perform(() => enterView(route));
 }
 
-async function enterView(route) {
+async function enterView(route, force = false) {
   if (route.view === "home" || (route.view === "tab" && currentViewName() === "home")) {
-    await loadStatus();
+    await loadStatus(force);
   } else if (route.view === "downloads") {
     renderDownloads();
   } else if (route.view === "links") {
-    await loadQueue();
+    await loadQueue(force);
   } else if (route.view === "settings") {
-    await enterSettings(route.section);
+    await enterSettings(route.section, force);
   } else if (route.view === "tab") {
     await ensureLoaded(findTab(route.tabId));
   }
@@ -267,6 +409,7 @@ function updateChrome() {
   setShown("bookmarkBar", bar);
   $("webLoading").hidden = !(tab && tab.loading);
   updateWebStatus(tab);
+  updateCfHint(tab);
   updatePinnedTabs();
   updateMobileBar();
 }
@@ -323,23 +466,44 @@ function updateWebStatus(tab) {
   const box = $("webStatus");
   box.replaceChildren();
   if (!tab || !tab.history.length) return;
-  const label = tab.mode === "interactive" ? "限定操作" : "強い制限";
-  box.appendChild(element("span", label, "mode-badge " + tab.mode));
+  box.appendChild(element("span", MODE_LABELS[tab.mode] || MODE_LABELS.strict, "mode-badge " + tab.mode));
   let text;
   if (tab.error) text = "読み込めませんでした: " + tab.error;
   else if (!tab.current) text = "検証して読み込み中です…";
   else text = "隔離表示中: " + tab.current +
     " — サイトが埋め込みを禁止している場合は空白になります。⋮ メニューからSafariで開けます。" +
-    "枠内の遷移先URLは読み取れません。";
+    "枠内の遷移先URLは読み取れません。" +
+    (tab.mode === "compat" ? "互換モード: このサイト自身のCookie・ストレージを枠内で使えます。" : "");
   box.appendChild(element("span", text, "web-status-text"));
 }
 
+// Slim, non-blocking hint under the toolbar while the tab is not in compat mode.
+function updateCfHint(tab) {
+  $("cfHint").hidden = !(tab && tab.current && tab.mode !== "compat" && !tab.hintDismissed);
+}
+
 // ------------------------------------------------------------- status/home
-async function loadStatus() {
-  const s = await api("/api/status");
+function renderStatusData(s) {
   state.status = s;
   document.querySelectorAll(".js-version").forEach(n => { n.textContent = "v" + s.version; });
   renderStatusCards();
+}
+
+async function loadStatus(force = false) {
+  const s = await swr("status", "/api/status", renderStatusData, {force});
+  state.statusCheckedAt = Date.now();
+  checkBootVersion(s.version);
+}
+
+// The Hub may have been updated (from this or another device) since this page
+// loaded. Offer a reload; never reload automatically here.
+function checkBootVersion(version) {
+  if (typeof version !== "string" || !version) return;
+  if (!state.bootVersion) { state.bootVersion = version; return; }
+  if (version === state.bootVersion || state.updateWatching) return;
+  stickyToast("stale", "Hubがv" + version + "に更新されています。再読み込みしてください" +
+    "（再読み込み後に再ログインが必要です）", "info",
+    [{label: "再読み込み", run: () => location.reload()}]);
 }
 
 function statusCard(title, value, sub, ok, href) {
@@ -371,8 +535,7 @@ function renderStatusCards() {
 }
 
 // --------------------------------------------------------------- bookmarks
-async function loadBookmarks() {
-  const b = await api("/api/bookmarks");
+function renderBookmarks(b) {
   state.bookmarks = Array.isArray(b.items) ? b.items : [];
   renderBookmarkBar();
   renderSpeedDial();
@@ -380,9 +543,13 @@ async function loadBookmarks() {
   updateChrome();
 }
 
+async function loadBookmarks(force = false) {
+  await swr("bookmarks", "/api/bookmarks", renderBookmarks, {force});
+}
+
 function renderBookmarkBar() {
   const bar = $("bookmarkBar");
-  bar.replaceChildren();
+  const nodes = [];
   for (const book of state.bookmarks.slice(0, 30)) {
     const btn = element("button", undefined, "bookmark-chip");
     btn.type = "button";
@@ -390,13 +557,14 @@ function renderBookmarkBar() {
     btn.appendChild(icon("star"));
     btn.appendChild(element("span", book.title || hostOf(book.url)));
     btn.addEventListener("click", () => perform(() => openWebUrl(book.url)));
-    bar.appendChild(btn);
+    nodes.push(btn);
   }
+  bar.replaceChildren(...nodes);
 }
 
 function renderSpeedDial() {
   const dial = $("speedDial");
-  dial.replaceChildren();
+  const nodes = [];
   for (const book of state.bookmarks.slice(0, 24)) {
     const tile = element("button", undefined, "dial-tile");
     tile.type = "button";
@@ -407,18 +575,19 @@ function renderSpeedDial() {
     tile.appendChild(element("span", book.title || hostOf(book.url), "dial-title"));
     tile.appendChild(element("span", hostOf(book.url), "dial-host"));
     tile.addEventListener("click", () => perform(() => openWebUrl(book.url)));
-    dial.appendChild(tile);
+    nodes.push(tile);
   }
+  dial.replaceChildren(...nodes);
   setShown("speedDialEmpty", state.bookmarks.length === 0);
 }
 
 function renderBookmarkList() {
   const list = $("bookmarkItems");
-  list.replaceChildren();
   if (!state.bookmarks.length) {
-    list.appendChild(element("p", "ブックマークはまだありません。", "empty-state"));
+    list.replaceChildren(element("p", "ブックマークはまだありません。", "empty-state"));
     return;
   }
+  const nodes = [];
   for (const book of state.bookmarks) {
     const box = element("div", undefined, "item");
     const open = element("button", book.title || hostOf(book.url), "linklike");
@@ -426,19 +595,21 @@ function renderBookmarkList() {
     open.addEventListener("click", () => perform(() => openWebUrl(book.url)));
     box.appendChild(open);
     box.appendChild(element("span", book.url));
-    list.appendChild(box);
+    nodes.push(box);
   }
+  list.replaceChildren(...nodes);
 }
 
 async function addBookmark(title, url) {
   await api("/api/bookmarks", {title, url});
-  await loadBookmarks();
+  await loadBookmarks(true);
 }
 
 // -------------------------------------------------------------- web tabs
 function newTabRecord(id) {
   return {id, history: [], index: -1, mode: "strict", current: "",
-    loaded: false, loading: false, token: 0, frame: null, error: ""};
+    loaded: false, loading: false, token: 0, frame: null, error: "",
+    lastUsed: 0, hintDismissed: false};
 }
 
 function saveTabs() {
@@ -461,7 +632,7 @@ function restoreTabs() {
       u.startsWith("https://")).slice(-MAX_HISTORY);
     const idx = Number.isInteger(raw.index) ? raw.index : tab.history.length - 1;
     tab.index = tab.history.length ? Math.min(Math.max(idx, 0), tab.history.length - 1) : -1;
-    tab.mode = raw.mode === "interactive" ? "interactive" : "strict";
+    tab.mode = normalizeMode(raw.mode);
     state.tabs.push(tab);   // loaded=false: validated and loaded lazily on selection
     maxId = Math.max(maxId, Number(raw.id.slice(1)));
   }
@@ -529,12 +700,53 @@ async function validateUrl(value) {
   return result.url;
 }
 
+// Defense in depth for compat mode (the backend enforces the same rule): the
+// page's origin must differ from the Hub's and must not be a tailnet name.
+function compatAllowedFor(url) {
+  let host;
+  try {
+    const parsed = new URL(url);
+    if (parsed.protocol !== "https:") return false;
+    host = parsed.hostname.toLowerCase();
+  } catch (e) { return false; }
+  const hub = location.hostname.toLowerCase().replace(/^\[|\]$/g, "");
+  return host !== hub && host !== "ts.net" && !host.endsWith(".ts.net");
+}
+
+function unloadTab(tab) {
+  tab.token++;
+  if (tab.frame) tab.frame.remove();
+  tab.frame = null;
+  tab.loaded = false;
+  tab.loading = false;
+  tab.current = "";   // history is kept; selecting the tab re-validates and reloads
+}
+
+function liveFrameLimit() {
+  let narrow = false;
+  try { narrow = window.matchMedia("(max-width: 759px)").matches; } catch (e) { narrow = false; }
+  return narrow ? MAX_LIVE_FRAMES_NARROW : MAX_LIVE_FRAMES_WIDE;
+}
+
+// LRU: unload the least recently used frames beyond the limit (never `keep`).
+function enforceLiveLimit(keep) {
+  const limit = liveFrameLimit();
+  const live = state.tabs.filter(t => t.frame);
+  if (live.length <= limit) return;
+  live.filter(t => t !== keep).sort((a, b) => a.lastUsed - b.lastUsed)
+    .slice(0, live.length - limit).forEach(unloadTab);
+}
+
 function mountFrame(tab, validatedUrl) {
   // SECURITY: validatedUrl must come from validateUrl(). The iframe is rebuilt
   // each time so the sandbox attribute is in force before navigation starts.
   if (tab.frame) tab.frame.remove();
+  if (tab.mode === "compat" && !compatAllowedFor(validatedUrl)) {
+    tab.mode = "strict";
+    toast("このアドレスでは互換モードを使えません。強い制限モードで表示します。", "error");
+  }
   const frame = document.createElement("iframe");
-  frame.setAttribute("sandbox", tab.mode === "interactive" ? SANDBOX_INTERACTIVE : SANDBOX_STRICT);
+  frame.setAttribute("sandbox", sandboxFor(tab.mode));
   frame.setAttribute("referrerpolicy", "no-referrer");
   frame.title = "外部サイトの隔離プレビュー（" + hostOf(validatedUrl) + "）";
   frame.className = "web-frame";
@@ -547,13 +759,26 @@ function mountFrame(tab, validatedUrl) {
   $("frames").appendChild(frame);
   tab.frame = frame;
   tab.loading = true;
+  tab.lastUsed = Date.now();
   frame.src = validatedUrl;
+  enforceLiveLimit(tab);
 }
 
 function syncFrameVisibility() {
   for (const tab of state.tabs) {
-    if (tab.frame) tab.frame.hidden = !(state.route.view === "tab" && state.route.tabId === tab.id);
+    if (!tab.frame) continue;
+    const active = state.route.view === "tab" && state.route.tabId === tab.id;
+    tab.frame.hidden = !active;
+    if (active) tab.lastUsed = Date.now();
   }
+}
+
+// The mode follows the hostname: a remembered mode applies when a tab opens
+// that host; compat never carries over to a host the user did not choose it for.
+function applyHostMode(tab, url) {
+  const remembered = rememberedMode(hostOf(url));
+  if (remembered) tab.mode = remembered;
+  else if (tab.mode === "compat") tab.mode = "strict";
 }
 
 // Validate `value`, let `commit` update the history, then (re)load the iframe.
@@ -570,7 +795,9 @@ async function openInTab(tab, value, commit) {
     throw e;
   }
   if (token !== tab.token || !state.tabs.includes(tab)) return;
+  const previous = tab.history.length ? tab.history[tab.index] : "";
   commit(url);
+  if (!previous || hostOf(previous) !== hostOf(url)) applyHostMode(tab, url);
   tab.current = url;
   tab.loaded = true;
   mountFrame(tab, url);
@@ -621,6 +848,7 @@ async function openWebUrl(value) {
   const url = await validateUrl(value);
   const fresh = createTab();
   pushHistory(fresh, url);
+  applyHostMode(fresh, url);
   fresh.current = url;
   fresh.loaded = true;
   mountFrame(fresh, url);
@@ -628,13 +856,20 @@ async function openWebUrl(value) {
   navigate("#/tab/" + fresh.id);
 }
 
-async function toggleMode(tab) {
-  if (tab.mode === "strict") {
-    if (!confirm("外部サイトのスクリプトとフォームを隔離枠内で実行します。ログインやCloudflareの動作保証はありません。続けますか？")) return;
-    tab.mode = "interactive";
-  } else {
-    tab.mode = "strict";
-  }
+const COMPAT_CONFIRM = "互換モードに切り替えます。\n\n" +
+  "・このサイト自身のCookie・ストレージを枠内で使えるようにします（Hub自体のものではありません）。\n" +
+  "・Cloudflareの確認を回避する機能ではありません。\n" +
+  "・iPhoneのSafariではサードパーティCookieのブロックにより動作しない場合があります。その場合は「Safariで開く」を使ってください。\n\n" +
+  "続けますか？";
+
+async function setMode(tab, target) {
+  target = normalizeMode(target);
+  if (tab.mode === target) return;
+  if (target === "interactive" && tab.mode === "strict" &&
+      !confirm("外部サイトのスクリプトとフォームを隔離枠内で実行します。ログインやCloudflareの動作保証はありません。続けますか？")) return;
+  if (target === "compat" && !confirm(COMPAT_CONFIRM)) return;
+  tab.mode = target;
+  if (tab.history.length) rememberHostMode(hostOf(tab.history[tab.index]), target);
   saveTabs();
   if (tab.history.length) await reloadTab(tab);   // re-validates and rebuilds the iframe
   updateChrome();
@@ -717,6 +952,8 @@ function configureMenu() {
   $("menu").querySelector("[data-action='reopen']").disabled = state.closed.length === 0;
   $("menuMode").textContent = tab && tab.mode === "interactive" ?
     "強い制限モードに戻す" : "限定操作モードに切り替え";
+  $("menuCompat").textContent = tab && tab.mode === "compat" ?
+    "互換モードをやめる（強い制限へ）" : "互換モードに切り替え";
 }
 
 function openMenu() {
@@ -732,7 +969,8 @@ async function menuAction(action) {
   const tab = activeWebTab();
   if (action === "newTab") createBlankTab();
   else if (action === "reopen") reopenClosedTab();
-  else if (action === "toggleMode" && tab) await toggleMode(tab);
+  else if (action === "toggleMode" && tab) await setMode(tab, tab.mode === "interactive" ? "strict" : "interactive");
+  else if (action === "compatMode" && tab) await setMode(tab, tab.mode === "compat" ? "strict" : "compat");
   else if (action === "external" && tab) openExternal(tab);
   else if (action === "stageUrl" && tab) await stageTabUrl(tab);
   else if (action === "bookmark" && tab) await bookmarkTab(tab);
@@ -764,6 +1002,7 @@ async function bookmarkTab(tab) {
 async function logout() {
   await api("/api/logout", {});
   writeSession(TAB_STORAGE_KEY, null);
+  writeSession(SHELL_KEY, null);
   history.replaceState(null, "", "#/home");
   state.csrf = "";
   await go();
@@ -877,6 +1116,10 @@ function matchesFilter(item) {
 // Pure client-side rendering of the last fetched snapshot (filter + search).
 function renderDownloads() {
   const snap = state.snapshot;
+  // Repaint only when snapshot, filter or search changed.
+  const sig = snap ? state.snapshotJson + "|" + state.filter + "|" + state.query : "";
+  if (sig === state.downloadsSig) return;
+  state.downloadsSig = sig;
   const packages = $("downloadPackages"), links = $("downloadLinks"), metrics = $("downloadsSummary");
   packages.replaceChildren(); links.replaceChildren(); metrics.replaceChildren();
   if (!snap) return;
@@ -912,6 +1155,7 @@ async function loadDownloads(page, options = {}) {
   try {
     const snap = await api("/api/jd2/downloads?page=" + page);
     state.snapshot = snap;
+    state.snapshotJson = JSON.stringify(snap);
     state.snapshotAt = Date.now();
     state.downloadsPage = snap.page;
     renderDownloads();
@@ -974,11 +1218,9 @@ function setFilter(filter) {
 }
 
 // ----------------------------------------------------------------- links
-async function loadQueue() {
-  const list = $("queueItems");
-  list.replaceChildren();
-  const q = await api("/api/links");
-  if (!q.items.length) list.appendChild(element("p", "保留中のリンクはありません。", "empty-state"));
+function renderQueue(q) {
+  const nodes = [];
+  if (!q.items.length) nodes.push(element("p", "保留中のリンクはありません。", "empty-state"));
   for (const link of q.items) {
     const container = element("div", undefined, "item");
     container.appendChild(element("span", link.url));
@@ -991,13 +1233,18 @@ async function loadQueue() {
       send.addEventListener("click", () => perform(async () => {
         if (!confirm("このリンクをJD2のLinkGrabberへ送ります。自動開始はOFFです。既存のPackagizerルールによりフォルダが変わる可能性があります。続けますか？")) return;
         await api("/api/links/send", {id: link.id});
-        await loadQueue();
+        await loadQueue(true);
         flash("JD2のLinkGrabberへ登録しました。処理はまだ開始していません");
       }));
       container.appendChild(send);
     }
-    list.appendChild(container);
+    nodes.push(container);
   }
+  $("queueItems").replaceChildren(...nodes);   // swapped in one step, never cleared first
+}
+
+async function loadQueue(force = false) {
+  await swr("links", "/api/links", renderQueue, {force});
 }
 
 async function previewRapidgator() {
@@ -1024,56 +1271,70 @@ async function stageRapidgator() {
     {content: snapshot.content, limit: snapshot.limit, digest: snapshot.digest, commit: true});
   $("rapidgatorResult").replaceChildren(element("p",
     "保留キューへ新規 " + staged.staged + "件を登録しました。JD2へは未送信です。"));
-  await loadQueue();
+  await loadQueue(true);
   flash("保存完了。必要なら保留キューから個別にJD2へ送ってください");
 }
 
 // -------------------------------------------------------------- settings
-async function enterSettings(section) {
+function showSettingsSection(section) {
   document.querySelectorAll(".settings-section").forEach(n => { n.hidden = n.dataset.section !== section; });
   document.querySelectorAll(".settings-nav a").forEach(a => {
     if (a.dataset.section === section) a.setAttribute("aria-current", "page");
     else a.removeAttribute("aria-current");
   });
+}
+
+function renderDownloadDir(s) {
+  $("selectedFolder").textContent = s.download_dir ? "保存先：" + s.download_dir : "保存先：未選択";
+}
+
+function renderJd2Config(cfg) {
+  $("jd2ConfigState").textContent = cfg.configured ?
+    "MyJD設定済み / デバイス: " + cfg.device_name +
+      " / JD2更新: " + (cfg.can_update ? "明示許可済み" : "無効") +
+      " / リンク送信: " + (cfg.can_send ? "明示許可済み" : "無効") :
+    "MyJD未設定: " + (cfg.reason || "接続設定を作成してください");
+}
+
+async function enterSettings(section, force = false) {
+  showSettingsSection(section);
   if (section === "storage") {
-    const s = await api("/api/settings");
-    $("selectedFolder").textContent = s.download_dir ? "保存先：" + s.download_dir : "保存先：未選択";
-    await folders("");
+    await Promise.all([
+      swr("settings", "/api/settings", renderDownloadDir, {force}),
+      folders(state.folderPath, force).catch(e => {
+        if (!state.folderPath) throw e;
+        return folders("", force);   // remembered folder vanished: back to the shares
+      }),
+    ]);
   } else if (section === "jd2") {
-    const cfg = await api("/api/jd2/config");
-    $("jd2ConfigState").textContent = cfg.configured ?
-      "MyJD設定済み / デバイス: " + cfg.device_name +
-        " / JD2更新: " + (cfg.can_update ? "明示許可済み" : "無効") +
-        " / リンク送信: " + (cfg.can_send ? "明示許可済み" : "無効") :
-      "MyJD未設定: " + (cfg.reason || "接続設定を作成してください");
+    await swr("jd2config", "/api/jd2/config", renderJd2Config, {force});
   } else if (section === "bookmarks") {
-    await loadBookmarks();
+    await loadBookmarks(force);
   } else if (section === "updates") {
-    await updateStatus();
+    await updateStatus(force);
   } else if (section === "about") {
-    await loadStatus();
+    await loadStatus(force);
   }
 }
 
-async function folders(path) {
-  const data = await api("/api/folders" + (path ? "?path=" + encodeURIComponent(path) : ""));
-  const picker = $("folderPicker");
-  picker.replaceChildren();
+function renderFolders(path, data) {
+  const nodes = [];
   if (path) {
-    picker.appendChild(element("p", "表示フォルダ: " + data.path, "path"));
+    nodes.push(element("p", "表示フォルダ: " + data.path, "path"));
     const select = element("button", "このフォルダを保存する", "btn primary");
     select.type = "button";
     select.disabled = !data.writable;
     select.addEventListener("click", () => perform(async () => {
       const v = await api("/api/settings/folder", {path: data.path});
       $("selectedFolder").textContent = "保存先：" + v.download_dir;
+      swrDrop("settings", "status");
       flash("保存先を永続保存しました");
     }));
-    picker.appendChild(select);
+    nodes.push(select);
     const back = element("button", "← 共有フォルダ一覧", "btn");
     back.type = "button";
     back.addEventListener("click", () => perform(() => folders("")));
-    picker.appendChild(back);
+    nodes.push(back);
   }
   for (const child of data.items) {
     const btn = element("button", undefined, "folder");
@@ -1081,21 +1342,44 @@ async function folders(path) {
     btn.appendChild(icon("folder"));
     btn.appendChild(element("span", child.name + " " + (child.writable ? "" : "(読取のみ)")));
     btn.addEventListener("click", () => perform(() => folders(child.path)));
-    picker.appendChild(btn);
+    nodes.push(btn);
+  }
+  $("folderPicker").replaceChildren(...nodes);
+}
+
+// The picker keeps its position between visits and is rebuilt only when the
+// folder listing it shows actually changed (see swr).
+async function folders(path, force = false) {
+  const previous = state.folderPath;
+  state.folderPath = path;
+  try {
+    await swr("folders:" + path, "/api/folders" + (path ? "?path=" + encodeURIComponent(path) : ""),
+      data => renderFolders(path, data), {slot: "folderPicker", force});
+  } catch (e) {
+    state.folderPath = previous;
+    throw e;
   }
 }
 
-async function updateStatus() {
-  const s = await api("/api/update/status");
+function renderUpdateStatus(s) {
   $("updateStatus").textContent = "更新状態: " + s.phase + " — " + (s.message || s.unsupported_reason || "待機中");
   $("updateApply").disabled = Boolean(s.busy) || !s.supported;
-  const jd = await api("/api/jd2/status");
+}
+
+function renderJd2Status(jd) {
   $("jd2Status").textContent = jd.connected ?
     "JD2接続中 / Core revision: " + (jd.revision || "不明") + " / 更新: " + (jd.update_available ? "あり" : "なし") :
     "JD2未接続: " + (jd.reason || "接続アダプタの構成待ち");
   $("jd2Check").disabled = !jd.connected || !jd.can_update;
   $("jd2Update").disabled = !jd.connected || !jd.can_update || !jd.update_available;
   $("jd2Preset").disabled = !jd.connected || !jd.can_preset;
+}
+
+async function updateStatus(force = false) {
+  await Promise.all([
+    swr("update-status", "/api/update/status", renderUpdateStatus, {force}),
+    swr("jd2-status", "/api/jd2/status", renderJd2Status, {force}),
+  ]);
 }
 
 async function checkUpdate() {
@@ -1107,7 +1391,7 @@ async function checkUpdate() {
     "更新あり: " + u.release.version + (u.release.version.includes("-rc") ? "（RC版）" : "（正式版）") :
     (channel === "rc" ? "新しい正式版・RC版のQPKGはありません" : "新しい正式版のQPKGはありません");
   setShown("updateApply", Boolean(u.available));
-  await updateStatus();
+  await updateStatus(true);
 }
 
 async function applyPreset() {
@@ -1121,8 +1405,50 @@ async function applyPreset() {
   if (!confirm("次のJD2設定をOFFに変更します（既存キューは変更しません）。\n" +
       changed.map(x => "・" + x.label).join("\n") + "\n適用しますか？")) return;
   await api("/api/jd2/preset/apply", {confirmed: true});
-  await updateStatus();
+  await updateStatus(true);
   flash("推奨設定を再適用し、再読込で確認しました");
+}
+
+// ------------------------------------------------------- update auto reload
+async function fetchHealthVersion() {
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), 4000);
+  try {
+    const res = await fetch("/api/health", {cache: "no-store", credentials: "same-origin", signal: ctl.signal});
+    if (!res.ok) return "";
+    const data = await res.json();
+    return typeof data.version === "string" ? data.version : "";
+  } catch (e) {
+    return "";   // service restarting / offline: not an error here
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function serverVersion() {
+  return (await fetchHealthVersion()) || (state.status && state.status.version) || state.bootVersion;
+}
+
+// After POST /api/update/apply: poll /api/health until it reports a different
+// version, then reload. Sessions are in memory, so the login screen follows.
+async function watchForUpdate(before) {
+  if (state.updateWatching) return;
+  state.updateWatching = true;
+  document.querySelectorAll("#notice [data-sticky='stale']").forEach(n => n.remove());
+  stickyToast("update", "更新中… 完了後に自動で再読み込みします（再読み込み後に再ログインが必要です）", "progress");
+  const deadline = Date.now() + UPDATE_WATCH_MS;
+  while (Date.now() < deadline) {
+    await new Promise(resolve => setTimeout(resolve, UPDATE_POLL_MS));
+    const version = await fetchHealthVersion();
+    if (version && before && version !== before) {
+      location.reload();
+      return;
+    }
+  }
+  state.updateWatching = false;
+  stickyToast("update", "更新の完了を確認できませんでした。Hubの更新ログを確認し、手動で再読み込みしてください" +
+    "（再読み込み後に再ログインが必要です）", "error",
+    [{label: "再読み込み", run: () => location.reload()}]);
 }
 
 // ------------------------------------------------------------ session / boot
@@ -1137,14 +1463,57 @@ function teardownSession() {
   state.closed = [];
   state.lastWebTabId = null;
   state.snapshot = null;
+  state.snapshotJson = "";
+  state.downloadsSig = "";
   state.snapshotAt = 0;
+  state.folderPath = "";
   state.bookmarks = [];
   state.status = null;
+  swrReset();
+  writeSession(SHELL_KEY, null);
+  for (const id of ["downloadPackages", "downloadLinks", "downloadsSummary", "queueItems",
+      "folderPicker", "bookmarkItems", "speedDial", "bookmarkBar", "status", "webTabs"]) {
+    $(id).replaceChildren();
+  }
   resetExtraction();
   $("rapidgatorText").value = "";
   closeMenu(false);
   closeSwitcher(false);
   updateBadge();
+}
+
+function initShellState() {
+  if (state.shellReady) return;
+  state.shellReady = true;
+  restoreTabs();
+  state.autoRefresh = readLocal(AUTO_STORAGE_KEY) === "1";
+  $("downloadsAuto").checked = state.autoRefresh;
+}
+
+// iOS may reload the home-screen app after killing its WebContent process.
+// Paint the shell (tab strip, last route) from sessionStorage right away, then
+// let go() verify the session. No external page is loaded and no API is called.
+function paintShellEarly() {
+  const raw = readSession(SHELL_KEY);
+  if (!raw) return;
+  let saved = null;
+  try { saved = JSON.parse(raw); } catch (e) { saved = null; }
+  if (!saved || saved.v !== 1) return;
+  initShellState();
+  if (!location.hash && typeof saved.hash === "string" && /^#\/[A-Za-z0-9\/_-]{0,80}$/.test(saved.hash)) {
+    history.replaceState(null, "", saved.hash);
+  }
+  const route = parseRoute();
+  state.route = route.view === "tab" && !findTab(route.tabId) ? {view: "home"} : route;
+  setShown("authArea", false);
+  setShown("app", true);
+  const shown = currentViewName();
+  for (const name of ["home", "downloads", "links", "settings", "web"]) {
+    $("view-" + name).hidden = name !== shown;
+  }
+  if (state.route.view === "settings") showSettingsSection(state.route.section);
+  renderWebTabs();
+  updatePinnedTabs();
 }
 
 async function go() {
@@ -1155,13 +1524,9 @@ async function go() {
       state.authed = true;
       setShown("authArea", false);
       setShown("app", true);
-      if (!state.shellReady) {
-        state.shellReady = true;
-        restoreTabs();
-        state.autoRefresh = readLocal(AUTO_STORAGE_KEY) === "1";
-        $("downloadsAuto").checked = state.autoRefresh;
-      }
+      initShellState();
       loadBookmarks().catch(() => {});
+      loadStatus().catch(() => {});   // also detects "Hub updated since this page loaded"
       applyRoute();
     } else {
       teardownSession();
@@ -1222,6 +1587,25 @@ function onTabstripKeydown(event) {
 function wireShell() {
   window.addEventListener("hashchange", applyRoute);
   document.addEventListener("visibilitychange", syncAutoRefresh);
+  document.addEventListener("visibilitychange", () => {
+    // Long-open page: notice a Hub update done elsewhere (toast only, no reload).
+    if (document.visibilityState === "visible" && state.authed &&
+        Date.now() - state.statusCheckedAt > STALE_CHECK_MS) {
+      loadStatus(true).catch(() => {});
+    }
+  });
+  $("cfCompat").addEventListener("click", () => {
+    const tab = activeWebTab();
+    if (tab) perform(() => setMode(tab, "compat"));
+  });
+  $("cfSafari").addEventListener("click", () => {
+    const tab = activeWebTab();
+    if (tab) openExternal(tab);
+  });
+  $("cfDismiss").addEventListener("click", () => {
+    const tab = activeWebTab();
+    if (tab) { tab.hintDismissed = true; updateChrome(); }
+  });
   document.addEventListener("keydown", onKeydown);
   document.addEventListener("click", event => {
     if (!$("menu").hidden && !event.target.closest(".menu-wrap")) closeMenu(false);
@@ -1244,7 +1628,7 @@ function wireShell() {
     const tab = activeWebTab();
     if (tab && tab.history.length) perform(() => reloadTab(tab));
     else if (state.route.view === "downloads") loadDownloads(state.downloadsPage);
-    else perform(() => enterView(state.route));
+    else perform(() => enterView(state.route, true));
   });
 
   $("omniForm").addEventListener("submit", event => {
@@ -1318,7 +1702,7 @@ function wireLinks() {
   $("queueAdd").addEventListener("click", () => perform(async () => {
     await api("/api/links", {url: $("queueUrl").value.trim()});
     $("queueUrl").value = "";
-    await loadQueue();
+    await loadQueue(true);
   }));
   $("rapidgatorText").addEventListener("input", resetExtraction);
   $("rapidgatorPreview").addEventListener("click", () => perform(previewRapidgator));
@@ -1326,7 +1710,7 @@ function wireLinks() {
 }
 
 function wireSettings() {
-  $("folderRoots").addEventListener("click", () => perform(() => folders("")));
+  $("folderRoots").addEventListener("click", () => perform(() => folders("", true)));
   $("bookmarkForm").addEventListener("submit", event => {
     event.preventDefault();
     perform(async () => {
@@ -1374,30 +1758,35 @@ function wireSettings() {
   $("updateCheck").addEventListener("click", () => perform(checkUpdate));
   $("jd2Check").addEventListener("click", () => perform(async () => {
     const result = await api("/api/jd2/update/check", {});
-    await updateStatus();
+    await updateStatus(true);
     flash(result.update_available ? "JD2の更新があります" : "JD2に新しい更新はありません");
   }));
   $("jd2Update").addEventListener("click", () => perform(async () => {
     if (!confirm("JDownloader 2本体だけを更新します。JD2のダウンロードは一時中断される場合があります。よろしいですか？")) return;
     await api("/api/jd2/update/apply", {confirmed: true});
-    await updateStatus();
+    await updateStatus(true);
   }));
   $("jd2Preset").addEventListener("click", () => perform(applyPreset));
   $("updateApply").addEventListener("click", () => perform(async () => {
     if (!state.selectedVersion || !confirm(state.selectedVersion + " にQPKGを更新します。サービスが再起動されます。続けますか？")) return;
+    const before = await serverVersion();
     await api("/api/update/apply", {version: state.selectedVersion, channel: state.selectedChannel});
-    await updateStatus();
+    watchForUpdate(before);   // not awaited: polls until the new version answers
+    try { await updateStatus(true); } catch (e) { /* the service may already be restarting */ }
   }));
 }
 
 document.addEventListener("DOMContentLoaded", () => {
   const plainLan = location.protocol === "http:" &&
-    !["localhost", "127.0.0.1", "::1", "[::1]"].includes(location.hostname);
+    !["localhost", "127.0.0.1", "::1", "[::1]"].includes(location.hostname) &&
+    !isTailscaleHost(location.hostname);   // WireGuard already encrypts the tunnel
   setShown("lanSecurityWarning", plainLan);
   wireAuth();
   wireShell();
   wireDownloads();
   wireLinks();
   wireSettings();
+  paintShellEarly();
+  fetchHealthVersion().then(v => { if (v && !state.bootVersion) state.bootVersion = v; });
   go();
 });

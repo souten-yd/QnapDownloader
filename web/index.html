@@ -7,6 +7,7 @@
 <title>QnapDownloader</title>
 <meta name="theme-color" content="#071a2d">
 <meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-title" content="Downloader">
 <link rel="icon" type="image/svg+xml" href="/icon.svg">
 <link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
@@ -90,6 +91,7 @@
      <button type="button" role="menuitem" data-action="reopen">閉じたタブを開き直す</button>
      <hr data-scope="web">
      <button type="button" role="menuitem" data-action="toggleMode" data-scope="web" id="menuMode">限定操作モードに切り替え</button>
+     <button type="button" role="menuitem" data-action="compatMode" data-scope="web" id="menuCompat">互換モードに切り替え</button>
      <button type="button" role="menuitem" data-action="external" data-scope="web">Safari／外部ブラウザで開く</button>
      <button type="button" role="menuitem" data-action="stageUrl" data-scope="web">このURLをリンク保留へ追加</button>
      <button type="button" role="menuitem" data-action="bookmark" data-scope="web">ブックマークに追加</button>
@@ -286,6 +288,12 @@
   <section id="view-web" class="view view-web" role="tabpanel" aria-label="Web閲覧" hidden>
    <div id="webLoading" class="loading-bar" hidden></div>
    <div id="webStatus" class="web-status"></div>
+   <div id="cfHint" class="cf-hint" role="note" hidden>
+    <span class="cf-hint-text">Cloudflareの確認が進まない場合 →</span>
+    <button type="button" id="cfCompat" class="btn small">互換モードで再読み込み</button>
+    <button type="button" id="cfSafari" class="btn small">Safariで開く</button>
+    <button type="button" id="cfDismiss" class="icon-btn small" aria-label="このヒントを閉じる" title="閉じる"><svg class="icon" aria-hidden="true"><use href="#i-x"/></svg></button>
+   </div>
    <div id="frames" class="frames"></div>
   </section>
  </main>

@@ -1,4 +1,4 @@
-# ブラウザ型Web管理画面（v0.1.9 / ロードマップM0）
+# ブラウザ型Web管理画面（v0.1.10 / ロードマップM0）
 
 ## 目的
 QnapDownloaderの画面を「普段使っているWebブラウザ」と同じ感覚で使えるようにする。JD2の管理（ダウンロード・リンク収集・設定）はブラウザのタブのように切り替え、外部サイトの閲覧も同じタブ列で行う。ただし**管理用タブと閲覧用タブは役割も寿命も違う**ので、見た目と挙動で明確に分ける。
@@ -35,11 +35,11 @@ QnapDownloaderの画面を「普段使っているWebブラウザ」と同じ感
 ### 通常タブ（Web閲覧）
 - `+` または ⋮ メニュー「新しいタブ」で作成。最大6枚（iPhoneのメモリと隔離iframeの負荷を考慮）。上限時は理由を表示し作成しない。
 - タブ名はホスト名（別オリジンのページタイトルは読めないため）。新しいタブは「新しいタブ」。
-- 各タブは独自の履歴（Hubで検証済みURLのみ）と隔離モード（厳格/限定操作）を持つ。iframe内部の遷移は読めない旨を従来どおり表示。
+- 各タブは独自の履歴（Hubで検証済みURLのみ）と隔離モード（強い制限/限定操作/互換）を持つ。iframe内部の遷移は読めない旨を従来どおり表示。
 - タブごとにiframeを保持し、非表示タブは `hidden` で隠す（状態維持）。ページ再読み込み後の復元時は**選択されたタブだけ**読み込み、他は選択時に遅延読み込み。
 - タブ一覧は `sessionStorage`（try/catch、失敗時は復元なし）にURL・モード・履歴だけ保存。復元したURLも読み込み前に `/api/browser/validate` で再検証。Cookie等は保存しない。
 - 閉じたタブは最大10件までメモリに保持し、⋮ メニュー「閉じたタブを開き直す」で復元。
-- ⋮ メニュー（Webタブ時）: 隔離モード切替（限定操作へは確認ダイアログ）、Safari/外部ブラウザで開く、このURLをリンク保留へ追加（確認あり）、ブックマークに追加、タブを閉じる。
+- ⋮ メニュー（Webタブ時）: 隔離モード切替（限定操作・互換へは確認ダイアログ）、Safari/外部ブラウザで開く、このURLをリンク保留へ追加（確認あり）、ブックマークに追加、タブを閉じる。
 
 ### オムニボックス（アドレスバー）
 - 管理タブでは `qnap://…` を表示。Webタブでは現在の検証済みURL（🔒）。
@@ -73,12 +73,38 @@ QnapDownloaderの画面を「普段使っているWebブラウザ」と同じ感
 - タブ列は `role="tablist"`/`role="tab"`/`aria-selected`、コンテンツは `role="tabpanel"`。フォーカスリング可視、`prefers-reduced-motion` 尊重。
 
 ## セキュリティ不変条件（変更禁止・テストで検証）
-- iframe の sandbox 値は `""` または `"allow-scripts allow-forms"` のみ。`allow-same-origin`・`allow-popups`・`allow-top-navigation`・`allow-downloads`・`allow-modals` を付与しない。
+- iframe の sandbox 値は次の3つの定数のみ（`app.js` の `sandboxFor(mode)` 経由で1箇所だけ設定）: `""`（強い制限）、`"allow-scripts allow-forms"`（限定操作）、`"allow-scripts allow-forms allow-same-origin"`（互換、v0.1.10〜）。`allow-popups`・`allow-top-navigation`・`allow-downloads`・`allow-modals` はいかなるモードでも付与しない。
+- `allow-same-origin` は互換モードの定数1箇所にだけ現れてよい（テストで出現回数1を検証）。以前の「scriptsとsame-originの併用禁止」という一律禁止は、理由を明示した次の条件付き許可に置き換えた。理由: 隔離iframeは同一オリジン権限を持たないopaque originになりCookie/ストレージが使えず、Cloudflare等の正規の確認が完了できない。外部ページは常に公開DNS名のhttps（`browser_safety.validate`）、Hubは `http://<LAN/VPN IP>:17864` またはリバースプロキシのホストなので、外部ページのオリジンがHubと一致することはなく、`allow-same-origin` が与えるのはそのページ**自身**のオリジンのCookie/ストレージだけでHubのセッションやストレージには届かない。この前提を壊さないため、バックエンドは `/api/browser/validate` でHub自身のホスト名（Hostヘッダー、大文字小文字無視・ポート除去）と `*.ts.net` を全モードで拒否し、フロントも互換iframe生成直前に同じ検査をする。
 - iframe の `src` には `/api/browser/validate` が返したURLだけを設定。`referrerpolicy="no-referrer"`。
 - DOM生成は `textContent`/`createElement` のみ（`innerHTML`・`insertAdjacentHTML`・`document.write`・`eval`・`new Function` 不使用）。
 - インライン `<script>`/`style=` 属性/イベントハンドラ属性を HTML に書かない（CSPが `script-src 'self'; style-src 'self'` のため）。SVGアイコンは `<symbol>`＋`<use>`。
-- `sessionStorage`/`localStorage` に資格情報・CSRFトークン・Cookieを保存しない。
-- バックエンドAPI・CSP・Cookie設定は本PRでは変更しない。
+- `sessionStorage`/`localStorage` に資格情報・CSRFトークン・Cookieを保存しない（v0.1.10で追加した保存物も、最後のルートのハッシュと「ホスト名→モード」の組のみ）。
+- CSP・Cookie設定は変更しない。バックエンドの変更は v0.1.10 の `/api/browser/validate` のHub自身/`*.ts.net`拒否のみ。
 
 ## 非対象
 外部ページのタイトル/ファビコン取得（サーバーが外部へアクセスすることになるため不可）、iframe内リンクの自動検出、検索エンジン連携、タブの並べ替え・グループ、ダウンロード操作ボタン（M2）。
+
+## v0.1.10 変更
+
+### 1. Tailscale経由ではHTTP警告を出さない
+`isTailscaleHost(hostname)`（純関数）が、100.64.0.0/10のIPv4・`*.ts.net`・`fd7a:115c:a1e0::/48`のIPv6（角括弧付き可）をTailscaleと判定し、その場合は「HTTP接続です…」警告（`#lanSecurityWarning`）を隠す。TailscaleのWireGuardトンネルが通信を暗号化するため。それ以外の非ループバックHTTPでは従来どおり表示する。
+
+### 2. 互換モード（Cloudflareの確認が白画面のままになる問題）
+- タブごとの第3モード「互換」。sandbox は `allow-scripts allow-forms allow-same-origin` ちょうど。ポップアップ・ダウンロード・モーダル・親画面遷移は付与しない。安全性の根拠は上記「セキュリティ不変条件」を参照。
+- 切り替え時に `confirm()`: サイト自身のCookie/ストレージを枠内で使える／Cloudflareを回避する機能ではない／iPhone Safariのサードパーティ Cookie ブロックで動かない場合は「Safariで開く」を使う。
+- 互換でないWebタブには、ツールバー下に細いヒントバー「Cloudflareの確認が進まない場合 → [互換モードで再読み込み] [Safariで開く]」を表示（ブロックしない・タブごとに×で閉じられる）。
+- 選んだモードはホスト名ごとに `localStorage`（try/catch）へ記憶し、同じホストを開くとき適用する。保存するのはホスト名とモードの組のみ、最大100件、強い制限（既定）は保存しない。互換は、記憶のない別ホストへ移ると強い制限に戻る。新しいホストの既定は従来どおり強い制限。
+- バックエンド: `/api/browser/validate` は `browser_safety.validate` の後に、URLのホスト名がリクエストのHostヘッダーのホスト名と等しい（大文字小文字無視・ポート除去）、または `*.ts.net` の場合、日本語メッセージで400を返す。
+
+### 3. なめらかさ・iOSの全画面再読み込み対策
+「タブ切り替え時にアイコンだけの読み込み画面が出る」原因は、アプリ側のスプラッシュではなく、メモリ不足でiOSがWebContentプロセスを終了しホーム画面アプリを丸ごと再読み込みすることと推定される。対策:
+- 生きた外部iframeは狭い画面（<760px）で最大1、PCで最大3（LRU）。外れたタブは検証済み履歴を保持し、選択時に再検証して再読み込み（薄い読み込みバーのみ、空白の全画面状態は出さない）。タブ数の上限6は不変。
+- 表示のstale-while-revalidate: ホーム状態・保留キュー・設定各節（保存先/フォルダ選択、JD2設定、更新状態）・ブックマークは直近データを即時表示し、10秒より古い場合だけ背景で再取得。取得前に一覧を消さず、JSONが変わった時だけDOMを更新。フォルダ選択は設定を開くたびに作り直さない。ダウンロード一覧は従来どおり手動/任意の自動更新のみ（サーバー側ポーリングは追加しない）。
+- 高さの予約（`min-height`の骨格、スピナーのオーバーレイなし）、長い一覧に `content-visibility:auto`、画面切替の120msフェード（`prefers-reduced-motion` では無し）。ループ内でレイアウトを読まない。
+- ルーティングは `hashchange` と `history.replaceState` のみで、ページ全体の再読み込みはしない。
+- 復元の高速化: ホーム画面アプリが再読み込みされたら、`sessionStorage` からタブ列と最後のルートを `/api/session` の応答前に描画し、その後セッションを確認する（外部ページはこの時点では読み込まない）。
+- `<meta name="mobile-web-app-capable">` を追加。
+
+### 4. Hub更新後の自動再読み込み
+`POST /api/update/apply` 成功後、消せない進捗トースト「更新中… 完了後に自動で再読み込みします」を出し、2秒ごとに `GET /api/health`（`no-store`、再起動中のネットワークエラーは無視）を最大5分間確認する。適用前と違うversionが返ったら `location.reload()`。5分経過したらエラートーストと手動の「再読み込み」ボタン。セッションはメモリ上のため再読み込み後はログイン画面が出る（トースト文にも記載）。
+また、どの画面でも `/api/status` のversionがページ起動時と違えば（他端末で更新した場合など）「再読み込み」ボタン付きのトーストを出す（自動再読み込みはしない）。
