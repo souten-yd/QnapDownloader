@@ -105,6 +105,21 @@ class MyJDTests(unittest.TestCase):
         self.assertIn("connect", api.calls)
         self.assertIsNone(allowed._device)
 
+    def test_default_factory_uses_real_myjdapi_class(self):
+        import sys
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        generated = []
+        def factory():
+            api = FakeAPI()
+            generated.append(api)
+            return api
+        fake_module = SimpleNamespace(Myjdapi=factory)
+        with patch.dict(sys.modules, {"myjdapi": fake_module}):
+            adapter = jd.MyJDAdapter(self.opts())
+            self.assertEqual(adapter.core_revision(), 123456)
+        self.assertEqual(len(generated), 1)
+
     def test_no_deprecated_direct_api_or_unsafe_credentials_log(self):
         import inspect
         src = inspect.getsource(jd.MyJDAdapter)
