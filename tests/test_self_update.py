@@ -73,6 +73,14 @@ class QpkgSelfUpdateTests(unittest.TestCase):
         finally:
             os.close(fd)
 
+    def test_log_tail_is_bounded_and_never_uses_arbitrary_path(self):
+        logfile = self.job / "update.log"
+        logfile.write_text("A" * 18000, encoding="utf-8")
+        self.assertEqual(len(self.manager.log_tail()), 16000)
+        update.write_json(self.manager.state_file, {
+            "id": "../../etc/shadow", "phase": "failed"})
+        self.assertEqual(self.manager.log_tail(), "")
+
     def test_update_lock_prevents_parallel_jobs(self):
         fd = self.manager.lock()
         try:
