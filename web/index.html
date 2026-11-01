@@ -15,7 +15,7 @@
 <script src="/app.js" defer></script>
 </head>
 <body>
-<header><div class="brand"><img src="/icon.svg" width="36" height="36" alt="" loading="eager"> QnapDownloader <small>0.1.7</small></div><button id="logout" class="secondary hidden">ログアウト</button></header>
+<header><div class="brand"><img src="/icon.svg" width="36" height="36" alt="" loading="eager"> QnapDownloader <small>0.1.8</small></div><button id="logout" class="secondary hidden">ログアウト</button></header>
 <main>
 <div id="lanSecurityWarning" class="notice hidden" role="note">この画面はHTTP接続です。パスワード保護はありますが通信は暗号化されません。信頼できる家庭内LANのみで利用し、外部公開しないでください。遠隔アクセスにはHTTPSリバースプロキシ／VPNを使用してください。</div>
 <section id="setup" class="panel hidden">
@@ -119,6 +119,14 @@
   <p id="selectedFolder"></p>
   <div id="folderPicker"></div>
   <button id="folderRoots" class="secondary">共有フォルダから選び直す</button>
+  <hr><h3>ディスクI/OとローカルJD2診断</h3>
+  <p class="muted">手動で取得する読取専用診断です。Hubの物理I/O累積値を確認できます。JD2側の書込は含まれません。</p>
+  <div class="quick-actions">
+   <button id="diagnosticIo" class="secondary">HubのI/Oを確認</button>
+   <button id="diagnosticJd2" class="secondary">NAS内3128番ポートを確認</button>
+  </div>
+  <p id="diagnosticResult" class="muted" role="status" aria-live="polite">診断待ちです。定期的な自動取得は行いません。</p>
+  <p class="muted">3128番へのTCP接続成功だけではJD2の認証やLAN隔離を証明できないため、ローカルAPI操作はまだ許可しません。QNAPのDockerは、localhost公開だけでは安全でない旧バージョンがあります。</p>
   <hr><h3>JDownloader 2 接続設定</h3>
   <p id="jd2ConfigState" class="muted">接続設定を確認しています。</p>
   <p class="muted">MyJDownloaderの認証済みAPIを使用します。接続先の設定ファイルはQPKGの永続データ領域の <code>config/myjd.json</code> です。現時点では資格情報をHTTP画面から送信せず、NASのSSHから権限0600で登録します。</p>

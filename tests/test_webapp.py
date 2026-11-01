@@ -101,7 +101,7 @@ class HttpTests(unittest.TestCase):
                                          headers={"Host": "192.168.68.57:17864"})
         with self.client.open(request, timeout=4) as response:
             self.assertEqual(response.status, 200)
-            self.assertEqual(json.load(response)["version"], "0.1.7")
+            self.assertEqual(json.load(response)["version"], "0.1.8")
         with self.client.open(self.url + "/icon.svg", timeout=4) as response:
             self.assertEqual(response.status, 200)
             self.assertEqual(response.headers.get_content_type(), "image/svg+xml")
@@ -323,13 +323,32 @@ class HttpTests(unittest.TestCase):
         self.assertIn('id="downloadsRefresh"',html)
         self.assertIn('id="downloadPackages"',html)
 
+    def test_low_io_and_local_jd2_preflight_are_login_protected(self):
+        self.assertEqual(self.req("/api/diagnostics/io")[0], 401)
+        self.assertEqual(self.req("/api/jd2/local-preflight")[0], 401)
+        self.login()
+        status, data = self.req("/api/diagnostics/io")
+        self.assertEqual(status, 200)
+        self.assertIn("process_io", data)
+        self.assertIn("events", data)
+        self.assertTrue(data["local_only"])
+        self.assertFalse(data["log_persistence"])
+        with patch.object(webapp.runtime_diagnostics, "local_jd2_preflight",
+                          return_value={"tcp_reachable": True,
+                                        "operations_enabled": False}) as probe:
+            status, result = self.req("/api/jd2/local-preflight")
+        self.assertEqual(status, 200)
+        self.assertTrue(result["tcp_reachable"])
+        self.assertFalse(result["operations_enabled"])
+        probe.assert_called_once_with()
+
     def test_update_apply_fails_closed_when_not_qpkg(self):
         self.login()
         info = self.req("/api/update/status")[1]
         self.assertFalse(info["supported"])
-        code, _ = self.req("/api/update/apply", {"version": "v0.1.7"})
+        code, _ = self.req("/api/update/apply", {"version": "v0.1.8"})
         self.assertEqual(code, 400)
-        self.assertEqual(self.req("/api/health")[1]["version"], "0.1.7")
+        self.assertEqual(self.req("/api/health")[1]["version"], "0.1.8")
         self.assertFalse(self.req("/api/jd2/status")[1]["connected"])
         self.assertEqual(self.req("/api/jd2/update/apply", {"confirmed": True})[0], 400)
         self.assertEqual(self.req("/api/jd2/preset/apply", {"confirmed": True})[0], 400)

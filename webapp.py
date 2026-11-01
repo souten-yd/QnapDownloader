@@ -19,10 +19,11 @@ import jd2_control
 import jd2_transfer
 import rapidgator_extract
 import browser_safety
+import runtime_diagnostics
 import jd2_myjd
 import updater
 
-VERSION = "0.1.7"
+VERSION = "0.1.8"
 PORT = 17864
 ROOT = Path(__file__).resolve().parent
 FILES = {"/": ("web/index.html", "text/html; charset=utf-8"),
@@ -239,6 +240,13 @@ class Handler(BaseHTTPRequestHandler):
                     "mode": "management-shell"})
             if path == "/api/settings":
                 return self.send_data(200, self.store.settings())
+            if path == "/api/diagnostics/io":
+                # Reads /proc/self/io only; no writes or background polling.
+                return self.send_data(200, runtime_diagnostics.snapshot())
+            if path == "/api/jd2/local-preflight":
+                # No legacy API command or Docker socket interaction: TCP
+                # presence alone never authorizes unauthenticated JD2 control.
+                return self.send_data(200, runtime_diagnostics.local_jd2_preflight())
             if path == "/api/jd2/config":
                 return self.send_data(200, jd2_myjd.configuration_status(self.store.root))
             if path == "/api/jd2/status":
@@ -324,6 +332,7 @@ class Handler(BaseHTTPRequestHandler):
                     if len(attempts) >= 10:
                         return self.reject("ログイン試行が多すぎます", 429)
                 if not self.store.check_password(body.get("password")):
+                    runtime_diagnostics.event("login_failed")
                     with SESSION_LOCK:
                         # Bound the per-address retry tracker against memory abuse.
                         if address not in FAILED and len(FAILED) >= 256:
@@ -447,6 +456,7 @@ def main():
     remove_legacy_setup_token(data)
     server.updates = self_update.UpdateManager(data, ROOT, VERSION, "x86_64", args.port)
     server.jd2 = jd2_control.JD2Controller(jd2_myjd.configured_adapter(data))
+    runtime_diagnostics.event("web_started")
     try:
         server.serve_forever(poll_interval=0.5)
     finally:

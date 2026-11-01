@@ -13,7 +13,16 @@ pidfile="$root/downloader.pid"
 # when QDK updates the package. Requires no Container Station/Docker share.
 # Never auto-switch data directories based on shares appearing at boot.
 data_dir=${DOWNLOADER_DATA_DIR:-"$(dirname "$root")/QnapDownloader-data"}
+# Persistent disk logging is opt-in. Default stores only bounded,
+# non-secret structured diagnostics in the Python process memory.
+# A normal request or Hub start does not append to the NAS HDD log.
 logfile="$data_dir/logs/downloader.log"
+log_mode=${DOWNLOADER_LOG_MODE:-memory}
+case "$log_mode" in
+    memory) log_output=/dev/null ;;
+    disk) log_output="$logfile" ;;
+    *) echo "DOWNLOADER_LOG_MODE must be memory or disk" >&2; exit 1 ;;
+esac
 
 resolve_python() {
     /bin/sh "$root/python3-path"
@@ -84,9 +93,9 @@ case "${1:-}" in
             *) echo "DOWNLOADER_LAN_ENABLED must be 1 or 0" >&2; exit 1 ;;
         esac
         if [ "$network_mode" = lan ]; then
-            (cd "$root" && exec "$python" -B "$root/webapp.py" --lan --port 17864 --data-dir "$data_dir") < /dev/null > "$logfile" 2>&1 &
+            (cd "$root" && exec "$python" -B "$root/webapp.py" --lan --port 17864 --data-dir "$data_dir") < /dev/null > "$log_output" 2>&1 &
         else
-            (cd "$root" && exec "$python" -B "$root/webapp.py" --secure-cookie --port 17864 --data-dir "$data_dir") < /dev/null > "$logfile" 2>&1 &
+            (cd "$root" && exec "$python" -B "$root/webapp.py" --secure-cookie --port 17864 --data-dir "$data_dir") < /dev/null > "$log_output" 2>&1 &
         fi
         echo $! > "$pidfile"
         # SQLite initialization and QTS filesystem warm-up may take longer
@@ -96,7 +105,12 @@ case "${1:-}" in
         while ! check_owned; do
             attempts=$((attempts + 1))
             if [ "$attempts" -ge 15 ]; then
-                echo "Web UI failed to start with verified PID; check $logfile" >&2
+                echo "Web UI did not start with verified PID. Run: sh $root/downloader-diagnose" >&2
+                if [ "$log_mode" = disk ]; then
+                    echo "Startup log: $logfile" >&2
+                else
+                    echo "Memory-only logging is enabled; set DOWNLOADER_LOG_MODE=disk temporarily to capture startup stderr." >&2
+                fi
                 exit 1
             fi
             sleep 1

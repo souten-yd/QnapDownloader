@@ -3,7 +3,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
-python3 -m py_compile webapp.py storage.py durability.py updater.py self_update.py jd2_policy.py jd2_control.py jd2_downloads.py browser_safety.py qpkg/shared/downloader_pid.py
+python3 -m py_compile webapp.py storage.py durability.py updater.py self_update.py jd2_policy.py jd2_control.py jd2_downloads.py runtime_diagnostics.py browser_safety.py qpkg/shared/downloader_pid.py
 python3 -m unittest discover -s tests -v
 
 sh -n qpkg/shared/downloader.sh
@@ -16,7 +16,7 @@ else
   exit 1
 fi
 
-if grep -En 'no-sandbox|disable-web-security|synchronous[[:space:]]*=[[:space:]]*OFF|npm[[:space:]]+(run[[:space:]]+)?build' webapp.py storage.py self_update.py jd2_policy.py jd2_control.py browser_safety.py qpkg/shared/downloader.sh; then
+if grep -En 'no-sandbox|disable-web-security|synchronous[[:space:]]*=[[:space:]]*OFF|npm[[:space:]]+(run[[:space:]]+)?build' webapp.py storage.py self_update.py jd2_policy.py jd2_control.py runtime_diagnostics.py browser_safety.py qpkg/shared/downloader.sh; then
   echo "Safety grep matched prohibited runtime pattern" >&2
   exit 1
 fi

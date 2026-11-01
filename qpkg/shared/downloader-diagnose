@@ -61,10 +61,15 @@ if command -v curl >/dev/null 2>&1; then
 else
   echo "curl missing: cannot probe HTTP health"
 fi
+echo "--- QnapDownloader logging policy ---"
+echo "DOWNLOADER_LOG_MODE: ${DOWNLOADER_LOG_MODE:-memory} (memory is the default)"
 if [ -f "$data_dir/logs/downloader.log" ]; then
-  echo "Web startup log exists ($data_dir/logs/downloader.log)"
-  echo "Read only AFTER removing secrets before sharing logs."
+  echo "Old/opt-in persistent log exists ($data_dir/logs/downloader.log)"
+  echo "It is not deleted automatically. Review locally; redact secrets before sharing."
 else
-  echo "Web startup log is absent: service may have failed before Web launch"
+  echo "No persistent log file (expected for default memory-only operation)"
 fi
+echo "Read-only local Docker/JD2 check: docker ps --format '{{.Names}} {{.Ports}}'"
+echo "Do not change Docker port mappings or enable JD2 Deprecated API from this diagnostic."
+
 echo "This diagnostic makes no changes to the service or to JD2."
