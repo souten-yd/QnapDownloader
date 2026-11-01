@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Administrator-only utility: NEVER invoked by the application or QPKG.
 set -euo pipefail
+set +x  # Prevent tracing the admin token when a caller used bash -x
 umask 077
 command -v curl >/dev/null || { echo "curl required" >&2; exit 1; }
 command -v python3 >/dev/null || { echo "python3 required" >&2; exit 1; }
@@ -14,7 +15,13 @@ TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"; unset TOKEN' EXIT
 API="https://api.github.com/repos/souten-yd/QnapDownloader"
 NAME="Require PR for main (QnapDownloader)"
-headers=(-H 'Accept: application/vnd.github+json' -H 'X-GitHub-Api-Version: 2026-03-10' -H "Authorization: Bearer $TOKEN")
+# Keep the secret OUT of curl argv (which /proc and ps can expose).
+# The private curl config file is created under a 0700 temporary directory.
+[[ "$TOKEN" =~ ^[A-Za-z0-9_-]+$ ]] || { echo "Invalid token characters" >&2; exit 1; }
+printf 'header = "Authorization: Bearer %s"\n' "$TOKEN" > "$TMP/curl-auth.conf"
+chmod 600 "$TMP/curl-auth.conf"
+unset TOKEN
+headers=(-K "$TMP/curl-auth.conf" -H 'Accept: application/vnd.github+json' -H 'Content-Type: application/json' -H 'X-GitHub-Api-Version: 2026-03-10')
 # Additive: never overwrite existing rulesets or branch protection.
 curl --fail --silent --show-error "${headers[@]}" "$API/rulesets?per_page=100" > "$TMP/existing.json"
 if python3 - "$TMP/existing.json" "$NAME" <<'PY'
