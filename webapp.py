@@ -20,7 +20,7 @@ import jd2_transfer
 import jd2_myjd
 import updater
 
-VERSION = "0.1.0"
+VERSION = "0.1.1"
 PORT = 17864
 ROOT = Path(__file__).resolve().parent
 FILES = {"/": ("web/index.html", "text/html; charset=utf-8"),
