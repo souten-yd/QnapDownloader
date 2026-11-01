@@ -54,6 +54,10 @@ class MyJDAdapter:
         self._device = None
         self._handles = {}
 
+    @property
+    def allow_update(self):
+        return self._options.get("allow_jd2_update") is True
+
     def _connect(self):
         if self._device is not None:
             return self._device
