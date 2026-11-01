@@ -238,6 +238,8 @@ class Handler(BaseHTTPRequestHandler):
                     "mode": "management-shell"})
             if path == "/api/settings":
                 return self.send_data(200, self.store.settings())
+            if path == "/api/jd2/config":
+                return self.send_data(200, jd2_myjd.configuration_status(self.store.root))
             if path == "/api/jd2/status":
                 return self.send_data(200, self.server.jd2.status())
             if path == "/api/jd2/preset/preview":
@@ -383,6 +385,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_data(200, outcome)
             if path == "/api/update/apply":
                 return self.send_data(202, self.server.updates.apply(body.get("version")))
+            if path == "/api/jd2/connect/test":
+                return self.send_data(200, self.server.jd2.connection_test())
             if path == "/api/jd2/update/check":
                 return self.send_data(200, self.server.jd2.update_check())
             if path == "/api/jd2/update/apply":
