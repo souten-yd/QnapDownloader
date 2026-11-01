@@ -42,7 +42,7 @@ def validate(url):
             not labels[-1].startswith("xn--") or
             any(DOMAIN_LABEL.fullmatch(label) is None for label in labels)):
         raise ValueError("公開DNSドメインのHTTPS URLを指定してください")
-    if parts.path.startswith("//") or "\\" in url:
+    if parts.path.startswith("//") or "\\" in url or re.search(r"%(?:0[0-9a-f]|1[0-9a-f]|7f)", url, re.I):
         raise ValueError("紛らわしいURL表記は許可されません")
     # Keep the user-selected URL, including path/query, without following it.
     netloc = hostname + (":443" if port == 443 else "")
