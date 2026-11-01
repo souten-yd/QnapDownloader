@@ -1,0 +1,76 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="color-scheme" content="dark light">
+<title>QnapDownloader</title>
+<link rel="stylesheet" href="/style.css">
+<script src="/app.js" defer></script>
+</head>
+<body>
+<header><div class="brand">◈ QnapDownloader <small>0.1.0</small></div><button id="logout" class="secondary hidden">ログアウト</button></header>
+<main>
+<section id="setup" class="panel hidden">
+  <h2>初期管理者設定</h2>
+  <p>NASのSSHから <code>&lt;QPKGインストール親ディレクトリ&gt;/QnapDownloader-data/config/bootstrap-token</code> の内容を確認し、ここで一度だけ設定します。パスワードは12文字以上。</p>
+  <label>初期設定トークン<input id="bootstrapToken" type="password" autocomplete="off"></label>
+  <label>新しい管理者パスワード<input id="setupPassword" type="password" autocomplete="new-password"></label>
+  <button id="setupButton">管理者を登録</button>
+</section>
+<section id="login" class="panel hidden">
+  <h2>管理者ログイン</h2>
+  <label>パスワード<input id="password" type="password" autocomplete="current-password"></label>
+  <button id="loginButton">ログイン</button>
+</section>
+<section id="app" class="hidden">
+ <div class="notice">初期開発版：ダウンロードエンジンとWebページ閲覧・自動ダウンロードは未実装です。以下のリンク登録は安全な保留キューに保存されるだけです。</div>
+ <nav><button data-tab="dashboard" class="active">概要</button><button data-tab="queue">リンク保留</button><button data-tab="bookmarks">ブックマーク</button><button data-tab="settings">設定</button><button data-tab="updates">アップデート</button></nav>
+ <section id="dashboard" class="panel tab">
+  <h2>ダッシュボード</h2><div id="status"></div>
+  <p class="muted">リンク収集・Rapidgator判別・安全ブラウザ・JDownloader接続は次の開発段階で追加します。</p>
+ </section>
+ <section id="queue" class="panel tab hidden">
+  <h2>リンクの保留登録</h2><p>明示的に追加したHTTPSリンクを重複なく保存します。自動で取得・実行しません。</p>
+  <div class="stack"><input id="queueUrl" type="url" placeholder="https://rapidgator.net/file/..."><button id="queueAdd">保留キューに追加</button></div>
+  <div id="queueItems" class="items"></div>
+ </section>
+ <section id="bookmarks" class="panel tab hidden">
+  <h2>ブックマーク</h2>
+  <label>名前<input id="bookmarkName" maxlength="200" placeholder="サイト名"></label>
+  <label>URL<input id="bookmarkUrl" type="url" placeholder="https://example.com"></label>
+  <button id="bookmarkAdd">追加</button><div id="bookmarkItems" class="items"></div>
+ </section>
+ <section id="settings" class="panel tab hidden">
+  <h2>保存設定</h2>
+  <div class="grid">
+   <div class="setting"><b>フォルダ階層</b><span>作成しない</span></div>
+   <div class="setting"><b>リンクの自動開始</b><span>OFF</span></div>
+   <div class="setting"><b>自動解凍</b><span>OFF</span></div>
+   <div class="setting"><b>完了ファイルの削除</b><span>OFF</span></div>
+  </div>
+  <h3>NAS側の保存先</h3><p class="muted">サーバ内で許可した共有フォルダのみ選べます。変更後は永続保存されます。</p>
+  <p id="selectedFolder"></p>
+  <div id="folderPicker"></div>
+  <button id="folderRoots" class="secondary">共有フォルダから選び直す</button>
+ </section>
+ <section id="updates" class="panel tab hidden">
+  <h2>アップデート</h2>
+  <h3>QnapDownloader Hubの更新</h3><p>QnapSelfCare方式：Hubの新しい正式QPKGを検出し、SHA-256検証・DBバックアップ・QPKG適用・起動検証を実施します。JDownloader 2本体の更新には影響しません。</p>
+  <button id="updateCheck">更新を確認</button><p id="updateResult"></p><button id="updateApply" class="hidden">検証して更新する</button>
+  <div id="updateStatus" class="muted"></div>
+  <button id="updateLogButton" class="secondary">更新ログを表示</button><pre id="updateLog" class="update-log hidden"></pre>
+  <p class="muted">QNAPにQPKGとしてインストールされた環境のみ適用できます。公開Releaseがない場合は更新できません。</p>
+  <hr><h3>JDownloader 2の単独更新と推奨設定</h3>
+  <p>JD2は公式の更新機能を使用し、Hubとは独立してCore/ホストプラグインを更新します。設定が変わった場合はHub側で差分を確認し、推奨設定を再適用します。</p>
+  <p id="jd2Status" class="muted">接続アダプタの実装待ちです。現段階ではJD2の更新/設定変更は実行できません。</p>
+  <button id="jd2Check" class="secondary" disabled>JD2の更新を確認</button>
+  <button id="jd2Update" disabled>JD2だけ更新する（接続後に有効）</button>
+  <button id="jd2Preset" class="secondary" disabled>推奨設定を確認して再適用（接続後に有効）</button>
+  <p class="muted">JD2の更新後、リンク自動開始OFF、自動解凍OFF、パッケージ別フォルダ作成OFFなどを再確認する設計です。既存キューは変更しません。</p>
+ </section>
+</section>
+<div id="notice" class="notice hidden" role="status" aria-live="polite"></div>
+</main>
+</body>
+</html>

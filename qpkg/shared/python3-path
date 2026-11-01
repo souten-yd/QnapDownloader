@@ -1,0 +1,43 @@
+#!/bin/sh
+# Print a usable Python 3 executable. App Center does not always add its bin to PATH.
+set -eu
+config=/etc/config/qpkg.conf
+
+usable() {
+    [ -x "$1" ] && "$1" -c 'import sys; sys.exit(sys.version_info < (3, 8))' >/dev/null 2>&1
+}
+
+if [ -n "${DOWNLOADER_PYTHON:-}" ]; then
+    if usable "$DOWNLOADER_PYTHON"; then
+        printf '%s\n' "$DOWNLOADER_PYTHON"
+        exit 0
+    fi
+    echo 'DOWNLOADER_PYTHON must point to an executable Python 3.8 or newer.' >&2
+    exit 1
+fi
+
+if [ -x /sbin/getcfg ] && [ -f "$config" ]; then
+    python_root=$(/sbin/getcfg Python3 Install_Path -d '' -f "$config" || true)
+    if [ -n "$python_root" ]; then
+        for candidate in "$python_root/python3/bin/python3" "$python_root/bin/python3"; do
+            if usable "$candidate"; then
+                printf '%s\n' "$candidate"
+                exit 0
+            fi
+        done
+    fi
+fi
+
+for candidate in /opt/bin/python3.11 /opt/bin/python3 /opt/python3/bin/python3 /usr/local/bin/python3; do
+    if usable "$candidate"; then
+        printf '%s\n' "$candidate"
+        exit 0
+    fi
+done
+candidate=$(command -v python3 || true)
+if [ -n "$candidate" ] && usable "$candidate"; then
+    printf '%s\n' "$candidate"
+    exit 0
+fi
+echo 'Python 3.8+ was not found. Install Python3 in QNAP App Center or set DOWNLOADER_PYTHON.' >&2
+exit 1

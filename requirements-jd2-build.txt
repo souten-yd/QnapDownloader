@@ -1,0 +1,3 @@
+# Installed only at QPKG build-time, never at NAS startup.
+# Authenticated, encrypted MyJDownloader API transport.
+myjdapi==1.1.11

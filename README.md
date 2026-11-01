@@ -2,7 +2,7 @@
 
 QNAP TS-253Be (QTS 5.x, x86_64)向け **JDownloader 2 + 安全なWebブラウザ／リンク収集／ダウンロード管理** 統合QPKGの設計リポジトリ。Rapidgatorリンク検出・ボタン化、Click'n'Load互換取り込み、サイト別の明示許可付き自動収集、ブックマーク、NAS側保存先選択を目指します。
 
-**現在の状態: 設計文書のみ。アプリとQPKGは未実装、QNAP実機試験も未実施です。** 既存のDocker版JDownloader 2やQNAPの別QPKGは変更しません。
+**現在の状態: v0.1.0 初期実装（PRレビュー中）**。管理者ログイン、NAS共有フォルダ選択/永続化、手動リンク保留、ブックマーク、更新確認とQPKG自己更新ワーカー、Web管理画面、QDKビルド定義を追加しました。**JD2の実際の接続・ダウンロード、内蔵ブラウザ、Rapidgator自動検出、広告遮断は未実装**であり、完了したとは表示しません。QPKGビルド・QNAP実機試験も未実施です。既存Docker版JDownloader 2や別QPKGは変更しません。
 
 ## 仕様・開発ルール
 
@@ -26,3 +26,38 @@ QNAP TS-253Be (QTS 5.x, x86_64)向け **JDownloader 2 + 安全なWebブラウザ
 ## 開発前の調査
 
 TS-253Beの実RAM/QTS、既存JD2の設定とAPI、Chromiumサンドボックスの稼働可否、Cloudflareのブラウザ互換性、QnapExtractor連携手段、QDKビルド環境とNASへの保存先権限は実装時に検証します。
+
+
+## 初期実装の起動・注意事項
+
+- Python 3.8+、標準ライブラリ。NASが起動してボリュームをマウントしてから、開発環境では `python3 -B webapp.py --data-dir ./runtime --port 17864` でループバック起動します（ルート権限と公開範囲に注意）。外部ネットワークへポート転送しないでください。
+- 最初のアクセスで、NASの管理者が後述のSSHコマンドで永続データ領域の `config/bootstrap-token` を読み、Webに入力して管理者パスワード（12文字以上）を登録します。トークンは完了後に削除されます。
+- **QPKGの既定待受は127.0.0.1:17864のみ**で、`--secure-cookie`を使用します。QTSのHTTPSリバースプロキシ（ループバックポート17864を転送）から利用してください。明示的にLAN公開が必要なら`DOWNLOADER_LAN_ENABLED=1`の管理者設定を使用し、Tailscale等の暗号化された接続に限定してください。HTTPポートをインターネットへ公開しないでください。プロキシ用ホスト名を使う場合は`DOWNLOADER_ALLOWED_HOSTS`で明示的に許可します。
+- 保存先ピッカーの表示ルートは既定`/share/Download`。許可対象を変える場合は`DOWNLOADER_ALLOWED_ROOTS`で絶対パスをコロン区切り指定します（管理者のみ編集）。
+- ブックマーク、設定、保留キューはDBに保存。**保留キューはJD2へは送信されない**ため、まだ実際にダウンロードしません。
+- GitHub Releaseの更新確認は既存の正式Releaseが存在する場合のみ成功します。更新適用は正規QPKGインストール状態でのみサポート。ダウンロードしたQPKGのSHA-256、更新前SQLiteバックアップ、更新後ヘルスチェックを要求します。
+- QDK導入済みの開発マシンで `bash scripts/build-qpkg.sh x86_64 dist`。起動時にnpm build等は実行しません。
+
+テスト: `python3 -m unittest discover -s tests -v`、`python3 -m py_compile webapp.py storage.py updater.py self_update.py durability.py qpkg/shared/downloader_pid.py`、`node --check web/app.js`、`sh -n qpkg/shared/downloader.sh qpkg/shared/python3-path`。追加のセキュリティ/ダウンロード本体機能は後続PRで検証します。
+
+## JDownloader 2の独立更新と推奨設定の再適用
+
+**JDownloader 2はJD2標準のアップデーターで単独更新**します。HubのQPKG自己更新はJD2のファイルやプラグインを入れ替えません。JD2更新後に一般設定・Packagizer・LinkGrabber・自動解凍が変化した場合はHubの「推奨設定を確認して再適用」で差分確認・復旧できる設計です。**現v0.1.0ではJD2の認証済みAPIアダプタがまだなく、JD2更新ボタンと再適用ボタンは無効**です。正式なJD2接続/設定読書きができるまで有効化しません。手順: [JD2独立更新と再適用](docs/jd2-independent-updates.md)。
+
+
+### Docker不要の永続データ保存
+
+QPKGの標準保存先は **QPKGインストール場所の親ディレクトリにある `QnapDownloader-data`** です（例: `/share/CACHEDEV1_DATA/.qpkg/QnapDownloader-data`）。本体インストール先とは別なのでQPKG更新時にデータを上書きせず、`/share/Container`共有フォルダ・Container Station・Dockerを必須としません。起動時に利用可能な別の共有フォルダへ自動フォールバックしたり、既存データを勝手に移動しません。
+
+初期設定トークンをSSHで確認する例:
+
+```sh
+INSTALL=$(/sbin/getcfg QnapDownloader Install_Path -f /etc/config/qpkg.conf)
+cat "$(dirname "$INSTALL")/QnapDownloader-data/config/bootstrap-token"
+```
+
+別のデータ領域を使う場合は、初回起動前にQPKGサービスへ管理者が`DOWNLOADER_DATA_DIR`を明示設定してください。後から変更する場合は既存データの移行を計画し、サービス停止中にバックアップ・復旧確認してから変更してください。
+
+## JD2への認証済み接続（任意）
+
+MyJDownloader認証済みアダプタを追加しました。QPKGへライブラリを同梱した場合、管理者がconfig/myjd.jsonを0600で設定することでJD2更新状態を照会できます。JD2本体の更新は明示的opt-inです。推奨設定の全項目再適用は、実機で設定キーと既存Packagizerルールの安全性を確認するまで無効です。詳細: [MyJD接続設定](docs/myjd-setup.md)。
