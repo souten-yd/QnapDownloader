@@ -124,10 +124,14 @@ class UpdateManager:
         except FileNotFoundError:
             return ''
 
-    def apply(self, expected):
+    def apply(self, expected, channel="rc"):
         if not isinstance(expected, str):
             raise ValueError('更新対象のバージョンが必要です')
         updater.version(expected)
+        if channel not in ("stable", "rc"):
+            raise ValueError("不明な更新チャンネルです")
+        if channel == "stable" and updater.VERSION.fullmatch(expected).group(4) is not None:
+            raise ValueError("RC版を適用するにはRCを含むチャンネルを選択してください")
         if updater.version(expected) <= updater.version(self.current):
             raise ValueError('新しいバージョンだけに更新できます')
         check_environment(self.install_root, self.current)
@@ -143,7 +147,7 @@ class UpdateManager:
             # Snapshot executable code outside the installation being replaced.
             for name in ('self_update.py', 'updater.py', 'durability.py'):
                 shutil.copyfile(self.install_root / name, job / name)
-            request = dict(id=identifier, current=self.current, target=expected, arch=self.arch,
+            request = dict(id=identifier, current=self.current, target=expected, channel=channel, arch=self.arch,
                            data_root=str(self.data_root), install_root=str(self.install_root), port=self.port)
             write_json(job / 'request.json', request)
             write_json(self.state_file, dict(id=identifier, phase='queued', target=expected,
@@ -216,8 +220,11 @@ def run_job(job, lock_fd):
     try:
         check_environment(request['install_root'], request['current'])
         phase('checking', '更新対象を確認しています')
-        asset = updater.latest(request['current'], request['arch'])
-        if asset is None or updater.version(asset['version']) != updater.version(request['target']):
+        channel = request.get('channel', 'stable')
+        if channel not in ('stable', 'rc'):
+            raise ValueError('更新チャンネルの値が不正です')
+        asset = updater.latest(request['current'], request['arch'], channel)
+        if asset is None or asset['version'] != request['target']:
             raise ValueError('公開中の更新対象が変わりました。更新確認をやり直してください')
         for directory in (job, Path(request['install_root'])):
             if shutil.disk_usage(directory).free < asset['size'] * 4 + 64 * 1024 * 1024:

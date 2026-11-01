@@ -4,3 +4,10 @@
 textarea{display:block;background:#081520;border:1px solid #496079;color:#eef7ff;border-radius:8px;padding:11px;width:100%;font:inherit;resize:vertical;min-height:100px;max-height:400px}
 
 .brand{display:flex;align-items:center;gap:10px}.brand img{width:36px;height:36px;border-radius:8px;flex:none}#lanSecurityWarning{border-left-color:#d9a64b;background:#3a321e;color:#fce8ae;font-size:13px}
+
+/* External page rendering stays in a sandboxed, non-same-origin iframe. */
+.browser-tools{display:flex;gap:8px;flex-wrap:wrap;margin:11px 0}
+.browser-frame-box{border:1px solid #496079;border-radius:12px;background:#0c1b2b;overflow:hidden;margin:14px 0;min-height:300px}
+#browserFrame{display:block;width:100%;height:min(65dvh,640px);min-height:300px;border:0;background:#fff}
+select{display:block;background:#081520;color:#eef7ff;border:1px solid #496079;border-radius:8px;padding:11px;max-width:100%;font-size:16px;margin-top:6px}
+@media(max-width:600px){.browser-tools button{flex:1 1 auto}#browserFrame{height:58dvh;min-height:360px}}

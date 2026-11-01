@@ -2,7 +2,7 @@
 
 QNAP TS-253Be (QTS 5.x, x86_64)向け **JDownloader 2 + 安全なWebブラウザ／リンク収集／ダウンロード管理** 統合QPKGの設計リポジトリ。Rapidgatorリンク検出・ボタン化、Click'n'Load互換取り込み、サイト別の明示許可付き自動収集、ブックマーク、NAS側保存先選択を目指します。
 
-**現在の状態: v0.1.5 QNAP App Center起動修正・JD2接続状態表示・iPhone/QNAPアイコン修正**。管理者ログイン、NAS共有フォルダ選択/永続化、手動リンク保留、ブックマーク、更新確認とQPKG自己更新ワーカー、Web管理画面、QDKビルド定義を追加しました。**JD2接続アダプタと手動LinkGrabber転送は実装済みですが、JD2実機接続・実ダウンロードは未検証です。内蔵ブラウザ、Rapidgator自動検出、広告遮断は未実装**であり、完了したとは表示しません。QDKでのx86_64 QPKG自動ビルド・テストは実施済みですが、QNAP実機でのインストール・起動・JD2接続は未検証です。既存Docker版JDownloader 2や別QPKGは変更しません。
+**現在の状態: v0.1.6 RC更新チャンネルと軽量隔離ブラウザ（実験的）を追加**。管理者ログイン、NAS共有フォルダ選択/永続化、手動リンク保留、ブックマーク、更新確認とQPKG自己更新ワーカー、Web管理画面、QDKビルド定義を追加しました。**JD2接続アダプタと手動LinkGrabber転送は実装済みですが、JD2実機接続・実ダウンロードは未検証です。ブラウザは端末側の隔離iframeプレビューのみ実装で、独立したChromiumブラウザ、サイト自動巡回、広告遮断、ページDOMの自動収集は未実装**であり、完了したとは表示しません。QDKでのx86_64 QPKG自動ビルド・テストは実施済みですが、QNAP実機でのインストール・起動・JD2接続は未検証です。既存Docker版JDownloader 2や別QPKGは変更しません。
 
 ## 仕様・開発ルール
 
@@ -35,7 +35,7 @@ TS-253Beの実RAM/QTS、既存JD2の設定とAPI、Chromiumサンドボックス
 - **v0.1.3以降のQPKGは家庭内LANからのWebアクセスを初期状態で許可**します。例: http://192.168.68.57:17864/ 。サーバーはRFC1918/ループバック/プライベートVPN以外の接続元を拒否し、Host検証・ログイン・CSRF保護を維持します。ただしLAN HTTPは暗号化されません。信頼できるLANでのみ利用し、17864をインターネットにポート開放しないでください。遠隔操作にはHTTPSリバースプロキシやVPNを使ってください。保存データのconfig/network-modeにloopbackを書いて再起動すればNAS自身からのアクセスだけに戻せます（lanでLAN待受）。DOWNLOADER_LAN_ENABLED=0|1で一時上書きできます。
 - 保存先ピッカーの表示ルートは既定`/share/Download`。許可対象を変える場合は`DOWNLOADER_ALLOWED_ROOTS`で絶対パスをコロン区切り指定します（管理者のみ編集）。
 - ブックマーク、設定、保留キューはDBに保存。**保留キューはJD2へは送信されない**ため、まだ実際にダウンロードしません。
-- GitHub Releaseの更新確認は既存の正式Releaseが存在する場合のみ成功します。更新適用は正規QPKGインストール状態でのみサポート。ダウンロードしたQPKGのSHA-256、更新前SQLiteバックアップ、更新後ヘルスチェックを要求します。
+- GitHub Releaseの更新は**RC版を含む／正式版のみ**を管理画面で選べます（初期値RC版を含む）。公開された正規タグ`vX.Y.Z`または`vX.Y.Z-rcN`のQPKGのみ対象です。QPKGのSHA-256検証、更新前SQLiteバックアップ、更新後ヘルスチェックは従来通り必須。最初にRCチャンネル対応版へ上げる際は旧版がRCを認識できないため、手動でv0.1.6-rc1 QPKGを上書きしてください。
 - QDK導入済みの開発マシンで `bash scripts/build-qpkg.sh x86_64 dist`。起動時にnpm build等は実行しません。
 
 テスト: `python3 -m unittest discover -s tests -v`、`python3 -m py_compile webapp.py storage.py updater.py self_update.py durability.py qpkg/shared/downloader_pid.py`、`node --check web/app.js`、`sh -n qpkg/shared/downloader.sh qpkg/shared/python3-path`。追加のセキュリティ/ダウンロード本体機能は後続PRで検証します。
@@ -67,7 +67,7 @@ MyJDownloader認証済みアダプタを追加しました。QPKGへライブラ
 
 ## Web画面が開かないとき
 
-最初のv0.1.0-rc1 QPKGにもWeb画面は含まれます。ただしNASの127.0.0.1だけで待受する初期設定のため、iPhoneからNASのLAN-IP:17864へアクセスできません。v0.1.3でLAN待受を初期値としました。プレリリースは自動更新対象外なのでQPKGをApp Centerで手動上書きしてください。
+最初のv0.1.0-rc1 QPKGにもWeb画面は含まれます。ただしNASの127.0.0.1だけで待受する初期設定のため、iPhoneからNASのLAN-IP:17864へアクセスできません。v0.1.3でLAN待受を初期値としました。v0.1.5以前の更新画面はRC版を検出しません。v0.1.6への更新だけはApp Centerで手動上書きし、以後はRCチャンネルから検出・明示的に適用できます。
 
 更新後、SSHの読取専用診断を実行できます（サービスは停止・更新しません）。
 
@@ -109,3 +109,11 @@ QPKGマニフェストは`QPKG_WEBUI=/`、`QPKG_WEB_PORT=17864`、`QPKG_WEB_SSL_
 「設定」画面に、MyJDownloaderの接続設定有無・対象デバイス名・更新/リンク送信の許可状況を表示します。「JD2接続をテストする」は明示的な認証済み読取操作のみで、JD2の更新・ダウンロードや既存Dockerには手を触れません。接続用メール・パスワードはWebレスポンスに含まず、LANの平文HTTPを通して入力させないため、現状はNAS SSHから`config/myjd.json`（0600）を設定してください。詳細は[docs/myjd-setup.md](docs/myjd-setup.md)。
 
 Web画面左上のアプリアイコンが表示されない問題も、厳格なCSP設定に`img-src 'self'`が欠けていたため修正しました。外部画像やスクリプトを許可する変更ではありません。
+
+## RCプレリリース更新と安全な軽量ブラウザ (v0.1.6)
+
+「アップデート」ではGitHubの最新正式版のみを参照していたため、これまでのv0.1.x-rc1リリースを見逃していました。今後はRCチャンネルで`/releases?per_page=30`を調べ、**新しい**`vX.Y.Z-rcN`と正式版のうち対応x86_64 QPKGを選びます。GitHub APIの返却値を無条件には信頼せず、厳密なタグ/asset URL/サイズ/ SHA-256ダイジェスト検証を維持します。公開されていないdraftやnightlyには更新しません。更新は手動確認・明示承認であり、自動インストールしません。QPKG内のバージョンは`X.Y.Z`なので、同じ内部バージョン間のRC番号だけの差は自動更新対象にしません。
+
+「安全ブラウザ」タブは**iPhone/SafariのWebKit上で動く限定プレビュー**です。初期モードは隔離iframe内のスクリプト・フォーム実行を禁止し、管理画面のCookie/DOMとは異なる権限で開きます。利用者の承認でスクリプト/フォームのみを限定許可できますが、`allow-same-origin`、ダウンロード、ポップアップ、親画面操作は許可しません。NASのPython側は外部サイトを取得しません。閲覧先は公開HTTPSドメインのみ、IP/ローカル名/非標準ポート/認証情報付きURLは拒否します。
+
+**制限**: 外部サイトの`X-Frame-Options`や`frame-ancestors`、Cookie・Cloudflareの制限で表示できないことが多くあります。その場合は「Safariで開く」を使用してください。iframe内で遷移したURLやDOMは取り出せず、保留キューにはアドレス欄で明示したURLのみを登録します。ダウンロードやJD2への自動送信、Webコンテンツ・Cookieのサーバ保存はありません。詳細: [隔離ブラウザ仕様](docs/browser-sandbox.md)。

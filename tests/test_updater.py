@@ -1,5 +1,6 @@
 import hashlib
 import io
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -26,6 +27,58 @@ class UpdaterTests(unittest.TestCase):
                 updater.select({**release, "assets": [{**self.asset(), **changed}]}, "1.2.2", "x86_64")
         with self.assertRaises(ValueError):
             updater.select(release, "1.2.2", "../x86_64")
+
+    def test_rc_channel_accepts_numbered_prerelease_with_verified_asset(self):
+        for tag in ("v1.2.3-rc1", "v1.2.3-rc2"):
+            asset={**self.asset(), "browser_download_url":
+                f"https://github.com/{updater.REPO}/releases/download/{tag}/QnapDownloader_1.2.3_x86_64.qpkg"}
+            release={"tag_name":tag, "prerelease":True, "assets":[asset]}
+            self.assertIsNone(updater.select(release,"1.2.2","x86_64"))
+            chosen=updater.select(release,"1.2.2","x86_64",include_rc=True)
+            self.assertEqual(chosen["version"],tag)
+            self.assertEqual(chosen["name"],"QnapDownloader_1.2.3_x86_64.qpkg")
+            self.assertIsNone(updater.select(release,"1.2.3","x86_64",include_rc=True))
+        for tag in ("v1.2.3-beta1", "v1.2.3-dev", "v1.2.3-rc0"):
+            with self.assertRaises(ValueError):
+                updater.version(tag)
+
+    def test_rc_api_lists_releases_selects_highest_and_ignores_drafts(self):
+        def release(tag, prerelease):
+            name="QnapDownloader_"+tag.split("-")[0].removeprefix("v")+"_x86_64.qpkg"
+            payload=b"candidate package"
+            return {"tag_name":tag, "prerelease":prerelease,
+              "assets":[{"name":name,"size":len(payload),
+                 "digest":"sha256:"+hashlib.sha256(payload).hexdigest(),
+                 "browser_download_url":
+                   f"https://github.com/{updater.REPO}/releases/download/{tag}/{name}"}]}
+        choices=[release("v1.2.5-rc1",True),release("v1.2.4",False),
+                 {**release("v9.9.9-rc1",True),"draft":True},
+                 release("v1.2.5-rc2",True)]
+        with patch.object(updater.urllib.request,"urlopen",
+                          return_value=io.BytesIO(json.dumps(choices).encode())) as call:
+            candidate=updater.latest("1.2.3","x86_64","rc")
+        self.assertEqual(candidate["version"],"v1.2.5-rc2")
+        self.assertEqual(call.call_args.args[0].full_url, updater.API_RC)
+        with patch.object(updater.urllib.request,"urlopen",
+                          return_value=io.BytesIO(json.dumps(choices).encode())):
+            self.assertIsNone(updater.latest("1.2.5","x86_64","rc"))
+
+    def test_rc_channel_never_uses_stable_latest_or_ignores_integrity(self):
+        asset={**self.asset(), "browser_download_url":
+              f"https://github.com/{updater.REPO}/releases/download/v1.2.3-rc1/QnapDownloader_1.2.3_x86_64.qpkg",
+              "digest":None}
+        release={"tag_name":"v1.2.3-rc1","prerelease":True,"assets":[asset]}
+        with patch.object(updater.urllib.request,"urlopen",
+             return_value=io.BytesIO(json.dumps([release]).encode())):
+            with self.assertRaisesRegex(ValueError,"SHA-256"):
+                updater.latest("1.2.2","x86_64","rc")
+        import urllib.error
+        with patch.object(updater.urllib.request,"urlopen",
+             side_effect=urllib.error.HTTPError(updater.API_RC,404,"Not found",None,None)):
+            with self.assertRaises(urllib.error.HTTPError):
+                updater.latest("1.2.2","x86_64","rc")
+        with self.assertRaises(ValueError):
+            updater.latest("1.2.2","x86_64","nightly")
 
     def test_no_release_is_not_an_installable_update(self):
         import urllib.error

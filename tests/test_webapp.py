@@ -101,7 +101,7 @@ class HttpTests(unittest.TestCase):
                                          headers={"Host": "192.168.68.57:17864"})
         with self.client.open(request, timeout=4) as response:
             self.assertEqual(response.status, 200)
-            self.assertEqual(json.load(response)["version"], "0.1.5")
+            self.assertEqual(json.load(response)["version"], "0.1.6")
         with self.client.open(self.url + "/icon.svg", timeout=4) as response:
             self.assertEqual(response.status, 200)
             self.assertEqual(response.headers.get_content_type(), "image/svg+xml")
@@ -247,13 +247,58 @@ class HttpTests(unittest.TestCase):
         self.assertEqual(self.req("/api/rapidgator/extract",
                                  {"content": oversized})[0], 400)
 
+    def test_browser_url_validation_requires_login_and_never_fetches_url(self):
+        import urllib.parse
+        valid="/api/browser/validate?url="+urllib.parse.quote(
+            "https://rapidgator.net/file/1234",safe="")
+        self.assertEqual(self.req(valid)[0], 401)
+        self.login()
+        code, data=self.req(valid)
+        self.assertEqual(code,200)
+        self.assertEqual(data["url"],"https://rapidgator.net/file/1234")
+        self.assertFalse(data["server_fetched"])
+        for url in ("http://example.com", "https://192.168.68.57:17864",
+                    "https://localhost/", "javascript:alert(1)"):
+            with self.subTest(url=url):
+                path="/api/browser/validate?url="+urllib.parse.quote(url,safe="")
+                self.assertEqual(self.req(path)[0],400)
+        with self.client.open(self.url,timeout=4) as response:
+            html=response.read().decode()
+            csp=response.headers.get("Content-Security-Policy")
+        self.assertIn('id="browserFrame"',html)
+        self.assertIn('sandbox=""',html)
+        self.assertIn("frame-src https:",csp)
+        self.assertIn("frame-ancestors 'none'",csp)
+        self.assertNotIn("allow-same-origin",html)
+        self.assertNotIn("allow-downloads",html)
+
+    def test_update_channel_select_rc_releases_without_installer_execution(self):
+        self.assertEqual(self.req("/api/update/check?channel=rc")[0],401)
+        self.login()
+        asset={"version":"v0.1.7-rc1","size":9000}
+        with patch.object(webapp.updater,"latest",return_value=asset) as latest:
+            code,result=self.req("/api/update/check?channel=rc")
+        self.assertEqual(code,200)
+        self.assertEqual(result["release"]["version"],"v0.1.7-rc1")
+        self.assertEqual(result["channel"],"rc")
+        latest.assert_called_once_with(webapp.VERSION,"x86_64","rc")
+        with patch.object(webapp.updater,"latest",return_value=None) as latest:
+            code,result=self.req("/api/update/check?channel=stable")
+        self.assertEqual(code,200)
+        self.assertFalse(result["available"])
+        latest.assert_called_once_with(webapp.VERSION,"x86_64","stable")
+        self.assertEqual(self.req("/api/update/check?channel=invalid")[0],400)
+        # Applies still require a real QNAP package registration.
+        self.assertEqual(self.req("/api/update/apply",
+            {"version":"v0.1.7-rc1","channel":"rc"})[0],400)
+
     def test_update_apply_fails_closed_when_not_qpkg(self):
         self.login()
         info = self.req("/api/update/status")[1]
         self.assertFalse(info["supported"])
-        code, _ = self.req("/api/update/apply", {"version": "v0.1.5"})
+        code, _ = self.req("/api/update/apply", {"version": "v0.1.6"})
         self.assertEqual(code, 400)
-        self.assertEqual(self.req("/api/health")[1]["version"], "0.1.5")
+        self.assertEqual(self.req("/api/health")[1]["version"], "0.1.6")
         self.assertFalse(self.req("/api/jd2/status")[1]["connected"])
         self.assertEqual(self.req("/api/jd2/update/apply", {"confirmed": True})[0], 400)
         self.assertEqual(self.req("/api/jd2/preset/apply", {"confirmed": True})[0], 400)

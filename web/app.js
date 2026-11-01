@@ -1,5 +1,6 @@
 "use strict";
-let csrf="", selectedVersion="", rapidgatorSnapshot=null;
+let csrf="", selectedVersion="", selectedChannel="rc", rapidgatorSnapshot=null;
+let browserHistory=[], browserIndex=-1, browserCurrent="";
 const $=id=>document.getElementById(id);
 function visible(id,on){$(id).classList.toggle("hidden",!on)}
 function flash(message){$("notice").textContent=message;visible("notice",true)}
@@ -19,6 +20,7 @@ async function go(){
  if(state.authenticated){
    visible("app",true);visible("login",false);visible("setup",false);visible("logout",true);
    await refresh("dashboard");
+   browserHistoryButtons();
  }else{
    visible("app",false);visible("logout",false);
    const boot=await api("/api/setup/status");
@@ -121,6 +123,36 @@ async function folders(path){
    picker.appendChild(btn);
  }
 }
+function browserHistoryButtons(){
+ $("browserBack").disabled=browserIndex<=0;
+ $("browserForward").disabled=browserIndex<0||browserIndex>=browserHistory.length-1;
+ const available=Boolean(browserCurrent);
+ $("browserOpenSafari").disabled=!available;
+ $("browserQueue").disabled=!available;
+}
+function browserDisplay(url){
+ browserCurrent=url;
+ const frame=$("browserFrame");
+ const interactive=$("browserMode").value==="interactive";
+ // Never combine allow-scripts with allow-same-origin. All remote pages
+ // remain opaque-origin, cannot reach Hub DOM or invoke its same-origin API.
+ frame.setAttribute("sandbox",interactive?"allow-scripts allow-forms":"");
+ frame.setAttribute("referrerpolicy","no-referrer");
+ frame.src=url;
+ $("browserUrl").value=url;
+ $("browserStatus").textContent="隔離表示中: "+url+
+  " — サイトが埋め込みを禁止している場合は空白になります。Safariで開いてください。";
+ browserHistoryButtons();
+}
+async function browserNavigate(value,record=true){
+ const result=await api("/api/browser/validate?url="+encodeURIComponent(value));
+ if(record){
+  browserHistory=browserHistory.slice(0,browserIndex+1);
+  browserHistory.push(result.url);
+  browserIndex=browserHistory.length-1;
+ }
+ browserDisplay(result.url);
+}
 async function updateStatus(){
  const s=await api("/api/update/status");
  $("updateStatus").textContent="更新状態: "+s.phase+" — "+(s.message||s.unsupported_reason||"待機中");
@@ -178,6 +210,44 @@ document.addEventListener("DOMContentLoaded",()=>{
   await refresh("queue");
   flash("保存完了。必要なら保留キューから個別にJD2へ送ってください");
  }));
+ $("browserOpen").addEventListener("click",()=>perform(async()=>{
+  await browserNavigate($("browserUrl").value.trim());
+ }));
+ $("browserBack").addEventListener("click",()=>perform(async()=>{
+  if(browserIndex<=0)return;
+  const next=browserHistory[browserIndex-1];
+  await browserNavigate(next,false);browserIndex--;browserHistoryButtons();
+ }));
+ $("browserForward").addEventListener("click",()=>perform(async()=>{
+  if(browserIndex<0||browserIndex>=browserHistory.length-1)return;
+  const next=browserHistory[browserIndex+1];
+  await browserNavigate(next,false);browserIndex++;browserHistoryButtons();
+ }));
+ $("browserClose").addEventListener("click",()=>{
+  $("browserFrame").removeAttribute("src");
+  $("browserFrame").setAttribute("sandbox","");
+  browserCurrent="";browserHistory=[];browserIndex=-1;
+  browserHistoryButtons();
+  $("browserStatus").textContent="プレビューを閉じました。";
+ });
+ $("browserMode").addEventListener("change",()=>{
+  if(browserCurrent){
+    if($("browserMode").value==="interactive" &&
+       !confirm("外部サイトのスクリプトとフォームを隔離枠内で実行します。ログインやCloudflareの動作保証はありません。続けますか？")){
+      $("browserMode").value="strict";return;
+    }
+    browserDisplay(browserCurrent);
+  }
+ });
+ $("browserOpenSafari").addEventListener("click",()=>{
+  if(!browserCurrent)return;
+  window.open(browserCurrent,"_blank","noopener,noreferrer");
+ });
+ $("browserQueue").addEventListener("click",()=>perform(async()=>{
+  if(!browserCurrent||!confirm("現在のアドレス欄のURLを保留キューに登録します。サイト内リンクは自動解析せず、JD2へも送信しません。よろしいですか？"))return;
+  await api("/api/links",{url:browserCurrent});
+  $("browserStatus").textContent="保留キューに登録しました。ダウンロードは開始しません。";
+ }));
  $("bookmarkAdd").addEventListener("click",()=>perform(async()=>{
   await api("/api/bookmarks",{title:$("bookmarkName").value,url:$("bookmarkUrl").value.trim()});
   $("bookmarkName").value="";$("bookmarkUrl").value="";await refresh("bookmarks");
@@ -198,10 +268,20 @@ document.addEventListener("DOMContentLoaded",()=>{
   $("updateLog").textContent=result.log||"まだ更新ログはありません";
   visible("updateLog",true);
  }));
+ $("updateChannel").addEventListener("change",()=>{
+  selectedVersion="";
+  selectedChannel=$("updateChannel").value;
+  $("updateResult").textContent="チャンネルを変更しました。更新を再確認してください。";
+  visible("updateApply",false);
+ });
  $("updateCheck").addEventListener("click",()=>perform(async()=>{
-  const u=await api("/api/update/check");
+  const channel=$("updateChannel").value;
+  const u=await api("/api/update/check?channel="+encodeURIComponent(channel));
   selectedVersion=u.available?u.release.version:"";
-  $("updateResult").textContent=u.available?"更新あり: "+u.release.version:"現在利用できる新しい正式QPKGリリースはありません";
+  selectedChannel=channel;
+  $("updateResult").textContent=u.available?
+    "更新あり: "+u.release.version+(u.release.version.includes("-rc")?"（RC版）":"（正式版）"):
+    (channel==="rc"?"新しい正式版・RC版のQPKGはありません":"新しい正式版のQPKGはありません");
   visible("updateApply",Boolean(u.available));
   await updateStatus();
  }));
@@ -229,7 +309,7 @@ document.addEventListener("DOMContentLoaded",()=>{
  }));
  $("updateApply").addEventListener("click",()=>perform(async()=>{
   if(!selectedVersion||!confirm(selectedVersion+" にQPKGを更新します。サービスが再起動されます。続けますか？"))return;
-  await api("/api/update/apply",{version:selectedVersion});await updateStatus();
+  await api("/api/update/apply",{version:selectedVersion,channel:selectedChannel});await updateStatus();
  }));
  go();
 });
