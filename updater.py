@@ -15,6 +15,8 @@ import urllib.request
 
 REPO = "souten-yd/QnapDownloader"
 API = f"https://api.github.com/repos/{REPO}/releases/latest"
+API_RC = f"https://api.github.com/repos/{REPO}/releases?per_page=30"
+RELEASE_BYTES_MAX = 4 * 1024 * 1024
 VERSION = re.compile(r"^v?(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$")
 ARCH = re.compile(r"^[A-Za-z0-9_-]+$")
 MAX_BYTES = 512 * 1024 * 1024
@@ -23,18 +25,25 @@ MAX_BYTES = 512 * 1024 * 1024
 def version(value):
     match = VERSION.fullmatch(value)
     if not match:
-        raise ValueError("version must be X.Y.Z or vX.Y.Z")
-    return tuple(map(int, match.groups()))
+        raise ValueError("version must be X.Y.Z or vX.Y.Z[-rcN]")
+    return tuple(map(int, match.groups()[:3]))
 
 
-def select(release, current, arch):
+def select(release, current, arch, include_rc=False):
     if not ARCH.fullmatch(arch):
         raise ValueError("invalid architecture")
     tag = release.get("tag_name", "")
     if not isinstance(tag, str):
         raise ValueError("invalid release tag")
     new = version(tag)
-    if release.get("draft") or release.get("prerelease") or new <= version(current):
+    # Experimental releases must be explicitly selected; only numbered
+    # RC tags are accepted, never arbitrary beta/nightly build identifiers.
+    is_rc = VERSION.fullmatch(tag).group(4) is not None
+    if release.get("draft") or new <= version(current):
+        return None
+    if is_rc and (not include_rc or release.get("prerelease") is not True):
+        return None
+    if not is_rc and release.get("prerelease"):
         return None
     name = f"QnapDownloader_{'.'.join(map(str, new))}_{arch}.qpkg"
     matching = [a for a in release.get("assets", []) if a.get("name") == name]
@@ -54,19 +63,53 @@ def select(release, current, arch):
             "sha256": digest[7:].lower(), "size": size}
 
 
-def latest(current, arch):
-    request = urllib.request.Request(API, headers={
-        "Accept": "application/vnd.github+json", "User-Agent": "QnapDownloader-updater/0.1"})
+def latest(current, arch, channel="stable"):
+    """Select highest installable stable/RC package from trusted GitHub API."""
+    if channel not in ("stable", "rc"):
+        raise ValueError("unknown update channel")
+    address = API if channel == "stable" else API_RC
+    request = urllib.request.Request(address, headers={
+        "Accept": "application/vnd.github+json",
+        "User-Agent": "QnapDownloader-updater/0.1"})
     try:
         with urllib.request.urlopen(request, timeout=15) as response:
-            release = json.load(response)
+            content = response.read(RELEASE_BYTES_MAX + 1)
+            if len(content) > RELEASE_BYTES_MAX:
+                raise ValueError("GitHub release metadata exceeds size limit")
+            releases = json.loads(content)
     except urllib.error.HTTPError as error:
-        # GitHub returns 404 until a repository has its first stable Release.
-        # Other HTTP failures (rate limit, 5xx, permissions) remain visible.
-        if error.code == 404:
+        # Only /releases/latest returns 404 when there is no stable release.
+        if channel == "stable" and error.code == 404:
             return None
         raise
-    return select(release, current, arch)
+    if channel == "stable":
+        if not isinstance(releases, dict):
+            raise ValueError("invalid stable GitHub release response")
+        return select(releases, current, arch)
+    if not isinstance(releases, list) or len(releases) > 30:
+        raise ValueError("invalid GitHub release list")
+    eligible = []
+    for release in releases:
+        if not isinstance(release, dict):
+            raise ValueError("invalid GitHub release metadata")
+        tag = release.get("tag_name")
+        if not isinstance(tag, str) or VERSION.fullmatch(tag) is None:
+            continue
+        if release.get("draft") or version(tag) <= version(current):
+            continue
+        # Only stable and explicitly marked numbered RC prereleases.
+        if release.get("prerelease") and VERSION.fullmatch(tag).group(4) is None:
+            continue
+        eligible.append(release)
+    eligible.sort(key=lambda item: (
+        version(item["tag_name"]),
+        VERSION.fullmatch(item["tag_name"]).group(4) is None,
+        int(VERSION.fullmatch(item["tag_name"]).group(4) or 0)), reverse=True)
+    for release in eligible:
+        asset = select(release, current, arch, include_rc=True)
+        if asset is not None:
+            return asset
+    return None
 
 
 def stage(asset, destination):
@@ -109,15 +152,16 @@ def main(argv=None):
     parser.add_argument("action", choices=("check", "download"))
     parser.add_argument("--current-version", required=True)
     parser.add_argument("--arch", required=True)
+    parser.add_argument("--channel", choices=("stable", "rc"), default="rc")
     parser.add_argument("--dest", help="existing private directory for verified downloads")
     args = parser.parse_args(argv)
     try:
         version(args.current_version)
         if args.action == "download" and not args.dest:
             parser.error("download requires --dest")
-        asset = latest(args.current_version, args.arch)
+        asset = latest(args.current_version, args.arch, args.channel)
         if asset is None:
-            print("No newer stable release.")
+            print("No newer release for selected channel.")
         elif args.action == "check":
             print(json.dumps({"version": asset["version"], "asset": asset["name"]}))
         else:
