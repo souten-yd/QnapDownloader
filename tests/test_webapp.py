@@ -89,6 +89,7 @@ class HttpTests(unittest.TestCase):
 
     def test_setup_login_csrf_and_private_api(self):
         self.assertEqual(self.req("/api/settings")[0], 401)
+        self.assertEqual(self.req("/api/update/log")[0], 401)
         self.assertEqual(self.req("/api/bootstrap", {
             "token": "wrong", "password": "correct horse staple 123"})[0], 403)
         self.login()
