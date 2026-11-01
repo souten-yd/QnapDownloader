@@ -12,7 +12,7 @@ trap 'rm -rf "$WORK"' EXIT
 mkdir -p "$WORK/shared" "$OUTPUT"
 cp "$ROOT/qpkg/qpkg.cfg" "$WORK/qpkg.cfg"
 cp "$ROOT/qpkg/package_routines" "$WORK/package_routines"
-cp "$ROOT"/{webapp.py,storage.py,updater.py,self_update.py,durability.py,jd2_policy.py,jd2_control.py,jd2_myjd.py,jd2_transfer.py,README.md} "$WORK/shared/"
+cp "$ROOT"/{webapp.py,storage.py,updater.py,self_update.py,durability.py,jd2_policy.py,jd2_control.py,jd2_myjd.py,jd2_transfer.py,rapidgator_extract.py,README.md} "$WORK/shared/"
 cp "$ROOT"/qpkg/shared/{downloader.sh,downloader_pid.py,python3-path} "$WORK/shared/"
 cp -R "$ROOT/web" "$WORK/shared/web"
 # Native x86_64 dependencies must be prepared on the build machine.

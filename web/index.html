@@ -9,7 +9,7 @@
 <script src="/app.js" defer></script>
 </head>
 <body>
-<header><div class="brand">◈ QnapDownloader <small>0.1.1</small></div><button id="logout" class="secondary hidden">ログアウト</button></header>
+<header><div class="brand">◈ QnapDownloader <small>0.1.2</small></div><button id="logout" class="secondary hidden">ログアウト</button></header>
 <main>
 <section id="setup" class="panel hidden">
   <h2>初期管理者設定</h2>
@@ -33,6 +33,13 @@
  <section id="queue" class="panel tab hidden">
   <h2>リンクの保留登録</h2><p>明示的に追加したHTTPSリンクを重複なく保存します。自動で取得・実行しません。</p>
   <div class="stack"><input id="queueUrl" type="url" placeholder="https://rapidgator.net/file/..."><button id="queueAdd">保留キューに追加</button></div>
+  <h3>Rapidgatorリンクの抽出（貼り付けのみ）</h3>
+  <p class="muted">コピーしたテキストやHTMLからRapidgatorのHTTPSリンクを最大20件抽出します。外部サイトへの通信、ページ内スクリプト実行、Cloudflare回避は行いません。</p>
+  <label>サイトからコピーした内容<textarea id="rapidgatorText" rows="5" maxlength="65536" placeholder="コピーしたテキストまたはHTMLを貼り付け"></textarea></label>
+  <button id="rapidgatorPreview" class="secondary">リンクを抽出して確認</button>
+  <button id="rapidgatorStage" disabled>確認したリンクを保留キューに登録</button>
+  <div id="rapidgatorResult" class="items" role="status" aria-live="polite"></div>
+  <h3>保留キュー</h3>
   <div id="queueItems" class="items"></div>
  </section>
  <section id="bookmarks" class="panel tab hidden">
