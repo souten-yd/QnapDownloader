@@ -1,0 +1,45 @@
+name: Publish QnapDownloader v0.1.5-rc1 QTS App Center launch fix
+on:
+  push:
+    branches: [release/experimental-0.1.5-rc1]
+permissions:
+  contents: write
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Full regression
+        run: bash scripts/verify.sh
+      - name: Install QDK and build-only tools
+        run: |
+          curl -fLSs --retry 2 https://github.com/qnap-dev/QDK/releases/download/v2.5.3/qdk_2.5.3_amd64.deb -o /tmp/qdk.deb
+          sudo apt-get update -qq
+          sudo apt-get install -y /tmp/qdk.deb rsync
+          python3 -m pip install --disable-pip-version-check 'cairosvg==2.8.2' 'pillow>=10,<13'
+          python3 -m pip install --disable-pip-version-check --only-binary=:all: --target vendor -r requirements-jd2-build.txt
+      - name: Build and verify checksum
+        run: |
+          bash scripts/build-qpkg.sh x86_64 dist
+          (cd dist && sha256sum QnapDownloader_0.1.5_x86_64.qpkg > SHA256SUMS && sha256sum -c SHA256SUMS)
+      - name: Release explicitly as prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view v0.1.5-rc1 >/dev/null 2>&1; then
+            echo 'Release already exists; will not overwrite'
+            exit 1
+          fi
+          gh release create v0.1.5-rc1 dist/QnapDownloader_0.1.5_x86_64.qpkg dist/SHA256SUMS \
+            --repo "${{ github.repository }}" \
+            --target "870b9f6c89c814fa380d5bcf9bfd9451b5b05682" \
+            --title "QnapDownloader v0.1.5-rc1: QTS App Center click and icon fix" \
+            --prerelease \
+            --notes "Experimental QNAP x86_64 build for hardware validation. Fixes QTS App Center launch by explicitly opening a NEW browser tab (QPKG_DESKTOP_APP=0); the Web UI intentionally disallows desktop iframe embedding. Adds first-party img-src CSP so the header icon renders. Adds authenticated read-only MyJDownloader setup status and connection test; NO MyJD credentials are collected on LAN HTTP. No Docker/JD2 mutation or automatic download. 75 automated tests and QDK 2.5.3 build passed. App Center click behavior must still be verified on actual QTS hardware. Private LAN HTTP is unencrypted: do not forward TCP 17864 to Internet."
