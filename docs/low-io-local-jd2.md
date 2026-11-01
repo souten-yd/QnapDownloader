@@ -1,5 +1,7 @@
 # QnapDownloader v0.1.8 — 低I/O運用・安全なローカルJD2事前診断
 
+> **注記（v0.1.11）:** MyJDownloader連携は削除され、JD2との通信はHub管理のローカルエンジンのみです（docs/engine-setup.md）。本書中のMyJD記述は設計当時の経緯（履歴）です。
+
 ## 現状と目的
 v0.1.7以前はQPKG起動時、Python標準出力・エラー出力をNASの永続`logs/downloader.log`へ書き込んでいた。普通の健康確認やWeb画面表示でもディスクアクセスが生じ得た。v0.1.8ではHubの通常ログをディスクへ出力せず、必要最低限の匿名化イベントだけPythonプロセス内に最大64件保存する。
 
@@ -13,7 +15,7 @@ v0.1.7以前はQPKG起動時、Python標準出力・エラー出力をNASの永�
 - 管理者が設定画面の「NAS内3128番ポートを確認」を押した場合だけ、QnapDownloaderバックエンドから固定IPv4`127.0.0.1:3128`へのTCP接続を最大0.35秒試みる。HTTPリクエスト、JD2メソッド、Dockerソケットへのアクセス、プロセス起動・停止・設定変更は一切なし。
 - TCP接続できた場合も**JD2の実体、ユーザー認証、外部ネットワークからの到達不能を証明しない**。`api_authenticated=false, network_isolation_verified=false, operations_enabled=false`を返し、MyJDモードを切替えない。
 - QNAP Container StationのDocker版が古いと、ホスト127.0.0.1への-p公開が同一L2 LANから届く脆弱なケースがある。Docker公式の28.0.0以降の修正と、NASの実ポート公開設定・ルーティングを調査するまで、認証のない旧RemoteAPIを使ったJD2のダウンロード/アカウント変更を実装しない。
-- 既存DockerのJD2への接続実証は、QNAP実機のネットワーク分離・アクセス権とJD2認証済みブリッジの選択がブロッカー。MyJDownloader不要の内蔵JD2方式は`docs/embedded-jd2-architecture.md`の後続PRで実装する。
+- 既存DockerのJD2への接続実証は、QNAP実機のネットワーク分離・アクセス権とJD2認証済みブリッジの選択がブロッカー。MyJDownloader不要の内蔵JD2方式（v0.1.11でローカルエンジンとして実装、実機未検証）は`docs/embedded-jd2-architecture.md`の後続PRで実装する。
 
 ## QNAP SSH読取専用確認
 ```sh

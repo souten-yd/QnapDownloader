@@ -11,7 +11,7 @@ iPhone/SafariとQNAP App Centerの両方で、QnapDownloaderの画面だけか�
 
 ## Backend契約
 - GET /api/jd2/downloads?page=0..20（管理者認証必須）。明示的なブラウザ操作の時のみ呼び、サービス起動時やバックグラウンドでのポーリングを行わない。
-- JD2 myjdapi 1.1.11 のdownloads.query_packages/query_linksに、必要なread-onlyキーだけのquery dictを渡す。maxResults=30、startAt=page*30。
+- Hub管理のローカルエンジン（v0.1.11、旧MyJD経由は削除）の `downloadsV2/queryPackages`/`queryLinks` に、必要なread-onlyキーだけのquery dictを渡す。maxResults=30、startAt=page*30。
 - `jd2_downloads.py` で受け取った値の型・サイズ・長さを制限し、未知のJSONフィールドを出力しない。保存先・URL・password・Cookie・生アカウント情報は返さない。
 - 任意JD2メソッド名をWebへ渡す機構は追加しない。POST APIやJD2データ変更はこのPRに含めない。
 - 実機JD2のqueryLinks/queryPackagesの戻り形式が想定外ならHTTP 400エラーと状態案内にし、架空の結果やダウンロード操作を返さない。

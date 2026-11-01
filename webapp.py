@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import secrets
+import signal
 import sqlite3
 import threading
 import time
@@ -20,10 +21,10 @@ import jd2_transfer
 import rapidgator_extract
 import browser_safety
 import runtime_diagnostics
-import jd2_myjd
+import engine_supervisor
 import updater
 
-VERSION = "0.1.10"
+VERSION = "0.1.11"
 PORT = 17864
 ROOT = Path(__file__).resolve().parent
 FILES = {"/": ("web/index.html", "text/html; charset=utf-8"),
@@ -253,6 +254,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_data(200, {"version": VERSION, "configured": self.store.has_admin(),
                     "settings_revision": self.store.revision(),
                     "jd2": self.server.jd2.status(),
+                    "engine": self.server.engine.status(),
                     "mode": "management-shell"})
             if path == "/api/settings":
                 return self.send_data(200, self.store.settings())
@@ -263,8 +265,11 @@ class Handler(BaseHTTPRequestHandler):
                 # No legacy API command or Docker socket interaction: TCP
                 # presence alone never authorizes unauthenticated JD2 control.
                 return self.send_data(200, runtime_diagnostics.local_jd2_preflight())
-            if path == "/api/jd2/config":
-                return self.send_data(200, jd2_myjd.configuration_status(self.store.root))
+            if path == "/api/engine/status":
+                return self.send_data(200, self.server.engine.status())
+            if path == "/api/engine/log":
+                # RAM ring only; secrets are scrubbed when lines are recorded.
+                return self.send_data(200, {"lines": self.server.engine.log_lines()})
             if path == "/api/jd2/status":
                 return self.send_data(200, self.server.jd2.status())
             if path == "/api/jd2/downloads":
@@ -429,6 +434,26 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_data(200, outcome)
             if path == "/api/update/apply":
                 return self.send_data(202, self.server.updates.apply(body.get("version"), channel=body.get("channel", "rc")))
+            if path == "/api/engine/setup":
+                if body.get("confirmed") is not True:
+                    raise ValueError("初期設定の開始には確認が必要です")
+                # The destination must still be inside the allowed shares.
+                checked_directory(self.store.settings().get("download_dir"))
+                try:
+                    self.server.engine.start_setup()
+                except engine_supervisor.SetupBusy as exc:
+                    return self.reject(str(exc), 409)
+                return self.send_data(202, {"started": True})
+            if path == "/api/engine/start":
+                self.server.engine.start()
+                return self.send_data(202, {"started": True})
+            if path == "/api/engine/stop":
+                if body.get("confirmed") is not True:
+                    raise ValueError("エンジンの停止には確認が必要です")
+                return self.send_data(200, self.server.engine.stop())
+            if path == "/api/engine/autostart":
+                return self.send_data(200, {"autostart": self.server.engine.set_autostart(
+                    body.get("enabled"))})
             if path == "/api/jd2/connect/test":
                 return self.send_data(200, self.server.jd2.connection_test())
             if path == "/api/jd2/update/check":
@@ -473,12 +498,23 @@ def main():
     server.secure_cookies = args.secure_cookie
     remove_legacy_setup_token(data)
     server.updates = self_update.UpdateManager(data, ROOT, VERSION, "x86_64", args.port)
-    server.jd2 = jd2_control.JD2Controller(jd2_myjd.configured_adapter(data))
+    server.engine = engine_supervisor.EngineManager(data, store)
+    server.jd2 = jd2_control.JD2Controller(server.engine.adapter)
     runtime_diagnostics.event("web_started")
+
+    def request_shutdown(signum, frame):
+        # server.shutdown() blocks until serve_forever exits: run it off the
+        # signal-handling (main) thread to avoid a deadlock.
+        threading.Thread(target=server.shutdown, daemon=True).start()
+    signal.signal(signal.SIGTERM, request_shutdown)
+    signal.signal(signal.SIGINT, request_shutdown)
+    # Non-blocking: adopts a surviving engine or autostarts it in a thread.
+    server.engine.startup()
     try:
         server.serve_forever(poll_interval=0.5)
     finally:
         server.server_close()
+        server.engine.shutdown()
         store.close()
 
 

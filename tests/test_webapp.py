@@ -13,6 +13,7 @@ from unittest.mock import patch
 
 import self_update
 import storage
+import engine_supervisor
 import jd2_control
 import webapp
 
@@ -31,7 +32,8 @@ class HttpTests(unittest.TestCase):
         self.addCleanup(self.store.close)
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), webapp.Handler)
         self.server.store = self.store
-        self.server.jd2 = jd2_control.JD2Controller()
+        self.server.engine = engine_supervisor.EngineManager(self.root, self.store)
+        self.server.jd2 = jd2_control.JD2Controller(self.server.engine.adapter)
         self.server.secure_cookies = False
         self.server.updates = self_update.UpdateManager(self.root, webapp.ROOT,
                                                        webapp.VERSION, "x86_64", self.server.server_port)
@@ -101,7 +103,7 @@ class HttpTests(unittest.TestCase):
                                          headers={"Host": "192.168.68.57:17864"})
         with self.client.open(request, timeout=4) as response:
             self.assertEqual(response.status, 200)
-            self.assertEqual(json.load(response)["version"], "0.1.10")
+            self.assertEqual(json.load(response)["version"], "0.1.11")
         with self.client.open(self.url + "/icon.svg", timeout=4) as response:
             self.assertEqual(response.status, 200)
             self.assertEqual(response.headers.get_content_type(), "image/svg+xml")
@@ -187,16 +189,56 @@ class HttpTests(unittest.TestCase):
             self.assertIn("frame-ancestors 'none'", csp)
             self.assertEqual(response.headers.get("X-Frame-Options"), "DENY")
 
-    def test_authenticated_myjd_setup_status_and_read_only_probe(self):
+    def test_removed_myjd_config_and_probe_requires_running_engine(self):
         self.assertEqual(self.req("/api/jd2/config")[0], 401)
         self.assertEqual(self.req("/api/jd2/connect/test", {})[0], 401)
         self.login()
-        code, cfg = self.req("/api/jd2/config")
-        self.assertEqual(code, 200)
-        self.assertFalse(cfg["configured"])
-        self.assertNotIn("password", cfg)
+        self.assertEqual(self.req("/api/jd2/config")[0], 404)
         self.assertEqual(self.req("/api/jd2/connect/test", {}, csrf=False)[0], 403)
+        # Engine not installed: fail closed.
         self.assertEqual(self.req("/api/jd2/connect/test", {})[0], 400)
+        status = self.req("/api/jd2/status")[1]
+        self.assertFalse(status["connected"])
+        self.assertIn("エンジン未起動/未導入", status["reason"])
+        self.assertFalse(status["can_send"])
+
+    def test_engine_api_auth_csrf_origin_and_confirmation(self):
+        self.assertEqual(self.req("/api/engine/status")[0], 401)
+        self.assertEqual(self.req("/api/engine/log")[0], 401)
+        for name in ("setup", "start", "stop", "autostart"):
+            self.assertEqual(self.req("/api/engine/" + name, {})[0], 401)
+        self.login()
+        code, status = self.req("/api/engine/status")
+        self.assertEqual(code, 200)
+        self.assertEqual(status["phase"], "not_installed")
+        self.assertEqual([s["id"] for s in status["steps"]][0], "precheck")
+        self.assertEqual(self.req("/api/engine/log")[1]["lines"], [])
+        for name in ("setup", "start", "stop", "autostart"):
+            self.assertEqual(self.req("/api/engine/" + name, {}, csrf=False)[0], 403)
+            self.assertEqual(self.req("/api/engine/" + name, {}, origin=False)[0], 403)
+        self.assertEqual(self.req("/api/engine/setup", {})[0], 400)
+        self.assertEqual(self.req("/api/engine/setup", {"confirmed": "true"})[0], 400)
+        self.assertEqual(self.req("/api/engine/stop", {})[0], 400)
+        self.assertEqual(self.req("/api/engine/autostart", {"enabled": "yes"})[0], 400)
+        self.assertEqual(self.req("/api/engine/start", {})[0], 400)
+        # No download folder selected: setup is refused before any thread starts.
+        self.assertEqual(self.req("/api/engine/setup", {"confirmed": True})[0], 400)
+        self.assertFalse(self.server.engine.status()["setup_running"])
+        self.assertEqual(self.req("/api/engine/autostart", {"enabled": True})[0], 200)
+        self.assertTrue(self.req("/api/engine/status")[1]["autostart"])
+
+    def test_engine_setup_busy_returns_409(self):
+        self.login()
+        folder = self.allowed / "dl"
+        folder.mkdir()
+        self.assertEqual(self.req("/api/settings/folder", {"path": str(folder)})[0], 200)
+        started = []
+        self.server.engine.start_setup = lambda: started.append(1)
+        self.assertEqual(self.req("/api/engine/setup", {"confirmed": True})[0], 202)
+        def busy():
+            raise engine_supervisor.SetupBusy("実行中")
+        self.server.engine.start_setup = busy
+        self.assertEqual(self.req("/api/engine/setup", {"confirmed": True})[0], 409)
 
     def test_folder_picker_persists_allowed_path_only(self):
         folder = self.allowed / "subdir"
@@ -329,7 +371,7 @@ class HttpTests(unittest.TestCase):
         class ReadOnly:
             def list_downloads(self, page):
                 calls.append(page)
-                return {"source":"myjd-remote-readonly","page":page,
+                return {"source":"local-readonly","page":page,
                         "page_size":30,"packages":[],"links":[{
                             "name":"filename.zip","host":"rapidgator.net",
                             "progress":25,"status":"待機",
@@ -377,7 +419,7 @@ class HttpTests(unittest.TestCase):
         self.assertFalse(info["supported"])
         code, _ = self.req("/api/update/apply", {"version": "v0.1.8"})
         self.assertEqual(code, 400)
-        self.assertEqual(self.req("/api/health")[1]["version"], "0.1.10")
+        self.assertEqual(self.req("/api/health")[1]["version"], "0.1.11")
         self.assertFalse(self.req("/api/jd2/status")[1]["connected"])
         self.assertEqual(self.req("/api/jd2/update/apply", {"confirmed": True})[0], 400)
         self.assertEqual(self.req("/api/jd2/preset/apply", {"confirmed": True})[0], 400)

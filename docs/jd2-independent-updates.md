@@ -13,7 +13,7 @@
 
 JD2は公式アップデート機構によって小さなホストプラグイン変更を稼働中に反映でき、Core更新は再起動が必要になる。Hubはこの動作を妨げず、更新後は再接続してバージョンや設定のドリフトを検査する。
 
-公式API: `/update/runUpdateCheck`、`/update/isUpdateAvailable`、`/update/restartAndUpdate`、`/toolbar/triggerUpdate`。接続はMyJDownloaderの認証済みAPI／確認済みの安全な経路のみ。公開LANへの無認証legacy API公開は禁止。
+公式API: `/update/runUpdateCheck`、`/update/isUpdateAvailable`、`/update/restartAndUpdate`、`/toolbar/triggerUpdate`。接続はHub管理のローカルエンジンへのloopback接続のみ（v0.1.11。旧MyJDownloader経路は削除）。公開LANへの無認証legacy API公開は禁止。
 
 ### 重要なDocker版の例外
 
@@ -53,7 +53,7 @@ JD2は公式アップデート機構によって小さなホストプラグイ�
 
 ## 現時点の実装の境界
 
-`jd2_policy.py` はプレビューの必要条件と、値のドリフト/キー不足によるfail-closed判定を担う。しかし正式なMyJDownloaderアダプタとJDownloader接続/更新UIを有効化するまでは**実設定の更新は実行できない**。次のPRで実際のAPI接続と設定名を検証してから有効化する。
+`jd2_policy.py` はプレビューの必要条件と、値のドリフト/キー不足によるfail-closed判定を担う。しかしローカルエンジンの実機検証（設定キー名の確認を含む）が済むまでは**実設定の更新は実行できない**。次のPRで実際のAPI接続と設定名を検証してから有効化する。
 
 必要な試験:
 - JD2側だけ更新してもHub QPKGと設定DBは保持。

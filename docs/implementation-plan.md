@@ -37,11 +37,11 @@ Measure 5-minute idle and active NAS disk reads/writes and jbd2, JVM/JD2 process
 
 ## Embedded headless JD2 + Java + account management roadmap (2026-11-01)
 
-**Current v0.1.6 remains a Hub / external authenticated MyJD bridge only.** An embedded JDownloader.jar and full Java runtime are **not yet shipped**. The earlier PR-1...PR-5 table is historical planning, not evidence of implemented behavior or actual GitHub PR numbers.
+**Historical (v0.1.6): a Hub / external authenticated MyJD bridge only. Since v0.1.11 MyJD is removed and the Hub manages a locally installed JD2 engine (docs/engine-setup.md).** An embedded JDownloader.jar and full Java runtime are **not yet shipped**. The earlier PR-1...PR-5 table is historical planning, not evidence of implemented behavior or actual GitHub PR numbers.
 
 The new detailed implementation source of truth is [embedded-engine architecture](embedded-jd2-architecture.md), with [premium account management](premium-accounts-design.md). The recommended order is Engine-0 (signed artifact / redistribution and local authenticated bridge spike) → Engine-1 (QPKG and immutable Java / persistent JD2 storage) → Engine-2 (supervisor + authenticated internal IPC) → Engine-3 (real download dashboard) → Engine-4 (premium account manager, read-only then HTTPS-gated mutations) → Engine-5 (JD2 independent updates and settings readback) → Engine-6 (optional RAM staging / low-I/O measurements) → Engine-7 (unified UI and actual TS-253Be acceptance). 
 
-**Do NOT enable embedded mode by default, remove the external-MyJD compatibility mode, redistribute an unlicensed JD2 binary, open unauthenticated JD2 RemoteAPI, expose premium credentials on HTTP, or put persistent account/queue data in tmpfs.** These restrictions remain until explicit technical, license and QNAP hardware acceptance is documented.
+**Do NOT enable embedded mode by default, (external-MyJD compatibility mode was removed in v0.1.11 by owner decision), redistribute an unlicensed JD2 binary, open unauthenticated JD2 RemoteAPI, expose premium credentials on HTTP, or put persistent account/queue data in tmpfs.** These restrictions remain until explicit technical, license and QNAP hardware acceptance is documented.
 
 ## Release
 

@@ -91,7 +91,7 @@ def terminate(matches, root, data):
         except OSError as error:
             print("QnapDownloader SIGTERM failed:", error, file=sys.stderr)
             return False
-    deadline = time.monotonic() + 14.0
+    deadline = time.monotonic() + 45.0  # Hub stops the JD2 engine (up to ~35s) before exiting
     while time.monotonic() < deadline:
         if not any((info := owned(pid, root, data)) is not None and
                    info[0] == birth for pid, (birth, _) in matches.items()):

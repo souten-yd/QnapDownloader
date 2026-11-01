@@ -118,6 +118,22 @@ if (bad.length) { console.error("mismatch: " + bad.join(",")); process.exit(1); 
     def test_external_open_uses_noopener(self):
         self.assertIn('window.open(tab.current, "_blank", "noopener,noreferrer")', self.js)
 
+    def test_engine_section_and_alias(self):
+        for ident in ("engineSetup", "engineStart", "engineStop", "engineTest", "engineAutostart",
+                      "engineSteps", "engineLog", "homeEngineSetup", "downloadsEngineNotice",
+                      "linksEngineNotice"):
+            self.assertIn('id="%s"' % ident, self.html)
+        self.assertIn('data-section="engine"', self.html)
+        self.assertNotIn('data-section="jd2"', self.html)
+        self.assertIn("SECTION_ALIASES", self.js)
+        self.assertIn("#/settings/engine", self.js)
+        self.assertRegex(self.js, r"ENGINE_POLL_MS\s*=\s*1500\b")
+        # Log text only via textContent; confirm names sources and sizes.
+        self.assertIn('$("engineLog").textContent', self.js)
+        for needle in ("installer.jdownloader.org", "github.com/adoptium", "自動開始しません"):
+            self.assertIn(needle, self.js)
+        self.assertIn("JD2エンジンが起動していません", self.html)
+
     def test_icons_use_symbol_sprite(self):
         self.assertIn("<symbol", self.html)
         self.assertIn('id="notice"', self.html)

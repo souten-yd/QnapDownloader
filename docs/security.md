@@ -2,6 +2,10 @@
 
 Status: design specification; no browser, backend or threat filters implemented. No software can guarantee detection of every malicious site.
 
+## Hub-managed JD2 engine (v0.1.11)
+
+The JD2 engine is installed only by an explicit admin action from pinned official URLs (HTTPS only, redirects only to HTTPS, fixed SHA-256 and size, tar members checked for absolute paths, `..`, devices and escaping links). JD2's unauthenticated RemoteAPI is used only on `127.0.0.1` after the Hub verifies, before every call, that all LISTEN sockets on the port are loopback and owned by the Java process the Hub started (pid, start time, command line). Only a fixed method allowlist is callable and the browser can never reach JD2 directly. The engine runs as the Hub's (non-root) user with `start_new_session`; stop signals are sent only after re-verifying pid, start time and command line. The in-RAM log (300 lines) scrubs password/cookie/token-like text. Residual risk: other root-level processes on the same host can reach the API (same trust boundary as the Hub). MyJDownloader integration was removed. Real-device behaviour is unverified.
+
 ## Threat model
 
 Untrusted inputs: third-party sites/HTML/JS, advertisements, tracking scripts, redirect destinations, Click'n'Load containers, host/plugin output, filenames, credentials embedded in URLs and downloaded file contents. Trusted controls: authenticated QNAP management UI/API, permission policy engine, NAS folder picker, credential store and local JD2 adapter.

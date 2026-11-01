@@ -1,6 +1,8 @@
-"""JD2 independent update coordinator using opt-in authenticated MyJD.
+"""JD2 independent update coordinator for the Hub-managed local engine.
 
-No unprotected LAN legacy API. Does not install or configure JD2 automatically.
+The adapter (jd2_local.LocalAdapter) only talks to the verified loopback
+listener of the engine the Hub started. Fails closed when the engine is not
+running.
 """
 import threading
 
@@ -15,22 +17,23 @@ class JD2Controller:
 
     def _require(self):
         if self.adapter is None:
-            raise PresetUnavailable("JDownloader 2への接続が未設定です")
+            raise PresetUnavailable("エンジン未起動/未導入")
         return self.adapter
 
     def status(self):
         if self.adapter is None:
-            return {"connected": False, "reason": "MyJDownloader未設定。設定画面の手順を確認してください",
-                    "can_update": False, "can_preset": False}
+            return {"connected": False, "reason": "エンジン未起動/未導入",
+                    "can_update": False, "can_preset": False, "can_send": False}
         with self.lock:
             try:
                 adapter = self._require()
                 return {"connected": True, "can_update": getattr(adapter, "allow_update", True), "can_preset": True,
+                        "can_send": getattr(adapter, "can_send", False) is True,
                         "revision": adapter.core_revision(),
                         "update_available": adapter.is_update_available()}
             except Exception as error:
                 return {"connected": False, "reason": str(error),
-                        "can_update": False, "can_preset": False}
+                        "can_update": False, "can_preset": False, "can_send": False}
 
     def downloads_snapshot(self, page=0):
         """Read-only; never triggers JD2 updates, queue mutations or downloads."""
@@ -62,6 +65,9 @@ class JD2Controller:
             self._preview = None
             # JD2's own official update engine; Hub QPKG is never touched.
             adapter.restart_and_update()
+            stale = getattr(adapter, "note_preset_stale", None)
+            if stale is not None:
+                stale()  # JD2 may change settings while updating
             return {"started": True, "note": "JD2本体のみ更新中です。更新後に推奨設定を再確認してください"}
 
     def preset_preview(self):
@@ -80,4 +86,8 @@ class JD2Controller:
             self._preview = None  # Single-use snapshot to prevent repeated writes.
             if old is None:
                 raise PresetUnavailable("推奨設定のプレビューをやり直してください")
-            return apply_preset(adapter, old)
+            result = apply_preset(adapter, old)
+            applied = getattr(adapter, "note_preset_applied", None)
+            if applied is not None:
+                applied()
+            return result

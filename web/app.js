@@ -1,6 +1,6 @@
 "use strict";
 /*
- * QnapDownloader browser-style shell (v0.1.10).
+ * QnapDownloader browser-style shell (v0.1.11).
  * Spec: docs/browser-shell-ui.md. Single file, no build step.
  *
  * Security notes (see "Security invariants" in the spec):
@@ -49,7 +49,9 @@ const SHELL_KEY = "qnapdl.shell.v1";
 const HOST_MODE_KEY = "qnapdl.hostmodes.v1";
 const TAB_STORAGE_KEY = "qnapdl.webtabs.v1";
 const AUTO_STORAGE_KEY = "qnapdl.downloads.auto";
-const SETTINGS_SECTIONS = ["storage", "jd2", "bookmarks", "updates", "diagnostics", "about"];
+const SETTINGS_SECTIONS = ["storage", "engine", "bookmarks", "updates", "diagnostics", "about"];
+const SECTION_ALIASES = {jd2: "engine"};   // old #/settings/jd2 links
+const ENGINE_POLL_MS = 1500;
 const SVG_NS = "http://www.w3.org/2000/svg";
 const RAPIDGATOR_LIMIT = 65536;
 
@@ -64,6 +66,7 @@ const state = {
   menuReturnFocus: null,
   snapshotJson: "", downloadsSig: "", folderPath: "",
   bootVersion: "", statusCheckedAt: 0, updateWatching: false,
+  engine: null, engineTimer: null, engineBusy: false,
 };
 
 // ------------------------------------------------------------------ helpers
@@ -296,8 +299,9 @@ function parseRoute() {
   const head = parts[0] || "home";
   if (head === "downloads" || head === "links") return {view: head};
   if (head === "settings") {
+    const wanted = SECTION_ALIASES[parts[1]] || parts[1];
     return {view: "settings",
-      section: SETTINGS_SECTIONS.includes(parts[1]) ? parts[1] : "storage"};
+      section: SETTINGS_SECTIONS.includes(wanted) ? wanted : "storage"};
   }
   if (head === "tab" && /^t\d+$/.test(parts[1] || "")) return {view: "tab", tabId: parts[1]};
   return {view: "home"};
@@ -329,6 +333,7 @@ function currentViewName() {
 function applyRoute() {
   if (!state.authed) return;
   const route = parseRoute();
+  if (/^#\/settings\/jd2\/?$/.test(location.hash)) { replaceRoute("#/settings/engine"); return; }
   if (route.view === "tab" && !findTab(route.tabId)) { replaceRoute("#/home"); return; }
   state.route = route;
   if (route.view === "tab") state.lastWebTabId = route.tabId;
@@ -343,6 +348,7 @@ function applyRoute() {
   renderWebTabs();
   updateChrome();
   syncAutoRefresh();
+  syncEnginePoll();
   // Last route (a hash, never a secret) lets a reloaded iOS web app resume.
   writeSession(SHELL_KEY, JSON.stringify({v: 1, hash: location.hash || "#/home"}));
   perform(() => enterView(route));
@@ -353,8 +359,9 @@ async function enterView(route, force = false) {
     await loadStatus(force);
   } else if (route.view === "downloads") {
     renderDownloads();
+    await loadEngine(force);
   } else if (route.view === "links") {
-    await loadQueue(force);
+    await Promise.all([loadQueue(force), loadEngine(force)]);
   } else if (route.view === "settings") {
     await enterSettings(route.section, force);
   } else if (route.view === "tab") {
@@ -485,6 +492,7 @@ function updateCfHint(tab) {
 // ------------------------------------------------------------- status/home
 function renderStatusData(s) {
   state.status = s;
+  if (s.engine) applyEngine(s.engine);
   document.querySelectorAll(".js-version").forEach(n => { n.textContent = "v" + s.version; });
   renderStatusCards();
 }
@@ -525,9 +533,14 @@ function renderStatusCards() {
   if (!s) return;
   box.appendChild(statusCard("Web管理画面", "稼働中",
     "version " + s.version + " / 設定改訂 " + s.settings_revision, true));
-  box.appendChild(statusCard("JDownloader 2", s.jd2.connected ? "接続中" : "未接続",
-    s.jd2.connected ? "Core revision " + s.jd2.revision : (s.jd2.reason || "接続設定を確認してください"),
-    Boolean(s.jd2.connected), "#/settings/jd2"));
+  const engine = s.engine || state.engine;
+  if (engine) {
+    box.appendChild(statusCard("JD2エンジン", PHASE_LABELS[engine.phase] || engine.phase,
+      engine.running ? (s.jd2.connected ? "Core revision " + s.jd2.revision : (s.jd2.reason || "接続を確認中"))
+        : (engine.error || "エンジン設定を開いて状態を確認してください"),
+      engine.phase === "running" ? true : (engine.phase === "stopped" || engine.phase === "not_installed") ? null : false,
+      "#/settings/engine"));
+  }
   const running = runningCount();
   box.appendChild(statusCard("ダウンロード", running === null ? "未取得" : running + "件 実行中",
     running === null ? "ダウンロード画面で取得します" : "最後に取得した一覧より",
@@ -889,7 +902,7 @@ function classifyInput(raw) {
     if (path[0] === "links" && path.length === 1) return {kind: "route", value: "#/links"};
     if (path[0] === "home" || path[0] === "") return {kind: "route", value: "#/home"};
     if (path[0] === "settings" && path.length <= 2) {
-      const section = path[1] || "storage";
+      const section = SECTION_ALIASES[path[1]] || path[1] || "storage";
       if (SETTINGS_SECTIONS.includes(section)) return {kind: "route", value: "#/settings/" + section};
     }
     return {kind: "unknown-qnap"};
@@ -1167,7 +1180,7 @@ async function loadDownloads(page, options = {}) {
     $("downloadsNext").disabled = !snap.has_more || snap.page >= 20;
     if (state.route.view === "home" || currentViewName() === "home") renderStatusCards();
   } catch (error) {
-    let message = "取得できませんでした: " + error.message + "。設定でMyJDownloader接続を確認してください。";
+    let message = "取得できませんでした: " + error.message + "。エンジンが起動しているか確認してください。";
     if (state.autoRefresh) {
       setAutoRefresh(false);
       message += " 自動更新を停止しました。";
@@ -1288,14 +1301,6 @@ function renderDownloadDir(s) {
   $("selectedFolder").textContent = s.download_dir ? "保存先：" + s.download_dir : "保存先：未選択";
 }
 
-function renderJd2Config(cfg) {
-  $("jd2ConfigState").textContent = cfg.configured ?
-    "MyJD設定済み / デバイス: " + cfg.device_name +
-      " / JD2更新: " + (cfg.can_update ? "明示許可済み" : "無効") +
-      " / リンク送信: " + (cfg.can_send ? "明示許可済み" : "無効") :
-    "MyJD未設定: " + (cfg.reason || "接続設定を作成してください");
-}
-
 async function enterSettings(section, force = false) {
   showSettingsSection(section);
   if (section === "storage") {
@@ -1306,8 +1311,8 @@ async function enterSettings(section, force = false) {
         return folders("", force);   // remembered folder vanished: back to the shares
       }),
     ]);
-  } else if (section === "jd2") {
-    await swr("jd2config", "/api/jd2/config", renderJd2Config, {force});
+  } else if (section === "engine") {
+    await loadEngine(force);
   } else if (section === "bookmarks") {
     await loadBookmarks(force);
   } else if (section === "updates") {
@@ -1709,6 +1714,178 @@ function wireLinks() {
   $("rapidgatorStage").addEventListener("click", () => perform(stageRapidgator));
 }
 
+// ------------------------------------------------------------------ engine
+const PHASE_LABELS = {
+  not_installed: "未導入", setup: "初期設定中", starting: "起動中", running: "稼働中",
+  stopped: "停止中", failed: "失敗",
+};
+const STEP_MARKS = {pending: "○", running: "…", done: "✓", skipped: "↷", warn: "!", failed: "✕"};
+const STEP_TEXT = {pending: "待機", running: "実行中", done: "完了", skipped: "スキップ", warn: "警告", failed: "失敗"};
+
+function engineSectionVisible() {
+  return state.route.view === "settings" && state.route.section === "engine";
+}
+
+// Poll only while a setup/start is in progress AND the engine section or the
+// home page is on screen (and the page is visible). Stops on any error.
+function enginePollWanted() {
+  const e = state.engine;
+  return Boolean(state.authed && e && (e.phase === "setup" || e.phase === "starting") &&
+    document.visibilityState === "visible" && (engineSectionVisible() || currentViewName() === "home"));
+}
+
+function syncEnginePoll() {
+  clearTimeout(state.engineTimer);
+  state.engineTimer = null;
+  if (!enginePollWanted() || state.engineBusy) return;
+  state.engineTimer = setTimeout(engineTick, ENGINE_POLL_MS);
+}
+
+async function engineTick() {
+  state.engineTimer = null;
+  if (!enginePollWanted() || state.engineBusy) return;
+  state.engineBusy = true;
+  try {
+    applyEngine(await api("/api/engine/status"));
+    if (!$("engineLog").hidden) await loadEngineLog();
+  } catch (e) {
+    toast("エンジン状態を取得できませんでした: " + e.message, "error");
+    state.engineBusy = false;
+    return;   // polling stops until the next user action
+  }
+  state.engineBusy = false;
+  syncEnginePoll();
+}
+
+function applyEngine(e) {
+  state.engine = e;
+  renderEngine(e);
+  syncEnginePoll();
+}
+
+async function loadEngine(force = false) {
+  await swr("engine", "/api/engine/status", applyEngine, {force});
+}
+
+function renderEngine(e) {
+  const busy = e.phase === "setup" || e.phase === "starting";
+  $("engineState").textContent = "状態: " + (PHASE_LABELS[e.phase] || e.phase) +
+    (e.core_revision && e.running ? " / Core revision " + e.core_revision : "") +
+    (e.preset_applied ? " / 推奨設定: 適用済み" : e.installed ? " / 推奨設定: 未適用（リンク送信は無効）" : "");
+  $("engineError").hidden = !e.error;
+  $("engineError").textContent = e.error ? "エラー: " + e.error : "";
+  $("engineSetup").textContent = e.installed || e.error ? "初期設定を再実行" : "初期設定を開始";
+  $("engineSetup").disabled = busy || e.running;
+  $("engineStart").disabled = busy || e.running || !e.installed;
+  $("engineStop").disabled = !(e.running) || e.phase === "setup";
+  $("engineTest").disabled = e.phase !== "running";
+  $("engineAutostart").disabled = !e.installed;
+  $("engineAutostart").checked = Boolean(e.autostart);
+  const comps = (e.components || []).map(c => {
+    const box = element("div", undefined, "item");
+    box.appendChild(element("b", c.label));
+    box.appendChild(element("span", (c.installed ? "導入済み" : "未導入") +
+      " · 版: " + (c.version || c.pinned_version || "不明") + " · SHA-256 " + c.sha256 + "… · " +
+      readableSize(c.size)));
+    return box;
+  });
+  $("engineComponents").replaceChildren(...comps);
+  const steps = (e.steps || []).map(step => {
+    const li = element("li", undefined, "engine-step is-" + step.status);
+    li.appendChild(element("span", STEP_MARKS[step.status] || "?", "step-mark"));
+    const body = element("span", undefined, "step-body");
+    body.appendChild(element("b", step.label));
+    body.appendChild(element("span", " — " + (STEP_TEXT[step.status] || step.status) +
+      (step.detail ? "：" + step.detail : ""), "step-detail"));
+    if (typeof step.progress === "number" && step.status === "running") {
+      const bar = element("progress");
+      bar.max = 100; bar.value = step.progress;
+      body.appendChild(bar);
+    }
+    li.appendChild(body);
+    return li;
+  });
+  $("engineSteps").replaceChildren(...steps);
+  renderEngineNotices(e);
+}
+
+function renderEngineNotices(e) {
+  const running = e.phase === "running";
+  setShown("downloadsEngineNotice", !running);
+  setShown("linksEngineNotice", !running);
+  setShown("homeEngine", !e.installed && e.phase !== "setup");
+}
+
+async function loadEngineLog() {
+  const data = await api("/api/engine/log");
+  $("engineLog").textContent = (data.lines || []).join("\n") || "まだログはありません";
+}
+
+function engineSetupConfirm() {
+  return confirm("JD2エンジンの初期設定を開始します。\n\n" +
+    "取得元（公式の固定URL・SHA-256検証つき）:\n" +
+    "・Java 21 JRE（Eclipse Temurin 21.0.13+9）github.com/adoptium 約52MB\n" +
+    "・JDownloader.jar（公式インストーラ）installer.jdownloader.org 約5MB\n\n" +
+    "配置先: Hubの永続データ領域の engine/ フォルダ（QPKGには同梱しません）\n" +
+    "空き容量400MB以上が必要です。取得後、JD2が公式アップデートを自己適用するため時間がかかります。\n" +
+    "ダウンロードは自動開始しません。既存のDocker版JD2には触れません。\n\nよろしいですか？");
+}
+
+async function startEngineSetup() {
+  if (!engineSetupConfirm()) return;
+  await api("/api/engine/setup", {confirmed: true});
+  swrDrop("engine", "status");
+  flash("初期設定を開始しました");
+  applyEngine(await api("/api/engine/status"));
+}
+
+function wireEngine() {
+  $("engineSetup").addEventListener("click", () => perform(startEngineSetup));
+  $("homeEngineSetup").addEventListener("click", () => perform(async () => {
+    await startEngineSetup();
+    navigate("#/settings/engine");
+  }));
+  $("engineStart").addEventListener("click", () => perform(async () => {
+    await api("/api/engine/start", {});
+    swrDrop("engine", "status");
+    applyEngine(await api("/api/engine/status"));
+  }));
+  $("engineStop").addEventListener("click", () => perform(async () => {
+    if (!confirm("JD2エンジンを停止します。実行中のダウンロードは中断されます（最大30秒かかります）。よろしいですか？")) return;
+    $("engineStop").disabled = true;
+    await api("/api/engine/stop", {confirmed: true});
+    swrDrop("engine", "status", "jd2-status");
+    applyEngine(await api("/api/engine/status"));
+    flash("エンジンを停止しました");
+  }));
+  $("engineAutostart").addEventListener("change", () => perform(async () => {
+    const wanted = $("engineAutostart").checked;
+    try {
+      await api("/api/engine/autostart", {enabled: wanted});
+    } catch (e) {
+      $("engineAutostart").checked = !wanted;
+      throw e;
+    }
+    swrDrop("engine");
+    flash(wanted ? "Hub起動時にエンジンを自動起動します" : "自動起動をOFFにしました");
+  }));
+  $("engineTest").addEventListener("click", () => perform(async () => {
+    $("engineTestResult").textContent = "ローカル接続を確認しています。操作や更新は行いません。";
+    try {
+      const response = await api("/api/jd2/connect/test", {});
+      $("engineTestResult").textContent = "接続できました。Core revision " + response.revision +
+        " / 更新: " + (response.update_available ? "あり" : "なし");
+    } catch (err) {
+      $("engineTestResult").textContent = "接続できませんでした: " + err.message;
+    }
+  }));
+  $("engineLogButton").addEventListener("click", () => perform(async () => {
+    await loadEngineLog();
+    setShown("engineLog", true);
+  }));
+  document.addEventListener("visibilitychange", syncEnginePoll);
+}
+
 function wireSettings() {
   $("folderRoots").addEventListener("click", () => perform(() => folders("", true)));
   $("bookmarkForm").addEventListener("submit", event => {
@@ -1734,16 +1911,7 @@ function wireSettings() {
       "NASの127.0.0.1:3128にTCP接続できました。" : "NASの127.0.0.1:3128に接続できません。") +
       " JD2本体の確認・LAN隔離検証・操作の許可はまだ行っていません。";
   }));
-  $("jd2TestConnection").addEventListener("click", () => perform(async () => {
-    $("jd2TestResult").textContent = "JD2の認証済み接続を確認しています。操作や更新は行いません。";
-    try {
-      const response = await api("/api/jd2/connect/test", {});
-      $("jd2TestResult").textContent = "接続できました。Core revision " + response.revision +
-        " / 更新: " + (response.update_available ? "あり" : "なし");
-    } catch (err) {
-      $("jd2TestResult").textContent = "接続できませんでした: " + err.message;
-    }
-  }));
+  wireEngine();
   $("updateLogButton").addEventListener("click", () => perform(async () => {
     const result = await api("/api/update/log");
     $("updateLog").textContent = result.log || "まだ更新ログはありません";
