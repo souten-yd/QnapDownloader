@@ -84,6 +84,13 @@ class MyJDAdapter:
             device = client.get_device(device_id=names[0]["id"])
             if device is None:
                 raise MyJDUnavailable("指定JD2デバイスに接続できません")
+            # myjdapi 1.1.11's Jddevice enables direct LAN HTTP
+            # connections by DEFAULT. Disable them before any device
+            # action; missing/unsupported capability is fail closed.
+            disable = getattr(device, "disable_direct_connection", None)
+            if not callable(disable):
+                raise MyJDUnavailable("安全なMyJD接続モードを設定できません")
+            disable()
             self._client, self._device = client, device
             return device
         except MyJDUnavailable:
