@@ -2,7 +2,7 @@
 
 QNAP TS-253Be (QTS 5.x, x86_64)向け **JDownloader 2 + 安全なWebブラウザ／リンク収集／ダウンロード管理** 統合QPKGの設計リポジトリ。Rapidgatorリンク検出・ボタン化、Click'n'Load互換取り込み、サイト別の明示許可付き自動収集、ブックマーク、NAS側保存先選択を目指します。
 
-**現在の状態: v0.1.0 初期実装（PRレビュー中）**。管理者ログイン、NAS共有フォルダ選択/永続化、手動リンク保留、ブックマーク、更新確認とQPKG自己更新ワーカー、Web管理画面、QDKビルド定義を追加しました。**JD2の実際の接続・ダウンロード、内蔵ブラウザ、Rapidgator自動検出、広告遮断は未実装**であり、完了したとは表示しません。QPKGビルド・QNAP実機試験も未実施です。既存Docker版JDownloader 2や別QPKGは変更しません。
+**現在の状態: v0.1.1 手動LinkGrabber転送機能（PRレビュー中）**。管理者ログイン、NAS共有フォルダ選択/永続化、手動リンク保留、ブックマーク、更新確認とQPKG自己更新ワーカー、Web管理画面、QDKビルド定義を追加しました。**JD2接続アダプタと手動LinkGrabber転送は実装済みですが、JD2実機接続・実ダウンロードは未検証です。内蔵ブラウザ、Rapidgator自動検出、広告遮断は未実装**であり、完了したとは表示しません。QPKGビルド・QNAP実機試験も未実施です。既存Docker版JDownloader 2や別QPKGは変更しません。
 
 ## 仕様・開発ルール
 
@@ -61,3 +61,7 @@ cat "$(dirname "$INSTALL")/QnapDownloader-data/config/bootstrap-token"
 ## JD2への認証済み接続（任意）
 
 MyJDownloader認証済みアダプタを追加しました。QPKGへライブラリを同梱した場合、管理者がconfig/myjd.jsonを0600で設定することでJD2更新状態を照会できます。JD2本体の更新は明示的opt-inです。推奨設定の全項目再適用は、実機で設定キーと既存Packagizerルールの安全性を確認するまで無効です。詳細: [MyJD接続設定](docs/myjd-setup.md)。
+
+## 手動LinkGrabber転送（開発段階）
+
+保留リンクを1件ずつJD2へ手動送信するAPIと画面を追加しました。既存Dockerの保存先とNASのパスの対応は自動推測しません。管理者による明示設定と、自動確定/自動開始OFFの検証が必須です。Packagizerルール未検証時は追加opt-inを要求します。送信結果不明時は自動再送しません。詳細は[MyJD接続設定](docs/myjd-setup.md)。

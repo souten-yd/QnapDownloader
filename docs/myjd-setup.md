@@ -34,3 +34,19 @@ allow_jd2_updateは初期値false。trueの場合のみJD2公式Updaterの更新
 実機で全必須キーの実値・型・読戻し・rollbackを検証することが、推奨設定一括適用ボタンを有効にする条件です。
 
 API仕様: https://my.jdownloader.org/developers/
+
+## 保留リンクの手動LinkGrabber転送（次の段階）
+
+Hubのキューで「JD2に手動で送る」を押した場合に限りJD2へ送信します。自動クロール・自動開始・任意スクリプト実行はしません。ネットワークエラー後の送信成否が不明なリンクはuncertainで永続保持し、自動再送しません。
+
+実機上の既存Docker JD2ではNAS上のパスとJD2コンテナ内のパスが異なるため、管理者が `config/myjd.json` に次の項目を明示してください。
+
+```json
+{"nas_root":"/share/Download","jd2_root":"/downloads","allow_link_submit":true,"allow_unverified_packagizer":true}
+```
+
+※上記は既存myjd.jsonに追加するフィールドのみの例です。実際のパスはQNAP側とDockerマウント設定に合わせてください。
+
+`allow_unverified_packagizer`は**既存のPackagizerルールを確認した管理者のみ**trueにしてください。自動でPackagizerのルールを削除したり、サブフォルダ生成を強制OFFにすることはありません。JD2の実際の一般設定とPackagizerルールが未検証なら、フラット保存は保証できません。
+
+手動転送でもLinkGrabberの自動確定・自動開始が実際にOFFであることを送信直前に確認し、HTTPS URL・保存先マッピング・権限・明示的許可のいずれかが不明なら送信を停止します。送信直前の障害はuncertainとなるため、復旧前にJD2 LinkGrabberを確認してください。

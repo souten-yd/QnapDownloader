@@ -16,10 +16,11 @@ from urllib.parse import parse_qs, urlsplit
 import self_update
 import storage
 import jd2_control
+import jd2_transfer
 import jd2_myjd
 import updater
 
-VERSION = "0.1.0"
+VERSION = "0.1.1"
 PORT = 17864
 ROOT = Path(__file__).resolve().parent
 FILES = {"/": ("web/index.html", "text/html; charset=utf-8"),
@@ -322,6 +323,23 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_data(201, {"id": identifier})
             if path == "/api/links":
                 return self.send_data(201, self.store.add_link(body.get("url")))
+            if path == "/api/links/send":
+                chosen = checked_directory(self.store.settings().get("download_dir"))
+                ident = body.get("id")
+                # Serialize with JD2 independent update and preset reapply.
+                # The read-only preflight runs before the intent is marked
+                # sending; there is no automatic retry after uncertain sends.
+                with self.server.jd2.lock:
+                    adapter = self.server.jd2._require()
+                    jd2_transfer.prepare_transfer(adapter, str(chosen))
+                    url = self.store.begin_send(ident)
+                    try:
+                        outcome = jd2_transfer.transfer(adapter, url, str(chosen))
+                    except Exception:
+                        self.store.finish_send(ident, "uncertain")
+                        raise ValueError("JD2への送信結果が不明です。JD2で確認してください") from None
+                    self.store.finish_send(ident, "sent")
+                return self.send_data(200, outcome)
             if path == "/api/update/apply":
                 return self.send_data(202, self.server.updates.apply(body.get("version")))
             if path == "/api/jd2/update/check":

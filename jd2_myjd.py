@@ -156,6 +156,21 @@ class MyJDAdapter:
                                 "current": value, "handle": logical}
         return {"jd_revision": revision, "entries": entries}
 
+    def add_link(self, url, destination):
+        # No automatic download or Packagizer overwrite. JD2 may still have
+        # user-authored rules, which the transfer preflight independently checks.
+        if not isinstance(url, str) or not url.startswith("https://"):
+            raise MyJDUnavailable("HTTPSリンクのみ転送できます")
+        if not isinstance(destination, str) or not destination.startswith("/"):
+            raise MyJDUnavailable("JD2側の保存先が不正です")
+        return self._call("linkgrabber", "add_links", [{
+            "links": url,
+            "autostart": False,
+            "destinationFolder": destination,
+            "overwritePackagizerRules": False,
+            "priority": "DEFAULT"
+        }])
+
     def update_preset(self, logical, value):
         if logical not in KNOWN_BOOLEAN_KEYS or type(value) is not bool:
             raise MyJDUnavailable("未検証のJD2設定を変更できません")

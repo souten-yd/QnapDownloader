@@ -102,6 +102,8 @@ class HttpTests(unittest.TestCase):
         self.assertEqual(code, 201)
         self.assertEqual(body["state"], "staged")
         self.assertEqual(self.req("/api/links")[1]["items"][0]["state"], "staged")
+        self.assertEqual(self.req("/api/links/send", {"id": body["id"]})[0], 400)
+        self.assertEqual(self.req("/api/links")[1]["items"][0]["state"], "staged")
         self.assertEqual(self.req("/api/logout", {})[0], 200)
         self.assertEqual(self.req("/api/settings")[0], 401)
 
@@ -121,7 +123,7 @@ class HttpTests(unittest.TestCase):
         self.assertFalse(info["supported"])
         code, _ = self.req("/api/update/apply", {"version": "v0.1.1"})
         self.assertEqual(code, 400)
-        self.assertEqual(self.req("/api/health")[1]["version"], "0.1.0")
+        self.assertEqual(self.req("/api/health")[1]["version"], "0.1.1")
         self.assertFalse(self.req("/api/jd2/status")[1]["connected"])
         self.assertEqual(self.req("/api/jd2/update/apply", {"confirmed": True})[0], 400)
         self.assertEqual(self.req("/api/jd2/preset/apply", {"confirmed": True})[0], 400)

@@ -55,7 +55,24 @@ async function refresh(tab){
  if(tab==="queue"){
    clear("queueItems");
    const q=await api("/api/links");
-   for(const link of q.items)itemLine($("queueItems"),link.url,"保留中（JD2未登録）");
+   for(const link of q.items){
+    const container=element("div",undefined,"item");
+    container.appendChild(element("span",link.url));
+    const status=element("span",link.state==="staged"?"保留中（自動送信なし）":
+      link.state==="sending"||link.state==="uncertain"?"送信結果未確認・JD2で確認してください":
+      link.state==="sent"?"JD2へ送信済み":"状態: "+link.state);
+    container.appendChild(status);
+    if(link.state==="staged"){
+      const send=element("button","JD2に手動で送る","secondary");
+      send.addEventListener("click",()=>perform(async()=>{
+        if(!confirm("このリンクをJD2のLinkGrabberへ送ります。自動開始はOFFです。既存のPackagizerルールによりフォルダが変わる可能性があります。続けますか？"))return;
+        await api("/api/links/send",{id:link.id});await refresh("queue");
+        flash("JD2のLinkGrabberへ登録しました。処理はまだ開始していません");
+      }));
+      container.appendChild(send);
+    }
+    $("queueItems").appendChild(container);
+   }
  }
  if(tab==="bookmarks"){
    clear("bookmarkItems");

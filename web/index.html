@@ -9,7 +9,7 @@
 <script src="/app.js" defer></script>
 </head>
 <body>
-<header><div class="brand">◈ QnapDownloader <small>0.1.0</small></div><button id="logout" class="secondary hidden">ログアウト</button></header>
+<header><div class="brand">◈ QnapDownloader <small>0.1.1</small></div><button id="logout" class="secondary hidden">ログアウト</button></header>
 <main>
 <section id="setup" class="panel hidden">
   <h2>初期管理者設定</h2>
@@ -24,7 +24,7 @@
   <button id="loginButton">ログイン</button>
 </section>
 <section id="app" class="hidden">
- <div class="notice">初期開発版：ダウンロードエンジンとWebページ閲覧・自動ダウンロードは未実装です。以下のリンク登録は安全な保留キューに保存されるだけです。</div>
+ <div class="notice">初期開発版：ダウンロードエンジンとWebページ閲覧・自動ダウンロードは未実装です。リンクは保留キューに保存されます。認証済みJD2接続・管理者の明示許可・保存先確認後に限り、個別の「JD2に手動で送る」からLinkGrabberへ送信できます。</div>
  <nav><button data-tab="dashboard" class="active">概要</button><button data-tab="queue">リンク保留</button><button data-tab="bookmarks">ブックマーク</button><button data-tab="settings">設定</button><button data-tab="updates">アップデート</button></nav>
  <section id="dashboard" class="panel tab">
   <h2>ダッシュボード</h2><div id="status"></div>
