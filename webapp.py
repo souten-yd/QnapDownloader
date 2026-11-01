@@ -49,22 +49,29 @@ def checked_directory(path, roots=None):
 
 
 def public_host_allowed(host):
+    """Reject malformed or public Host values, including ambiguous IPv6 ports."""
+    if not isinstance(host, str) or len(host) > 255 or any(ch.isspace() for ch in host):
+        return False
     try:
-        hostname = urlsplit("http://" + host).hostname
-        if not hostname:
+        parsed = urlsplit("http://" + host)
+        hostname = parsed.hostname
+        port = parsed.port  # Parse/validate malformed port; it may be None.
+        if (not hostname or parsed.username is not None or parsed.password is not None or
+                parsed.path not in ("", "/") or parsed.query or parsed.fragment or
+                (port is not None and not 0 < port < 65536)):
             return False
-        hostname = hostname.lower()
-        if hostname == "localhost":
-            return True
+    except (ValueError, TypeError):
+        return False
+    hostname = hostname.lower()
+    if hostname == "localhost":
+        return True
+    try:
         address = ipaddress.ip_address(hostname)
-        # RFC6598 shared-address space is used by Tailscale and is not
-        # reported as is_private by Python's ipaddress module.
         return (address.is_private or address.is_loopback or
                 address in ipaddress.ip_network("100.64.0.0/10"))
     except ValueError:
         configured = os.environ.get("DOWNLOADER_ALLOWED_HOSTS", "")
-        return bool(hostname) and hostname in {
-            x.strip().lower() for x in configured.split(",") if x.strip()}
+        return hostname in {item.strip().lower() for item in configured.split(",") if item.strip()}
 
 
 class Handler(BaseHTTPRequestHandler):
