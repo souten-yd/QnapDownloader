@@ -15,7 +15,7 @@
 <script src="/app.js" defer></script>
 </head>
 <body>
-<header><div class="brand"><img src="/icon.svg" width="36" height="36" alt="" loading="eager"> QnapDownloader <small>0.1.5</small></div><button id="logout" class="secondary hidden">ログアウト</button></header>
+<header><div class="brand"><img src="/icon.svg" width="36" height="36" alt="" loading="eager"> QnapDownloader <small>0.1.6</small></div><button id="logout" class="secondary hidden">ログアウト</button></header>
 <main>
 <div id="lanSecurityWarning" class="notice hidden" role="note">この画面はHTTP接続です。パスワード保護はありますが通信は暗号化されません。信頼できる家庭内LANのみで利用し、外部公開しないでください。遠隔アクセスにはHTTPSリバースプロキシ／VPNを使用してください。</div>
 <section id="setup" class="panel hidden">
@@ -31,11 +31,11 @@
   <button id="loginButton">ログイン</button>
 </section>
 <section id="app" class="hidden">
- <div class="notice">初期開発版：Hub単体のダウンロードエンジン・内蔵ブラウザ・自動ダウンロードは未実装です。リンクは保留キューに保存されます。認証済みJD2接続・管理者の明示許可・保存先確認後に限り、個別の「JD2に手動で送る」からLinkGrabberへ送信できます。</div>
- <nav><button data-tab="dashboard" class="active">概要</button><button data-tab="queue">リンク保留</button><button data-tab="bookmarks">ブックマーク</button><button data-tab="settings">設定</button><button data-tab="updates">アップデート</button></nav>
+ <div class="notice">初期開発版：Hub単体のダウンロードエンジン・フル機能ブラウザ・自動ダウンロードは未実装です。リンクは保留キューに保存されます。認証済みJD2接続・管理者の明示許可・保存先確認後に限り、個別の「JD2に手動で送る」からLinkGrabberへ送信できます。</div>
+ <nav><button data-tab="dashboard" class="active">概要</button><button data-tab="queue">リンク保留</button><button data-tab="browser">安全ブラウザ</button><button data-tab="bookmarks">ブックマーク</button><button data-tab="settings">設定</button><button data-tab="updates">アップデート</button></nav>
  <section id="dashboard" class="panel tab">
   <h2>ダッシュボード</h2><div id="status"></div>
-  <p class="muted">Rapidgator貼り付け抽出と認証済みMyJDownloader接続は対応済みです。サイト自動巡回・内蔵ブラウザと実機でのJD2操作検証は今後の段階です。</p>
+  <p class="muted">Rapidgator貼り付け抽出と認証済みMyJDownloader接続は対応済みです。サイト自動巡回は未実装です。隔離型の軽量Web閲覧プレビューには対応していますが、埋め込み禁止サイトはSafariを利用してください。実機でのJD2操作検証は継続中です。</p>
  </section>
  <section id="queue" class="panel tab hidden">
   <h2>リンクの保留登録</h2><p>明示的に追加したHTTPSリンクを重複なく保存します。自動で取得・実行しません。</p>
@@ -48,6 +48,31 @@
   <div id="rapidgatorResult" class="items" role="status" aria-live="polite"></div>
   <h3>保留キュー</h3>
   <div id="queueItems" class="items"></div>
+ </section>
+ <section id="browser" class="panel tab hidden">
+  <h2>軽量安全ブラウザ（制限付きプレビュー）</h2>
+  <p class="muted">外部サイトは別の隔離されたiframeで読み込みます。NASサーバーが外部ページを取得・保存することはありません。埋め込みを禁止するサイトやログイン/Cloudflare等の操作は表示できないことがあります。</p>
+  <label>閲覧する公開HTTPS URL<input id="browserUrl" type="url" maxlength="2048" autocomplete="off" spellcheck="false" placeholder="https://rapidgator.net/"></label>
+  <div class="browser-tools">
+    <button id="browserOpen">隔離プレビューを開く</button>
+    <button id="browserBack" class="secondary" disabled>戻る</button>
+    <button id="browserForward" class="secondary" disabled>進む</button>
+    <button id="browserClose" class="secondary">プレビューを閉じる</button>
+  </div>
+  <label>隔離モード
+    <select id="browserMode">
+      <option value="strict">強い制限（スクリプト・フォーム不可）</option>
+      <option value="interactive">限定操作（スクリプト・フォーム可、同一オリジン権限なし）</option>
+    </select>
+  </label>
+  <p class="muted">限定操作でもポップアップ・ダウンロード・親画面の操作・同一オリジン権限は許可しません。サイトの動作や安全性を保証するものではありません。</p>
+  <div id="browserStatus" class="muted" role="status" aria-live="polite">URLを入力して「隔離プレビューを開く」を押してください。</div>
+  <div class="browser-frame-box"><iframe id="browserFrame" title="外部サイトの隔離プレビュー" sandbox="" referrerpolicy="no-referrer" loading="lazy"></iframe></div>
+  <div class="browser-tools">
+    <button id="browserOpenSafari" class="secondary" disabled>Safariで開く</button>
+    <button id="browserQueue" class="secondary" disabled>表示中のURLを保留キューへ</button>
+  </div>
+  <p class="muted">iframe内で遷移したリンク先URLは権限分離のため読み取れません。「URLを保留キューへ」はアドレス欄で検証したURLのみを登録し、自動送信・ダウンロードはしません。Safariのページのリンクを取り込む場合はURLをコピーして貼り付けてください。</p>
  </section>
  <section id="bookmarks" class="panel tab hidden">
   <h2>ブックマーク</h2>
@@ -76,11 +101,18 @@
  </section>
  <section id="updates" class="panel tab hidden">
   <h2>アップデート</h2>
-  <h3>QnapDownloader Hubの更新</h3><p>QnapSelfCare方式：Hubの新しい正式QPKGを検出し、SHA-256検証・DBバックアップ・QPKG適用・起動検証を実施します。JDownloader 2本体の更新には影響しません。</p>
+  <h3>QnapDownloader Hubの更新</h3><p>QnapSelfCare方式：選択したチャンネルの新しいQPKGを検出し、SHA-256検証・DBバックアップ・QPKG適用・起動検証を実施します。JDownloader 2本体の更新には影響しません。</p>
+  <label>更新チャンネル
+   <select id="updateChannel">
+     <option value="rc" selected>RC版も含む（プレリリース・試験用）</option>
+     <option value="stable">正式版のみ</option>
+   </select>
+  </label>
+  <p class="muted">現在のQnapDownloaderはRC版で提供されています。RCチャンネルは手動更新時にのみ利用し、自動インストールは行いません。</p>
   <button id="updateCheck">更新を確認</button><p id="updateResult"></p><button id="updateApply" class="hidden">検証して更新する</button>
   <div id="updateStatus" class="muted"></div>
   <button id="updateLogButton" class="secondary">更新ログを表示</button><pre id="updateLog" class="update-log hidden"></pre>
-  <p class="muted">QNAPにQPKGとしてインストールされた環境のみ適用できます。公開Releaseがない場合は更新できません。</p>
+  <p class="muted">QNAPにQPKGとしてインストールされた環境のみ適用できます。選択したチャンネルに新しい公開Releaseがない場合は更新できません。</p>
   <hr><h3>JDownloader 2の単独更新と推奨設定</h3>
   <p>JD2は公式の更新機能を使用し、Hubとは独立してCore/ホストプラグインを更新します。設定が変わった場合はHub側で差分を確認し、推奨設定を再適用します。</p>
   <p id="jd2Status" class="muted">MyJDownloaderを設定してください。実機の接続状態と、許可済み操作を確認します。</p>
