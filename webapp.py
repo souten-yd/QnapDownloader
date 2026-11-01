@@ -16,6 +16,7 @@ from urllib.parse import parse_qs, urlsplit
 import self_update
 import storage
 import jd2_control
+import jd2_myjd
 import updater
 
 VERSION = "0.1.0"
@@ -366,7 +367,7 @@ def main():
     server.secure_cookies = args.secure_cookie
     server.bootstrap_token = "" if store.has_admin() else bootstrap(data)
     server.updates = self_update.UpdateManager(data, ROOT, VERSION, "x86_64", args.port)
-    server.jd2 = jd2_control.JD2Controller()
+    server.jd2 = jd2_control.JD2Controller(jd2_myjd.configured_adapter(data))
     try:
         server.serve_forever(poll_interval=0.5)
     finally:
