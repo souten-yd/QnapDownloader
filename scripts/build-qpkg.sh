@@ -12,7 +12,7 @@ trap 'rm -rf "$WORK"' EXIT
 mkdir -p "$WORK/shared" "$OUTPUT"
 cp "$ROOT/qpkg/qpkg.cfg" "$WORK/qpkg.cfg"
 cp "$ROOT/qpkg/package_routines" "$WORK/package_routines"
-cp "$ROOT"/{webapp.py,storage.py,updater.py,self_update.py,durability.py,jd2_policy.py,jd2_control.py,jd2_myjd.py,jd2_transfer.py,rapidgator_extract.py,README.md} "$WORK/shared/"
+cp "$ROOT"/{webapp.py,storage.py,updater.py,self_update.py,durability.py,jd2_policy.py,jd2_control.py,jd2_myjd.py,jd2_transfer.py,rapidgator_extract.py,browser_safety.py,README.md} "$WORK/shared/"
 cp "$ROOT"/qpkg/shared/{downloader.sh,downloader_pid.py,python3-path,downloader-diagnose} "$WORK/shared/"
 cp -R "$ROOT/web" "$WORK/shared/web"
 python3 "$ROOT/scripts/render-icons.py" "$WORK/shared/web" "$WORK/icons"
