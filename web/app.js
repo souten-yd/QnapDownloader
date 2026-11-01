@@ -45,12 +45,18 @@ async function refresh(tab){
   const s=await api("/api/status");
   $("status").replaceChildren();
   itemLine($("status"),"Web管理画面：稼働中","version "+s.version+" / 設定改訂 "+s.settings_revision);
-  itemLine($("status"),"JDownloader 2：未接続",s.jd2.reason);
+  itemLine($("status"),"JDownloader 2："+(s.jd2.connected?"接続中":"未接続"),s.jd2.connected?("Core revision "+s.jd2.revision):(s.jd2.reason||"接続設定を確認してください"));
  }
  if(tab==="settings"){
    const s=await api("/api/settings");
    $("selectedFolder").textContent=s.download_dir ? "保存先："+s.download_dir : "保存先：未選択";
    await folders("");
+   const cfg=await api("/api/jd2/config");
+   $("jd2ConfigState").textContent=cfg.configured ?
+     "MyJD設定済み / デバイス: "+cfg.device_name+
+       " / JD2更新: "+(cfg.can_update?"明示許可済み":"無効")+
+       " / リンク送信: "+(cfg.can_send?"明示許可済み":"無効") :
+     "MyJD未設定: "+(cfg.reason||"接続設定を作成してください");
  }
  if(tab==="queue"){
    clear("queueItems");
@@ -175,6 +181,16 @@ document.addEventListener("DOMContentLoaded",()=>{
  $("bookmarkAdd").addEventListener("click",()=>perform(async()=>{
   await api("/api/bookmarks",{title:$("bookmarkName").value,url:$("bookmarkUrl").value.trim()});
   $("bookmarkName").value="";$("bookmarkUrl").value="";await refresh("bookmarks");
+ }));
+ $("jd2TestConnection").addEventListener("click",()=>perform(async()=>{
+  $("jd2TestResult").textContent="JD2の認証済み接続を確認しています。操作や更新は行いません。";
+  try {
+    const response=await api("/api/jd2/connect/test",{});
+    $("jd2TestResult").textContent="接続できました。Core revision "+response.revision+
+      " / 更新: "+(response.update_available?"あり":"なし");
+  } catch(err) {
+    $("jd2TestResult").textContent="接続できませんでした: "+err.message;
+  }
  }));
  $("folderRoots").addEventListener("click",()=>perform(()=>folders("")));
  $("updateLogButton").addEventListener("click",()=>perform(async()=>{

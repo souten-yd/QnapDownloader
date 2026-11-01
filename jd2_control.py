@@ -1,7 +1,6 @@
-"""JD2 independent update coordinator.
+"""JD2 independent update coordinator using opt-in authenticated MyJD.
 
-The authenticated adapter is intentionally not instantiated until the concrete
-MyJDownloader integration is verified. Never use an unprotected LAN legacy API.
+No unprotected LAN legacy API. Does not install or configure JD2 automatically.
 """
 import threading
 
@@ -16,12 +15,12 @@ class JD2Controller:
 
     def _require(self):
         if self.adapter is None:
-            raise PresetUnavailable("JDownloader 2接続アダプタは未実装です")
+            raise PresetUnavailable("JDownloader 2への接続が未設定です")
         return self.adapter
 
     def status(self):
         if self.adapter is None:
-            return {"connected": False, "reason": "JD2接続アダプタ未実装",
+            return {"connected": False, "reason": "MyJDownloader未設定。設定画面の手順を確認してください",
                     "can_update": False, "can_preset": False}
         with self.lock:
             try:
@@ -32,6 +31,14 @@ class JD2Controller:
             except Exception as error:
                 return {"connected": False, "reason": str(error),
                         "can_update": False, "can_preset": False}
+
+    def connection_test(self):
+        """Explicit read-only probe; never starts an update/download."""
+        with self.lock:
+            adapter = self._require()
+            return {"connected": True, "revision": adapter.core_revision(),
+                    "update_available": adapter.is_update_available(),
+                    "can_update": getattr(adapter, "allow_update", False)}
 
     def update_check(self):
         with self.lock:

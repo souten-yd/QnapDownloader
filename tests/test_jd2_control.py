@@ -45,6 +45,16 @@ class ControllerTests(unittest.TestCase):
         with self.assertRaises(jd2_policy.PresetUnavailable):
             ctrl.restart_and_update(confirmed=True)
 
+    def test_explicit_connection_probe_is_read_only(self):
+        adapter=Adapter()
+        ctrl=jd2_control.JD2Controller(adapter)
+        status=ctrl.connection_test()
+        self.assertEqual(status["revision"], "jd2-core-2026")
+        self.assertTrue(status["connected"])
+        self.assertTrue(status["update_available"])
+        self.assertEqual(adapter.update_count, 0)
+        self.assertTrue(all(adapter.values.values()))
+
     def test_jd_update_does_not_call_hub_updater(self):
         jd = Adapter()
         ctl = jd2_control.JD2Controller(jd)

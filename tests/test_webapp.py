@@ -101,7 +101,7 @@ class HttpTests(unittest.TestCase):
                                          headers={"Host": "192.168.68.57:17864"})
         with self.client.open(request, timeout=4) as response:
             self.assertEqual(response.status, 200)
-            self.assertEqual(json.load(response)["version"], "0.1.4")
+            self.assertEqual(json.load(response)["version"], "0.1.5")
         with self.client.open(self.url + "/icon.svg", timeout=4) as response:
             self.assertEqual(response.status, 200)
             self.assertEqual(response.headers.get_content_type(), "image/svg+xml")
@@ -179,6 +179,25 @@ class HttpTests(unittest.TestCase):
             self.assertEqual(response.status, 201)
         self.assertTrue(self.store.has_admin())
 
+    def test_csp_allows_first_party_icons_but_blocks_iframes(self):
+        req = urllib.request.Request(self.url + "/icon.svg")
+        with self.client.open(req, timeout=4) as response:
+            csp = response.headers.get("Content-Security-Policy")
+            self.assertIn("img-src 'self'", csp)
+            self.assertIn("frame-ancestors 'none'", csp)
+            self.assertEqual(response.headers.get("X-Frame-Options"), "DENY")
+
+    def test_authenticated_myjd_setup_status_and_read_only_probe(self):
+        self.assertEqual(self.req("/api/jd2/config")[0], 401)
+        self.assertEqual(self.req("/api/jd2/connect/test", {})[0], 401)
+        self.login()
+        code, cfg = self.req("/api/jd2/config")
+        self.assertEqual(code, 200)
+        self.assertFalse(cfg["configured"])
+        self.assertNotIn("password", cfg)
+        self.assertEqual(self.req("/api/jd2/connect/test", {}, csrf=False)[0], 403)
+        self.assertEqual(self.req("/api/jd2/connect/test", {})[0], 400)
+
     def test_folder_picker_persists_allowed_path_only(self):
         folder = self.allowed / "subdir"
         folder.mkdir()
@@ -232,9 +251,9 @@ class HttpTests(unittest.TestCase):
         self.login()
         info = self.req("/api/update/status")[1]
         self.assertFalse(info["supported"])
-        code, _ = self.req("/api/update/apply", {"version": "v0.1.4"})
+        code, _ = self.req("/api/update/apply", {"version": "v0.1.5"})
         self.assertEqual(code, 400)
-        self.assertEqual(self.req("/api/health")[1]["version"], "0.1.4")
+        self.assertEqual(self.req("/api/health")[1]["version"], "0.1.5")
         self.assertFalse(self.req("/api/jd2/status")[1]["connected"])
         self.assertEqual(self.req("/api/jd2/update/apply", {"confirmed": True})[0], 400)
         self.assertEqual(self.req("/api/jd2/preset/apply", {"confirmed": True})[0], 400)

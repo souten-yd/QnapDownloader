@@ -15,7 +15,7 @@
 <script src="/app.js" defer></script>
 </head>
 <body>
-<header><div class="brand"><img src="/icon.svg" width="36" height="36" alt="" loading="eager"> QnapDownloader <small>0.1.4</small></div><button id="logout" class="secondary hidden">ログアウト</button></header>
+<header><div class="brand"><img src="/icon.svg" width="36" height="36" alt="" loading="eager"> QnapDownloader <small>0.1.5</small></div><button id="logout" class="secondary hidden">ログアウト</button></header>
 <main>
 <div id="lanSecurityWarning" class="notice hidden" role="note">この画面はHTTP接続です。パスワード保護はありますが通信は暗号化されません。信頼できる家庭内LANのみで利用し、外部公開しないでください。遠隔アクセスにはHTTPSリバースプロキシ／VPNを使用してください。</div>
 <section id="setup" class="panel hidden">
@@ -31,11 +31,11 @@
   <button id="loginButton">ログイン</button>
 </section>
 <section id="app" class="hidden">
- <div class="notice">初期開発版：ダウンロードエンジンとWebページ閲覧・自動ダウンロードは未実装です。リンクは保留キューに保存されます。認証済みJD2接続・管理者の明示許可・保存先確認後に限り、個別の「JD2に手動で送る」からLinkGrabberへ送信できます。</div>
+ <div class="notice">初期開発版：Hub単体のダウンロードエンジン・内蔵ブラウザ・自動ダウンロードは未実装です。リンクは保留キューに保存されます。認証済みJD2接続・管理者の明示許可・保存先確認後に限り、個別の「JD2に手動で送る」からLinkGrabberへ送信できます。</div>
  <nav><button data-tab="dashboard" class="active">概要</button><button data-tab="queue">リンク保留</button><button data-tab="bookmarks">ブックマーク</button><button data-tab="settings">設定</button><button data-tab="updates">アップデート</button></nav>
  <section id="dashboard" class="panel tab">
   <h2>ダッシュボード</h2><div id="status"></div>
-  <p class="muted">リンク収集・Rapidgator判別・安全ブラウザ・JDownloader接続は次の開発段階で追加します。</p>
+  <p class="muted">Rapidgator貼り付け抽出と認証済みMyJDownloader接続は対応済みです。サイト自動巡回・内蔵ブラウザと実機でのJD2操作検証は今後の段階です。</p>
  </section>
  <section id="queue" class="panel tab hidden">
   <h2>リンクの保留登録</h2><p>明示的に追加したHTTPSリンクを重複なく保存します。自動で取得・実行しません。</p>
@@ -67,6 +67,12 @@
   <p id="selectedFolder"></p>
   <div id="folderPicker"></div>
   <button id="folderRoots" class="secondary">共有フォルダから選び直す</button>
+  <hr><h3>JDownloader 2 接続設定</h3>
+  <p id="jd2ConfigState" class="muted">接続設定を確認しています。</p>
+  <p class="muted">MyJDownloaderの認証済みAPIを使用します。接続先の設定ファイルはQPKGの永続データ領域の <code>config/myjd.json</code> です。現時点では資格情報をHTTP画面から送信せず、NASのSSHから権限0600で登録します。</p>
+  <button id="jd2TestConnection" class="secondary">JD2接続をテストする</button>
+  <p id="jd2TestResult" class="muted" role="status" aria-live="polite"></p>
+  <p><a href="https://github.com/souten-yd/QnapDownloader/blob/main/docs/myjd-setup.md" target="_blank" rel="noopener noreferrer">MyJDownloader接続の設定手順</a></p>
  </section>
  <section id="updates" class="panel tab hidden">
   <h2>アップデート</h2>
@@ -77,7 +83,7 @@
   <p class="muted">QNAPにQPKGとしてインストールされた環境のみ適用できます。公開Releaseがない場合は更新できません。</p>
   <hr><h3>JDownloader 2の単独更新と推奨設定</h3>
   <p>JD2は公式の更新機能を使用し、Hubとは独立してCore/ホストプラグインを更新します。設定が変わった場合はHub側で差分を確認し、推奨設定を再適用します。</p>
-  <p id="jd2Status" class="muted">接続アダプタの実装待ちです。現段階ではJD2の更新/設定変更は実行できません。</p>
+  <p id="jd2Status" class="muted">MyJDownloaderを設定してください。実機の接続状態と、許可済み操作を確認します。</p>
   <button id="jd2Check" class="secondary" disabled>JD2の更新を確認</button>
   <button id="jd2Update" disabled>JD2だけ更新する（接続後に有効）</button>
   <button id="jd2Preset" class="secondary" disabled>推奨設定を確認して再適用（接続後に有効）</button>
