@@ -277,13 +277,24 @@ class Handler(BaseHTTPRequestHandler):
                         return self.reject("ログイン試行が多すぎます", 429)
                 if not self.store.check_password(body.get("password")):
                     with SESSION_LOCK:
+                        # Bound the per-address retry tracker against memory abuse.
+                        if address not in FAILED and len(FAILED) >= 256:
+                            oldest = min(FAILED, key=lambda key: FAILED[key][-1] if FAILED[key] else 0)
+                            FAILED.pop(oldest, None)
                         FAILED[address] = attempts + [time.time()]
                     return self.reject("パスワードが正しくありません", 401)
                 with SESSION_LOCK:
                     FAILED.pop(address, None)
+                    now = time.time()
+                    for key, data in list(SESSIONS.items()):
+                        if data["until"] <= now:
+                            SESSIONS.pop(key, None)
+                    if len(SESSIONS) >= 128:
+                        oldest = min(SESSIONS, key=lambda key: SESSIONS[key]["until"])
+                        SESSIONS.pop(oldest, None)
                     sid = secrets.token_urlsafe(32)
                     csrf = secrets.token_urlsafe(32)
-                    SESSIONS[sid] = {"csrf": csrf, "until": time.time()+8*3600}
+                    SESSIONS[sid] = {"csrf": csrf, "until": now+8*3600}
                 self.set_cookie(sid, 8*3600)
                 return self.send_data(200, {"ok": True, "csrf": csrf})
             if not self.authorize(write=True):
