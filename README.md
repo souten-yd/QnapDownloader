@@ -10,6 +10,8 @@ QNAP TS-253Be (QTS 5.x, x86_64)向け **JDownloader 2 + 安全なWebブラウザ
 - [推奨設定・フラット保存・NASフォルダ選択](docs/storage-and-presets.md)
 - [広告・悪意ある遷移・NAS保護の安全設計](docs/security.md)
 - [実装計画と受け入れ試験](docs/implementation-plan.md)
+- [内蔵JD2/Java・単一Web UI・独立更新と低I/Oアーキテクチャ](docs/embedded-jd2-architecture.md)
+- [プレミアムアカウント管理・認証情報保護・公式JD2 API対応](docs/premium-accounts-design.md)
 - [QnapSelfCare準拠の開発ワークフロー](DEVELOPMENT_WORKFLOW.md)
 - [GitHub main保護・PR作成制限の適用方法](docs/github-protection.md)
 
@@ -22,6 +24,12 @@ QNAP TS-253Be (QTS 5.x, x86_64)向け **JDownloader 2 + 安全なWebブラウザ
 5. 広告・トラッキング・危険なポップアップ・勝手な遷移とダウンロードをブロック。Cloudflare等の正規認証は対応可能な標準ブラウザで手動実施する。
 6. 確定データは耐障害性を確保し、進捗表示・遮断件数・一時キャッシュはRAM主体でNAS HDDへの無駄な読み書きを抑える。
 7. GitHub mainへの変更はPR経由、PR作成は書き込み権限あるコラボレーター/管理者のみ。GitHub側の保護設定は管理者による別途適用が必要。
+
+## 内蔵JD2・Javaとプレミアムアカウント管理の今後の方針
+
+**推奨設計はQPKG内のヘッドレスJD2 + フルJavaランタイム + QnapDownloader Web UIを唯一の操作画面とする構成**です。進捗・開始/停止/再開・リンク収集・ホスト別プレミアムアカウント（追加、期限/残容量、再認証、無効化、削除）・Hub/JD2/Javaの独立更新を一画面にまとめます。
+
+現行v0.1.6にはJD2とJavaのバイナリは同梱されておらず、アカウント管理や実ダウンロードUIも**未実装**です。配布ライセンス、公式JD2署名、ローカル認証ブリッジ、実RAM（TS-253Be 2/4/8GB）を先に検証します。RAMのtmpfs展開はオプションで、パスワード/キュー/設定・JD2更新内容は永続保存し、ディスク書込ゼロは約束しません。既存Docker版JD2は変更しません。
 
 ## 開発前の調査
 
