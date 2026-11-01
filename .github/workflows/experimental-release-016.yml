@@ -1,0 +1,44 @@
+name: Publish QnapDownloader v0.1.6-rc1 RC updater and sandbox browser
+on:
+  push:
+    branches: [release/experimental-0.1.6-rc1]
+permissions:
+  contents: write
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Verify source with full regression and safety checks
+        run: bash scripts/verify.sh
+      - name: Install QDK and build-time icon dependencies
+        run: |
+          curl -fLSs --retry 2 https://github.com/qnap-dev/QDK/releases/download/v2.5.3/qdk_2.5.3_amd64.deb -o /tmp/qdk.deb
+          sudo apt-get update -qq
+          sudo apt-get install -y /tmp/qdk.deb rsync
+          python3 -m pip install --disable-pip-version-check 'cairosvg==2.8.2' 'pillow>=10,<13'
+          python3 -m pip install --disable-pip-version-check --only-binary=:all: --target vendor -r requirements-jd2-build.txt
+      - name: Build verified x86_64 package
+        run: |
+          bash scripts/build-qpkg.sh x86_64 dist
+          (cd dist && sha256sum QnapDownloader_0.1.6_x86_64.qpkg > SHA256SUMS && sha256sum -c SHA256SUMS)
+      - name: Publish experimental prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view v0.1.6-rc1 >/dev/null 2>&1; then
+            echo 'Release tag already exists; refusing to overwrite'
+            exit 1
+          fi
+          gh release create v0.1.6-rc1 dist/QnapDownloader_0.1.6_x86_64.qpkg dist/SHA256SUMS \
+            --repo "${{ github.repository }}" --target "29c4692939455d2408338191675c476299c17e87" \
+            --title "QnapDownloader v0.1.6-rc1: RC update detection and isolated lightweight browser" \
+            --prerelease \
+            --notes "Experimental QNAP x86_64 QPKG. FIX: GitHub prerelease RC versions were ignored by the stable-only update API. Update page now defaults to RC-inclusive manual update mode, with optional stable-only mode. GitHub asset SHA-256, exact release tag, SQLite backup, installer checks and post-update health remain mandatory. NEW: light browser tab using a strongly sandboxed client-side iframe, no same-origin or automatic downloads; limited opt-in scripts/forms. Websites may block embedding and can be opened in Safari instead. No backend proxy/fetch, no Cloudflare bypass, no automatic JD2 downloads or browser link harvesting. 83 tests and QDK build passed; actual QNAP/Safari behavior still requires hardware validation. IMPORTANT: users on v0.1.5 or older must manually install this QPKG once because their old updater cannot see RC releases. Never port-forward HTTP 17864 to Internet."
