@@ -30,10 +30,29 @@ SESSION_LOCK = threading.RLock()
 
 
 def allowed_roots():
-    roots = os.environ.get("DOWNLOADER_ALLOWED_ROOTS", "/share/Download").split(":")
-    return [p.resolve() for text in roots if text and
-            (p := Path(text)).is_dir() and not p.is_symlink() or
-            text and (p := Path(text)).is_symlink() and p.resolve().is_dir()]
+    """Only existing QNAP shared folders, never arbitrary system directories.
+
+    /share/Download is often a QTS symlink to a mounted CACHEDEV volume.
+    Resolve it only after validating that the lexical root belongs to /share.
+    """
+    result = []
+    values = os.environ.get("DOWNLOADER_ALLOWED_ROOTS", "/share/Download").split(":")
+    for value in values:
+        if not value or not value.startswith("/share/"):
+            continue
+        original = Path(value)
+        if ".." in original.parts:
+            continue
+        try:
+            resolved = original.resolve(strict=True)
+            if (resolved.is_dir() and
+                    (str(resolved).startswith("/share/") or
+                     str(resolved).startswith("/mnt/") and original.is_symlink()) and
+                    resolved not in result):
+                result.append(resolved)
+        except (ValueError, OSError):
+            continue
+    return result
 
 
 def checked_directory(path, roots=None):
