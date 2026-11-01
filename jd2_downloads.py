@@ -81,7 +81,7 @@ def snapshot(packages, links, page):
         if not isinstance(value, list) or len(value) > PAGE_SIZE:
             raise ValueError("JD2のダウンロード情報が上限を超えています")
     return {
-        "source": "myjd-remote-readonly",
+        "source": "local-readonly",
         "page": page,
         "page_size": PAGE_SIZE,
         "packages": [_normalize(entry, True) for entry in packages],

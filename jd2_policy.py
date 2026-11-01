@@ -1,7 +1,7 @@
 """Independent JD2 update and safe preset re-application contract.
 
 JD2's own updater is NEVER replaced by the Hub QPKG updater.
-A concrete authenticated MyJDownloader adapter must be connected before applying.
+The Hub-managed local engine adapter (jd2_local.py) must be connected before applying.
 """
 REQUIRED = (
     "linkgrabber.auto_confirm",
@@ -11,6 +11,13 @@ REQUIRED = (
     "extraction.auto_extract",
     "downloads.auto_start",
 )
+
+# These two keys are documented by JD2; all other settings remain unsupported
+# until their exact AdvancedConfig metadata is observed on the real engine.
+KNOWN_BOOLEAN_KEYS = {
+    "linkgrabber.auto_confirm": ("linkgrabber", "linkgrabberautoconfirmenabled"),
+    "linkgrabber.auto_start": ("linkgrabber", "linkgrabberautostartenabled"),
+}
 
 LABELS = {
     "linkgrabber.auto_confirm": "リンク自動確定",

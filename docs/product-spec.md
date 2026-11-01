@@ -88,7 +88,7 @@ JD2アダプタ（正式API優先; バージョン差異検出）
 ### LK-02 CNL
 - CNL2のプレーンリンク/対応コンテナをユーザー操作から取り込み、JD2のLinkGrabberへ渡す。
 - CNL2は原来`127.0.0.1:9666`にPOSTする方式であり、端末のlocalhostはNASのlocalhostではない。Webアプリは独自の認証付きNAS APIへ正しく橋渡しする。localhostポートをLANに無認証公開しない。
-- サイト固有の暗号化コンテナや互換性差異は、JD2連携と実サイトテストに基づき順次対応。非対応時はURL貼り付け/公式MyJDownloader拡張で代替。
+- サイト固有の暗号化コンテナや互換性差異は、JD2連携と実サイトテストに基づき順次対応。非対応時はURL貼り付けで代替。
 - JD2側での解析・リンク抽出後、ファイル名・容量・オンライン状態・要認証/要CAPTCHA状態を表示する。
 
 ### LK-03 自動収集・自動開始ポリシー
@@ -156,7 +156,7 @@ JD2アダプタ（正式API優先; バージョン差異検出）
 - 現行のJD2更新を無条件に止めたり、署名・証明書検証を無効化しない。
 
 ### JD-03 エンジンモード
-- **接続モード**: 既存JD2の正式API/MyJDownloader等のサポート済み経路で接続し、権限と接続状態を検査。外部エンジンの停止/再起動は無断実行しない。
+- **接続モード**: Hub管理のローカルJD2エンジン（v0.1.11、docs/engine-setup.md。MyJDownloader連携は削除）に接続し、権限と接続状態を検査。外部エンジンの停止/再起動は無断実行しない。
 - **内蔵モード**: Javaランタイムの適合性確認、ヘッドレス起動、PID管理、停止時の正常終了、更新後の再起動、異常終了時バックオフ、ローカル管理ポートの限定公開。
 - 同一ダウンロード先を複数エンジンが競合利用しないよう警告。既存コンテナを削除・変更せず併用可能性を検証。
 
@@ -311,7 +311,7 @@ QNAP再起動/停電復元、RAM 2/4/8GB条件、ストレージ負荷、広告/
 ## 15. 調査済み一次資料
 
 - QNAP TS-253Be 製品仕様: https://www.qnap.com/ja-jp/product/ts-253be/specs/software
-- JDownloader MyJDownloader API: https://my.jdownloader.org/developers/
+- JDownloader MyJDownloader API: https://my.jdownloader.org/developers/ （履歴。MyJD連携はv0.1.11で削除）
 - JDownloader CNL2: https://jdownloader.org/knowledge/wiki/glossary/cnl2
 - JDownloader CNL FAQ: https://support.jdownloader.org/en/knowledgebase/article/click-and-load-does-not-work
 - JDownloader NAS運用: https://support.jdownloader.org/de/knowledgebase/article/install-jdownloader-on-nas-and-embedded-devices

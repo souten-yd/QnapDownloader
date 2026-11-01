@@ -1,7 +1,8 @@
 """Explicit JD2 LinkGrabber handoff; never auto-fetch or start downloads.
 
 All paths must be configured by a NAS administrator. A host path is not
-assumed to be visible to an external Docker JD2 instance.
+assumed to be visible to an external Docker JD2 instance. The Hub-managed
+engine runs on the same host (same_host option).
 """
 from pathlib import Path, PurePosixPath
 import os
@@ -14,6 +15,15 @@ class TransferBlocked(ValueError):
 def jd2_destination(selected, options):
     if not isinstance(selected, str) or not selected.startswith("/"):
         raise TransferBlocked("NASの保存先を選択してください")
+    if options.get("same_host") is True:
+        # Hub-managed engine runs on the same host: no path mapping needed.
+        try:
+            chosen = Path(selected).resolve(strict=True)
+        except (OSError, ValueError):
+            raise TransferBlocked("保存先フォルダが存在しません") from None
+        if not chosen.is_dir() or not os.access(chosen, os.W_OK):
+            raise TransferBlocked("NAS保存先が書き込み可能ではありません")
+        return str(chosen)
     host_base = options.get("nas_root")
     target_base = options.get("jd2_root")
     if not all(isinstance(x, str) and x.startswith("/") for x in (host_base, target_base)):

@@ -265,3 +265,18 @@ a.status-card:hover{border-color:var(--accent)}
   .view:not(.view-web):not([hidden]){animation:none}
   *,*::before,*::after{animation:none!important;transition:none!important}
 }
+
+/* JD2 engine settings (v0.1.11) */
+.engine-state{font-weight:600;margin:6px 0}
+.engine-error{color:var(--danger);background:var(--danger-soft);border-radius:6px;padding:9px 12px;overflow-wrap:anywhere}
+.engine-steps{list-style:none;margin:10px 0 14px;padding:0;display:grid;gap:6px}
+.engine-step{display:flex;gap:10px;align-items:flex-start;padding:8px 10px;border:1px solid var(--border);border-radius:8px;background:var(--surface);overflow-wrap:anywhere}
+.engine-step .step-mark{flex:0 0 1.6em;text-align:center;font-weight:700;color:var(--muted)}
+.engine-step .step-body{flex:1;min-width:0}
+.engine-step .step-detail{color:var(--muted);font-size:12.5px}
+.engine-step progress{display:block;width:100%;height:8px;margin-top:6px}
+.engine-step.is-done .step-mark{color:var(--ok)}
+.engine-step.is-warn .step-mark{color:var(--warn)}
+.engine-step.is-failed{border-color:var(--danger)}
+.engine-step.is-failed .step-mark{color:var(--danger)}
+.engine-step.is-running{border-color:var(--accent);background:var(--accent-soft)}

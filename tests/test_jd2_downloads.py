@@ -1,7 +1,7 @@
 import unittest
 from unittest.mock import Mock
 import jd2_downloads as view
-import jd2_myjd
+import jd2_local
 
 
 class DownloadViewTests(unittest.TestCase):
@@ -34,7 +34,7 @@ class DownloadViewTests(unittest.TestCase):
         self.assertEqual(payload["packages"][0]["child_count"], 2)
         self.assertEqual(payload["links"][0]["host"], "rapidgator.net")
         self.assertEqual(payload["links"][0]["eta_seconds"], 5)
-        self.assertEqual(payload["source"], "myjd-remote-readonly")
+        self.assertEqual(payload["source"], "local-readonly")
         self.assertNotIn("super-secret", str(payload))
         self.assertNotIn("/share/private", str(payload))
         self.assertNotIn("example.com/private", str(payload))
@@ -61,26 +61,33 @@ class DownloadViewTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             view.snapshot([], [None], 0)
 
-    def test_adapter_uses_actual_query_methods_without_mutations(self):
-        packages = Mock(return_value=[{"name":"Pictures","bytesTotal": 50}])
-        links = Mock(return_value=[{"name":"a.zip","bytesLoaded":5,"bytesTotal":10}])
-        device = Mock()
-        device.downloads.query_packages = packages
-        device.downloads.query_links = links
-        adapter = jd2_myjd.MyJDAdapter({
-            "email": "example@domain.tld", "password": "secret",
-            "device_name": "NAS"}, api_factory=lambda: None)
-        adapter._device = device
-        result = adapter.list_downloads(0)
-        self.assertEqual(result["packages"][0]["name"],"Pictures")
-        self.assertEqual(result["links"][0]["progress"],50)
-        self.assertNotIn("password",str(packages.call_args))
-        self.assertNotIn("url",str(links.call_args))
-        self.assertEqual(packages.call_count,1)
-        self.assertEqual(links.call_count,1)
-        device.downloadcontroller.assert_not_called()
-        device.update.assert_not_called()
+    def test_local_adapter_uses_query_methods_without_mutations(self):
+        calls = []
 
+        class Engine:
+            preset_applied = False
+
+            def is_ours_running(self):
+                return True
+
+            def connection_target(self):
+                return 1
+
+        adapter = jd2_local.LocalAdapter(Engine())
+
+        def fake(namespace, method, *args):
+            calls.append((namespace, method, args))
+            if method == "queryPackages":
+                return [{"name": "Pictures", "bytesTotal": 50}]
+            return [{"name": "a.zip", "bytesLoaded": 5, "bytesTotal": 10}]
+        adapter._call = fake
+        result = adapter.list_downloads(0)
+        self.assertEqual(result["packages"][0]["name"], "Pictures")
+        self.assertEqual(result["links"][0]["progress"], 50)
+        self.assertEqual([c[:2] for c in calls], [("downloadsV2", "queryPackages"),
+                                                  ("downloadsV2", "queryLinks")])
+        self.assertNotIn("password", str(calls))
+        self.assertNotIn("url", str(calls))
 
 if __name__ == "__main__":
     unittest.main()

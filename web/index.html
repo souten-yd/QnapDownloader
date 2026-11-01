@@ -122,8 +122,16 @@
     <h2>ブックマーク</h2>
     <div id="speedDial" class="dial"></div>
     <p id="speedDialEmpty" class="muted" hidden>ブックマークはまだありません。Webタブで ☆ を押すか、<a href="#/settings/bookmarks">設定</a>から追加できます。</p>
-    <div class="notice">初期開発版：Hub単体のダウンロードエンジン・フル機能ブラウザ・自動ダウンロードは未実装です。リンクは保留キューに保存されます。認証済みJD2接続・管理者の明示許可・保存先確認後に限り、個別の「JD2に手動で送る」からLinkGrabberへ送信できます。</div>
-    <p class="muted">Rapidgator貼り付け抽出と認証済みMyJDownloader接続は対応済みです。サイト自動巡回は未実装です。隔離型の軽量Web閲覧プレビューには対応していますが、埋め込み禁止サイトはSafariを利用してください。実機でのJD2操作検証は継続中です。</p>
+    <div id="homeEngine" class="notice" hidden>
+     <b>JD2エンジンの初期設定</b>
+     <p>Hubが管理するJDownloader 2（Java同梱なし）を、公式配布物の取得・SHA-256検証つきで導入します。ダウンロードは自動開始しません。</p>
+     <div class="actions">
+      <button type="button" class="btn primary" id="homeEngineSetup">初期設定を開始</button>
+      <a class="btn" href="#/settings/engine">エンジン設定を開く</a>
+     </div>
+    </div>
+    <div class="notice">初期開発版：フル機能ブラウザ・自動ダウンロードは未実装です。リンクは保留キューに保存されます。エンジンの初期設定と推奨設定の適用後に限り、個別の「JD2に手動で送る」からLinkGrabberへ送信できます。</div>
+    <p class="muted">Rapidgator貼り付け抽出とHub管理のローカルJD2エンジンに対応しています。サイト自動巡回は未実装です。隔離型の軽量Web閲覧プレビューには対応していますが、埋め込み禁止サイトはSafariを利用してください。実機でのJD2動作は未検証です。</p>
    </div>
   </section>
 
@@ -138,7 +146,7 @@
       <span class="switch-track" aria-hidden="true"></span>
       <span>表示中は自動更新（15秒）</span>
      </label>
-     <a class="btn" href="#/settings/jd2">JD2接続設定</a>
+     <a class="btn" href="#/settings/engine">エンジン設定</a>
     </div>
     <div class="toolbar-row">
      <div class="chips" role="group" aria-label="状態で絞り込み">
@@ -149,6 +157,7 @@
      </div>
      <input type="search" id="downloadsSearch" class="search" placeholder="ファイル名で絞り込み" aria-label="ファイル名で絞り込み" maxlength="200" autocomplete="off">
     </div>
+    <div id="downloadsEngineNotice" class="notice" hidden>JD2エンジンが起動していません → <a href="#/settings/engine">エンジン設定</a></div>
     <p id="downloadsMessage" class="muted" role="status" aria-live="polite">「最新の状態を取得」を押してください。自動更新は既定でOFFです。</p>
     <div id="downloadsSummary" class="summary-metrics"></div>
     <h2>ダウンロード中・待機中のパッケージ</h2>
@@ -177,6 +186,7 @@
     </div>
     <div id="rapidgatorResult" class="items" role="status" aria-live="polite"></div>
     <h2>保留キュー</h2>
+    <div id="linksEngineNotice" class="notice" hidden>JD2エンジンが起動していません → <a href="#/settings/engine">エンジン設定</a>（保留キューへの登録は可能です）</div>
     <div id="queueItems" class="items"></div>
    </div>
   </section>
@@ -185,7 +195,7 @@
    <div class="settings-layout">
     <nav class="settings-nav" aria-label="設定の項目">
      <a href="#/settings/storage" data-section="storage">保存先</a>
-     <a href="#/settings/jd2" data-section="jd2">JD2接続</a>
+     <a href="#/settings/engine" data-section="engine">エンジン</a>
      <a href="#/settings/bookmarks" data-section="bookmarks">ブックマーク</a>
      <a href="#/settings/updates" data-section="updates">更新</a>
      <a href="#/settings/diagnostics" data-section="diagnostics">診断</a>
@@ -207,13 +217,29 @@
       <button type="button" id="folderRoots" class="btn">共有フォルダから選び直す</button>
      </section>
 
-     <section class="settings-section" data-section="jd2" hidden>
-      <h1>JDownloader 2 接続設定</h1>
-      <p id="jd2ConfigState" class="muted">接続設定を確認しています。</p>
-      <p class="muted">MyJDownloaderの認証済みAPIを使用します。接続先の設定ファイルはQPKGの永続データ領域の <code>config/myjd.json</code> です。現時点では資格情報をHTTP画面から送信せず、NASのSSHから権限0600で登録します。</p>
-      <button type="button" id="jd2TestConnection" class="btn">JD2接続をテストする</button>
-      <p id="jd2TestResult" class="muted" role="status" aria-live="polite"></p>
-      <p><a href="https://github.com/souten-yd/QnapDownloader/blob/main/docs/myjd-setup.md" target="_blank" rel="noopener noreferrer">MyJDownloader接続の設定手順</a></p>
+     <section class="settings-section" data-section="engine" hidden>
+      <h1>JD2エンジン</h1>
+      <p id="engineState" class="engine-state" role="status" aria-live="polite">状態を確認しています。</p>
+      <p id="engineError" class="engine-error" hidden></p>
+      <div id="engineComponents" class="items"></div>
+      <div class="actions">
+       <button type="button" id="engineSetup" class="btn primary">初期設定を開始</button>
+       <button type="button" id="engineStart" class="btn" disabled>起動</button>
+       <button type="button" id="engineStop" class="btn" disabled>停止</button>
+       <button type="button" id="engineTest" class="btn" disabled>接続確認</button>
+      </div>
+      <label class="switch" for="engineAutostart">
+       <input type="checkbox" id="engineAutostart" role="switch" disabled>
+       <span class="switch-track" aria-hidden="true"></span>
+       <span>Hub起動時にエンジンを自動起動</span>
+      </label>
+      <p id="engineTestResult" class="muted" role="status" aria-live="polite"></p>
+      <h2>初期設定の進行状況</h2>
+      <ol id="engineSteps" class="engine-steps"></ol>
+      <button type="button" id="engineLogButton" class="btn">RAMログを表示</button>
+      <pre id="engineLog" class="update-log" hidden></pre>
+      <p class="muted">JD2とJavaはQPKGに同梱されません。公式の固定URLから取得し、固定のSHA-256で検証してから永続データ領域に配置します。JD2本体の更新はJD2公式の更新機能が行います。ログはHubのメモリ上に最新300行だけ保持し、パスワード等は伏せます。</p>
+      <p><a href="https://github.com/souten-yd/QnapDownloader/blob/main/docs/engine-setup.md" target="_blank" rel="noopener noreferrer">エンジン初期設定の仕様</a></p>
      </section>
 
      <section class="settings-section" data-section="bookmarks" hidden>
@@ -249,7 +275,7 @@
       <hr>
       <h2>JDownloader 2の単独更新と推奨設定</h2>
       <p>JD2は公式の更新機能を使用し、Hubとは独立してCore/ホストプラグインを更新します。設定が変わった場合はHub側で差分を確認し、推奨設定を再適用します。</p>
-      <p id="jd2Status" class="muted">MyJDownloaderを設定してください。実機の接続状態と、許可済み操作を確認します。</p>
+      <p id="jd2Status" class="muted">エンジンの状態を確認しています。</p>
       <div class="actions">
        <button type="button" id="jd2Check" class="btn" disabled>JD2の更新を確認</button>
        <button type="button" id="jd2Update" class="btn" disabled>JD2だけ更新する（接続後に有効）</button>
@@ -278,7 +304,7 @@
        <li><a href="https://github.com/souten-yd/QnapDownloader/blob/main/docs/roadmap.md" target="_blank" rel="noopener noreferrer">ロードマップ</a></li>
        <li><a href="https://github.com/souten-yd/QnapDownloader/blob/main/docs/browser-sandbox.md" target="_blank" rel="noopener noreferrer">軽量安全ブラウザ（隔離プレビュー）</a></li>
        <li><a href="https://github.com/souten-yd/QnapDownloader/blob/main/docs/security.md" target="_blank" rel="noopener noreferrer">セキュリティ設計</a></li>
-       <li><a href="https://github.com/souten-yd/QnapDownloader/blob/main/docs/myjd-setup.md" target="_blank" rel="noopener noreferrer">MyJDownloader接続の設定手順</a></li>
+       <li><a href="https://github.com/souten-yd/QnapDownloader/blob/main/docs/engine-setup.md" target="_blank" rel="noopener noreferrer">JD2エンジンの初期設定</a></li>
       </ul>
      </section>
     </div>
