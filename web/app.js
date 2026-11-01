@@ -106,6 +106,7 @@ async function updateStatus(){
  $("jd2Status").textContent=jd.connected ?
    "JD2接続中 / Core revision: "+(jd.revision||"不明")+" / 更新: "+(jd.update_available?"あり":"なし") :
    "JD2未接続: "+(jd.reason||"接続アダプタの構成待ち");
+ $("jd2Check").disabled=!jd.connected||!jd.can_update;
  $("jd2Update").disabled=!jd.connected||!jd.can_update||!jd.update_available;
  $("jd2Preset").disabled=!jd.connected||!jd.can_preset;
 }
@@ -138,6 +139,11 @@ document.addEventListener("DOMContentLoaded",()=>{
   $("updateResult").textContent=u.available?"更新あり: "+u.release.version:"現在利用できる新しい正式QPKGリリースはありません";
   visible("updateApply",Boolean(u.available));
   await updateStatus();
+ }));
+ $("jd2Check").addEventListener("click",()=>perform(async()=>{
+  const result=await api("/api/jd2/update/check",{});
+  await updateStatus();
+  flash(result.update_available?"JD2の更新があります":"JD2に新しい更新はありません");
  }));
  $("jd2Update").addEventListener("click",()=>perform(async()=>{
   if(!confirm("JDownloader 2本体だけを更新します。JD2のダウンロードは一時中断される場合があります。よろしいですか？"))return;
