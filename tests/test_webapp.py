@@ -75,6 +75,13 @@ class HttpTests(unittest.TestCase):
         self.assertEqual(code, 200)
         self.csrf = body["csrf"]
 
+    def test_host_filter_allows_private_and_tailscale_not_public(self):
+        self.assertTrue(webapp.public_host_allowed("192.168.0.5:17864"))
+        self.assertTrue(webapp.public_host_allowed("100.64.1.2:17864"))
+        self.assertTrue(webapp.public_host_allowed("[::1]:17864"))
+        self.assertFalse(webapp.public_host_allowed("8.8.8.8:17864"))
+        self.assertFalse(webapp.public_host_allowed("evil.example:17864"))
+
     def test_setup_login_csrf_and_private_api(self):
         self.assertEqual(self.req("/api/settings")[0], 401)
         self.assertEqual(self.req("/api/bootstrap", {
