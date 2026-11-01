@@ -18,10 +18,11 @@ import storage
 import jd2_control
 import jd2_transfer
 import rapidgator_extract
+import browser_safety
 import jd2_myjd
 import updater
 
-VERSION = "0.1.5"
+VERSION = "0.1.6"
 PORT = 17864
 ROOT = Path(__file__).resolve().parent
 FILES = {"/": ("web/index.html", "text/html; charset=utf-8"),
@@ -145,7 +146,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("X-Frame-Options", "DENY")
         self.send_header("Referrer-Policy", "no-referrer")
         self.send_header("Permissions-Policy", "geolocation=(),camera=(),microphone=(),payment=()")
-        self.send_header("Content-Security-Policy", "default-src 'none'; img-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'")
+        self.send_header("Content-Security-Policy", "default-src 'none'; img-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; frame-src https:; base-uri 'none'; frame-ancestors 'none'; form-action 'self'")
         if getattr(self, "_cookie", None):
             self.send_header("Set-Cookie", self._cookie)
         self.end_headers()
@@ -276,11 +277,18 @@ class Handler(BaseHTTPRequestHandler):
                 # Admin-authenticated, bounded tail; never expose an arbitrary
                 # caller-provided file path or the updater's internal directory.
                 return self.send_data(200, {"log": self.server.updates.log_tail()})
+            if path == "/api/browser/validate":
+                query = parse_qs(urlsplit(self.path).query)
+                value = query.get("url", [""])[0]
+                return self.send_data(200, {"url": browser_safety.validate(value),
+                  "mode": "sandboxed-client-only", "server_fetched": False})
             if path == "/api/update/check":
-                release = updater.latest(VERSION, "x86_64")
+                query = parse_qs(urlsplit(self.path).query)
+                channel = query.get("channel", ["rc"])[0]
+                release = updater.latest(VERSION, "x86_64", channel)
                 return self.send_data(200, {"available": release is not None,
                   "release": {"version": release["version"], "size": release["size"]}
-                            if release else None, "current": VERSION})
+                            if release else None, "current": VERSION, "channel": channel})
         except (OSError, ValueError, RuntimeError, KeyError, sqlite3.Error) as exc:
             return self.reject(str(exc))
         self.reject("APIが存在しません", 404)
@@ -384,7 +392,7 @@ class Handler(BaseHTTPRequestHandler):
                     self.store.finish_send(ident, "sent")
                 return self.send_data(200, outcome)
             if path == "/api/update/apply":
-                return self.send_data(202, self.server.updates.apply(body.get("version")))
+                return self.send_data(202, self.server.updates.apply(body.get("version"), channel=body.get("channel", "rc")))
             if path == "/api/jd2/connect/test":
                 return self.send_data(200, self.server.jd2.connection_test())
             if path == "/api/jd2/update/check":
