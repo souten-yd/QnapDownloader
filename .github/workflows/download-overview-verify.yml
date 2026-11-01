@@ -1,0 +1,57 @@
+name: Validate mobile JD2 download overview 0.1.7
+on:
+  push:
+    branches: [feat/mobile-downloads-overview-017]
+  workflow_dispatch:
+concurrency:
+  group: qdl-download-overview-017
+  cancel-in-progress: true
+permissions:
+  contents: read
+jobs:
+  tests:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: bash scripts/verify.sh
+      - name: Validate pinned MyJDownloader read-only API surface
+        run: |
+          python3 -m pip install --disable-pip-version-check --only-binary=:all: --target vendor -r requirements-jd2-build.txt
+          PYTHONPATH=vendor python3 - <<'PY'
+          from myjdapi.myjdapi import Downloads
+          for method in ("query_links","query_packages"):
+              assert callable(getattr(Downloads,method)), method
+          print("Actual MyJD downloadsV2 query methods exist")
+          PY
+  package:
+    needs: tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install QDK and build-only dependencies
+        run: |
+          curl -fLSs --retry 2 https://github.com/qnap-dev/QDK/releases/download/v2.5.3/qdk_2.5.3_amd64.deb -o /tmp/qdk.deb
+          sudo apt-get update -qq
+          sudo apt-get install -y /tmp/qdk.deb rsync
+          python3 -m pip install --disable-pip-version-check 'cairosvg==2.8.2' 'pillow>=10,<13'
+          python3 -m pip install --disable-pip-version-check --only-binary=:all: --target vendor -r requirements-jd2-build.txt
+      - name: Build and checksum 0.1.7 QPKG
+        run: |
+          bash scripts/build-qpkg.sh x86_64 dist
+          (cd dist && sha256sum QnapDownloader_0.1.7_x86_64.qpkg > SHA256SUMS && sha256sum -c SHA256SUMS)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: QnapDownloader-0.1.7-readonly-download-dashboard
+          path: dist/
+          retention-days: 7
