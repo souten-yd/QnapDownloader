@@ -9,12 +9,12 @@ MAX_PAGE = 20
 LINK_FIELDS = {
     "name": True, "host": True, "bytesLoaded": True, "bytesTotal": True,
     "speed": True, "eta": True, "status": True, "running": True,
-    "finished": True, "enabled": True
+    "finished": True, "enabled": True, "packageUUID": True
 }
 PACKAGE_FIELDS = {
     "name": True, "bytesLoaded": True, "bytesTotal": True,
     "speed": True, "eta": True, "status": True, "running": True,
-    "finished": True, "childCount": True
+    "finished": True, "childCount": True, "uuid": True
 }
 
 
@@ -39,6 +39,13 @@ def _nonnegative(value):
     if type(value) is not int or value < 0:
         return None
     return min(value, 2**53-1)
+
+
+def _uuid(value):
+    # JD2 UUIDs are 64-bit; hand them to the browser as strings (JS numbers lose precision).
+    if type(value) is not int or value < 0:
+        return None
+    return str(value)
 
 
 def _boolean(value):
@@ -69,8 +76,10 @@ def _normalize(entry, is_package=False):
     }
     if is_package:
         item["child_count"] = _nonnegative(entry.get("childCount"))
+        item["id"] = _uuid(entry.get("uuid"))
     else:
         item["host"] = _string(entry.get("host"), 120)
+        item["package_id"] = _uuid(entry.get("packageUUID"))
         item["enabled"] = _boolean(entry.get("enabled"))
     return item
 

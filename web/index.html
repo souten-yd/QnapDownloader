@@ -64,7 +64,7 @@
   <div class="tablist pinned" role="tablist" aria-label="管理画面">
    <a class="tab pinned-tab" role="tab" href="#/downloads" data-tab="downloads" aria-selected="false"><svg class="icon" aria-hidden="true"><use href="#i-download"/></svg><span class="tab-label">ダウンロード</span></a>
    <a class="tab pinned-tab" role="tab" href="#/links" data-tab="links" aria-selected="false"><svg class="icon" aria-hidden="true"><use href="#i-link"/></svg><span class="tab-label">リンク</span></a>
-   <a class="tab pinned-tab" role="tab" href="#/settings/storage" data-tab="settings" aria-selected="false"><svg class="icon" aria-hidden="true"><use href="#i-gear"/></svg><span class="tab-label">設定</span></a>
+   <a class="tab pinned-tab" role="tab" href="#/settings" data-tab="settings" aria-selected="false"><svg class="icon" aria-hidden="true"><use href="#i-gear"/></svg><span class="tab-label">設定</span></a>
   </div>
   <span class="strip-sep" aria-hidden="true"></span>
   <div class="tablist webtabs" id="webTabs" role="tablist" aria-label="Webタブ"></div>
@@ -79,7 +79,7 @@
   </div>
   <form id="omniForm" class="omnibox" autocomplete="off">
    <svg class="icon omni-icon" aria-hidden="true"><use id="omniIcon" href="#i-gear"/></svg>
-   <input id="omnibox" type="text" inputmode="url" enterkeyhint="go" autocapitalize="off" autocorrect="off" spellcheck="false" maxlength="65536" aria-label="アドレスバー" placeholder="URLを入力、または qnap:// で画面を移動  （/ キーで移動）">
+   <input id="omnibox" type="text" inputmode="url" enterkeyhint="go" autocapitalize="off" autocorrect="off" spellcheck="false" maxlength="65536" aria-label="アドレスバー" placeholder="URLを入力または貼り付け">
    <button type="button" id="starBtn" class="icon-btn small" aria-label="ブックマークに追加" aria-pressed="false" title="ブックマークに追加"><svg class="icon" aria-hidden="true"><use href="#i-star"/></svg></button>
   </form>
   <div class="tool-right">
@@ -93,7 +93,7 @@
      <button type="button" role="menuitem" data-action="toggleMode" data-scope="web" id="menuMode">限定操作モードに切り替え</button>
      <button type="button" role="menuitem" data-action="compatMode" data-scope="web" id="menuCompat">互換モードに切り替え</button>
      <button type="button" role="menuitem" data-action="external" data-scope="web">Safari／外部ブラウザで開く</button>
-     <button type="button" role="menuitem" data-action="stageUrl" data-scope="web">このURLをリンク保留へ追加</button>
+     <button type="button" role="menuitem" data-action="stageUrl" data-scope="web">このURLを追加したリンクへ</button>
      <button type="button" role="menuitem" data-action="bookmark" data-scope="web">ブックマークに追加</button>
      <button type="button" role="menuitem" data-action="closeTab" data-scope="web">タブを閉じる</button>
      <hr>
@@ -111,82 +111,86 @@
   <section id="view-home" class="view" role="tabpanel" aria-label="新しいタブ" hidden>
    <div class="page">
     <h1 class="home-title"><img src="/icon.svg" width="34" height="34" alt=""> QnapDownloader <small class="js-version"></small></h1>
-    <div id="status" class="cards" aria-live="polite"></div>
-    <h2>よく使う操作</h2>
-    <div class="actions">
-     <a class="btn" href="#/downloads"><svg class="icon" aria-hidden="true"><use href="#i-download"/></svg>ダウンロード状況を見る</a>
-     <a class="btn" href="#/links"><svg class="icon" aria-hidden="true"><use href="#i-link"/></svg>リンクを登録する</a>
-     <a class="btn" href="#/settings/storage"><svg class="icon" aria-hidden="true"><use href="#i-gear"/></svg>接続・保存先を設定する</a>
-     <button type="button" class="btn" id="homeOpenWeb"><svg class="icon" aria-hidden="true"><use href="#i-globe"/></svg>Webサイトを開く</button>
+    <section id="onboarding" class="card onboarding" aria-label="はじめに" hidden>
+     <h2>はじめに</h2>
+     <ol class="checklist">
+      <li id="obStorage" class="check-row">
+       <span class="check-mark" aria-hidden="true"></span>
+       <span class="check-body"><b>保存先を選ぶ</b><span id="obStorageText" class="muted"></span></span>
+       <a id="obStorageBtn" class="btn small primary" href="#/settings/storage">選ぶ</a>
+      </li>
+      <li id="obEngine" class="check-row">
+       <span class="check-mark" aria-hidden="true"></span>
+       <span class="check-body"><b>JD2エンジンを準備</b><span id="obEngineText" class="muted"></span></span>
+       <button type="button" class="btn small primary" id="homeEngineSetup">初期設定を開始</button>
+      </li>
+     </ol>
+    </section>
+    <div id="homeStatus" class="home-status" aria-live="polite" hidden>
+     <span id="homeStatusDot" class="dot"></span>
+     <span id="homeStatusText"></span>
+     <a id="homeStatusLink" class="home-status-link" href="#/downloads" hidden></a>
+     <button type="button" id="homeEngineStart" class="btn small" hidden>起動</button>
     </div>
-    <h2>ブックマーク</h2>
     <div id="speedDial" class="dial"></div>
-    <p id="speedDialEmpty" class="muted" hidden>ブックマークはまだありません。Webタブで ☆ を押すか、<a href="#/settings/bookmarks">設定</a>から追加できます。</p>
-    <div id="homeEngine" class="notice" hidden>
-     <b>JD2エンジンの初期設定</b>
-     <p>Hubが管理するJDownloader 2（Java同梱なし）を、公式配布物の取得・SHA-256検証つきで導入します。ダウンロードは自動開始しません。</p>
-     <div class="actions">
-      <button type="button" class="btn primary" id="homeEngineSetup">初期設定を開始</button>
-      <a class="btn" href="#/settings/engine">エンジン設定を開く</a>
-     </div>
-    </div>
-    <div class="notice">初期開発版：フル機能ブラウザ・自動ダウンロードは未実装です。リンクは保留キューに保存されます。エンジンの初期設定と推奨設定の適用後に限り、個別の「JD2に手動で送る」からLinkGrabberへ送信できます。</div>
-    <p class="muted">Rapidgator貼り付け抽出とHub管理のローカルJD2エンジンに対応しています。サイト自動巡回は未実装です。隔離型の軽量Web閲覧プレビューには対応していますが、埋め込み禁止サイトはSafariを利用してください。実機でのJD2動作は未検証です。</p>
+    <p id="speedDialEmpty" class="muted" hidden>ブックマークはありません。Webタブの ☆ で追加できます。</p>
    </div>
   </section>
 
   <section id="view-downloads" class="view" role="tabpanel" aria-label="ダウンロード" hidden>
    <div class="page">
-    <h1>ダウンロード管理</h1>
-    <p class="muted">JDownloader 2の実際の状態を読み取り専用で表示します。開始・停止・削除ボタンは安全な実機検証後に実装します。</p>
-    <div class="toolbar-row">
-     <button type="button" id="downloadsRefresh" class="btn primary">最新の状態を取得</button>
-     <label class="switch" for="downloadsAuto">
-      <input type="checkbox" id="downloadsAuto" role="switch">
-      <span class="switch-track" aria-hidden="true"></span>
-      <span>表示中は自動更新（15秒）</span>
-     </label>
-     <a class="btn" href="#/settings/engine">エンジン設定</a>
+    <div class="page-head">
+     <h1>ダウンロード</h1>
+     <span class="head-tools">
+      <span id="downloadsUpdated" class="muted" role="status"></span>
+      <button type="button" id="downloadsRefresh" class="icon-btn small" aria-label="今すぐ更新" title="今すぐ更新"><svg class="icon" aria-hidden="true"><use href="#i-reload"/></svg></button>
+     </span>
     </div>
-    <div class="toolbar-row">
-     <div class="chips" role="group" aria-label="状態で絞り込み">
-      <button type="button" class="chip" data-filter="all" aria-pressed="true">すべて</button>
-      <button type="button" class="chip" data-filter="running" aria-pressed="false">実行中</button>
-      <button type="button" class="chip" data-filter="waiting" aria-pressed="false">待機</button>
-      <button type="button" class="chip" data-filter="finished" aria-pressed="false">完了</button>
+    <div id="downloadsEmpty" class="empty-card" hidden>
+     <p><b>JD2エンジンが起動していません</b></p>
+     <p id="downloadsEmptyNote" class="muted" hidden></p>
+     <button type="button" id="downloadsEngineAction" class="btn primary">起動</button>
+    </div>
+    <div id="downloadsBody" hidden>
+     <p id="downloadsMessage" class="muted" role="status" aria-live="polite"></p>
+     <div id="downloadsTools" class="toolbar-row" hidden>
+      <div class="chips" role="group" aria-label="状態で絞り込み">
+       <button type="button" class="chip" data-filter="all" aria-pressed="true">すべて</button>
+       <button type="button" class="chip" data-filter="running" aria-pressed="false">実行中</button>
+       <button type="button" class="chip" data-filter="waiting" aria-pressed="false">待機</button>
+       <button type="button" class="chip" data-filter="finished" aria-pressed="false">完了</button>
+      </div>
+      <input type="search" id="downloadsSearch" class="search" placeholder="名前で絞り込み" aria-label="名前で絞り込み" maxlength="200" autocomplete="off">
      </div>
-     <input type="search" id="downloadsSearch" class="search" placeholder="ファイル名で絞り込み" aria-label="ファイル名で絞り込み" maxlength="200" autocomplete="off">
-    </div>
-    <div id="downloadsEngineNotice" class="notice" hidden>JD2エンジンが起動していません → <a href="#/settings/engine">エンジン設定</a></div>
-    <p id="downloadsMessage" class="muted" role="status" aria-live="polite">「最新の状態を取得」を押してください。自動更新は既定でOFFです。</p>
-    <div id="downloadsSummary" class="summary-metrics"></div>
-    <h2>ダウンロード中・待機中のパッケージ</h2>
-    <div id="downloadPackages" class="items"></div>
-    <h2>ファイル一覧</h2>
-    <div id="downloadLinks" class="items"></div>
-    <div class="toolbar-row pager">
-     <button type="button" class="btn" id="downloadsPrev" disabled>前の30件</button>
-     <span id="downloadsPage" class="muted">1ページ目</span>
-     <button type="button" class="btn" id="downloadsNext" disabled>次の30件</button>
+     <div id="downloadsSummary" class="summary-line muted"></div>
+     <div id="downloadList" class="items"></div>
+     <details id="orphanFiles" class="fold" hidden>
+      <summary id="orphanSummary">その他のファイル</summary>
+      <div id="downloadOrphans" class="items"></div>
+     </details>
+     <div id="downloadsPager" class="toolbar-row pager" hidden>
+      <button type="button" class="btn small" id="downloadsPrev" disabled>前へ</button>
+      <span id="downloadsPage" class="muted">1ページ目</span>
+      <button type="button" class="btn small" id="downloadsNext" disabled>次へ</button>
+     </div>
     </div>
    </div>
   </section>
 
   <section id="view-links" class="view" role="tabpanel" aria-label="リンク" hidden>
    <div class="page">
-    <h1>リンクの保留登録</h1>
-    <p>明示的に追加したHTTPSリンクを重複なく保存します。自動で取得・実行しません。</p>
-    <div class="stack"><input id="queueUrl" type="url" placeholder="https://rapidgator.net/file/..." aria-label="追加するHTTPSリンク"><button type="button" id="queueAdd" class="btn primary">保留キューに追加</button></div>
-    <h2>Rapidgatorリンクの抽出（貼り付けのみ）</h2>
-    <p class="muted">コピーしたテキストやHTMLからRapidgatorのHTTPSリンクを最大20件抽出します。外部サイトへの通信、ページ内スクリプト実行、Cloudflare回避は行いません。</p>
-    <label>サイトからコピーした内容<textarea id="rapidgatorText" rows="5" maxlength="65536" placeholder="コピーしたテキストまたはHTMLを貼り付け"></textarea></label>
-    <div class="actions">
-     <button type="button" id="rapidgatorPreview" class="btn">リンクを抽出して確認</button>
-     <button type="button" id="rapidgatorStage" class="btn primary" disabled>確認したリンクを保留キューに登録</button>
+    <h1>リンク</h1>
+    <label for="pasteBox">リンクを貼り付け（URL・テキスト・HTML）</label>
+    <textarea id="pasteBox" rows="3" maxlength="65536" placeholder="https://…" autocomplete="off" autocapitalize="off" spellcheck="false"></textarea>
+    <div id="pasteResult" class="paste-result" role="status" aria-live="polite" hidden>
+     <p id="pasteSummary"></p>
+     <div id="pasteList" class="items compact"></div>
+     <button type="button" id="pasteAdd" class="btn primary" disabled>追加</button>
     </div>
-    <div id="rapidgatorResult" class="items" role="status" aria-live="polite"></div>
-    <h2>保留キュー</h2>
-    <div id="linksEngineNotice" class="notice" hidden>JD2エンジンが起動していません → <a href="#/settings/engine">エンジン設定</a>（保留キューへの登録は可能です）</div>
+    <div class="section-head">
+     <h2>追加したリンク</h2>
+     <button type="button" id="sendAll" class="btn small" hidden>すべてJD2へ送る</button>
+    </div>
     <div id="queueItems" class="items"></div>
    </div>
   </section>
@@ -194,117 +198,137 @@
   <section id="view-settings" class="view" role="tabpanel" aria-label="設定" hidden>
    <div class="settings-layout">
     <nav class="settings-nav" aria-label="設定の項目">
-     <a href="#/settings/storage" data-section="storage">保存先</a>
      <a href="#/settings/engine" data-section="engine">エンジン</a>
+     <a href="#/settings/storage" data-section="storage">保存先</a>
      <a href="#/settings/bookmarks" data-section="bookmarks">ブックマーク</a>
      <a href="#/settings/updates" data-section="updates">更新</a>
      <a href="#/settings/diagnostics" data-section="diagnostics">診断</a>
      <a href="#/settings/about" data-section="about">このアプリについて</a>
     </nav>
     <div class="settings-body">
-     <section class="settings-section" data-section="storage" hidden>
-      <h1>保存先</h1>
-      <div class="grid">
-       <div class="setting"><b>フォルダ階層</b><span>作成しない</span></div>
-       <div class="setting"><b>リンクの自動開始</b><span>OFF</span></div>
-       <div class="setting"><b>自動解凍</b><span>OFF</span></div>
-       <div class="setting"><b>完了ファイルの削除</b><span>OFF</span></div>
-      </div>
-      <h2>NAS側の保存先</h2>
-      <p class="muted">サーバ内で許可した共有フォルダのみ選べます。変更後は永続保存されます。</p>
-      <p id="selectedFolder" class="path"></p>
-      <div id="folderPicker"></div>
-      <button type="button" id="folderRoots" class="btn">共有フォルダから選び直す</button>
-     </section>
-
      <section class="settings-section" data-section="engine" hidden>
       <h1>JD2エンジン</h1>
-      <p id="engineState" class="engine-state" role="status" aria-live="polite">状態を確認しています。</p>
-      <p id="engineError" class="engine-error" hidden></p>
-      <div id="engineComponents" class="items"></div>
-      <div class="actions">
-       <button type="button" id="engineSetup" class="btn primary">初期設定を開始</button>
-       <button type="button" id="engineStart" class="btn" disabled>起動</button>
-       <button type="button" id="engineStop" class="btn" disabled>停止</button>
-       <button type="button" id="engineTest" class="btn" disabled>接続確認</button>
+      <div class="engine-head">
+       <p id="engineState" class="engine-state" role="status" aria-live="polite">確認しています…</p>
+       <div class="engine-actions">
+        <button type="button" id="engineSetup" class="btn primary" hidden>初期設定を開始</button>
+        <button type="button" id="engineStart" class="btn primary" hidden>起動</button>
+        <button type="button" id="engineStop" class="btn quiet" hidden>停止</button>
+       </div>
       </div>
-      <label class="switch" for="engineAutostart">
-       <input type="checkbox" id="engineAutostart" role="switch" disabled>
-       <span class="switch-track" aria-hidden="true"></span>
-       <span>Hub起動時にエンジンを自動起動</span>
-      </label>
+      <p id="engineProgressText" class="muted" hidden></p>
+      <progress id="engineProgress" max="100" class="wide-progress" hidden></progress>
+      <p id="engineError" class="engine-error" hidden></p>
       <p id="engineTestResult" class="muted" role="status" aria-live="polite"></p>
-      <h2>初期設定の進行状況</h2>
-      <ol id="engineSteps" class="engine-steps"></ol>
-      <button type="button" id="engineLogButton" class="btn">RAMログを表示</button>
-      <pre id="engineLog" class="update-log" hidden></pre>
-      <p class="muted">JD2とJavaはQPKGに同梱されません。公式の固定URLから取得し、固定のSHA-256で検証してから永続データ領域に配置します。JD2本体の更新はJD2公式の更新機能が行います。ログはHubのメモリ上に最新300行だけ保持し、パスワード等は伏せます。</p>
-      <p><a href="https://github.com/souten-yd/QnapDownloader/blob/main/docs/engine-setup.md" target="_blank" rel="noopener noreferrer">エンジン初期設定の仕様</a></p>
+      <label class="switch" id="engineAutostartRow" for="engineAutostart" hidden>
+       <input type="checkbox" id="engineAutostart" role="switch">
+       <span class="switch-track" aria-hidden="true"></span>
+       <span>Hub起動時にエンジンも起動</span>
+      </label>
+      <div id="engineJd2" class="engine-row" hidden>
+       <span id="jd2Status" class="muted"></span>
+       <button type="button" id="jd2Check" class="btn small">JD2の更新を確認</button>
+       <button type="button" id="jd2Update" class="btn small" hidden>JD2を更新</button>
+       <button type="button" id="jd2Preset" class="btn small">推奨設定を再適用</button>
+      </div>
+      <details id="engineStepsBox" class="fold" hidden>
+       <summary id="engineStepsSummary">初期設定の進行状況</summary>
+       <ol id="engineSteps" class="engine-steps"></ol>
+      </details>
+      <details id="engineDetails" class="fold">
+       <summary>詳細</summary>
+       <div id="engineComponents" class="items"></div>
+       <p id="engineMeta" class="muted"></p>
+       <p class="muted">JD2とJavaはQPKGに同梱されません。公式の固定URLから取得し、SHA-256で検証して永続データ領域に置きます。</p>
+       <button type="button" id="engineResetup" class="btn small" hidden>初期設定をやり直す</button>
+       <div id="engineKeysRow" hidden>
+        <button type="button" id="engineKeys" class="btn small">推奨設定の項目を調べる</button>
+        <button type="button" id="engineKeysCopy" class="btn small" hidden>コピー</button>
+        <pre id="engineKeysOut" class="update-log" hidden></pre>
+       </div>
+      </details>
+      <details id="engineLogBox" class="fold">
+       <summary>ログ</summary>
+       <pre id="engineLog" class="update-log">開くと表示します</pre>
+      </details>
+     </section>
+
+     <section class="settings-section" data-section="storage" hidden>
+      <h1>保存先</h1>
+      <div class="card folder-card">
+       <span class="muted">現在の保存先</span>
+       <p id="selectedFolder" class="path-big">未選択</p>
+       <button type="button" id="folderChange" class="btn">変更</button>
+      </div>
+      <div id="folderPickerBox" class="folder-box" hidden>
+       <div id="folderPicker"></div>
+       <button type="button" id="folderCancel" class="btn small">閉じる</button>
+      </div>
+      <p class="muted">フォルダ作成・自動開始・自動解凍・自動削除はすべてOFF</p>
      </section>
 
      <section class="settings-section" data-section="bookmarks" hidden>
       <h1>ブックマーク</h1>
-      <form id="bookmarkForm">
-       <label>名前<input id="bookmarkName" maxlength="200" placeholder="サイト名"></label>
-       <label>URL<input id="bookmarkUrl" type="url" placeholder="https://example.com"></label>
+      <form id="bookmarkForm" class="inline-form">
+       <input id="bookmarkName" maxlength="200" placeholder="名前" aria-label="名前">
+       <input id="bookmarkUrl" type="url" placeholder="https://example.com" aria-label="URL">
        <button type="submit" id="bookmarkAdd" class="btn primary">追加</button>
       </form>
       <div id="bookmarkItems" class="items"></div>
      </section>
 
      <section class="settings-section" data-section="updates" hidden>
-      <h1>アップデート</h1>
-      <h2>QnapDownloader Hubの更新</h2>
-      <p>QnapSelfCare方式：選択したチャンネルの新しいQPKGを検出し、SHA-256検証・DBバックアップ・QPKG適用・起動検証を実施します。JDownloader 2本体の更新には影響しません。</p>
-      <label>更新チャンネル
-       <select id="updateChannel">
-        <option value="rc" selected>RC版も含む（プレリリース・試験用）</option>
+      <h1>更新</h1>
+      <div class="update-line">
+       <span>現在 <b class="js-version-bare"></b></span>
+       <button type="button" id="updateCheck" class="btn small primary">最新を確認</button>
+       <select id="updateChannel" class="inline-select" aria-label="更新チャンネル">
+        <option value="rc" selected>RC版を含む</option>
         <option value="stable">正式版のみ</option>
        </select>
-      </label>
-      <p class="muted">現在のQnapDownloaderはRC版で提供されています。RCチャンネルは手動更新時にのみ利用し、自動インストールは行いません。</p>
-      <div class="actions">
-       <button type="button" id="updateCheck" class="btn primary">更新を確認</button>
-       <button type="button" id="updateApply" class="btn" hidden>検証して更新する</button>
       </div>
-      <p id="updateResult"></p>
-      <div id="updateStatus" class="muted"></div>
-      <button type="button" id="updateLogButton" class="btn">更新ログを表示</button>
-      <pre id="updateLog" class="update-log" hidden></pre>
-      <p class="muted">QNAPにQPKGとしてインストールされた環境のみ適用できます。選択したチャンネルに新しい公開Releaseがない場合は更新できません。</p>
-      <hr>
-      <h2>JDownloader 2の単独更新と推奨設定</h2>
-      <p>JD2は公式の更新機能を使用し、Hubとは独立してCore/ホストプラグインを更新します。設定が変わった場合はHub側で差分を確認し、推奨設定を再適用します。</p>
-      <p id="jd2Status" class="muted">エンジンの状態を確認しています。</p>
-      <div class="actions">
-       <button type="button" id="jd2Check" class="btn" disabled>JD2の更新を確認</button>
-       <button type="button" id="jd2Update" class="btn" disabled>JD2だけ更新する（接続後に有効）</button>
-       <button type="button" id="jd2Preset" class="btn" disabled>推奨設定を確認して再適用（接続後に有効）</button>
+      <div class="update-line">
+       <span id="updateResult"></span>
+       <button type="button" id="updateApply" class="btn small primary" hidden>更新</button>
       </div>
-      <p class="muted">JD2の更新後、リンク自動開始OFF、自動解凍OFF、パッケージ別フォルダ作成OFFなどを再確認する設計です。既存キューは変更しません。</p>
+      <p id="updateStatus" class="muted"></p>
+      <details class="fold" id="updateLogBox">
+       <summary>更新ログ</summary>
+       <pre id="updateLog" class="update-log">開くと表示します</pre>
+      </details>
+      <p class="muted">QNAPにQPKGとして導入した環境のみ更新できます。JD2本体の更新は「エンジン」で行います。</p>
      </section>
 
      <section class="settings-section" data-section="diagnostics" hidden>
-      <h1>ディスクI/OとローカルJD2診断</h1>
-      <p class="muted">手動で取得する読取専用診断です。Hubの物理I/O累積値を確認できます。JD2側の書込は含まれません。</p>
+      <h1>診断</h1>
+      <p class="muted">手動で実行する読取専用の診断です。自動では取得しません。</p>
       <div class="actions">
        <button type="button" id="diagnosticIo" class="btn">HubのI/Oを確認</button>
-       <button type="button" id="diagnosticJd2" class="btn">NAS内3128番ポートを確認</button>
+       <button type="button" id="diagnosticJd2" class="btn">ポート3128を確認</button>
       </div>
-      <p id="diagnosticResult" class="muted" role="status" aria-live="polite">診断待ちです。定期的な自動取得は行いません。</p>
-      <p class="muted">3128番へのTCP接続成功だけではJD2の認証やLAN隔離を証明できないため、ローカルAPI操作はまだ許可しません。QNAPのDockerは、localhost公開だけでは安全でない旧バージョンがあります。</p>
+      <p id="diagnosticResult" class="muted" role="status" aria-live="polite"></p>
      </section>
 
      <section class="settings-section" data-section="about" hidden>
       <h1>このアプリについて</h1>
       <p><b>QnapDownloader</b> <span class="js-version"></span></p>
-      <p class="muted">JDownloader 2とWeb管理画面を組み合わせた、QNAP向けのダウンロード管理ツールです。外部Webの閲覧は端末側の隔離iframeのみで行い、NASが外部ページを取得することはありません。</p>
+      <p class="muted">JDownloader 2とWeb管理画面を組み合わせた、QNAP向けのダウンロード管理ツールです。</p>
+      <ul class="about-list">
+       <li>初期開発版です。実機（TS-253Be）でのJD2の動作は未検証です。</li>
+       <li>自動ダウンロードとサイトの自動巡回はありません。追加したリンクは手動でJD2へ送ります。</li>
+       <li>Rapidgatorのリンクは、貼り付けたテキストやHTMLから抽出できます。</li>
+       <li>Webの閲覧は端末側の隔離表示です。表示できないサイトはSafariで開いてください。</li>
+      </ul>
+      <details class="fold">
+       <summary>詳細</summary>
+       <p class="muted">外部ページの取得はブラウザ側の隔離iframeだけで行い、NASは外部ページを取得しません。JD2とJavaはQPKGに同梱されず、公式の固定URLからSHA-256検証つきで導入します。JD2本体の更新はJD2の公式機能が行い、Hubの更新は影響しません。</p>
+      </details>
       <ul class="link-list">
-       <li><a href="https://github.com/souten-yd/QnapDownloader/blob/main/docs/browser-shell-ui.md" target="_blank" rel="noopener noreferrer">ブラウザ型Web管理画面の仕様</a></li>
-       <li><a href="https://github.com/souten-yd/QnapDownloader/blob/main/docs/roadmap.md" target="_blank" rel="noopener noreferrer">ロードマップ</a></li>
-       <li><a href="https://github.com/souten-yd/QnapDownloader/blob/main/docs/browser-sandbox.md" target="_blank" rel="noopener noreferrer">軽量安全ブラウザ（隔離プレビュー）</a></li>
+       <li><a href="https://github.com/souten-yd/QnapDownloader/blob/main/docs/browser-shell-ui.md" target="_blank" rel="noopener noreferrer">画面の仕様</a></li>
+       <li><a href="https://github.com/souten-yd/QnapDownloader/blob/main/docs/engine-setup.md" target="_blank" rel="noopener noreferrer">エンジンの初期設定</a></li>
        <li><a href="https://github.com/souten-yd/QnapDownloader/blob/main/docs/security.md" target="_blank" rel="noopener noreferrer">セキュリティ設計</a></li>
-       <li><a href="https://github.com/souten-yd/QnapDownloader/blob/main/docs/engine-setup.md" target="_blank" rel="noopener noreferrer">JD2エンジンの初期設定</a></li>
+       <li><a href="https://github.com/souten-yd/QnapDownloader/blob/main/docs/browser-sandbox.md" target="_blank" rel="noopener noreferrer">隔離ブラウザ</a></li>
+       <li><a href="https://github.com/souten-yd/QnapDownloader/blob/main/docs/roadmap.md" target="_blank" rel="noopener noreferrer">ロードマップ</a></li>
       </ul>
      </section>
     </div>
@@ -328,7 +352,7 @@
   <a href="#/downloads" data-nav="downloads"><svg class="icon" aria-hidden="true"><use href="#i-download"/></svg><span>ダウンロード</span><span class="badge js-dl-badge" hidden></span></a>
   <a href="#/links" data-nav="links"><svg class="icon" aria-hidden="true"><use href="#i-link"/></svg><span>リンク</span></a>
   <button type="button" id="mobileBrowse" data-nav="browse"><svg class="icon" aria-hidden="true"><use href="#i-globe"/></svg><span>ブラウズ</span><span class="badge" id="tabCount" hidden></span></button>
-  <a href="#/settings/storage" data-nav="settings"><svg class="icon" aria-hidden="true"><use href="#i-gear"/></svg><span>設定</span></a>
+  <a href="#/settings" data-nav="settings"><svg class="icon" aria-hidden="true"><use href="#i-gear"/></svg><span>設定</span></a>
  </nav>
 
  <div id="tabSwitcher" class="switcher" role="dialog" aria-modal="true" aria-label="タブ一覧" hidden>

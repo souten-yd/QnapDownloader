@@ -100,6 +100,8 @@ class StubHandler(BaseHTTPRequestHandler):
         else:
             body = json.dumps(self.server.responses.get(namespace, {"data": None})).encode()
         status = self.server.status
+        if getattr(self.server, "fail_with_args", False) and "?" in self.path:
+            status = 500
         self.send_response(status)
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
@@ -190,6 +192,29 @@ class AdapterTests(unittest.TestCase):
         self.adapter.update_preset("linkgrabber.auto_confirm", False)
         with self.assertRaises(jl.LocalUnavailable):
             self.adapter.update_preset("downloads.auto_start", False)
+
+    def test_config_list_uses_five_arg_form_then_falls_back(self):
+        self.server.responses["/config/list"] = {"data": []}
+        self.adapter._config_entries()
+        path = self.server.paths[-1]
+        args = [json.loads(urllib.parse.unquote(a)) for a in path.split("?")[1].split("&")]
+        self.assertEqual(args, [".*", False, True, False, True])
+        self.server.paths.clear()
+        self.server.fail_with_args = True
+        self.adapter._config_entries()
+        self.assertEqual(len(self.server.paths), 2)
+        self.assertNotIn("?", self.server.paths[1])
+
+    def test_config_keys_filter(self):
+        entries = [
+            {"interfaceName": "a.Linkgrabber", "key": "AutoConfirm", "type": "BOOLEAN", "value": True},
+            {"interfaceName": "a.General", "key": "DefaultDownloadFolder", "type": "STRING", "value": "/x"},
+            {"interfaceName": "a.Account", "key": "ExtractX", "value": 1},
+            {"interfaceName": "a.Other", "key": "Unrelated", "value": 1},
+        ]
+        out = jl.filter_config_keys(entries)
+        self.assertEqual([e["key"] for e in out], ["AutoConfirm", "DefaultDownloadFolder"])
+        self.assertIsNone(out[1]["value"])
 
     def test_default_download_folder_found_and_missing(self):
         entries = [{"interfaceName": "org.jdownloader.settings.GeneralSettings",

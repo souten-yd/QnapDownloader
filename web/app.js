@@ -1,6 +1,6 @@
 "use strict";
 /*
- * QnapDownloader browser-style shell (v0.1.11).
+ * QnapDownloader browser-style shell (v0.1.12).
  * Spec: docs/browser-shell-ui.md. Single file, no build step.
  *
  * Security notes (see "Security invariants" in the spec):
@@ -27,7 +27,8 @@ const UPDATE_WATCH_MS = 5 * 60 * 1000;
 const STALE_CHECK_MS = 30000;
 const MAX_CLOSED_TABS = 10;
 const MAX_HISTORY = 50;
-const AUTO_REFRESH_MS = 15000;
+const AUTO_REFRESH_MS = 5000;     // downloads view: local data, refreshed while visible
+const BADGE_REFRESH_MS = 30000;   // header badge: only while the engine is running
 const FRAME_LOAD_TIMEOUT_MS = 12000;
 const PAGE_SIZE = 30;
 // Remote pages never get popups, downloads, modals or top navigation.
@@ -48,21 +49,25 @@ const MODE_LABELS = {strict: "強い制限", interactive: "限定操作", compat
 const SHELL_KEY = "qnapdl.shell.v1";
 const HOST_MODE_KEY = "qnapdl.hostmodes.v1";
 const TAB_STORAGE_KEY = "qnapdl.webtabs.v1";
-const AUTO_STORAGE_KEY = "qnapdl.downloads.auto";
-const SETTINGS_SECTIONS = ["storage", "engine", "bookmarks", "updates", "diagnostics", "about"];
+const LEGACY_AUTO_KEY = "qnapdl.downloads.auto";   // v0.1.11 switch; removed silently
+const SETTINGS_SECTIONS = ["engine", "storage", "bookmarks", "updates", "diagnostics", "about"];
 const SECTION_ALIASES = {jd2: "engine"};   // old #/settings/jd2 links
 const ENGINE_POLL_MS = 1500;
 const SVG_NS = "http://www.w3.org/2000/svg";
-const RAPIDGATOR_LIMIT = 65536;
+const PASTE_LIMIT = 65536;
+const PASTE_DEBOUNCE_MS = 400;
 
 const state = {
   csrf: "", authed: false, shellReady: false,
-  route: {view: "home"}, lastSection: "storage",
+  route: {view: "home"}, lastSection: "",
   tabs: [], nextTabId: 1, closed: [], lastWebTabId: null,
   bookmarks: [], status: null, omniDisplay: "",
   snapshot: null, snapshotAt: 0, downloadsPage: 0, downloadsBusy: false,
-  filter: "all", query: "", autoRefresh: false, autoTimer: null,
-  rapidgatorSnapshot: null, selectedVersion: "", selectedChannel: "rc",
+  filter: "all", query: "", autoTimer: null, downloadsFails: 0,
+  dlRunning: null, badgeTimer: null, badgeAt: 0, expanded: new Set(),
+  settings: null, jd2: null, queueData: null, pasteSeq: 0, pasteTimer: null, paste: null,
+  pickerOpen: false, connChecking: false, stepsMode: "",
+  selectedVersion: "", selectedChannel: "rc",
   menuReturnFocus: null,
   snapshotJson: "", downloadsSig: "", folderPath: "",
   bootVersion: "", statusCheckedAt: 0, updateWatching: false,
@@ -139,6 +144,9 @@ function readLocal(key) {
 }
 function writeLocal(key, value) {
   try { localStorage.setItem(key, value); } catch (e) { /* ignore */ }
+}
+function removeLocal(key) {
+  try { localStorage.removeItem(key); } catch (e) { /* ignore */ }
 }
 
 function normalizeMode(mode) { return MODES.includes(mode) ? mode : "strict"; }
@@ -301,11 +309,18 @@ function parseRoute() {
   if (head === "settings") {
     const wanted = SECTION_ALIASES[parts[1]] || parts[1];
     return {view: "settings",
-      section: SETTINGS_SECTIONS.includes(wanted) ? wanted : "storage"};
+      section: SETTINGS_SECTIONS.includes(wanted) ? wanted : defaultSection()};
   }
   if (head === "tab" && /^t\d+$/.test(parts[1] || "")) return {view: "tab", tabId: parts[1]};
   return {view: "home"};
 }
+
+// Engine first until it is running; then the save folder.
+function defaultSection() {
+  return state.engine && state.engine.phase === "running" ? "storage" : "engine";
+}
+
+function settingsHash() { return "#/settings/" + (state.lastSection || defaultSection()); }
 
 function navigate(hash) {
   if (location.hash === hash) applyRoute();
@@ -349,6 +364,7 @@ function applyRoute() {
   updateChrome();
   syncAutoRefresh();
   syncEnginePoll();
+  syncBadgeTimer();
   // Last route (a hash, never a secret) lets a reloaded iOS web app resume.
   writeSession(SHELL_KEY, JSON.stringify({v: 1, hash: location.hash || "#/home"}));
   perform(() => enterView(route));
@@ -356,12 +372,13 @@ function applyRoute() {
 
 async function enterView(route, force = false) {
   if (route.view === "home" || (route.view === "tab" && currentViewName() === "home")) {
-    await loadStatus(force);
+    await loadHome(force);
   } else if (route.view === "downloads") {
     renderDownloads();
     await loadEngine(force);
+    refreshDownloadsNow();
   } else if (route.view === "links") {
-    await Promise.all([loadQueue(force), loadEngine(force)]);
+    await Promise.all([loadQueue(force), loadJd2Status(force)]);
   } else if (route.view === "settings") {
     await enterSettings(route.section, force);
   } else if (route.view === "tab") {
@@ -407,6 +424,7 @@ function updateChrome() {
 
   const marked = Boolean(tab && tab.current);
   const on = marked && state.bookmarks.some(b => b.url === tab.current);
+  $("starBtn").hidden = !(tab && tab.history.length);   // only meaningful for web tabs
   $("starBtn").disabled = !marked;
   $("starBtn").classList.toggle("is-on", on);
   $("starBtn").setAttribute("aria-pressed", String(on));
@@ -425,7 +443,7 @@ function updatePinnedTabs() {
   const route = state.route;
   document.querySelectorAll("[data-tab]").forEach(a => {
     a.setAttribute("aria-selected", String(route.view === a.dataset.tab));
-    if (a.dataset.tab === "settings") a.setAttribute("href", "#/settings/" + state.lastSection);
+    if (a.dataset.tab === "settings") a.setAttribute("href", settingsHash());
   });
 }
 
@@ -493,14 +511,25 @@ function updateCfHint(tab) {
 function renderStatusData(s) {
   state.status = s;
   if (s.engine) applyEngine(s.engine);
+  if (s.jd2) state.jd2 = s.jd2;
   document.querySelectorAll(".js-version").forEach(n => { n.textContent = "v" + s.version; });
-  renderStatusCards();
+  document.querySelectorAll(".js-version-bare").forEach(n => { n.textContent = s.version; });
+  renderHome();
 }
 
 async function loadStatus(force = false) {
   const s = await swr("status", "/api/status", renderStatusData, {force});
   state.statusCheckedAt = Date.now();
   checkBootVersion(s.version);
+}
+
+async function loadSettings(force = false) {
+  await swr("settings", "/api/settings", renderDownloadDir, {force});
+}
+
+async function loadHome(force = false) {
+  await Promise.all([loadStatus(force), loadSettings(force)]);
+  refreshBadge();
 }
 
 // The Hub may have been updated (from this or another device) since this page
@@ -514,37 +543,53 @@ function checkBootVersion(version) {
     [{label: "再読み込み", run: () => location.reload()}]);
 }
 
-function statusCard(title, value, sub, ok, href) {
-  const card = element(href ? "a" : "div", undefined, "card status-card");
-  if (href) card.href = href;
-  const head = element("div", undefined, "status-head");
-  head.appendChild(element("span", undefined, "dot " + (ok === null ? "idle" : ok ? "ok" : "off")));
-  head.appendChild(element("span", title, "status-title"));
-  card.appendChild(head);
-  card.appendChild(element("strong", value, "status-value"));
-  card.appendChild(element("span", sub, "status-sub"));
-  return card;
+function setCheck(rowId, done) {
+  $(rowId).classList.toggle("is-done", done);
 }
 
-function renderStatusCards() {
-  const box = $("status");
-  box.replaceChildren();
-  const s = state.status;
-  if (!s) return;
-  box.appendChild(statusCard("Web管理画面", "稼働中",
-    "version " + s.version + " / 設定改訂 " + s.settings_revision, true));
-  const engine = s.engine || state.engine;
-  if (engine) {
-    box.appendChild(statusCard("JD2エンジン", PHASE_LABELS[engine.phase] || engine.phase,
-      engine.running ? (s.jd2.connected ? "Core revision " + s.jd2.revision : (s.jd2.reason || "接続を確認中"))
-        : (engine.error || "エンジン設定を開いて状態を確認してください"),
-      engine.phase === "running" ? true : (engine.phase === "stopped" || engine.phase === "not_installed") ? null : false,
-      "#/settings/engine"));
+// One "はじめに" checklist until a save folder is chosen and the engine is set
+// up; afterwards a single status line. Nothing renders before both are known.
+function renderHome() {
+  const e = state.engine, cfg = state.settings;
+  if (!e || !cfg) {
+    setShown("onboarding", false);
+    setShown("homeStatus", false);
+    return;
   }
-  const running = runningCount();
-  box.appendChild(statusCard("ダウンロード", running === null ? "未取得" : running + "件 実行中",
-    running === null ? "ダウンロード画面で取得します" : "最後に取得した一覧より",
-    running === null ? null : running > 0, "#/downloads"));
+  const folderDone = Boolean(cfg.download_dir);
+  const engineDone = e.installed === true;
+  const onboarding = !folderDone || !engineDone;
+  setShown("onboarding", onboarding);
+  setShown("homeStatus", !onboarding);
+  if (onboarding) {
+    setCheck("obStorage", folderDone);
+    setCheck("obEngine", engineDone);
+    $("obStorageText").textContent = folderDone ? cfg.download_dir : "ダウンロードの保存先フォルダ";
+    setShown("obStorageBtn", !folderDone);
+    const setupBtn = $("homeEngineSetup");
+    const busy = e.phase === "setup";
+    setupBtn.hidden = engineDone || busy;
+    setupBtn.disabled = !folderDone;
+    setupBtn.textContent = e.error ? "もう一度試す" : "初期設定を開始";
+    $("obEngineText").textContent = engineDone ? "準備できました" :
+      busy ? setupProgressText(e) :
+      e.error ? "失敗しました: " + e.error :
+      folderDone ? "JDownloader 2を導入します" : "先に保存先を選んでください";
+    return;
+  }
+  const phase = e.phase;
+  const running = phase === "running";
+  $("homeStatusDot").className = "dot " + (running ? "ok" : phase === "failed" ? "off" : "idle");
+  $("homeStatusText").textContent = running ? "エンジン稼働中" :
+    phase === "starting" ? "エンジン起動中…" :
+    phase === "failed" ? "エンジンを起動できません" : "エンジン停止中";
+  const link = $("homeStatusLink");
+  link.hidden = !running;
+  if (running) {
+    link.textContent = state.dlRunning === null ? "ダウンロードを見る" : "ダウンロード中 " + state.dlRunning + "件";
+    link.setAttribute("href", "#/downloads");
+  }
+  setShown("homeEngineStart", phase === "stopped" || phase === "failed");
 }
 
 // --------------------------------------------------------------- bookmarks
@@ -608,6 +653,13 @@ function renderBookmarkList() {
     open.addEventListener("click", () => perform(() => openWebUrl(book.url)));
     box.appendChild(open);
     box.appendChild(element("span", book.url));
+    const del = element("button", "削除", "btn small");
+    del.type = "button";
+    del.addEventListener("click", () => perform(async () => {
+      await api("/api/bookmarks/delete", {id: book.id});
+      await loadBookmarks(true);
+    }));
+    box.appendChild(del);
     nodes.push(box);
   }
   list.replaceChildren(...nodes);
@@ -902,7 +954,7 @@ function classifyInput(raw) {
     if (path[0] === "links" && path.length === 1) return {kind: "route", value: "#/links"};
     if (path[0] === "home" || path[0] === "") return {kind: "route", value: "#/home"};
     if (path[0] === "settings" && path.length <= 2) {
-      const section = SECTION_ALIASES[path[1]] || path[1] || "storage";
+      const section = SECTION_ALIASES[path[1]] || path[1] || defaultSection();
       if (SETTINGS_SECTIONS.includes(section)) return {kind: "route", value: "#/settings/" + section};
     }
     return {kind: "unknown-qnap"};
@@ -914,18 +966,11 @@ function classifyInput(raw) {
   return {kind: "hint"};
 }
 
-function resetExtraction() {
-  state.rapidgatorSnapshot = null;
-  $("rapidgatorStage").disabled = true;
-  $("rapidgatorResult").replaceChildren();
-}
-
 function prefillExtraction(text) {
-  // Prefill only. Nothing is saved or sent until the user previews and confirms.
-  $("rapidgatorText").value = text.slice(0, RAPIDGATOR_LIMIT);
-  resetExtraction();
+  // Prefill only. Nothing is saved until the user presses the add button.
+  $("pasteBox").value = text.slice(0, PASTE_LIMIT);
   navigate("#/links");
-  toast("Rapidgator抽出欄に転記しました。内容を確認して「リンクを抽出して確認」を押してください（自動保存はしません）。");
+  schedulePaste(0);
 }
 
 async function handleOmnibox(raw) {
@@ -989,7 +1034,7 @@ async function menuAction(action) {
   else if (action === "bookmark" && tab) await bookmarkTab(tab);
   else if (action === "closeTab" && tab) closeTab(tab.id);
   else if (action === "bookmarks") navigate("#/settings/bookmarks");
-  else if (action === "settings") navigate("#/settings/" + state.lastSection);
+  else if (action === "settings") navigate(settingsHash());
   else if (action === "logout") await logout();
 }
 
@@ -1000,9 +1045,9 @@ function openExternal(tab) {
 
 async function stageTabUrl(tab) {
   if (!tab.current) return;
-  if (!confirm("現在のアドレス欄のURLを保留キューに登録します。サイト内リンクは自動解析せず、JD2へも送信しません。よろしいですか？")) return;
-  await api("/api/links", {url: tab.current});
-  flash("保留キューに登録しました。ダウンロードは開始しません。");
+  await api("/api/links", {url: tab.current});   // local, deletable, never sent to JD2
+  swrDrop("links");
+  flash("追加したリンクに入れました（JD2へは未送信）");
 }
 
 async function bookmarkTab(tab) {
@@ -1072,10 +1117,11 @@ function itemState(item) {
   return "waiting";
 }
 
-function runningCount() {
-  if (!state.snapshot) return null;
-  return state.snapshot.links.filter(x => x.running === true).length;
-}
+function engineRunning() { return Boolean(state.engine && state.engine.phase === "running"); }
+
+function countRunning(snap) { return snap.links.filter(x => x.running === true).length; }
+
+function runningCount() { return state.dlRunning; }
 
 function updateBadge() {
   const running = runningCount();
@@ -1085,38 +1131,91 @@ function updateBadge() {
   });
   const label = running ? "ダウンロード（実行中 " + running + "件）" : "ダウンロード";
   $("dlButton").setAttribute("aria-label", label);
-  $("dlButton").title = running ? label + " ※最後に取得した一覧の件数" : "ダウンロード";
+  $("dlButton").title = label;
 }
 
-function downloadCard(item, packageItem) {
-  const card = element("article", undefined, "download-card " + itemState(item));
-  card.appendChild(element("strong", item.name, "download-title"));
-  const parts = [];
-  if (!packageItem && item.host) parts.push("ホスト: " + item.host);
-  if (packageItem && item.child_count !== null && item.child_count !== undefined) {
-    parts.push("ファイル: " + item.child_count + "件");
+const STATE_LABELS = {running: "ダウンロード中", finished: "完了", waiting: "待機"};
+
+function stateChip(item) {
+  const st = itemState(item);
+  const label = st === "waiting" && item.enabled === false ? "無効" : STATE_LABELS[st];
+  return element("span", label, "state-chip " + st);
+}
+
+function sizeText(item) {
+  const loaded = typeof item.bytes_loaded === "number" ? item.bytes_loaded : null;
+  if (typeof item.bytes_total === "number") return readableSize(loaded === null ? 0 : loaded) + " / " + readableSize(item.bytes_total);
+  return loaded === null ? "" : readableSize(loaded);
+}
+
+function metaText(item, extra) {
+  const parts = extra ? [extra] : [];
+  const size = sizeText(item);
+  if (size) parts.push(size);
+  if (item.running === true) {
+    if (typeof item.speed_bytes === "number") parts.push(readableSize(item.speed_bytes) + "/秒");
+    if (typeof item.eta_seconds === "number") parts.push("残り " + readableEta(item.eta_seconds));
   }
-  const label = item.finished === true ? "完了" : item.running === true ? "ダウンロード中" :
-    item.enabled === false ? "無効" : "待機/確認中";
-  parts.push(label);
   if (item.status) parts.push(item.status);
-  card.appendChild(element("p", parts.join(" / "), "download-detail"));
-  if (item.progress !== null && item.progress !== undefined) {
-    const track = element("div", undefined, "progress-track");
-    track.setAttribute("role", "progressbar");
-    track.setAttribute("aria-valuemin", "0");
-    track.setAttribute("aria-valuemax", "100");
-    track.setAttribute("aria-valuenow", String(item.progress));
-    track.setAttribute("aria-label", item.name + " 進捗");
-    const fill = element("div", undefined, "progress-fill");
-    fill.style.width = item.progress + "%";
-    track.appendChild(fill);
-    card.appendChild(track);
+  return parts.join(" · ");
+}
+
+function progressBar(item) {
+  if (item.progress === null || item.progress === undefined) return null;
+  const track = element("div", undefined, "progress-track");
+  track.setAttribute("role", "progressbar");
+  track.setAttribute("aria-valuemin", "0");
+  track.setAttribute("aria-valuemax", "100");
+  track.setAttribute("aria-valuenow", String(item.progress));
+  track.setAttribute("aria-label", item.name + " 進捗");
+  const fill = element("div", undefined, "progress-fill");
+  fill.style.width = item.progress + "%";
+  track.appendChild(fill);
+  return track;
+}
+
+function fileRow(item) {
+  const row = element("article", undefined, "file-row " + itemState(item));
+  const top = element("div", undefined, "row-top");
+  top.appendChild(element("span", item.name, "row-name"));
+  top.appendChild(stateChip(item));
+  row.appendChild(top);
+  const bar = progressBar(item);
+  if (bar) row.appendChild(bar);
+  const meta = metaText(item, item.host);
+  if (meta) row.appendChild(element("p", meta, "download-detail"));
+  return row;
+}
+
+function packageKey(item) { return item.id ? "id:" + item.id : "n:" + item.name; }
+
+function packageRow(pkg, files) {
+  const key = packageKey(pkg);
+  const open = state.expanded.has(key);
+  const card = element("article", undefined, "download-card pkg " + itemState(pkg));
+  const head = element("button", undefined, "pkg-head");
+  head.type = "button";
+  head.setAttribute("aria-expanded", String(open));
+  head.appendChild(element("span", open ? "▾" : "▸", "caret"));
+  head.appendChild(element("span", pkg.name, "row-name"));
+  head.appendChild(stateChip(pkg));
+  head.addEventListener("click", () => {
+    if (state.expanded.has(key)) state.expanded.delete(key); else state.expanded.add(key);
+    state.downloadsSig = "";
+    renderDownloads();
+  });
+  card.appendChild(head);
+  const bar = progressBar(pkg);
+  if (bar) card.appendChild(bar);
+  const count = typeof pkg.child_count === "number" ? "ファイル " + pkg.child_count + "件" : "";
+  const meta = metaText(pkg, count);
+  if (meta) card.appendChild(element("p", meta, "download-detail"));
+  if (open) {
+    const box = element("div", undefined, "pkg-files");
+    if (files.length) for (const f of files) box.appendChild(fileRow(f));
+    else box.appendChild(element("p", "このページに表示できるファイルがありません", "empty-state"));
+    card.appendChild(box);
   }
-  card.appendChild(element("p",
-    "転送: " + readableSize(item.bytes_loaded) + " / " + readableSize(item.bytes_total) +
-    " · 速度: " + readableSize(item.speed_bytes) + "/秒 · 残り: " + readableEta(item.eta_seconds),
-    "download-detail"));
   return card;
 }
 
@@ -1126,68 +1225,118 @@ function matchesFilter(item) {
   return !q || String(item.name).toLowerCase().includes(q);
 }
 
-// Pure client-side rendering of the last fetched snapshot (filter + search).
+function clockText(ms) {
+  const d = new Date(ms), two = n => String(n).padStart(2, "0");
+  return two(d.getHours()) + ":" + two(d.getMinutes()) + ":" + two(d.getSeconds());
+}
+
+// Empty state (engine not running) vs. list. Called on engine changes too.
+function renderDownloadsShell() {
+  const e = state.engine;
+  const running = engineRunning();
+  setShown("downloadsEmpty", Boolean(e) && !running);
+  setShown("downloadsBody", running);
+  $("downloadsRefresh").hidden = !running;
+  $("downloadsUpdated").hidden = !running;
+  if (!e || running) return;
+  const needSetup = !e.installed || e.phase === "setup";
+  const button = $("downloadsEngineAction");
+  button.dataset.action = needSetup ? "setup" : "start";
+  button.textContent = needSetup ? "初期設定へ" : "起動";
+  button.hidden = e.phase === "starting";
+  button.disabled = false;
+  const note = e.phase === "starting" ? "起動しています…" : e.error ? e.error : "";
+  $("downloadsEmptyNote").textContent = note;
+  setShown("downloadsEmptyNote", Boolean(note));
+}
+
+// Packages are the rows; their files (same snapshot, matched by package id)
+// expand on click. Files whose package is not on this page go to a fold.
 function renderDownloads() {
+  renderDownloadsShell();
   const snap = state.snapshot;
-  // Repaint only when snapshot, filter or search changed.
-  const sig = snap ? state.snapshotJson + "|" + state.filter + "|" + state.query : "";
+  const sig = snap ? state.snapshotJson + "|" + state.filter + "|" + state.query + "|" +
+    Array.from(state.expanded).join(",") : "";
   if (sig === state.downloadsSig) return;
   state.downloadsSig = sig;
-  const packages = $("downloadPackages"), links = $("downloadLinks"), metrics = $("downloadsSummary");
-  packages.replaceChildren(); links.replaceChildren(); metrics.replaceChildren();
-  if (!snap) return;
-  const shownPackages = snap.packages.filter(matchesFilter);
-  const shownLinks = snap.links.filter(matchesFilter);
-  for (const item of shownPackages) packages.appendChild(downloadCard(item, true));
-  for (const item of shownLinks) links.appendChild(downloadCard(item, false));
-  const filtering = state.filter !== "all" || state.query.trim() !== "";
-  if (!shownPackages.length) {
-    packages.appendChild(element("p", filtering && snap.packages.length ?
-      "条件に一致するパッケージはありません。" : "パッケージが見つかりません。", "empty-state"));
+  const list = $("downloadList"), orphans = $("downloadOrphans");
+  if (!snap) {
+    list.replaceChildren(); orphans.replaceChildren();
+    setShown("orphanFiles", false); setShown("downloadsTools", false);
+    $("downloadsSummary").textContent = "";
+    return;
   }
-  if (!shownLinks.length) {
-    links.appendChild(element("p", filtering && snap.links.length ?
-      "条件に一致するファイルはありません。" : "ファイルが見つかりません。", "empty-state"));
+  const hasItems = snap.packages.length > 0 || snap.links.length > 0;
+  setShown("downloadsTools", hasItems);
+  const byPackage = new Map();
+  const known = new Set(snap.packages.map(p => p.id).filter(Boolean));
+  const loose = [];
+  for (const file of snap.links) {
+    if (file.package_id && known.has(file.package_id)) {
+      if (!byPackage.has(file.package_id)) byPackage.set(file.package_id, []);
+      byPackage.get(file.package_id).push(file);
+    } else {
+      loose.push(file);
+    }
   }
+  const nodes = [];
+  for (const pkg of snap.packages) {
+    const files = pkg.id ? byPackage.get(pkg.id) || [] : [];
+    if (matchesFilter(pkg) || files.some(matchesFilter)) nodes.push(packageRow(pkg, files));
+  }
+  const looseShown = loose.filter(matchesFilter);
+  // Without any package on the page, loose files are the list itself.
+  if (!snap.packages.length) for (const file of looseShown) nodes.push(fileRow(file));
+  if (!nodes.length) {
+    const filtering = state.filter !== "all" || state.query.trim() !== "";
+    nodes.push(element("p", filtering && hasItems ? "条件に一致するものはありません" :
+      "ダウンロードはありません。「リンク」から追加できます", "empty-state"));
+  }
+  list.replaceChildren(...nodes);
+  const showLoose = snap.packages.length > 0 && looseShown.length > 0;
+  setShown("orphanFiles", showLoose);
+  orphans.replaceChildren(...(showLoose ? looseShown.map(fileRow) : []));
+  $("orphanSummary").textContent = "他のファイル（" + looseShown.length + "件）";
+  const rows = snap.packages.length ? snap.packages : snap.links;
   const counts = {running: 0, waiting: 0, finished: 0};
-  for (const item of snap.links) counts[itemState(item)]++;
-  for (const [title, value] of [["表示ファイル", snap.links.length + "件"], ["実行中", counts.running + "件"],
-      ["待機", counts.waiting + "件"], ["完了", counts.finished + "件"]]) {
-    const box = element("div", undefined, "metric");
-    box.appendChild(element("span", title));
-    box.appendChild(element("strong", value));
-    metrics.appendChild(box);
-  }
+  for (const item of rows) counts[itemState(item)]++;
+  $("downloadsSummary").textContent = hasItems ? "実行中 " + counts.running + " · 待機 " +
+    counts.waiting + " · 完了 " + counts.finished : "";
+}
+
+// Entering the downloads view: fetch immediately when the engine is running.
+function refreshDownloadsNow() {
+  if (!engineRunning()) return;
+  state.downloadsFails = 0;
+  loadDownloads(state.downloadsPage);
 }
 
 async function loadDownloads(page, options = {}) {
-  if (state.downloadsBusy) return;   // never overlap requests
+  if (state.downloadsBusy || !engineRunning()) return;   // never overlap requests
   state.downloadsBusy = true;
   $("downloadsRefresh").disabled = true;
-  $("downloadsMessage").textContent = "JD2から状態を取得中… ダウンロード操作は実行しません。";
   try {
     const snap = await api("/api/jd2/downloads?page=" + page);
     state.snapshot = snap;
     state.snapshotJson = JSON.stringify(snap);
     state.snapshotAt = Date.now();
+    state.badgeAt = state.snapshotAt;
     state.downloadsPage = snap.page;
+    state.downloadsFails = 0;
+    if (snap.page === 0) state.dlRunning = countRunning(snap);
     renderDownloads();
     updateBadge();
-    $("downloadsMessage").textContent = "JD2から取得しました（読み取り専用）。一覧は最大" + PAGE_SIZE +
-      "件ずつ表示します。" + (options.auto ? "（自動更新）" : "");
+    $("downloadsMessage").textContent = "";
+    $("downloadsUpdated").textContent = "更新: " + clockText(state.snapshotAt);
     $("downloadsPage").textContent = (snap.page + 1) + "ページ目";
     $("downloadsPrev").disabled = snap.page === 0;
     $("downloadsNext").disabled = !snap.has_more || snap.page >= 20;
-    if (state.route.view === "home" || currentViewName() === "home") renderStatusCards();
+    setShown("downloadsPager", Boolean(snap.has_more) || snap.page > 0);
+    renderHome();
   } catch (error) {
-    let message = "取得できませんでした: " + error.message + "。エンジンが起動しているか確認してください。";
-    if (state.autoRefresh) {
-      setAutoRefresh(false);
-      message += " 自動更新を停止しました。";
-    }
-    $("downloadsMessage").textContent = message;
-    $("downloadsPrev").disabled = true;
-    $("downloadsNext").disabled = true;
+    state.downloadsFails++;
+    $("downloadsMessage").textContent = "取得できませんでした: " + error.message;
+    loadEngine(true).catch(() => {});   // the engine may have stopped meanwhile
   } finally {
     state.downloadsBusy = false;
     $("downloadsRefresh").disabled = false;
@@ -1196,12 +1345,12 @@ async function loadDownloads(page, options = {}) {
 }
 
 function autoRefreshAllowed() {
-  return state.autoRefresh && state.authed && state.route.view === "downloads" &&
-    document.visibilityState === "visible";
+  return state.authed && state.route.view === "downloads" && engineRunning() &&
+    document.visibilityState === "visible" && state.downloadsFails < 3;
 }
 
-// Opt-in browser-side refresh: only while the downloads view is shown and the
-// page is visible. One request at a time; stops itself on any error.
+// Local data, so refresh every few seconds, but only while the downloads view is
+// on screen and the page is visible. One request at a time; gives up after 3 errors.
 function syncAutoRefresh() {
   clearTimeout(state.autoTimer);
   state.autoTimer = null;
@@ -1216,11 +1365,27 @@ async function autoTick() {
   await loadDownloads(state.downloadsPage, {auto: true});
 }
 
-function setAutoRefresh(on) {
-  state.autoRefresh = on;
-  $("downloadsAuto").checked = on;
-  writeLocal(AUTO_STORAGE_KEY, on ? "1" : "0");
-  syncAutoRefresh();
+// Header badge: light page-0 fetch every 30s while the engine runs and the page
+// is visible. The downloads view refreshes the count itself.
+async function refreshBadge() {
+  if (!state.authed || document.visibilityState !== "visible" || !engineRunning() ||
+      state.downloadsBusy || state.route.view === "downloads") return;
+  if (Date.now() - state.badgeAt < 10000) return;
+  state.downloadsBusy = true;
+  try {
+    const snap = await api("/api/jd2/downloads?page=0");
+    state.dlRunning = countRunning(snap);
+    state.badgeAt = Date.now();
+    updateBadge();
+    renderHome();
+  } catch (e) { /* silent: the badge just keeps its last value */ }
+  finally { state.downloadsBusy = false; }
+}
+
+function syncBadgeTimer() {
+  const want = state.authed && engineRunning();
+  if (want && !state.badgeTimer) state.badgeTimer = setInterval(refreshBadge, BADGE_REFRESH_MS);
+  else if (!want && state.badgeTimer) { clearInterval(state.badgeTimer); state.badgeTimer = null; }
 }
 
 function setFilter(filter) {
@@ -1231,26 +1396,41 @@ function setFilter(filter) {
 }
 
 // ----------------------------------------------------------------- links
+function jd2CanSend() { return Boolean(state.jd2 && state.jd2.can_send === true); }
+
+const LINK_STATE_LABELS = {staged: "未送信", sending: "送信中", uncertain: "要確認", sent: "送信済み"};
+
 function renderQueue(q) {
+  state.queueData = q;
   const nodes = [];
-  if (!q.items.length) nodes.push(element("p", "保留中のリンクはありません。", "empty-state"));
+  const canSend = jd2CanSend();
+  const staged = q.items.filter(l => l.state === "staged");
+  setShown("sendAll", canSend && staged.length >= 2);
+  if (!q.items.length) nodes.push(element("p", "追加したリンクはありません", "empty-state"));
   for (const link of q.items) {
-    const container = element("div", undefined, "item");
-    container.appendChild(element("span", link.url));
-    container.appendChild(element("span", link.state === "staged" ? "保留中（自動送信なし）" :
-      link.state === "sending" || link.state === "uncertain" ? "送信結果未確認・JD2で確認してください" :
-      link.state === "sent" ? "JD2へ送信済み" : "状態: " + link.state));
+    const container = element("div", undefined, "item link-item");
+    container.appendChild(element("span", link.url, "link-url"));
+    const row = element("div", undefined, "link-actions");
+    const chip = element("span", LINK_STATE_LABELS[link.state] || link.state, "state-chip link-" + link.state);
+    if (link.state === "uncertain" || link.state === "sending") chip.title = "送信結果が不明です。JD2で確認してください";
+    row.appendChild(chip);
     if (link.state === "staged") {
-      const send = element("button", "JD2に手動で送る", "btn");
-      send.type = "button";
-      send.addEventListener("click", () => perform(async () => {
-        if (!confirm("このリンクをJD2のLinkGrabberへ送ります。自動開始はOFFです。既存のPackagizerルールによりフォルダが変わる可能性があります。続けますか？")) return;
-        await api("/api/links/send", {id: link.id});
+      if (canSend) {
+        const send = element("button", "JD2へ送る", "btn small");
+        send.type = "button";
+        send.addEventListener("click", () => perform(() => sendLinks([link])));
+        row.appendChild(send);
+      }
+      const del = element("button", "削除", "btn small quiet");
+      del.type = "button";
+      del.addEventListener("click", () => perform(async () => {
+        await api("/api/links/delete", {id: link.id});
+        swrDrop("links");
         await loadQueue(true);
-        flash("JD2のLinkGrabberへ登録しました。処理はまだ開始していません");
       }));
-      container.appendChild(send);
+      row.appendChild(del);
     }
+    container.appendChild(row);
     nodes.push(container);
   }
   $("queueItems").replaceChildren(...nodes);   // swapped in one step, never cleared first
@@ -1260,32 +1440,113 @@ async function loadQueue(force = false) {
   await swr("links", "/api/links", renderQueue, {force});
 }
 
-async function previewRapidgator() {
-  const content = $("rapidgatorText").value;
-  const preview = await api("/api/rapidgator/extract", {content, limit: 20, commit: false});
-  state.rapidgatorSnapshot = {content, digest: preview.digest, limit: 20, count: preview.count};
-  $("rapidgatorStage").disabled = preview.count === 0;
-  const list = $("rapidgatorResult");
-  list.replaceChildren();
-  list.appendChild(element("p", "Rapidgatorリンク: " + preview.count + "件（未保存・未送信）"));
-  for (const url of preview.items) list.appendChild(element("div", url, "item"));
+function renderJd2Status(jd) {
+  state.jd2 = jd;
+  if (state.queueData) renderQueue(state.queueData);
+  renderEngineJd2();
 }
 
-async function stageRapidgator() {
-  const snapshot = state.rapidgatorSnapshot;
-  if (!snapshot || $("rapidgatorText").value !== snapshot.content) {
-    flash("貼り付け内容が変化しました。再抽出してください");
+async function loadJd2Status(force = false) {
+  await swr("jd2-status", "/api/jd2/status", renderJd2Status, {force});
+}
+
+// Sequential hand-off with one confirmation; stops at the first error.
+async function sendLinks(links) {
+  const many = links.length > 1;
+  if (!confirm(many ? links.length + "件のリンクをJD2のLinkGrabberへ順に送ります。自動開始はOFFです。既存のPackagizerルールによりフォルダが変わる可能性があります。続けますか？" :
+      "このリンクをJD2のLinkGrabberへ送ります。自動開始はOFFです。既存のPackagizerルールによりフォルダが変わる可能性があります。続けますか？")) return;
+  let sent = 0;
+  try {
+    for (const link of links) {
+      await api("/api/links/send", {id: link.id});
+      sent++;
+    }
+  } catch (e) {
+    swrDrop("links");
+    await loadQueue(true).catch(() => {});
+    throw new Error((many ? sent + "/" + links.length + "件送信後に停止: " : "") + e.message);
+  }
+  swrDrop("links");
+  await loadQueue(true);
+  flash(sent + "件をJD2のLinkGrabberへ送りました（ダウンロードは未開始）");
+}
+
+function sendAllStaged() {
+  const items = state.queueData ? state.queueData.items.filter(l => l.state === "staged") : [];
+  return items.length ? sendLinks(items) : Promise.resolve();
+}
+
+// ---- one paste box: single https URL, or preview of extracted links
+function schedulePaste(delay = PASTE_DEBOUNCE_MS) {
+  clearTimeout(state.pasteTimer);
+  state.pasteSeq++;
+  state.paste = null;
+  $("pasteAdd").disabled = true;
+  if (!$("pasteBox").value.trim()) { setShown("pasteResult", false); return; }
+  state.pasteTimer = setTimeout(() => perform(runPastePreview), delay);
+}
+
+function isSingleHttpsUrl(text) { return /^https:\/\/[^\s<>"']+$/.test(text); }
+
+function showPaste(summary, urls, buttonLabel) {
+  $("pasteSummary").textContent = summary;
+  $("pasteList").replaceChildren(...urls.map(u => element("div", u, "item")));
+  $("pasteAdd").textContent = buttonLabel || "追加";
+  $("pasteAdd").hidden = !buttonLabel;
+  setShown("pasteResult", true);
+}
+
+async function runPastePreview() {
+  const seq = state.pasteSeq;
+  const content = $("pasteBox").value;
+  const text = content.trim();
+  if (!text) { setShown("pasteResult", false); return; }
+  if (isSingleHttpsUrl(text)) {
+    state.paste = {kind: "url", url: text};
+    showPaste("追加するURL", [text], "このURLを追加");
+    $("pasteAdd").disabled = false;
     return;
   }
-  if (!confirm(snapshot.count + "件のリンクをHubの保留キューに保存します。JD2への送信・ダウンロードは開始しません。よろしいですか？")) return;
-  $("rapidgatorStage").disabled = true;
-  state.rapidgatorSnapshot = null;
-  const staged = await api("/api/rapidgator/extract",
-    {content: snapshot.content, limit: snapshot.limit, digest: snapshot.digest, commit: true});
-  $("rapidgatorResult").replaceChildren(element("p",
-    "保留キューへ新規 " + staged.staged + "件を登録しました。JD2へは未送信です。"));
+  const preview = await api("/api/rapidgator/extract", {content, limit: 20, commit: false});
+  if (seq !== state.pasteSeq) return;   // the box changed while waiting
+  if (!preview.count) {
+    state.paste = null;
+    showPaste(/^http:\/\/\S+$/.test(text) ? "httpsのURLだけ追加できます" :
+      "追加できるリンクが見つかりません", [], "");
+    return;
+  }
+  state.paste = {kind: "extract", content, digest: preview.digest, limit: 20, count: preview.count};
+  showPaste(preview.count + "件見つかりました", preview.items, preview.count + "件を追加");
+  $("pasteAdd").disabled = false;
+}
+
+async function addPasted() {
+  const pasted = state.paste;
+  if (!pasted) return;
+  if (pasted.kind === "extract" && $("pasteBox").value !== pasted.content) {
+    flash("貼り付け内容が変わりました。もう一度確認します");
+    schedulePaste(0);
+    return;
+  }
+  $("pasteAdd").disabled = true;
+  state.paste = null;
+  let message;
+  if (pasted.kind === "url") {
+    await api("/api/links", {url: pasted.url});
+    message = "追加しました";
+  } else {
+    const staged = await api("/api/rapidgator/extract",
+      {content: pasted.content, limit: pasted.limit, digest: pasted.digest, commit: true});
+    message = staged.staged === pasted.count ? pasted.count + "件を追加しました" :
+      staged.staged + "件を追加しました（" + (pasted.count - staged.staged) + "件は追加済み）";
+  }
+  clearTimeout(state.pasteTimer);
+  state.pasteSeq++;
+  $("pasteBox").value = "";
+  setShown("pasteResult", false);
+  swrDrop("links");
   await loadQueue(true);
-  flash("保存完了。必要なら保留キューから個別にJD2へ送ってください");
+  flash(message);
 }
 
 // -------------------------------------------------------------- settings
@@ -1298,25 +1559,39 @@ function showSettingsSection(section) {
 }
 
 function renderDownloadDir(s) {
-  $("selectedFolder").textContent = s.download_dir ? "保存先：" + s.download_dir : "保存先：未選択";
+  state.settings = s;
+  $("selectedFolder").textContent = s.download_dir || "未選択";
+  $("folderChange").textContent = s.download_dir ? "変更" : "選ぶ";
+  renderHome();
+}
+
+function setPicker(open) {
+  state.pickerOpen = open;
+  setShown("folderPickerBox", open);
 }
 
 async function enterSettings(section, force = false) {
   showSettingsSection(section);
   if (section === "storage") {
-    await Promise.all([
-      swr("settings", "/api/settings", renderDownloadDir, {force}),
-      folders(state.folderPath, force).catch(e => {
+    await loadSettings(force);
+    // Nothing chosen yet: go straight to the picker.
+    if (!state.settings || !state.settings.download_dir) setPicker(true);
+    if (state.pickerOpen) {
+      await folders(state.folderPath, force).catch(e => {
         if (!state.folderPath) throw e;
         return folders("", force);   // remembered folder vanished: back to the shares
-      }),
-    ]);
+      });
+    }
   } else if (section === "engine") {
     await loadEngine(force);
+    if (engineRunning()) {
+      await loadJd2Status(force);
+      checkConnection();
+    }
   } else if (section === "bookmarks") {
     await loadBookmarks(force);
   } else if (section === "updates") {
-    await updateStatus(force);
+    await Promise.all([loadStatus(force), updateStatus(force)]);
   } else if (section === "about") {
     await loadStatus(force);
   }
@@ -1325,18 +1600,19 @@ async function enterSettings(section, force = false) {
 function renderFolders(path, data) {
   const nodes = [];
   if (path) {
-    nodes.push(element("p", "表示フォルダ: " + data.path, "path"));
-    const select = element("button", "このフォルダを保存する", "btn primary");
+    nodes.push(element("p", data.path, "path"));
+    const select = element("button", "このフォルダにする", "btn primary");
     select.type = "button";
     select.disabled = !data.writable;
     select.addEventListener("click", () => perform(async () => {
-      const v = await api("/api/settings/folder", {path: data.path});
-      $("selectedFolder").textContent = "保存先：" + v.download_dir;
+      await api("/api/settings/folder", {path: data.path});
       swrDrop("settings", "status");
-      flash("保存先を永続保存しました");
+      await loadSettings(true);
+      setPicker(false);
+      flash("保存先を変更しました");
     }));
     nodes.push(select);
-    const back = element("button", "← 共有フォルダ一覧", "btn");
+    const back = element("button", "共有フォルダ一覧へ", "btn");
     back.type = "button";
     back.addEventListener("click", () => perform(() => folders("")));
     nodes.push(back);
@@ -1345,15 +1621,14 @@ function renderFolders(path, data) {
     const btn = element("button", undefined, "folder");
     btn.type = "button";
     btn.appendChild(icon("folder"));
-    btn.appendChild(element("span", child.name + " " + (child.writable ? "" : "(読取のみ)")));
+    btn.appendChild(element("span", child.name + (child.writable ? "" : "（読取のみ）")));
     btn.addEventListener("click", () => perform(() => folders(child.path)));
     nodes.push(btn);
   }
   $("folderPicker").replaceChildren(...nodes);
 }
 
-// The picker keeps its position between visits and is rebuilt only when the
-// folder listing it shows actually changed (see swr).
+// The picker is rebuilt only when the folder listing it shows actually changed (see swr).
 async function folders(path, force = false) {
   const previous = state.folderPath;
   state.folderPath = path;
@@ -1366,25 +1641,32 @@ async function folders(path, force = false) {
   }
 }
 
-function renderUpdateStatus(s) {
-  $("updateStatus").textContent = "更新状態: " + s.phase + " — " + (s.message || s.unsupported_reason || "待機中");
-  $("updateApply").disabled = Boolean(s.busy) || !s.supported;
+const UPDATE_PHASES = {
+  idle: "待機中", queued: "開始待ち", checking: "確認中", downloading: "取得中",
+  backup: "バックアップ中", installing: "適用中", verifying: "検証中",
+  success: "完了", failed: "失敗",
+};
+
+function syncUpdateApply() {
+  const info = state.updateInfo;
+  const ok = Boolean(state.selectedVersion && info && info.supported && !info.busy);
+  setShown("updateApply", ok);
 }
 
-function renderJd2Status(jd) {
-  $("jd2Status").textContent = jd.connected ?
-    "JD2接続中 / Core revision: " + (jd.revision || "不明") + " / 更新: " + (jd.update_available ? "あり" : "なし") :
-    "JD2未接続: " + (jd.reason || "接続アダプタの構成待ち");
-  $("jd2Check").disabled = !jd.connected || !jd.can_update;
-  $("jd2Update").disabled = !jd.connected || !jd.can_update || !jd.update_available;
-  $("jd2Preset").disabled = !jd.connected || !jd.can_preset;
+function renderUpdateStatus(s) {
+  state.updateInfo = s;
+  let text = "";
+  if (!s.supported) {
+    text = "この環境ではQPKGの更新を適用できません" + (s.unsupported_reason ? "（" + s.unsupported_reason + "）" : "");
+  } else if (s.phase && s.phase !== "idle") {
+    text = "更新: " + (UPDATE_PHASES[s.phase] || "処理中") + (s.message ? " — " + s.message : "");
+  }
+  $("updateStatus").textContent = text;
+  syncUpdateApply();
 }
 
 async function updateStatus(force = false) {
-  await Promise.all([
-    swr("update-status", "/api/update/status", renderUpdateStatus, {force}),
-    swr("jd2-status", "/api/jd2/status", renderJd2Status, {force}),
-  ]);
+  await swr("update-status", "/api/update/status", renderUpdateStatus, {force});
 }
 
 async function checkUpdate() {
@@ -1392,11 +1674,9 @@ async function checkUpdate() {
   const u = await api("/api/update/check?channel=" + encodeURIComponent(channel));
   state.selectedVersion = u.available ? u.release.version : "";
   state.selectedChannel = channel;
-  $("updateResult").textContent = u.available ?
-    "更新あり: " + u.release.version + (u.release.version.includes("-rc") ? "（RC版）" : "（正式版）") :
-    (channel === "rc" ? "新しい正式版・RC版のQPKGはありません" : "新しい正式版のQPKGはありません");
-  setShown("updateApply", Boolean(u.available));
+  $("updateResult").textContent = u.available ? u.release.version + " があります" : "最新です";
   await updateStatus(true);
+  syncUpdateApply();
 }
 
 async function applyPreset() {
@@ -1410,8 +1690,9 @@ async function applyPreset() {
   if (!confirm("次のJD2設定をOFFに変更します（既存キューは変更しません）。\n" +
       changed.map(x => "・" + x.label).join("\n") + "\n適用しますか？")) return;
   await api("/api/jd2/preset/apply", {confirmed: true});
-  await updateStatus(true);
-  flash("推奨設定を再適用し、再読込で確認しました");
+  swrDrop("engine", "status");
+  await Promise.all([loadJd2Status(true), loadEngine(true)]);
+  flash("推奨設定を再適用しました");
 }
 
 // ------------------------------------------------------- update auto reload
@@ -1462,6 +1743,20 @@ function teardownSession() {
   state.shellReady = false;
   clearTimeout(state.autoTimer);
   state.autoTimer = null;
+  clearTimeout(state.pasteTimer);
+  clearInterval(state.badgeTimer);
+  state.badgeTimer = null;
+  state.pasteSeq++;
+  state.paste = null;
+  state.settings = null;
+  state.jd2 = null;
+  state.queueData = null;
+  state.engine = null;
+  state.dlRunning = null;
+  state.expanded = new Set();
+  state.pickerOpen = false;
+  state.stepsMode = "";
+  state.downloadsFails = 0;
   for (const tab of state.tabs) tab.token++;
   $("frames").replaceChildren();   // unload every external page
   state.tabs = [];
@@ -1476,12 +1771,15 @@ function teardownSession() {
   state.status = null;
   swrReset();
   writeSession(SHELL_KEY, null);
-  for (const id of ["downloadPackages", "downloadLinks", "downloadsSummary", "queueItems",
-      "folderPicker", "bookmarkItems", "speedDial", "bookmarkBar", "status", "webTabs"]) {
+  for (const id of ["downloadList", "downloadOrphans", "queueItems", "pasteList",
+      "folderPicker", "bookmarkItems", "speedDial", "bookmarkBar", "webTabs"]) {
     $(id).replaceChildren();
   }
-  resetExtraction();
-  $("rapidgatorText").value = "";
+  $("downloadsSummary").textContent = "";
+  $("pasteBox").value = "";
+  setShown("pasteResult", false);
+  setShown("onboarding", false);
+  setShown("homeStatus", false);
   closeMenu(false);
   closeSwitcher(false);
   updateBadge();
@@ -1491,8 +1789,7 @@ function initShellState() {
   if (state.shellReady) return;
   state.shellReady = true;
   restoreTabs();
-  state.autoRefresh = readLocal(AUTO_STORAGE_KEY) === "1";
-  $("downloadsAuto").checked = state.autoRefresh;
+  removeLocal(LEGACY_AUTO_KEY);   // v0.1.11 auto-refresh switch no longer exists
 }
 
 // iOS may reload the home-screen app after killing its WebContent process.
@@ -1525,6 +1822,7 @@ async function go() {
   try {
     const session = await api("/api/session");
     state.csrf = session.csrf || "";
+    updateLanWarning(session.tailnet === true);
     if (session.authenticated) {
       state.authed = true;
       setShown("authArea", false);
@@ -1593,6 +1891,7 @@ function wireShell() {
   window.addEventListener("hashchange", applyRoute);
   document.addEventListener("visibilitychange", syncAutoRefresh);
   document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "visible") refreshBadge();
     // Long-open page: notice a Hub update done elsewhere (toast only, no reload).
     if (document.visibilityState === "visible" && state.authed &&
         Date.now() - state.statusCheckedAt > STALE_CHECK_MS) {
@@ -1617,7 +1916,6 @@ function wireShell() {
   });
   $("tabstrip").addEventListener("keydown", onTabstripKeydown);
   $("newTab").addEventListener("click", createBlankTab);
-  $("homeOpenWeb").addEventListener("click", focusOmnibox);
 
   $("navBack").addEventListener("click", () => {
     const tab = activeWebTab();
@@ -1632,7 +1930,7 @@ function wireShell() {
   $("navReload").addEventListener("click", () => {
     const tab = activeWebTab();
     if (tab && tab.history.length) perform(() => reloadTab(tab));
-    else if (state.route.view === "downloads") loadDownloads(state.downloadsPage);
+    else if (state.route.view === "downloads") { state.downloadsFails = 0; loadDownloads(state.downloadsPage); }
     else perform(() => enterView(state.route, true));
   });
 
@@ -1692,10 +1990,12 @@ function wireAuth() {
 }
 
 function wireDownloads() {
-  $("downloadsRefresh").addEventListener("click", () => loadDownloads(state.downloadsPage));
+  $("downloadsRefresh").addEventListener("click", () => {
+    state.downloadsFails = 0;
+    loadDownloads(state.downloadsPage);
+  });
   $("downloadsPrev").addEventListener("click", () => loadDownloads(state.downloadsPage - 1));
   $("downloadsNext").addEventListener("click", () => loadDownloads(state.downloadsPage + 1));
-  $("downloadsAuto").addEventListener("change", () => setAutoRefresh($("downloadsAuto").checked));
   document.querySelectorAll(".chip").forEach(c => c.addEventListener("click", () => setFilter(c.dataset.filter)));
   $("downloadsSearch").addEventListener("input", () => {
     state.query = $("downloadsSearch").value;
@@ -1704,19 +2004,14 @@ function wireDownloads() {
 }
 
 function wireLinks() {
-  $("queueAdd").addEventListener("click", () => perform(async () => {
-    await api("/api/links", {url: $("queueUrl").value.trim()});
-    $("queueUrl").value = "";
-    await loadQueue(true);
-  }));
-  $("rapidgatorText").addEventListener("input", resetExtraction);
-  $("rapidgatorPreview").addEventListener("click", () => perform(previewRapidgator));
-  $("rapidgatorStage").addEventListener("click", () => perform(stageRapidgator));
+  $("pasteBox").addEventListener("input", () => schedulePaste());
+  $("pasteAdd").addEventListener("click", () => perform(addPasted));
+  $("sendAll").addEventListener("click", () => perform(sendAllStaged));
 }
 
 // ------------------------------------------------------------------ engine
 const PHASE_LABELS = {
-  not_installed: "未導入", setup: "初期設定中", starting: "起動中", running: "稼働中",
+  not_installed: "未導入", setup: "初期設定中", starting: "起動中…", running: "稼働中",
   stopped: "停止中", failed: "失敗",
 };
 const STEP_MARKS = {pending: "○", running: "…", done: "✓", skipped: "↷", warn: "!", failed: "✕"};
@@ -1726,12 +2021,13 @@ function engineSectionVisible() {
   return state.route.view === "settings" && state.route.section === "engine";
 }
 
-// Poll only while a setup/start is in progress AND the engine section or the
-// home page is on screen (and the page is visible). Stops on any error.
+// Poll only while a setup/start is in progress AND a view that shows it (engine
+// section, home or downloads) is on screen and the page is visible.
 function enginePollWanted() {
   const e = state.engine;
   return Boolean(state.authed && e && (e.phase === "setup" || e.phase === "starting") &&
-    document.visibilityState === "visible" && (engineSectionVisible() || currentViewName() === "home"));
+    document.visibilityState === "visible" &&
+    (engineSectionVisible() || currentViewName() === "home" || state.route.view === "downloads"));
 }
 
 function syncEnginePoll() {
@@ -1747,9 +2043,9 @@ async function engineTick() {
   state.engineBusy = true;
   try {
     applyEngine(await api("/api/engine/status"));
-    if (!$("engineLog").hidden) await loadEngineLog();
+    if ($("engineLogBox").open) await loadEngineLog();
   } catch (e) {
-    toast("エンジン状態を取得できませんでした: " + e.message, "error");
+    toast("エンジンの状態を取得できませんでした: " + e.message, "error");
     state.engineBusy = false;
     return;   // polling stops until the next user action
   }
@@ -1758,39 +2054,100 @@ async function engineTick() {
 }
 
 function applyEngine(e) {
+  const before = state.engine ? state.engine.phase : "";
   state.engine = e;
   renderEngine(e);
+  renderEngineJd2();
+  renderHome();
+  renderDownloadsShell();
+  if (e.phase !== "running") {
+    state.dlRunning = null;
+    updateBadge();
+  } else if (before !== "running") {
+    state.badgeAt = 0;
+    refreshBadge();
+    if (engineSectionVisible()) { loadJd2Status(true).catch(() => {}); checkConnection(); }
+  }
   syncEnginePoll();
+  syncBadgeTimer();
+  syncAutoRefresh();
 }
 
 async function loadEngine(force = false) {
   await swr("engine", "/api/engine/status", applyEngine, {force});
 }
 
+// "3/9 Javaの展開と動作確認…" for the step that is running (the final marker step is not counted).
+function setupProgressText(e) {
+  const steps = (e.steps || []).filter(x => x.id !== "done");
+  if (!steps.length) return "準備しています…";
+  const at = steps.findIndex(x => x.status === "running");
+  if (at < 0) {
+    const done = steps.filter(x => x.status === "done" || x.status === "skipped").length;
+    return done + "/" + steps.length + " 準備しています…";
+  }
+  return (at + 1) + "/" + steps.length + " " + steps[at].label + "…";
+}
+
 function renderEngine(e) {
-  const busy = e.phase === "setup" || e.phase === "starting";
-  $("engineState").textContent = "状態: " + (PHASE_LABELS[e.phase] || e.phase) +
-    (e.core_revision && e.running ? " / Core revision " + e.core_revision : "") +
-    (e.preset_applied ? " / 推奨設定: 適用済み" : e.installed ? " / 推奨設定: 未適用（リンク送信は無効）" : "");
+  const phase = e.phase;
+  const busy = phase === "setup" || phase === "starting";
+  const running = phase === "running";
+  const failedSetup = !e.installed && Boolean(e.error);
+  const stateText = $("engineState");
+  stateText.textContent = phase === "failed" && e.installed ? "起動できません" : PHASE_LABELS[phase] || phase;
+  stateText.classList.toggle("is-ok", running);
+  // One primary action per state; unusable buttons are hidden, not disabled.
+  $("engineSetup").hidden = e.installed || busy;
+  $("engineSetup").textContent = failedSetup ? "初期設定をやり直す" : "初期設定を開始";
+  $("engineStart").hidden = !(e.installed && !running && !busy);
+  $("engineStop").hidden = !running || phase === "setup";
+  setShown("engineResetup", e.installed && !running && !busy);
+  setShown("engineKeysRow", running);
+  const progress = $("engineProgress");
+  const showProgress = busy;
+  setShown("engineProgressText", showProgress);
+  progress.hidden = phase !== "setup";
+  if (showProgress) {
+    $("engineProgressText").textContent = phase === "setup" ? setupProgressText(e) : "起動しています…";
+    const current = (e.steps || []).find(x => x.status === "running");
+    if (current && typeof current.progress === "number") progress.value = current.progress;
+    else progress.removeAttribute("value");
+  }
   $("engineError").hidden = !e.error;
-  $("engineError").textContent = e.error ? "エラー: " + e.error : "";
-  $("engineSetup").textContent = e.installed || e.error ? "初期設定を再実行" : "初期設定を開始";
-  $("engineSetup").disabled = busy || e.running;
-  $("engineStart").disabled = busy || e.running || !e.installed;
-  $("engineStop").disabled = !(e.running) || e.phase === "setup";
-  $("engineTest").disabled = e.phase !== "running";
-  $("engineAutostart").disabled = !e.installed;
+  $("engineError").textContent = e.error || "";
+  if (!running) $("engineTestResult").textContent = "";
+  setShown("engineAutostartRow", e.installed === true);
   $("engineAutostart").checked = Boolean(e.autostart);
+
+  // Details: components, version, hashes.
   const comps = (e.components || []).map(c => {
     const box = element("div", undefined, "item");
     box.appendChild(element("b", c.label));
     box.appendChild(element("span", (c.installed ? "導入済み" : "未導入") +
-      " · 版: " + (c.version || c.pinned_version || "不明") + " · SHA-256 " + c.sha256 + "… · " +
+      " · 版 " + (c.version || c.pinned_version || "不明") + " · SHA-256 " + c.sha256 + "… · " +
       readableSize(c.size)));
     return box;
   });
   $("engineComponents").replaceChildren(...comps);
-  const steps = (e.steps || []).map(step => {
+  const meta = [];
+  if (e.core_revision && running) meta.push("Core revision " + e.core_revision);
+  if (typeof e.restart_count === "number" && e.restart_count > 0) meta.push("自動再起動 " + e.restart_count + "回");
+  $("engineMeta").textContent = meta.join(" · ");
+
+  // Steps: open while running or after a failure; a collapsed record after success.
+  const steps = e.steps || [];
+  const active = steps.some(x => x.status !== "pending");
+  const failed = Boolean(e.error) || steps.some(x => x.status === "failed");
+  const mode = phase === "setup" ? "run" : failed && active ? "fail" : e.installed && active ? "done" : "none";
+  const box = $("engineStepsBox");
+  box.hidden = mode === "none";
+  if (mode !== state.stepsMode) {
+    state.stepsMode = mode;
+    box.open = mode === "run" || mode === "fail";
+    $("engineStepsSummary").textContent = mode === "done" ? "前回の初期設定の記録" : "初期設定の進行状況";
+  }
+  $("engineSteps").replaceChildren(...steps.map(step => {
     const li = element("li", undefined, "engine-step is-" + step.status);
     li.appendChild(element("span", STEP_MARKS[step.status] || "?", "step-mark"));
     const body = element("span", undefined, "step-body");
@@ -1804,16 +2161,50 @@ function renderEngine(e) {
     }
     li.appendChild(body);
     return li;
-  });
-  $("engineSteps").replaceChildren(...steps);
-  renderEngineNotices(e);
+  }));
 }
 
-function renderEngineNotices(e) {
-  const running = e.phase === "running";
-  setShown("downloadsEngineNotice", !running);
-  setShown("linksEngineNotice", !running);
-  setShown("homeEngine", !e.installed && e.phase !== "setup");
+// JD2 update / preset row: only while the engine runs; hidden buttons instead of disabled ones.
+function renderEngineJd2() {
+  const e = state.engine, jd = state.jd2;
+  const show = engineRunning();
+  setShown("engineJd2", show);
+  if (!show) return;
+  const connected = Boolean(jd && jd.connected);
+  const notes = [];
+  if (connected && jd.update_available) notes.push("JD2の更新があります");
+  if (e && e.preset_applied !== true) notes.push("推奨設定が未適用のため、リンクを送れません");
+  $("jd2Status").textContent = notes.join(" · ");
+  setShown("jd2Check", connected && jd.can_update === true);
+  setShown("jd2Update", connected && jd.can_update === true && jd.update_available === true);
+  setShown("jd2Preset", connected && jd.can_preset === true);
+}
+
+// Inline, automatic and read-only: runs when the engine section opens.
+async function checkConnection() {
+  if (state.connChecking || !engineRunning()) return;
+  state.connChecking = true;
+  const out = $("engineTestResult");
+  out.textContent = "接続を確認しています…";
+  try {
+    await api("/api/jd2/connect/test", {});
+    out.textContent = "接続OK";
+  } catch (err) {
+    out.textContent = "接続できません: " + err.message;
+  } finally {
+    state.connChecking = false;
+  }
+}
+
+async function loadEngineKeys() {
+  const data = await api("/api/engine/config-keys");
+  const lines = (data.items || []).map(i => i.interface + "." + i.key + " = " +
+    (i.value === null || i.value === undefined ? "-" : String(i.value)) +
+    " (" + (i.type || "?") + ")");
+  const out = $("engineKeysOut");
+  out.textContent = lines.join("\n") || "該当する項目がありません";
+  out.hidden = false;
+  $("engineKeysCopy").hidden = lines.length === 0;
 }
 
 async function loadEngineLog() {
@@ -1839,21 +2230,30 @@ async function startEngineSetup() {
   applyEngine(await api("/api/engine/status"));
 }
 
+async function startEngine() {
+  await api("/api/engine/start", {});
+  swrDrop("engine", "status");
+  applyEngine(await api("/api/engine/status"));
+}
+
 function wireEngine() {
   $("engineSetup").addEventListener("click", () => perform(startEngineSetup));
-  $("homeEngineSetup").addEventListener("click", () => perform(async () => {
-    await startEngineSetup();
-    navigate("#/settings/engine");
-  }));
-  $("engineStart").addEventListener("click", () => perform(async () => {
-    await api("/api/engine/start", {});
-    swrDrop("engine", "status");
-    applyEngine(await api("/api/engine/status"));
-  }));
+  $("engineResetup").addEventListener("click", () => perform(startEngineSetup));
+  $("homeEngineSetup").addEventListener("click", () => perform(startEngineSetup));
+  $("engineStart").addEventListener("click", () => perform(startEngine));
+  $("homeEngineStart").addEventListener("click", () => perform(startEngine));
+  $("downloadsEngineAction").addEventListener("click", () => {
+    if ($("downloadsEngineAction").dataset.action === "setup") navigate("#/settings/engine");
+    else perform(startEngine);
+  });
   $("engineStop").addEventListener("click", () => perform(async () => {
     if (!confirm("JD2エンジンを停止します。実行中のダウンロードは中断されます（最大30秒かかります）。よろしいですか？")) return;
     $("engineStop").disabled = true;
-    await api("/api/engine/stop", {confirmed: true});
+    try {
+      await api("/api/engine/stop", {confirmed: true});
+    } finally {
+      $("engineStop").disabled = false;
+    }
     swrDrop("engine", "status", "jd2-status");
     applyEngine(await api("/api/engine/status"));
     flash("エンジンを停止しました");
@@ -1867,27 +2267,27 @@ function wireEngine() {
       throw e;
     }
     swrDrop("engine");
-    flash(wanted ? "Hub起動時にエンジンを自動起動します" : "自動起動をOFFにしました");
+    flash(wanted ? "Hub起動時にエンジンも起動します" : "自動起動をOFFにしました");
   }));
-  $("engineTest").addEventListener("click", () => perform(async () => {
-    $("engineTestResult").textContent = "ローカル接続を確認しています。操作や更新は行いません。";
+  $("engineKeys").addEventListener("click", () => perform(loadEngineKeys));
+  $("engineKeysCopy").addEventListener("click", async () => {
     try {
-      const response = await api("/api/jd2/connect/test", {});
-      $("engineTestResult").textContent = "接続できました。Core revision " + response.revision +
-        " / 更新: " + (response.update_available ? "あり" : "なし");
-    } catch (err) {
-      $("engineTestResult").textContent = "接続できませんでした: " + err.message;
-    }
-  }));
-  $("engineLogButton").addEventListener("click", () => perform(async () => {
-    await loadEngineLog();
-    setShown("engineLog", true);
-  }));
+      await navigator.clipboard.writeText($("engineKeysOut").textContent);
+      flash("コピーしました");
+    } catch (e) { flash("コピーできませんでした"); }
+  });
+  $("engineLogBox").addEventListener("toggle", () => {
+    if ($("engineLogBox").open) perform(loadEngineLog);
+  });
   document.addEventListener("visibilitychange", syncEnginePoll);
 }
 
 function wireSettings() {
-  $("folderRoots").addEventListener("click", () => perform(() => folders("", true)));
+  $("folderChange").addEventListener("click", () => perform(async () => {
+    setPicker(true);
+    await folders("", true);
+  }));
+  $("folderCancel").addEventListener("click", () => setPicker(false));
   $("bookmarkForm").addEventListener("submit", event => {
     event.preventDefault();
     perform(async () => {
@@ -1902,37 +2302,41 @@ function wireSettings() {
       "Hub起動後の物理読込: " + readableSize(io.read_bytes) +
       " / 書込: " + readableSize(io.write_bytes) +
       " / 書込取消: " + readableSize(io.cancelled_write_bytes) +
-      "。これは累積値です。JD2や他QPKGのI/Oは含みません。" :
+      "（累積値。JD2や他アプリのI/Oは含みません）" :
       "この環境では/proc/self/ioを読み取れません。";
   }));
   $("diagnosticJd2").addEventListener("click", () => perform(async () => {
     const data = await api("/api/jd2/local-preflight");
     $("diagnosticResult").textContent = (data.tcp_reachable ?
-      "NASの127.0.0.1:3128にTCP接続できました。" : "NASの127.0.0.1:3128に接続できません。") +
-      " JD2本体の確認・LAN隔離検証・操作の許可はまだ行っていません。";
+      "127.0.0.1:3128にTCP接続できました。" : "127.0.0.1:3128に接続できません。") +
+      "接続できてもJD2の認証や外部からの隔離は確認できません。";
   }));
   wireEngine();
-  $("updateLogButton").addEventListener("click", () => perform(async () => {
-    const result = await api("/api/update/log");
-    $("updateLog").textContent = result.log || "まだ更新ログはありません";
-    setShown("updateLog", true);
-  }));
+  $("updateLogBox").addEventListener("toggle", () => {
+    if (!$("updateLogBox").open) return;
+    perform(async () => {
+      const result = await api("/api/update/log");
+      $("updateLog").textContent = result.log || "まだ更新ログはありません";
+    });
+  });
   $("updateChannel").addEventListener("change", () => {
     state.selectedVersion = "";
     state.selectedChannel = $("updateChannel").value;
-    $("updateResult").textContent = "チャンネルを変更しました。更新を再確認してください。";
-    setShown("updateApply", false);
+    $("updateResult").textContent = "";
+    syncUpdateApply();
   });
   $("updateCheck").addEventListener("click", () => perform(checkUpdate));
   $("jd2Check").addEventListener("click", () => perform(async () => {
     const result = await api("/api/jd2/update/check", {});
-    await updateStatus(true);
-    flash(result.update_available ? "JD2の更新があります" : "JD2に新しい更新はありません");
+    swrDrop("jd2-status", "status");
+    await loadJd2Status(true);
+    flash(result.update_available ? "JD2の更新があります" : "JD2は最新です");
   }));
   $("jd2Update").addEventListener("click", () => perform(async () => {
     if (!confirm("JDownloader 2本体だけを更新します。JD2のダウンロードは一時中断される場合があります。よろしいですか？")) return;
     await api("/api/jd2/update/apply", {confirmed: true});
-    await updateStatus(true);
+    swrDrop("jd2-status", "status");
+    await loadJd2Status(true);
   }));
   $("jd2Preset").addEventListener("click", () => perform(applyPreset));
   $("updateApply").addEventListener("click", () => perform(async () => {
@@ -1944,11 +2348,17 @@ function wireSettings() {
   }));
 }
 
-document.addEventListener("DOMContentLoaded", () => {
+// tailnet: server-side verdict from the TCP peer address (MagicDNS short names
+// are invisible to hostname checks). WireGuard already encrypts the tunnel.
+function updateLanWarning(tailnet) {
   const plainLan = location.protocol === "http:" &&
     !["localhost", "127.0.0.1", "::1", "[::1]"].includes(location.hostname) &&
-    !isTailscaleHost(location.hostname);   // WireGuard already encrypts the tunnel
+    !isTailscaleHost(location.hostname) && tailnet !== true;
   setShown("lanSecurityWarning", plainLan);
+}
+
+document.addEventListener("DOMContentLoaded", () => {
+  updateLanWarning(false);
   wireAuth();
   wireShell();
   wireDownloads();

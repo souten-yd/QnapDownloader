@@ -39,6 +39,16 @@ class DownloadViewTests(unittest.TestCase):
         self.assertNotIn("/share/private", str(payload))
         self.assertNotIn("example.com/private", str(payload))
 
+    def test_package_grouping_ids_are_strings(self):
+        big = 2**60 + 7
+        snap = view.snapshot([{"name": "P", "uuid": big}],
+                             [{"name": "a", "packageUUID": big}, {"name": "b", "packageUUID": -1}], 0)
+        self.assertEqual(snap["packages"][0]["id"], str(big))
+        self.assertEqual(snap["links"][0]["package_id"], str(big))
+        self.assertIsNone(snap["links"][1]["package_id"])
+        self.assertIn("uuid", view.PACKAGE_FIELDS)
+        self.assertIn("packageUUID", view.LINK_FIELDS)
+
     def test_unknown_and_invalid_values_are_not_guessed(self):
         snap = view.snapshot([], [{
             "name": "", "speed": -1, "bytesLoaded": 400,
