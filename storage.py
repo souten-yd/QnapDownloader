@@ -30,6 +30,15 @@ created_at REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY,value INTEGER NOT NULL);
 INSERT OR IGNORE INTO meta(key,value) VALUES('revision',0);
 """
+# v0.1.13: iPhone share tokens. Only a SHA-256 of the token is stored. Created
+# with IF NOT EXISTS for both new and upgraded databases.
+SHARE_SCHEMA = """
+CREATE TABLE IF NOT EXISTS share_tokens(id INTEGER PRIMARY KEY AUTOINCREMENT,
+name TEXT NOT NULL,token_hash TEXT NOT NULL UNIQUE,created_at REAL NOT NULL,
+last_used_at REAL);
+"""
+MAX_SHARE_TOKENS = 10
+SHARE_TOUCH_INTERVAL = 3600
 
 
 class Store:
@@ -56,6 +65,7 @@ class Store:
                     raise RuntimeError("設定DBの必須テーブルが不足しています")
                 if db.execute("PRAGMA quick_check").fetchone()[0] != "ok":
                     raise RuntimeError("設定DBの整合性に異常があります")
+            db.executescript(SHARE_SCHEMA)
         if fresh:
             marker.write_text("v1\n", encoding="utf-8")
             os.chmod(marker, 0o600)
@@ -235,3 +245,57 @@ class Store:
         with self.connect() as db:
             return [dict(id=r[0],url=r[1],state=r[2]) for r in
                     db.execute("SELECT id,url,state FROM link_intents ORDER BY id DESC LIMIT 300")]
+
+    # ---- iPhone share tokens (v0.1.13) -------------------------------------
+    @staticmethod
+    def _token_hash(raw):
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+    def share_tokens(self):
+        with self.connect() as db:
+            return [dict(id=r[0], name=r[1], created_at=r[2], last_used_at=r[3]) for r in
+                    db.execute("SELECT id,name,created_at,last_used_at FROM share_tokens ORDER BY id")]
+
+    def create_share_token(self, name):
+        """Return the raw token exactly once; only its SHA-256 is stored."""
+        if not isinstance(name, str) or not 1 <= len(name.strip()) <= 40:
+            raise ValueError("端末名は1～40文字にしてください")
+        raw = secrets.token_urlsafe(32)
+        with self._guard, self.connect() as db:
+            if db.execute("SELECT COUNT(*) FROM share_tokens").fetchone()[0] >= MAX_SHARE_TOKENS:
+                raise ValueError("登録できる端末は%d台までです。不要な端末を削除してください" % MAX_SHARE_TOKENS)
+            cur = db.execute("INSERT INTO share_tokens(name,token_hash,created_at) VALUES(?,?,?)",
+                             (name.strip(), self._token_hash(raw), time.time()))
+            return dict(id=cur.lastrowid, name=name.strip(), token=raw)
+
+    def delete_share_token(self, identifier):
+        if type(identifier) is not int or identifier <= 0:
+            raise ValueError("端末IDが不正です")
+        with self._guard, self.connect() as db:
+            if db.execute("DELETE FROM share_tokens WHERE id=?", (identifier,)).rowcount != 1:
+                raise ValueError("端末が見つかりません")
+
+    def verify_share_token(self, raw, now=None):
+        """Token id for a valid token, else None.
+
+        Every stored hash is compared in constant time (no early exit).
+        last_used_at is written at most once per SHARE_TOUCH_INTERVAL per
+        token so routine use does not cause HDD writes.
+        """
+        if not isinstance(raw, str) or not 1 <= len(raw) <= 200:
+            return None
+        digest = self._token_hash(raw)
+        matched = None
+        with self.connect() as db:
+            for ident, stored, used in db.execute(
+                    "SELECT id,token_hash,last_used_at FROM share_tokens"):
+                if hmac.compare_digest(digest, stored):
+                    matched = (ident, used)
+        if matched is None:
+            return None
+        now = time.time() if now is None else now
+        ident, used = matched
+        if used is None or now - used >= SHARE_TOUCH_INTERVAL:
+            with self._guard, self.connect() as db:
+                db.execute("UPDATE share_tokens SET last_used_at=? WHERE id=?", (now, ident))
+        return ident

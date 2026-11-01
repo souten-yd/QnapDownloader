@@ -6,6 +6,13 @@ Status: design specification; no browser, backend or threat filters implemented.
 
 The JD2 engine is installed only by an explicit admin action from pinned official URLs (HTTPS only, redirects only to HTTPS, fixed SHA-256 and size, tar members checked for absolute paths, `..`, devices and escaping links). JD2's unauthenticated RemoteAPI is used only on `127.0.0.1` after the Hub verifies, before every call, that all LISTEN sockets on the port are loopback and owned by the Java process the Hub started (pid, start time, command line). Only a fixed method allowlist is callable and the browser can never reach JD2 directly. The engine runs as the Hub's (non-root) user with `start_new_session`; stop signals are sent only after re-verifying pid, start time and command line. The in-RAM log (300 lines) scrubs password/cookie/token-like text. Residual risk: other root-level processes on the same host can reach the API (same trust boundary as the Hub). MyJDownloader integration was removed. Real-device behaviour is unverified.
 
+## HTTPS and share tokens (v0.1.13)
+
+Details: [https-and-share.md](https-and-share.md).
+
+- HTTPS is terminated by Tailscale Serve on the NAS; the Hub adds no listener and runs no command. `X-Forwarded-Proto` is trusted only from a loopback TCP peer. `*.ts.net` and single-label MagicDNS Host names are accepted only from loopback/tailnet peers; other dotted names never are. The session cookie gets `Secure` on HTTPS requests. HSTS is deliberately not sent (the same host name is used over plain HTTP on the LAN).
+- `POST /api/share` is the only state-changing endpoint without session+CSRF. It requires a per-device bearer token (256-bit random, shown once, only its SHA-256 stored, constant-time comparison, revocable, max 10), ignores cookies, refuses any foreign `Origin`, has no CORS, is rate limited (30/10 min per token, 20 failures/5 min per address) and can only stage Rapidgator/single https links. It never contacts JD2 or starts a download. Tokens are never logged or listed. A leaked token lets its holder add staged links until revoked; transport should be HTTPS or Tailscale.
+
 ## Threat model
 
 Untrusted inputs: third-party sites/HTML/JS, advertisements, tracking scripts, redirect destinations, Click'n'Load containers, host/plugin output, filenames, credentials embedded in URLs and downloaded file contents. Trusted controls: authenticated QNAP management UI/API, permission policy engine, NAS folder picker, credential store and local JD2 adapter.

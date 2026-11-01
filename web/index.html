@@ -200,6 +200,8 @@
     <nav class="settings-nav" aria-label="設定の項目">
      <a href="#/settings/engine" data-section="engine">エンジン</a>
      <a href="#/settings/storage" data-section="storage">保存先</a>
+     <a href="#/settings/https" data-section="https">HTTPS接続</a>
+     <a href="#/settings/share" data-section="share">iPhoneから送る</a>
      <a href="#/settings/bookmarks" data-section="bookmarks">ブックマーク</a>
      <a href="#/settings/updates" data-section="updates">更新</a>
      <a href="#/settings/diagnostics" data-section="diagnostics">診断</a>
@@ -265,6 +267,56 @@
        <button type="button" id="folderCancel" class="btn small">閉じる</button>
       </div>
       <p class="muted">フォルダ作成・自動開始・自動解凍・自動削除はすべてOFF</p>
+     </section>
+
+     <section class="settings-section" data-section="https" hidden>
+      <h1>HTTPS接続</h1>
+      <div class="card">
+       <p id="httpsState" class="engine-state" role="status" aria-live="polite">確認しています…</p>
+       <p id="httpsDetail" class="muted"></p>
+      </div>
+      <h2>Tailscale ServeでHTTPSにする</h2>
+      <p class="muted">Hubは新しい待ち受けを増やさず、Tailscale ServeがHTTPS（ts.netの証明書）をNASの中で終端して、Hubへ転送します。</p>
+      <ol class="guide">
+       <li>Tailscale管理画面で MagicDNS と HTTPS証明書 を有効にします。</li>
+       <li>NASにSSHで入り、次のコマンドを実行します。
+        <div class="copy-row"><code id="httpsCmd" class="code-box">tailscale serve --bg --https=443 http://127.0.0.1:17864</code><button type="button" id="httpsCmdCopy" class="btn small">コピー</button></div>
+        <span class="muted">QNAPのTailscaleアプリではコマンドの場所が異なることがあります。<code>which tailscale</code> で探すか、App Centerのインストール先（<code>/share/CACHEDEV1_DATA/.qpkg/Tailscale/</code> など）を確認してください。</span>
+       </li>
+       <li><code>https://&lt;NAS名&gt;.&lt;tailnet名&gt;.ts.net/</code> を開き、ホーム画面に追加し直します。</li>
+      </ol>
+      <p class="muted">Cloudflare確認は、HTTPS＋互換モード＋サイトが埋め込みを許可している場合に通過できる見込みです。iPhoneでは失敗することがあり、その場合は「iPhoneから送る」の共有メニュー方式（Safariで開いてリンクを送る）を使ってください。</p>
+     </section>
+
+     <section class="settings-section" data-section="share" hidden>
+      <h1>iPhoneから送る</h1>
+      <p class="muted">iPhoneの共有メニュー（ショートカット）からリンクを「追加したリンク」に送ります。JD2への送信やダウンロード開始は行いません。</p>
+      <div id="shareHttpWarning" class="notice lan-warning" role="note" hidden>この画面はHTTPで開かれています。トークンが暗号化されずに送られるため、HTTPS（「HTTPS接続」参照）またはTailscale経由での利用をおすすめします。</div>
+      <h2>登録した端末</h2>
+      <div id="shareDevices" class="items"></div>
+      <form id="shareForm" class="inline-form">
+       <input id="shareName" maxlength="40" placeholder="端末名（例: iPhone）" aria-label="端末名" autocomplete="off">
+       <button type="submit" id="shareAdd" class="btn primary">端末を追加</button>
+      </form>
+      <div id="shareNew" class="card share-new" role="status" hidden>
+       <p><b>トークン</b>（この画面を離れると二度と表示されません。今すぐショートカットに貼り付けてください）</p>
+       <div class="copy-row"><code id="shareToken" class="code-box"></code><button type="button" id="shareTokenCopy" class="btn small">コピー</button></div>
+      </div>
+      <h2>エンドポイント</h2>
+      <div class="copy-row"><code id="shareEndpoint" class="code-box"></code><button type="button" id="shareEndpointCopy" class="btn small">コピー</button></div>
+      <h2>ショートカットの作り方</h2>
+      <ol class="guide">
+       <li>ショートカットApp → 新規 → 詳細で「共有シートに表示」をONにし、入力を「URL・テキスト・Safari Webページ」にします。</li>
+       <li>アクション「WebページでJavaScriptを実行」を追加し、次のコードを貼り付けます（Safariから共有したときだけ動きます。テキストを共有する場合はこのアクションを省きます）。
+        <div class="copy-row"><code id="shareJs" class="code-box"></code><button type="button" id="shareJsCopy" class="btn small">コピー</button></div>
+       </li>
+       <li>アクション「URLの内容を取得」を追加し、URLに上のエンドポイント、方法を POST、ヘッダに <code>Authorization</code> = <code>Bearer &lt;トークン&gt;</code> と <code>Content-Type</code> = <code>application/json</code>、本文はJSONで <code>text</code> = 前のアクションの結果 にします。</li>
+       <li>アクション「通知を表示」を追加し、結果を表示します。</li>
+      </ol>
+      <p class="muted">エンドポイントはiPhoneから届く必要があります（Tailscale接続）。トークンを平文で送らないようHTTPSを推奨します。</p>
+      <h2>ブックマークレット（任意）</h2>
+      <p class="muted">Safariのブックマークとして登録すると、開いているページのURLを「リンク」の貼り付け欄に入れます（自動では保存しません）。</p>
+      <div class="copy-row"><code id="shareBookmarklet" class="code-box"></code><button type="button" id="shareBookmarkletCopy" class="btn small">コピー</button></div>
      </section>
 
      <section class="settings-section" data-section="bookmarks" hidden>
@@ -340,6 +392,7 @@
    <div id="webStatus" class="web-status"></div>
    <div id="cfHint" class="cf-hint" role="note" hidden>
     <span class="cf-hint-text">Cloudflareの確認が進まない場合 →</span>
+    <a id="cfHttps" class="btn small" href="#/settings/https" hidden>HTTPSで開くと通過しやすくなります</a>
     <button type="button" id="cfCompat" class="btn small">互換モードで再読み込み</button>
     <button type="button" id="cfSafari" class="btn small">Safariで開く</button>
     <button type="button" id="cfDismiss" class="icon-btn small" aria-label="このヒントを閉じる" title="閉じる"><svg class="icon" aria-hidden="true"><use href="#i-x"/></svg></button>

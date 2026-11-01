@@ -1,6 +1,6 @@
 "use strict";
 /*
- * QnapDownloader browser-style shell (v0.1.12).
+ * QnapDownloader browser-style shell (v0.1.13).
  * Spec: docs/browser-shell-ui.md. Single file, no build step.
  *
  * Security notes (see "Security invariants" in the spec):
@@ -50,12 +50,16 @@ const SHELL_KEY = "qnapdl.shell.v1";
 const HOST_MODE_KEY = "qnapdl.hostmodes.v1";
 const TAB_STORAGE_KEY = "qnapdl.webtabs.v1";
 const LEGACY_AUTO_KEY = "qnapdl.downloads.auto";   // v0.1.11 switch; removed silently
-const SETTINGS_SECTIONS = ["engine", "storage", "bookmarks", "updates", "diagnostics", "about"];
+const SETTINGS_SECTIONS = ["engine", "storage", "https", "share", "bookmarks", "updates", "diagnostics", "about"];
 const SECTION_ALIASES = {jd2: "engine"};   // old #/settings/jd2 links
 const ENGINE_POLL_MS = 1500;
 const SVG_NS = "http://www.w3.org/2000/svg";
 const PASTE_LIMIT = 65536;
 const PASTE_DEBOUNCE_MS = 400;
+const HTTPS_SERVE_COMMAND = "tailscale serve --bg --https=443 http://127.0.0.1:17864";
+// Shown for copying only; it runs in Shortcuts on the phone, never in this page.
+const SHARE_JS = "completion(Array.from(document.querySelectorAll('a[href]'),a=>a.href)" +
+  ".filter(h=>/rapidgator\\.net|rg\\.to/.test(h)).join('\\n')+'\\n'+location.href)";
 
 const state = {
   csrf: "", authed: false, shellReady: false,
@@ -72,6 +76,7 @@ const state = {
   snapshotJson: "", downloadsSig: "", folderPath: "",
   bootVersion: "", statusCheckedAt: 0, updateWatching: false,
   engine: null, engineTimer: null, engineBusy: false,
+  https: false, tailnet: false,
 };
 
 // ------------------------------------------------------------------ helpers
@@ -302,10 +307,20 @@ function stickyToast(key, message, kind, actions = []) {
 
 // ------------------------------------------------------------------ routing
 function parseRoute() {
-  const raw = (location.hash || "").replace(/^#\/?/, "");
+  const full = (location.hash || "").replace(/^#\/?/, "");
+  const cut = full.indexOf("?");
+  const raw = cut < 0 ? full : full.slice(0, cut);
   const parts = raw.split("/").filter(Boolean);
   const head = parts[0] || "home";
-  if (head === "downloads" || head === "links") return {view: head};
+  if (head === "links") {
+    // #/links?paste=<urlencoded>: prefill the paste box only (never auto-saves).
+    let paste = null;
+    if (cut >= 0) {
+      try { paste = new URLSearchParams(full.slice(cut + 1)).get("paste"); } catch (e) { paste = null; }
+    }
+    return paste ? {view: "links", paste} : {view: "links"};
+  }
+  if (head === "downloads") return {view: head};
   if (head === "settings") {
     const wanted = SECTION_ALIASES[parts[1]] || parts[1];
     return {view: "settings",
@@ -351,6 +366,13 @@ function applyRoute() {
   if (/^#\/settings\/jd2\/?$/.test(location.hash)) { replaceRoute("#/settings/engine"); return; }
   if (route.view === "tab" && !findTab(route.tabId)) { replaceRoute("#/home"); return; }
   state.route = route;
+  if (route.view === "links" && route.paste) {
+    // Drop the pasted text from the address bar and history state at once.
+    history.replaceState(null, "", "#/links");
+    $("pasteBox").value = route.paste.slice(0, PASTE_LIMIT);
+    schedulePaste(0);
+    state.route = {view: "links"};
+  }
   if (route.view === "tab") state.lastWebTabId = route.tabId;
   if (route.view === "settings") state.lastSection = route.section;
   closeMenu(false);
@@ -505,6 +527,7 @@ function updateWebStatus(tab) {
 // Slim, non-blocking hint under the toolbar while the tab is not in compat mode.
 function updateCfHint(tab) {
   $("cfHint").hidden = !(tab && tab.current && tab.mode !== "compat" && !tab.hintDismissed);
+  $("cfHttps").hidden = isHttpsNow();
 }
 
 // ------------------------------------------------------------- status/home
@@ -1572,6 +1595,7 @@ function setPicker(open) {
 
 async function enterSettings(section, force = false) {
   showSettingsSection(section);
+  if (section !== "share") hideShareToken();
   if (section === "storage") {
     await loadSettings(force);
     // Nothing chosen yet: go straight to the picker.
@@ -1588,6 +1612,11 @@ async function enterSettings(section, force = false) {
       await loadJd2Status(force);
       checkConnection();
     }
+  } else if (section === "https") {
+    renderHttps();
+  } else if (section === "share") {
+    renderShareStatic();
+    await swr("share-tokens", "/api/share/tokens", renderShareDevices, {force});
   } else if (section === "bookmarks") {
     await loadBookmarks(force);
   } else if (section === "updates") {
@@ -1595,6 +1624,91 @@ async function enterSettings(section, force = false) {
   } else if (section === "about") {
     await loadStatus(force);
   }
+}
+
+// ---- HTTPS / iPhone share (v0.1.13)
+function isHttpsNow() { return state.https === true || location.protocol === "https:"; }
+
+function renderHttps() {
+  const secure = isHttpsNow();
+  const state_ = $("httpsState");
+  state_.classList.toggle("is-ok", secure);
+  state_.textContent = secure ?
+    (isTailscaleHost(location.hostname) && location.hostname.endsWith(".ts.net") ?
+      "HTTPS ✓（ts.net経由）" : "HTTPS ✓") :
+    "HTTP（暗号化なし）";
+  $("httpsDetail").textContent = secure ?
+    "この接続は暗号化され、Cloudflare確認に必要な安全なコンテキストが使えます。" :
+    "Cloudflare確認は安全なコンテキスト（HTTPS）でないと通りにくくなります。下の手順でHTTPSを有効にできます。";
+  $("httpsCmd").textContent = HTTPS_SERVE_COMMAND;
+}
+
+async function copyText(text) {
+  try {
+    await navigator.clipboard.writeText(text);
+    flash("コピーしました");
+  } catch (e) { flash("コピーできませんでした。長押しで選択してください"); }
+}
+
+function shareEndpoint() { return location.origin + "/api/share"; }
+
+function shareBookmarklet() {
+  return "javascript:location.href='" + location.origin + "/#/links?paste='+encodeURIComponent(location.href)";
+}
+
+function renderShareStatic() {
+  $("shareEndpoint").textContent = shareEndpoint();
+  $("shareJs").textContent = SHARE_JS;
+  $("shareBookmarklet").textContent = shareBookmarklet();
+  const clear = !isHttpsNow() && location.protocol === "http:" &&
+    !isTailscaleHost(location.hostname) && state.tailnet !== true;
+  setShown("shareHttpWarning", clear);
+}
+
+function hideShareToken() {
+  $("shareToken").textContent = "";
+  setShown("shareNew", false);
+}
+
+function formatTime(seconds) {
+  if (typeof seconds !== "number") return "";
+  try { return new Date(seconds * 1000).toLocaleString("ja-JP"); } catch (e) { return ""; }
+}
+
+function renderShareDevices(data) {
+  const items = Array.isArray(data.items) ? data.items : [];
+  if (!items.length) {
+    $("shareDevices").replaceChildren(element("p", "登録した端末はありません。", "empty-state"));
+    return;
+  }
+  const nodes = [];
+  for (const device of items) {
+    const box = element("div", undefined, "item");
+    box.appendChild(element("b", device.name));
+    box.appendChild(element("span", "登録 " + formatTime(device.created_at) + " · 最終使用 " +
+      (device.last_used_at ? formatTime(device.last_used_at) : "未使用")));
+    const del = element("button", "削除", "btn small");
+    del.type = "button";
+    del.addEventListener("click", () => perform(async () => {
+      if (!confirm("「" + device.name + "」を削除します。この端末からは送れなくなります。よろしいですか？")) return;
+      await api("/api/share/tokens/delete", {id: device.id});
+      swrDrop("share-tokens");
+      await swr("share-tokens", "/api/share/tokens", renderShareDevices, {force: true});
+    }));
+    box.appendChild(del);
+    nodes.push(box);
+  }
+  $("shareDevices").replaceChildren(...nodes);
+}
+
+async function addShareDevice() {
+  const name = $("shareName").value.trim();
+  const made = await api("/api/share/tokens", {name});
+  $("shareName").value = "";
+  $("shareToken").textContent = made.token;   // shown once; cleared on leaving the section
+  setShown("shareNew", true);
+  swrDrop("share-tokens");
+  await swr("share-tokens", "/api/share/tokens", renderShareDevices, {force: true});
 }
 
 function renderFolders(path, data) {
@@ -1772,11 +1886,12 @@ function teardownSession() {
   swrReset();
   writeSession(SHELL_KEY, null);
   for (const id of ["downloadList", "downloadOrphans", "queueItems", "pasteList",
-      "folderPicker", "bookmarkItems", "speedDial", "bookmarkBar", "webTabs"]) {
+      "folderPicker", "bookmarkItems", "shareDevices", "speedDial", "bookmarkBar", "webTabs"]) {
     $(id).replaceChildren();
   }
   $("downloadsSummary").textContent = "";
   $("pasteBox").value = "";
+  hideShareToken();
   setShown("pasteResult", false);
   setShown("onboarding", false);
   setShown("homeStatus", false);
@@ -1822,7 +1937,9 @@ async function go() {
   try {
     const session = await api("/api/session");
     state.csrf = session.csrf || "";
-    updateLanWarning(session.tailnet === true);
+    state.https = session.https === true;
+    state.tailnet = session.tailnet === true;
+    updateLanWarning(session.tailnet === true, state.https);
     if (session.authenticated) {
       state.authed = true;
       setShown("authArea", false);
@@ -2312,6 +2429,15 @@ function wireSettings() {
       "接続できてもJD2の認証や外部からの隔離は確認できません。";
   }));
   wireEngine();
+  $("httpsCmdCopy").addEventListener("click", () => copyText(HTTPS_SERVE_COMMAND));
+  $("shareForm").addEventListener("submit", event => {
+    event.preventDefault();
+    perform(addShareDevice);
+  });
+  $("shareTokenCopy").addEventListener("click", () => copyText($("shareToken").textContent));
+  $("shareEndpointCopy").addEventListener("click", () => copyText(shareEndpoint()));
+  $("shareJsCopy").addEventListener("click", () => copyText(SHARE_JS));
+  $("shareBookmarkletCopy").addEventListener("click", () => copyText(shareBookmarklet()));
   $("updateLogBox").addEventListener("toggle", () => {
     if (!$("updateLogBox").open) return;
     perform(async () => {
@@ -2350,15 +2476,15 @@ function wireSettings() {
 
 // tailnet: server-side verdict from the TCP peer address (MagicDNS short names
 // are invisible to hostname checks). WireGuard already encrypts the tunnel.
-function updateLanWarning(tailnet) {
-  const plainLan = location.protocol === "http:" &&
+function updateLanWarning(tailnet, https) {
+  const plainLan = location.protocol === "http:" && https !== true &&
     !["localhost", "127.0.0.1", "::1", "[::1]"].includes(location.hostname) &&
     !isTailscaleHost(location.hostname) && tailnet !== true;
   setShown("lanSecurityWarning", plainLan);
 }
 
 document.addEventListener("DOMContentLoaded", () => {
-  updateLanWarning(false);
+  updateLanWarning(false, false);
   wireAuth();
   wireShell();
   wireDownloads();

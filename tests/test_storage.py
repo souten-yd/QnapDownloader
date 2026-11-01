@@ -131,5 +131,67 @@ class StorageTests(unittest.TestCase):
                 webapp.checked_directory(invalid, [allowed])
 
 
+class ShareTokenStorageTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.s = storage.Store(self.root)
+        self.addCleanup(self.s.close)
+
+    def test_token_is_returned_once_and_only_hash_is_stored(self):
+        made = self.s.create_share_token("iPhone")
+        self.assertEqual(set(made), {"id", "name", "token"})
+        self.assertNotIn("token", self.s.share_tokens()[0])
+        with self.s.connect() as db:
+            rows = db.execute("SELECT * FROM share_tokens").fetchall()
+        self.assertNotIn(made["token"], repr(rows))
+        self.assertEqual(self.s.verify_share_token(made["token"]), made["id"])
+        self.assertIsNone(self.s.verify_share_token(made["token"] + "x"))
+        self.assertIsNone(self.s.verify_share_token(""))
+        self.assertIsNone(self.s.verify_share_token(None))
+        self.assertIsNone(self.s.verify_share_token("a" * 500))
+
+    def test_name_and_count_limits_and_revocation(self):
+        for bad in ("", "   ", "x" * 41, None, 3):
+            with self.assertRaises(ValueError):
+                self.s.create_share_token(bad)
+        self.s.create_share_token("x" * 40)
+        tokens = [self.s.create_share_token("d%d" % i) for i in range(9)]
+        with self.assertRaises(ValueError):
+            self.s.create_share_token("eleventh")
+        self.s.delete_share_token(tokens[0]["id"])
+        self.assertIsNone(self.s.verify_share_token(tokens[0]["token"]))
+        self.assertIsNotNone(self.s.verify_share_token(tokens[1]["token"]))
+        with self.assertRaises(ValueError):
+            self.s.delete_share_token(tokens[0]["id"])
+        with self.assertRaises(ValueError):
+            self.s.delete_share_token(True)
+
+    def test_last_used_is_written_at_most_once_per_hour(self):
+        made = self.s.create_share_token("iPhone")
+        self.assertIsNone(self.s.share_tokens()[0]["last_used_at"])
+        self.s.verify_share_token(made["token"], now=10000.0)
+        self.assertEqual(self.s.share_tokens()[0]["last_used_at"], 10000.0)
+        self.s.verify_share_token(made["token"], now=10000.0 + 3599)
+        self.assertEqual(self.s.share_tokens()[0]["last_used_at"], 10000.0)
+        self.s.verify_share_token(made["token"], now=10000.0 + 3600)
+        self.assertEqual(self.s.share_tokens()[0]["last_used_at"], 13600.0)
+        # A failed attempt writes nothing.
+        before = self.s.share_tokens()
+        self.assertIsNone(self.s.verify_share_token("nope", now=99999.0))
+        self.assertEqual(self.s.share_tokens(), before)
+
+    def test_existing_database_gets_share_table_on_upgrade(self):
+        with self.s.connect() as db:
+            db.execute("DROP TABLE share_tokens")
+        again = storage.Store(self.root)
+        try:
+            self.assertEqual(again.share_tokens(), [])
+            self.assertTrue(again.create_share_token("iPhone")["token"])
+        finally:
+            again.close()
+
+
 if __name__ == "__main__":
     unittest.main()

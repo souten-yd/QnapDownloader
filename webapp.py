@@ -6,6 +6,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import ipaddress
 import json
 import os
+import re
 from pathlib import Path
 import secrets
 import signal
@@ -24,7 +25,7 @@ import runtime_diagnostics
 import engine_supervisor
 import updater
 
-VERSION = "0.1.12"
+VERSION = "0.1.13"
 PORT = 17864
 ROOT = Path(__file__).resolve().parent
 FILES = {"/": ("web/index.html", "text/html; charset=utf-8"),
@@ -35,6 +36,11 @@ FILES = {"/": ("web/index.html", "text/html; charset=utf-8"),
          "/icon-192.png": ("web/icon-192.png", "image/png")}
 SESSIONS = {}
 FAILED = {}
+SHARE_FAILED = {}    # per-address failed share-token attempts (RAM only)
+SHARE_RATE = {}      # token id -> request timestamps (RAM only)
+SHARE_FAIL_LIMIT, SHARE_FAIL_WINDOW = 20, 300
+SHARE_RATE_LIMIT, SHARE_RATE_WINDOW = 30, 600
+SHARE_LINK_LIMIT = 50
 SESSION_LOCK = threading.RLock()
 
 
@@ -80,8 +86,67 @@ def checked_directory(path, roots=None):
     return p
 
 
-def public_host_allowed(host):
-    """Reject malformed or public Host values, including ambiguous IPv6 ports."""
+LABEL = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
+
+
+def host_name(host):
+    """Lower-cased hostname of a Host header value (port ignored), or ''."""
+    try:
+        return (urlsplit("http://" + host).hostname or "").lower().rstrip(".")
+    except (ValueError, TypeError, AttributeError):
+        return ""
+
+
+def tailscale_name(hostname):
+    """True for a syntactically valid MagicDNS name such as nas.tail1234.ts.net."""
+    if (not isinstance(hostname, str) or len(hostname) > 253 or
+            not hostname.endswith(".ts.net")):
+        return False
+    labels = hostname.split(".")
+    return len(labels) >= 3 and all(LABEL.fullmatch(label) for label in labels)
+
+
+def magicdns_short_name(hostname):
+    """Single-label MagicDNS short name such as "nas" (no dots, not numeric).
+
+    Dotted non-ts.net names are never accepted this way (DNS rebinding).
+    """
+    return (isinstance(hostname, str) and "." not in hostname and
+            LABEL.fullmatch(hostname) is not None and not hostname.isdigit())
+
+
+def loopback_peer(value):
+    try:
+        peer = ipaddress.ip_address(value)
+        if isinstance(peer, ipaddress.IPv6Address) and peer.ipv4_mapped:
+            peer = peer.ipv4_mapped
+        return peer.is_loopback
+    except (ValueError, TypeError):
+        return False
+
+
+def request_is_https(peer, headers):
+    """True when this request reached the Hub through a local TLS terminator.
+
+    Tailscale Serve connects from loopback and keeps the ts.net Host header.
+    X-Forwarded-Proto is honoured ONLY from a loopback TCP peer; any other
+    peer could forge it. Used for the Secure cookie flag and /api/session.
+    """
+    if not loopback_peer(peer):
+        return False
+    forwarded = (headers.get("X-Forwarded-Proto") or "").split(",")[0].strip().lower()
+    if forwarded == "https":
+        return True
+    name = host_name(headers.get("Host") or "")
+    return name.endswith(".ts.net")
+
+
+def public_host_allowed(host, peer=None):
+    """Reject malformed or public Host values, including ambiguous IPv6 ports.
+
+    *.ts.net names are accepted only for a loopback peer (Tailscale Serve) or
+    a tailnet peer, never for other LAN peers.
+    """
     if not isinstance(host, str) or len(host) > 255 or any(ch.isspace() for ch in host):
         return False
     try:
@@ -102,6 +167,10 @@ def public_host_allowed(host):
         return (address.is_private or address.is_loopback or
                 address in ipaddress.ip_network("100.64.0.0/10"))
     except ValueError:
+        bare = hostname.rstrip(".")
+        if (peer is not None and (loopback_peer(peer) or tailnet_peer(peer)) and
+                (tailscale_name(bare) or magicdns_short_name(bare))):
+            return True
         configured = os.environ.get("DOWNLOADER_ALLOWED_HOSTS", "")
         return hostname in {item.strip().lower() for item in configured.split(",") if item.strip()}
 
@@ -160,6 +229,9 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(raw)))
         self.send_header("Cache-Control", "no-store")
+        # No Strict-Transport-Security on purpose: the same host name is also
+        # reached over plain HTTP on the LAN/tailnet, and HSTS would make
+        # browsers refuse that URL.
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("X-Frame-Options", "DENY")
         self.send_header("Referrer-Policy", "no-referrer")
@@ -176,7 +248,7 @@ class Handler(BaseHTTPRequestHandler):
     def check_host(self):
         host = self.headers.get("Host", "")
         return (private_peer_allowed(self.client_address[0]) and
-                bool(host) and public_host_allowed(host))
+                bool(host) and public_host_allowed(host, self.client_address[0]))
 
     def reject_hub_origin(self, checked_url):
         """Never allow an embedded page to share the Hub's own origin.
@@ -230,8 +302,9 @@ class Handler(BaseHTTPRequestHandler):
 
     def set_cookie(self, value, age):
         cookie = f"qdl_session={value}; Path=/; HttpOnly; SameSite=Strict; Max-Age={age}"
-        # Set Secure when the app is accessed over HTTPS via a trusted reverse proxy.
-        if self.server.secure_cookies:
+        # Secure when configured, or when this request came through a local TLS
+        # terminator (Tailscale Serve): see request_is_https.
+        if self.server.secure_cookies or request_is_https(self.client_address[0], self.headers):
             cookie += "; Secure"
         self._cookie = cookie
 
@@ -239,7 +312,7 @@ class Handler(BaseHTTPRequestHandler):
         if self.headers.get("Content-Type", "").split(";")[0] != "application/json":
             raise ValueError("JSON形式で送信してください")
         size = int(self.headers.get("Content-Length", "-1"))
-        maximum = 72000 if urlsplit(self.path).path == "/api/rapidgator/extract" else 16384
+        maximum = 72000 if urlsplit(self.path).path in ("/api/rapidgator/extract", "/api/share") else 16384
         if not 0 <= size <= maximum:
             raise ValueError("リクエストが大きすぎます")
         value = json.loads(self.rfile.read(size))
@@ -263,7 +336,8 @@ class Handler(BaseHTTPRequestHandler):
             data = self.session()
             return self.send_data(200, {"authenticated": bool(data),
                              "csrf": data["csrf"] if data else None,
-                             "tailnet": tailnet_peer(self.client_address[0])})
+                             "tailnet": tailnet_peer(self.client_address[0]),
+                             "https": request_is_https(self.client_address[0], self.headers)})
         if not self.authorize():
             return
         try:
@@ -307,6 +381,9 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_data(200, self.server.jd2.preset_preview())
             if path == "/api/bookmarks":
                 return self.send_data(200, {"items": self.store.bookmarks()})
+            if path == "/api/share/tokens":
+                # Names and dates only; hashes and tokens are never returned.
+                return self.send_data(200, {"items": self.store.share_tokens()})
             if path == "/api/links":
                 return self.send_data(200, {"items": self.store.links(),
                            "notice": "追加したリンクは未送信です。JD2へは手動で送ります"})
@@ -355,7 +432,65 @@ class Handler(BaseHTTPRequestHandler):
             return self.reject(str(exc))
         self.reject("APIが存在しません", 404)
 
+    def share_attempt_failed(self, address):
+        with SESSION_LOCK:
+            now = time.time()
+            if address not in SHARE_FAILED and len(SHARE_FAILED) >= 256:
+                oldest = min(SHARE_FAILED, key=lambda key: SHARE_FAILED[key][-1] if SHARE_FAILED[key] else 0)
+                SHARE_FAILED.pop(oldest, None)
+            SHARE_FAILED[address] = [t for t in SHARE_FAILED.get(address, [])
+                                     if now - t < SHARE_FAIL_WINDOW] + [now]
+
+    def handle_share(self):
+        """Bearer-token endpoint for the iOS Shortcut. Stages links only.
+
+        Cookies are never consulted (no ambient browser credential), any
+        Origin that is not the Hub's own is refused, and the result never goes
+        to JD2. Failed attempts are rate limited per address.
+        """
+        if not self.check_host():
+            return self.reject("アクセス元Hostが許可されていません", 403)
+        if self.headers.get("Origin") is not None and not self.origin_ok():
+            return self.reject("Originが許可されていません", 403)
+        address = self.client_address[0]
+        with SESSION_LOCK:
+            recent = [t for t in SHARE_FAILED.get(address, []) if time.time() - t < SHARE_FAIL_WINDOW]
+            if len(recent) >= SHARE_FAIL_LIMIT:
+                return self.reject("認証の試行が多すぎます", 429)
+        auth = self.headers.get("Authorization", "")
+        scheme, _, supplied = auth.partition(" ")
+        ident = None
+        if scheme.lower() == "bearer" and supplied.strip():
+            ident = self.store.verify_share_token(supplied.strip())
+        if ident is None:
+            self.share_attempt_failed(address)
+            return self.reject("認証に失敗しました", 401)
+        with SESSION_LOCK:
+            now = time.time()
+            hits = [t for t in SHARE_RATE.get(ident, []) if now - t < SHARE_RATE_WINDOW]
+            if len(hits) >= SHARE_RATE_LIMIT:
+                SHARE_RATE[ident] = hits
+                return self.reject("送信回数が多すぎます。しばらく待ってください", 429)
+            SHARE_RATE[ident] = hits + [now]
+        try:
+            body = self.body()
+            text = body.get("text", body.get("url"))
+            if not isinstance(text, str):
+                raise ValueError("textを文字列で指定してください")
+            found = rapidgator_extract.extract(text, SHARE_LINK_LIMIT)
+            if not found:
+                single = text.strip()
+                if single and not re.search(r"\s", single):
+                    # A lone https URL (Safari's share of the page itself).
+                    found = [self.store.validate_url(single)]
+            added = self.store.add_links(found) if found else 0
+        except (OSError, ValueError, KeyError, RuntimeError, json.JSONDecodeError, sqlite3.Error) as exc:
+            return self.reject(str(exc))
+        return self.send_data(200, {"added": added, "found": len(found)})
+
     def do_POST(self):
+        if urlsplit(self.path).path == "/api/share":
+            return self.handle_share()
         if not self.check_host() or not self.origin_ok():
             return self.reject("HostまたはOriginが許可されていません", 403)
         path = urlsplit(self.path).path
@@ -422,6 +557,14 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_data(200, {"deleted": True})
             if path == "/api/links":
                 return self.send_data(201, self.store.add_link(body.get("url")))
+            if path == "/api/share/tokens":
+                # The raw token is in this response only; it is not recoverable.
+                return self.send_data(201, self.store.create_share_token(body.get("name")))
+            if path == "/api/share/tokens/delete":
+                self.store.delete_share_token(body.get("id"))
+                with SESSION_LOCK:
+                    SHARE_RATE.pop(body.get("id"), None)
+                return self.send_data(200, {"deleted": True})
             if path == "/api/links/delete":
                 self.store.delete_link(body.get("id"))
                 return self.send_data(200, {"deleted": True})
