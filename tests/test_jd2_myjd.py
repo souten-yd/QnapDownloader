@@ -79,6 +79,29 @@ class MyJDTests(unittest.TestCase):
             with self.assertRaises(jd.MyJDUnavailable):
                 jd.load_configuration(tmp)
 
+    def test_safe_configuration_status_never_exposes_credentials(self):
+        with tempfile.TemporaryDirectory() as root:
+            self.assertFalse(jd.configuration_status(root)["configured"])
+            cfg = Path(root, "config")
+            cfg.mkdir()
+            path = cfg / "myjd.json"
+            path.write_text(json.dumps(dict(self.opts(), allow_jd2_update=True,
+                  allow_link_submit=False)), encoding="utf-8")
+            path.chmod(0o600)
+            info = jd.configuration_status(root)
+            self.assertTrue(info["configured"])
+            self.assertEqual(info["device_name"], "NAS JD2")
+            self.assertTrue(info["can_update"])
+            self.assertFalse(info["can_send"])
+            raw = json.dumps(info)
+            self.assertNotIn("secret", raw)
+            self.assertNotIn("example@example.com", raw)
+            path.chmod(0o644)
+            invalid = jd.configuration_status(root)
+            self.assertFalse(invalid["configured"])
+            self.assertTrue(invalid["invalid"])
+            self.assertNotIn("secret", json.dumps(invalid))
+
     def test_authentication_and_read_only_introspection(self):
         api = FakeAPI()
         adapter = jd.MyJDAdapter(self.opts(), api_factory=lambda: api)
