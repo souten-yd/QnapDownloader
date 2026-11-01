@@ -63,7 +63,13 @@ case "${1:-}" in
         fi
         rm -f "$root/admin-token"
         # -B avoids .pyc filesystem writes. A fixed cwd avoids QTS temp dirs.
-        (cd "$root" && exec "$python" -B "$root/webapp.py" --lan --port 17864 --data-dir "$data_dir") < /dev/null > "$logfile" 2>&1 &
+        # Secure default: loopback-only. QTS HTTPS reverse proxy/VPN is preferred.
+        # Explicit LAN HTTP exposure requires DOWNLOADER_LAN_ENABLED=1.
+        if [ "${DOWNLOADER_LAN_ENABLED:-0}" = "1" ]; then
+            (cd "$root" && exec "$python" -B "$root/webapp.py" --lan --port 17864 --data-dir "$data_dir") < /dev/null > "$logfile" 2>&1 &
+        else
+            (cd "$root" && exec "$python" -B "$root/webapp.py" --secure-cookie --port 17864 --data-dir "$data_dir") < /dev/null > "$logfile" 2>&1 &
+        fi
         echo $! > "$pidfile"
         sleep 1
         check_owned || { rm -f "$pidfile"; echo "Web UI failed to start with verified PID; check $logfile" >&2; exit 1; }
