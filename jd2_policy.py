@@ -3,9 +3,6 @@
 JD2's own updater is NEVER replaced by the Hub QPKG updater.
 A concrete authenticated MyJDownloader adapter must be connected before applying.
 """
-from dataclasses import dataclass
-from typing import Any
-
 REQUIRED = (
     "linkgrabber.auto_confirm",
     "linkgrabber.auto_start",
@@ -44,6 +41,10 @@ def build_preview(adapter):
     info = adapter.inspect_preset()
     if not isinstance(info, dict) or not isinstance(info.get("entries"), dict):
         raise PresetUnavailable("JD2設定情報を取得できません")
+    # Never permit applying settings without a stable, actual JD2 revision.
+    revision = info.get("jd_revision")
+    if isinstance(revision, bool) or not isinstance(revision, (str, int)) or not str(revision).strip():
+        raise PresetUnavailable("JD2 Coreリビジョンが確認できないため設定を変更できません")
     observed = info["entries"]
     entries = []
     missing = []
@@ -57,43 +58,68 @@ def build_preview(adapter):
         entries.append({"key": key, "label": LABELS[key],
                         "current": raw["current"], "target": False,
                         "change": raw["current"] is not False, "supported": True})
-    return {"jd_revision": info.get("jd_revision"), "entries": entries,
+    return {"jd_revision": revision, "entries": entries,
             "missing": missing, "applicable": not missing,
             "note": "JD2本体は独立更新。設定差分を確認してから再適用します。"}
 
 
 def apply_preset(adapter, preview):
-    """Explicitly requested change. Abort if any knob unsupported or drifted.
+    """Apply only after an unchanged explicit preview; verify rollback too.
 
-    Rollback is best effort and reported, never falsely claimed. Caller must
-    run while the engine is stable; updating JD2 and applying cannot overlap.
+    An adapter may mutate a setting and then raise; record the key *before*
+    invoking the adapter so recovery covers a partially completed write.
+    A failed rollback is surfaced, never described as successful.
     """
-    if not isinstance(preview, dict) or not preview.get("applicable"):
+    if not isinstance(preview, dict) or preview.get("applicable") is not True:
         raise PresetUnavailable("すべての必須設定が確認できるまで適用できません")
+    previous_entries = preview.get("entries")
+    if not isinstance(previous_entries, list) or len(previous_entries) != len(REQUIRED):
+        raise PresetUnavailable("プレビューが不完全です")
+    if [entry.get("key") for entry in previous_entries if isinstance(entry, dict)] != list(REQUIRED):
+        raise PresetUnavailable("プレビューの設定キーが一致しません")
+    if any(type(entry.get("current")) is not bool for entry in previous_entries):
+        raise PresetUnavailable("プレビューの設定値が不正です")
+
     current = build_preview(adapter)
-    if not current["applicable"] or current["jd_revision"] != preview["jd_revision"]:
+    if not current["applicable"] or current["jd_revision"] != preview.get("jd_revision"):
         raise PresetChanged("JD2更新または設定変更を検出しました。プレビューをやり直してください")
-    previous = {x["key"]: x.get("current") for x in preview["entries"]}
-    for x in current["entries"]:
-        if x["current"] is not previous.get(x["key"]):
+    previous = {entry["key"]: entry["current"] for entry in previous_entries}
+    for entry in current["entries"]:
+        if entry["current"] is not previous[entry["key"]]:
             raise PresetChanged("プレビュー後に設定が変更されました")
-    changed = []
+
+    attempted = []
     try:
         for entry in current["entries"]:
             if not entry["change"]:
                 continue
-            # Backend adapter must map to a VERIFIED JD2 key and type.
+            attempted.append(entry["key"])
             adapter.update_preset(entry["key"], False)
-            changed.append(entry["key"])
         post = build_preview(adapter)
-        if not post["applicable"] or any(x["current"] is not False for x in post["entries"]):
-            raise PresetChanged("再読込した設定が期待値と一致しません")
+        if (not post["applicable"] or
+                post["jd_revision"] != current["jd_revision"] or
+                any(entry["current"] is not False for entry in post["entries"])):
+            raise PresetChanged("適用後の値またはJD2リビジョンが一致しません")
+        return post
     except Exception:
-        for key in reversed(changed):
+        failures = []
+        for key in reversed(attempted):
             try:
                 adapter.update_preset(key, previous[key])
             except Exception:
-                # The caller must report partially applied/rollback failure.
-                raise PresetChanged("設定反映に失敗し、復旧にも失敗しました。JD2を確認してください")
+                failures.append(key)
+        # A successful API return alone does not prove restoration.
+        try:
+            restored = build_preview(adapter)
+            if (restored["jd_revision"] != current["jd_revision"] or
+                    not restored["applicable"] or
+                    any(entry["current"] is not previous[entry["key"]]
+                        for entry in restored["entries"])):
+                failures.append("readback")
+        except Exception:
+            failures.append("readback")
+        if failures:
+            raise PresetChanged(
+                "JD2設定適用に失敗し、元の状態を確認できませんでした。"
+                "更新処理を止めてJD2設定を手動で確認してください") from None
         raise
-    return post
