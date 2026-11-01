@@ -49,7 +49,8 @@ class ControllerTests(unittest.TestCase):
         jd = Adapter()
         ctl = jd2_control.JD2Controller(jd)
         self.assertTrue(ctl.status()["update_available"])
-        self.assertFalse(ctl.restart_and_update(confirmed=False) if False else False)
+        with self.assertRaises(ValueError):
+            ctl.restart_and_update(confirmed=False)
         result = ctl.restart_and_update(confirmed=True)
         self.assertTrue(result["started"])
         self.assertEqual(jd.update_count, 1)
