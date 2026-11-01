@@ -56,7 +56,6 @@ class StorageTests(unittest.TestCase):
 
     def test_reject_missing_database_after_initialization(self):
         self.s.close()
-        self.s = None
         for p in self.root.joinpath("data").glob("downloader.sqlite3*"):
             p.unlink()
         with self.assertRaisesRegex(RuntimeError, "消失"):
