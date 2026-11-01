@@ -14,6 +14,7 @@ from urllib.parse import parse_qs, urlsplit
 
 import self_update
 import storage
+import jd2_control
 import updater
 
 VERSION = "0.1.0"
@@ -168,10 +169,14 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/status":
                 return self.send_data(200, {"version": VERSION, "configured": self.store.has_admin(),
                     "settings_revision": self.store.revision(),
-                    "jd2": {"connected": False, "reason": "JD2接続は次段階で実装します"},
+                    "jd2": self.server.jd2.status(),
                     "mode": "management-shell"})
             if path == "/api/settings":
                 return self.send_data(200, self.store.settings())
+            if path == "/api/jd2/status":
+                return self.send_data(200, self.server.jd2.status())
+            if path == "/api/jd2/preset/preview":
+                return self.send_data(200, self.server.jd2.preset_preview())
             if path == "/api/bookmarks":
                 return self.send_data(200, {"items": self.store.bookmarks()})
             if path == "/api/links":
@@ -264,6 +269,14 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_data(201, self.store.add_link(body.get("url")))
             if path == "/api/update/apply":
                 return self.send_data(202, self.server.updates.apply(body.get("version")))
+            if path == "/api/jd2/update/check":
+                return self.send_data(200, self.server.jd2.update_check())
+            if path == "/api/jd2/update/apply":
+                return self.send_data(202, self.server.jd2.restart_and_update(
+                    confirmed=body.get("confirmed") is True))
+            if path == "/api/jd2/preset/apply":
+                return self.send_data(200, self.server.jd2.preset_reapply(
+                    confirmed=body.get("confirmed") is True))
         except (OSError, ValueError, KeyError, RuntimeError, json.JSONDecodeError) as exc:
             return self.reject(str(exc))
         self.reject("APIが存在しません", 404)
@@ -299,6 +312,7 @@ def main():
     server.secure_cookies = args.secure_cookie
     server.bootstrap_token = "" if store.has_admin() else bootstrap(data)
     server.updates = self_update.UpdateManager(data, ROOT, VERSION, "x86_64", args.port)
+    server.jd2 = jd2_control.JD2Controller()
     try:
         server.serve_forever(poll_interval=0.5)
     finally:
