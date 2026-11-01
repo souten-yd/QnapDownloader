@@ -48,6 +48,8 @@ class HttpTests(unittest.TestCase):
         self.thread.start()
         self.addCleanup(self.stop)
         self.csrf = ""
+        for table in (webapp.SHARE_FAILED, webapp.SHARE_RATE, webapp.FAILED):
+            table.clear()
 
     def stop(self):
         self.server.shutdown()
@@ -69,6 +71,22 @@ class HttpTests(unittest.TestCase):
                 return response.status, json.load(response)
         except urllib.error.HTTPError as error:
             return error.code, json.load(error)
+
+    def raw(self, path, body=None, headers=None, host=None, method=None):
+        """Request without the cookie jar; returns (status, headers, json)."""
+        sent = {"Host": host or self.host}
+        sent.update(headers or {})
+        data = None
+        if body is not None:
+            data = body if isinstance(body, bytes) else json.dumps(body).encode()
+            sent.setdefault("Content-Type", "application/json")
+        request = urllib.request.Request(self.url + path, data=data, headers=sent, method=method)
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        try:
+            with opener.open(request, timeout=4) as response:
+                return response.status, response.headers, json.load(response)
+        except urllib.error.HTTPError as error:
+            return error.code, error.headers, json.load(error)
 
     def login(self):
         self.assertEqual(self.req("/api/setup", {
@@ -104,7 +122,7 @@ class HttpTests(unittest.TestCase):
                                          headers={"Host": "192.168.68.57:17864"})
         with self.client.open(request, timeout=4) as response:
             self.assertEqual(response.status, 200)
-            self.assertEqual(json.load(response)["version"], "0.1.12")
+            self.assertEqual(json.load(response)["version"], "0.1.13")
         with self.client.open(self.url + "/icon.svg", timeout=4) as response:
             self.assertEqual(response.status, 200)
             self.assertEqual(response.headers.get_content_type(), "image/svg+xml")
@@ -376,6 +394,251 @@ class HttpTests(unittest.TestCase):
             self.assertEqual(code, 400)
             self.assertIn("Tailscale", data["error"])
 
+    # ---- v0.1.13: HTTPS behind Tailscale Serve ---------------------------
+    def test_request_is_https_only_for_loopback_peers(self):
+        https = {"X-Forwarded-Proto": "https", "Host": "192.168.1.5:17864"}
+        self.assertTrue(webapp.request_is_https("127.0.0.1", https))
+        self.assertTrue(webapp.request_is_https("::1", https))
+        self.assertTrue(webapp.request_is_https("::ffff:127.0.0.1", https))
+        self.assertTrue(webapp.request_is_https("127.0.0.1", {"Host": "nas.tail1234.ts.net"}))
+        self.assertTrue(webapp.request_is_https("127.0.0.1", {"Host": "NAS.tail1234.TS.NET:443"}))
+        # Forged header or ts.net Host from any non-loopback peer is ignored.
+        for peer in ("192.168.1.5", "100.64.0.9", "fd7a:115c:a1e0::5", "8.8.8.8", "garbage", None):
+            with self.subTest(peer=peer):
+                self.assertFalse(webapp.request_is_https(peer, https))
+                self.assertFalse(webapp.request_is_https(peer, {"Host": "nas.tail1234.ts.net"}))
+        self.assertFalse(webapp.request_is_https("127.0.0.1", {"Host": "192.168.1.5"}))
+        self.assertFalse(webapp.request_is_https("127.0.0.1", {"X-Forwarded-Proto": "http"}))
+        self.assertFalse(webapp.request_is_https("127.0.0.1", {"Host": "evilts.net"}))
+        self.assertFalse(webapp.request_is_https("127.0.0.1", {}))
+
+    def test_ts_net_host_allowed_only_for_loopback_and_tailnet_peers(self):
+        name = "nas.tail1234.ts.net:443"
+        self.assertTrue(webapp.public_host_allowed(name, "127.0.0.1"))
+        self.assertTrue(webapp.public_host_allowed(name, "::1"))
+        self.assertTrue(webapp.public_host_allowed("nas.tail1234.ts.net", "100.100.1.2"))
+        self.assertTrue(webapp.public_host_allowed("nas.tail1234.ts.net", "fd7a:115c:a1e0::7"))
+        self.assertFalse(webapp.public_host_allowed(name, "192.168.1.5"))
+        self.assertFalse(webapp.public_host_allowed(name, "8.8.8.8"))
+        self.assertFalse(webapp.public_host_allowed(name))
+        for bad in ("ts.net", "bad_name.tail1234.ts.net", "-a.tail1234.ts.net",
+                    "nas.tail1234.ts.net.evil.com", "nas.tail1234.ts.net:99999", "a b.tail1234.ts.net",
+                    "user@nas.tail1234.ts.net", "nas..tail1234.ts.net"):
+            with self.subTest(host=bad):
+                self.assertFalse(webapp.public_host_allowed(bad, "127.0.0.1"))
+
+    def test_direct_tailnet_access_accepts_ts_net_and_short_names_only_from_tailnet(self):
+        for peer in ("100.100.1.2", "fd7a:115c:a1e0::7", "127.0.0.1", "::1"):
+            for host in ("nas.tail1234.ts.net", "nas.tail1234.ts.net:17864", "NAS", "nas:17864",
+                         "my-nas:17864"):
+                with self.subTest(peer=peer, host=host):
+                    self.assertTrue(webapp.public_host_allowed(host, peer))
+            for host in ("evil.example.com", "evil.example.com:17864", "nas.local", "a.b",
+                         "bad_name", "-nas", "12345", "nas:99999", "nas/x", "u@nas"):
+                with self.subTest(peer=peer, host=host):
+                    self.assertFalse(webapp.public_host_allowed(host, peer))
+        for peer in ("192.168.68.57", "10.0.0.5", "8.8.8.8"):
+            for host in ("nas", "nas:17864", "nas.tail1234.ts.net:17864"):
+                with self.subTest(peer=peer, host=host):
+                    self.assertFalse(webapp.public_host_allowed(host, peer))
+        self.assertFalse(webapp.public_host_allowed("nas"))
+        handler = webapp.Handler.__new__(webapp.Handler)
+        handler.headers = {"Host": "nas.tail1234.ts.net:17864"}
+        handler.client_address = ("100.100.1.2", 1)
+        self.assertTrue(handler.check_host())
+        handler.headers = {"Host": "nas:17864"}
+        self.assertTrue(handler.check_host())
+        handler.client_address = ("192.168.68.57", 1)
+        self.assertFalse(handler.check_host())
+        handler.client_address = ("100.100.1.2", 1)
+        handler.headers = {"Host": "evil.example.com"}
+        self.assertFalse(handler.check_host())
+
+    def test_ts_net_host_served_for_loopback_peer_and_session_reports_https(self):
+        host = "nas.tail1234.ts.net"
+        code, headers, data = self.raw("/api/session", host=host)
+        self.assertEqual(code, 200)
+        self.assertTrue(data["https"])
+        code, headers, data = self.raw("/api/session")
+        self.assertFalse(data["https"])
+        code, headers, data = self.raw("/api/session", headers={"X-Forwarded-Proto": "https"})
+        self.assertTrue(data["https"])
+        # A ts.net Host is refused from a non-tailnet, non-loopback peer.
+        handler = webapp.Handler.__new__(webapp.Handler)
+        handler.client_address = ("192.168.1.5", 1)
+        handler.headers = {"Host": host}
+        self.assertFalse(handler.check_host())
+        handler.client_address = ("127.0.0.1", 1)
+        self.assertTrue(handler.check_host())
+
+    def test_cookie_is_secure_when_request_is_https_and_never_hsts(self):
+        self.assertEqual(self.req("/api/setup", {"password": "correct horse staple 123"})[0], 201)
+        login = {"password": "correct horse staple 123"}
+        plain = self.raw("/api/login", login, {"Origin": self.url})
+        self.assertEqual(plain[0], 200)
+        cookie = plain[1]["Set-Cookie"]
+        self.assertNotIn("Secure", cookie)
+        self.assertIn("HttpOnly", cookie)
+        self.assertIn("SameSite=Strict", cookie)
+        forwarded = self.raw("/api/login", login, {"Origin": self.url, "X-Forwarded-Proto": "https"})
+        self.assertIn("; Secure", forwarded[1]["Set-Cookie"])
+        self.assertIn("HttpOnly", forwarded[1]["Set-Cookie"])
+        host = "nas.tail1234.ts.net"
+        via_serve = self.raw("/api/login", login, {"Origin": "https://" + host}, host=host)
+        self.assertEqual(via_serve[0], 200)
+        self.assertIn("; Secure", via_serve[1]["Set-Cookie"])
+        self.assertIsNone(via_serve[1].get("Strict-Transport-Security"))
+        self.assertIsNone(forwarded[1].get("Strict-Transport-Security"))
+        self.server.secure_cookies = True
+        flagged = self.raw("/api/login", login, {"Origin": self.url})
+        self.assertIn("; Secure", flagged[1]["Set-Cookie"])
+
+    # ---- v0.1.13: iPhone share tokens ------------------------------------
+    def make_token(self, name="iPhone"):
+        self.login()
+        code, body = self.req("/api/share/tokens", {"name": name})
+        self.assertEqual(code, 201)
+        return body
+
+    def share(self, token, body=None, headers=None, host=None):
+        sent = {"Authorization": "Bearer " + token} if token is not None else {}
+        sent.update(headers or {})
+        return self.raw("/api/share", {"text": "nothing to see"} if body is None else body, sent, host)
+
+    def test_share_token_admin_api_auth_csrf_and_secrecy(self):
+        for path, body in (("/api/share/tokens", {"name": "a"}), ("/api/share/tokens/delete", {"id": 1})):
+            self.assertEqual(self.req(path, body)[0], 401)
+        self.assertEqual(self.req("/api/share/tokens")[0], 401)
+        self.login()
+        self.assertEqual(self.req("/api/share/tokens", {"name": "a"}, csrf=False)[0], 403)
+        self.assertEqual(self.req("/api/share/tokens", {"name": "a"}, origin=False)[0], 403)
+        self.assertEqual(self.req("/api/share/tokens", {"name": ""})[0], 400)
+        self.assertEqual(self.req("/api/share/tokens", {"name": "x" * 41})[0], 400)
+        self.assertEqual(self.req("/api/share/tokens", {"name": 5})[0], 400)
+        code, made = self.req("/api/share/tokens", {"name": " iPhone 15 "})
+        self.assertEqual(code, 201)
+        self.assertEqual(made["name"], "iPhone 15")
+        self.assertGreaterEqual(len(made["token"]), 40)
+        code, listing = self.req("/api/share/tokens")
+        self.assertEqual(code, 200)
+        self.assertEqual([i["name"] for i in listing["items"]], ["iPhone 15"])
+        self.assertEqual(set(listing["items"][0]), {"id", "name", "created_at", "last_used_at"})
+        self.assertNotIn(made["token"], json.dumps(listing))
+        # Only the hash is stored.
+        import hashlib
+        with self.store.connect() as db:
+            stored = db.execute("SELECT token_hash FROM share_tokens").fetchone()[0]
+            self.assertEqual(stored, hashlib.sha256(made["token"].encode()).hexdigest())
+            self.assertNotIn(made["token"], json.dumps(db.execute("SELECT * FROM share_tokens").fetchall()))
+        self.assertEqual(self.req("/api/share/tokens/delete", {"id": made["id"]}, csrf=False)[0], 403)
+        self.assertEqual(self.req("/api/share/tokens/delete", {"id": "1"})[0], 400)
+        self.assertEqual(self.req("/api/share/tokens/delete", {"id": 999})[0], 400)
+        self.assertEqual(self.req("/api/share/tokens/delete", {"id": made["id"]})[0], 200)
+        self.assertEqual(self.req("/api/share/tokens")[1]["items"], [])
+
+    def test_share_token_limit_is_ten(self):
+        self.login()
+        for index in range(10):
+            self.assertEqual(self.req("/api/share/tokens", {"name": "d%d" % index})[0], 201)
+        self.assertEqual(self.req("/api/share/tokens", {"name": "d10"})[0], 400)
+
+    def test_share_stages_rapidgator_links_with_good_token(self):
+        token = self.make_token()["token"]
+        text = ("https://example.com/a https://rapidgator.net/file/1111?x=1\n"
+                "https://rg.to/file/2222 https://rapidgator.net/file/1111")
+        code, _, data = self.share(token, {"text": text})
+        self.assertEqual((code, data), (200, {"added": 2, "found": 2}))
+        # Dedupe: the second send adds nothing new.
+        code, _, data = self.share(token, {"text": text})
+        self.assertEqual((code, data), (200, {"added": 0, "found": 2}))
+        urls = {i["url"] for i in self.req("/api/links")[1]["items"]}
+        self.assertEqual(urls, {"https://rapidgator.net/file/1111", "https://rapidgator.net/file/2222"})
+        # "url" is accepted too; a lone https URL is staged when no RG link exists.
+        code, _, data = self.share(token, {"url": "https://example.com/page?q=1"})
+        self.assertEqual((code, data), (200, {"added": 1, "found": 1}))
+        # Text that is neither: nothing staged.
+        code, _, data = self.share(token, {"text": "see https://example.com/a and more"})
+        self.assertEqual((code, data), (200, {"added": 0, "found": 0}))
+        code, _, data = self.share(token, {"text": "http://example.com/plain"})
+        self.assertEqual(code, 400)
+        for bad in ({"text": 5}, {}, {"text": "x" * 70000}):
+            self.assertEqual(self.share(token, bad)[0], 400)
+        links = self.req("/api/links")[1]["items"]
+        self.assertTrue(all(i["state"] == "staged" for i in links))
+        self.assertEqual(len(links), 3)
+
+    def test_share_never_touches_jd2(self):
+        token = self.make_token()["token"]
+        with patch("jd2_transfer.transfer") as transfer, \
+                patch("jd2_transfer.prepare_transfer") as prepare, \
+                patch.object(self.server.jd2, "_require") as require, \
+                patch.object(self.server.engine, "start") as start:
+            code, _, data = self.share(token, {"text": "https://rapidgator.net/file/4444"})
+        self.assertEqual(code, 200)
+        self.assertEqual(data["added"], 1)
+        for mock in (transfer, prepare, require, start):
+            mock.assert_not_called()
+
+    def test_share_rejects_bad_missing_and_revoked_tokens_uniformly(self):
+        made = self.make_token()
+        good = made["token"]
+        results = []
+        for supplied in (None, "", "wrong", good[:-1], good + "x", good.upper()):
+            code, _, data = self.share(supplied)
+            results.append((code, data))
+        self.assertEqual(results, [(401, {"error": "認証に失敗しました"})] * 6)
+        code, _, data = self.raw("/api/share", {"text": "nothing"}, {"Authorization": "Basic " + good})
+        self.assertEqual(code, 401)
+        # A logged-in browser session (cookie) is not enough on its own.
+        code, body = self.req("/api/share", {"text": "https://rapidgator.net/file/4444"})
+        self.assertEqual(code, 401)
+        self.assertEqual(self.req("/api/links")[1]["items"], [])
+        self.assertEqual(self.share(good)[0], 200)
+        self.assertEqual(self.req("/api/share/tokens/delete", {"id": made["id"]})[0], 200)
+        self.assertEqual(self.share(good)[0], 401)
+
+    def test_share_rejects_foreign_origin_and_bad_host(self):
+        token = self.make_token()["token"]
+        for origin in ("https://evil.example", "null", "http://127.0.0.1:1"):
+            with self.subTest(origin=origin):
+                self.assertEqual(self.share(token, headers={"Origin": origin})[0], 403)
+        self.assertEqual(self.share(token, headers={"Origin": self.url})[0], 200)
+        self.assertEqual(self.share(token)[0], 200)   # Shortcuts send no Origin
+        self.assertEqual(self.share(token, host="evil.example")[0], 403)
+        self.assertEqual(self.share(token, host="8.8.8.8")[0], 403)
+        # No CORS surface: preflight is not implemented.
+        request = urllib.request.Request(self.url + "/api/share", method="OPTIONS",
+                                         headers={"Host": self.host, "Origin": "https://evil.example"})
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        with self.assertRaises(urllib.error.HTTPError) as caught:
+            opener.open(request, timeout=4)
+        self.assertGreaterEqual(caught.exception.code, 400)
+        self.assertIsNone(caught.exception.headers.get("Access-Control-Allow-Origin"))
+
+    def test_share_rate_limit_per_token_and_failure_lockout(self):
+        first = self.make_token("a")["token"]
+        second = self.req("/api/share/tokens", {"name": "b"})[1]["token"]
+        for _ in range(30):
+            self.assertEqual(self.share(first)[0], 200)
+        self.assertEqual(self.share(first)[0], 429)
+        self.assertEqual(self.share(second)[0], 200)   # limit is per token
+        webapp.SHARE_RATE.clear()
+        self.assertEqual(self.share(first)[0], 200)
+        for _ in range(20):
+            self.assertEqual(self.share("wrong")[0], 401)
+        self.assertEqual(self.share("wrong")[0], 429)
+        self.assertEqual(self.share(first)[0], 429)    # address locked out for 5 minutes
+        webapp.SHARE_FAILED.clear()
+        self.assertEqual(self.share(first)[0], 200)
+
+    def test_share_requires_json_and_bounded_body(self):
+        token = self.make_token()["token"]
+        code, _, _ = self.raw("/api/share", b"text=x", {"Authorization": "Bearer " + token,
+                                                       "Content-Type": "text/plain"})
+        self.assertEqual(code, 400)
+        code, _, _ = self.raw("/api/share", b"x" * 80000, {"Authorization": "Bearer " + token})
+        self.assertEqual(code, 400)
+
     def test_update_channel_select_rc_releases_without_installer_execution(self):
         self.assertEqual(self.req("/api/update/check?channel=rc")[0],401)
         self.login()
@@ -482,7 +745,7 @@ class HttpTests(unittest.TestCase):
         self.assertFalse(info["supported"])
         code, _ = self.req("/api/update/apply", {"version": "v0.1.8"})
         self.assertEqual(code, 400)
-        self.assertEqual(self.req("/api/health")[1]["version"], "0.1.12")
+        self.assertEqual(self.req("/api/health")[1]["version"], "0.1.13")
         self.assertFalse(self.req("/api/jd2/status")[1]["connected"])
         self.assertEqual(self.req("/api/jd2/update/apply", {"confirmed": True})[0], 400)
         self.assertEqual(self.req("/api/jd2/preset/apply", {"confirmed": True})[0], 400)

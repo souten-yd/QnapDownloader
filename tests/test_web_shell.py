@@ -162,7 +162,7 @@ if (bad.length) { console.error("mismatch: " + bad.join(",")); process.exit(1); 
 
     def test_settings_order_and_auto_refresh_interval(self):
         order = re.findall(r'<a href="#/settings/(\w+)" data-section', self.html)
-        self.assertEqual(order, ["engine", "storage", "bookmarks", "updates", "diagnostics", "about"])
+        self.assertEqual(order, ["engine", "storage", "https", "share", "bookmarks", "updates", "diagnostics", "about"])
         self.assertRegex(self.js, r"AUTO_REFRESH_MS\s*=\s*5000\b")
         self.assertRegex(self.js, r"BADGE_REFRESH_MS\s*=\s*30000\b")
         self.assertRegex(self.js, r"PASTE_DEBOUNCE_MS\s*=\s*400\b")
@@ -170,6 +170,57 @@ if (bad.length) { console.error("mismatch: " + bad.join(",")); process.exit(1); 
         self.assertIn("/api/links/delete", self.js)
         self.assertIn("/api/bookmarks/delete", self.js)
         self.assertIn("confirm(many", self.js)
+
+    def test_v0113_https_and_share_sections(self):
+        for ident in ("httpsState", "httpsCmd", "httpsCmdCopy", "shareDevices", "shareForm", "shareName",
+                      "shareNew", "shareToken", "shareTokenCopy", "shareEndpoint", "shareEndpointCopy",
+                      "shareJs", "shareJsCopy", "shareBookmarklet", "shareBookmarkletCopy",
+                      "shareHttpWarning", "cfHttps"):
+            with self.subTest(ident=ident):
+                self.assertIn('id="%s"' % ident, self.html)
+        self.assertIn('data-section="https"', self.html)
+        self.assertIn('data-section="share"', self.html)
+        self.assertIn("HTTPS接続", self.html)
+        self.assertIn("iPhoneから送る", self.html)
+        self.assertIn('href="#/settings/https"', self.html)
+        self.assertIn("HTTPSで開くと通過しやすくなります", self.html)
+        self.assertIn("which tailscale", self.html)
+        self.assertIn("tailscale serve --bg --https=443 http://127.0.0.1:17864", self.js)
+        self.assertIn("/api/share/tokens", self.js)
+        self.assertIn("/api/share/tokens/delete", self.js)
+        self.assertIn('location.origin + "/api/share"', self.js)
+        self.assertIn("completion(Array.from(document.querySelectorAll('a[href]')", self.js)
+        self.assertIn("encodeURIComponent(location.href)", self.js)
+        self.assertIn("session.https", self.js)
+        # The token is shown via textContent only and never persisted.
+        self.assertIn('$("shareToken").textContent = made.token', self.js)
+        self.assertNotRegex(self.js, r"(?i)(session|local)Storage\.setItem\([^)]*token")
+        self.assertNotIn("shareToken\").value", self.js)
+
+    def test_links_paste_route_prefills_without_saving(self):
+        self.assertIn('new URLSearchParams(full.slice(cut + 1)).get("paste")', self.js)
+        self.assertIn('history.replaceState(null, "", "#/links")', self.js)
+        match = re.search(r'if \(route\.view === "links" && route\.paste\) \{.*?\n  \}\n', self.js, re.S)
+        self.assertIsNotNone(match)
+        self.assertIn("schedulePaste(0)", match.group(0))
+        self.assertNotIn("addPasted", match.group(0))
+        self.assertNotIn('"/api/links"', match.group(0))
+
+    @unittest.skipUnless(shutil.which("node"), "node not installed")
+    def test_share_js_snippet_extracts_links(self):
+        line = re.search(r"const SHARE_JS = .*?;\n", self.js, re.S).group(0)
+        script = line + """
+const hrefs = ["https://rapidgator.net/file/1", "https://example.com/x", "https://rg.to/file/2"];
+global.document = {querySelectorAll: () => hrefs.map(h => ({href: h}))};
+global.location = {href: "https://page.example/"};
+let out = null;
+global.completion = value => { out = value; };
+eval(SHARE_JS);
+const want = "https://rapidgator.net/file/1\\nhttps://rg.to/file/2\\nhttps://page.example/";
+if (out !== want) { console.error(JSON.stringify(out)); process.exit(1); }
+"""
+        result = subprocess.run(["node", "-e", script], capture_output=True, text=True, timeout=20)
+        self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_icons_use_symbol_sprite(self):
         self.assertIn("<symbol", self.html)

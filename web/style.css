@@ -349,3 +349,10 @@ label{display:block;margin:12px 0;color:var(--muted);font-size:13px}
   .engine-actions .btn{flex:1}
   .empty-card{padding:28px 12px}
 }
+
+/* ---- v0.1.13: HTTPS / share sections ---- */
+.guide{padding-left:22px;display:grid;gap:12px}
+.copy-row{display:flex;flex-wrap:wrap;align-items:center;gap:8px;margin:6px 0}
+.code-box{flex:1 1 240px;min-width:0;padding:8px 10px;border:1px solid var(--border);background:var(--surface);border-radius:8px;font-size:12.5px;overflow-wrap:anywhere;user-select:all}
+.share-new{margin:12px 0;border-color:var(--accent)}
+.share-new p{margin:0 0 6px}
