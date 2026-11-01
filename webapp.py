@@ -23,7 +23,7 @@ import runtime_diagnostics
 import jd2_myjd
 import updater
 
-VERSION = "0.1.9"
+VERSION = "0.1.10"
 PORT = 17864
 ROOT = Path(__file__).resolve().parent
 FILES = {"/": ("web/index.html", "text/html; charset=utf-8"),
@@ -161,6 +161,22 @@ class Handler(BaseHTTPRequestHandler):
         return (private_peer_allowed(self.client_address[0]) and
                 bool(host) and public_host_allowed(host))
 
+    def reject_hub_origin(self, checked_url):
+        """Never allow an embedded page to share the Hub's own origin.
+
+        The UI's compatibility mode lets a framed page keep its own origin
+        (cookies/storage). That is only safe while the page can never be the
+        Hub itself, so the Hub's own hostname (from the Host header, any port)
+        and Tailscale MagicDNS names are refused for every mode.
+        """
+        target = (urlsplit(checked_url).hostname or "").lower().rstrip(".")
+        try:
+            own = (urlsplit("http://" + self.headers.get("Host", "")).hostname or "").lower().rstrip(".")
+        except ValueError:
+            own = ""
+        if target == "ts.net" or target.endswith(".ts.net") or (own and target == own):
+            raise ValueError("このHub自身またはTailscaleのアドレスは埋め込み表示できません")
+
     def origin_ok(self):
         origin = self.headers.get("Origin")
         if not origin:
@@ -297,7 +313,9 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/browser/validate":
                 query = parse_qs(urlsplit(self.path).query)
                 value = query.get("url", [""])[0]
-                return self.send_data(200, {"url": browser_safety.validate(value),
+                checked = browser_safety.validate(value)
+                self.reject_hub_origin(checked)
+                return self.send_data(200, {"url": checked,
                   "mode": "sandboxed-client-only", "server_fetched": False})
             if path == "/api/update/check":
                 query = parse_qs(urlsplit(self.path).query)

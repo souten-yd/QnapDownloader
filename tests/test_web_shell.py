@@ -1,11 +1,16 @@
 """Static checks for the browser-style shell (web/). Stdlib only."""
 import re
+import shutil
+import subprocess
 import unittest
 from pathlib import Path
 
 WEB = Path(__file__).resolve().parent.parent / "web"
-FORBIDDEN_SANDBOX = ("allow-same-origin", "allow-popups", "allow-top-navigation",
+FORBIDDEN_SANDBOX = ("allow-popups", "allow-top-navigation",
                      "allow-downloads", "allow-modals")
+# The origin-sharing token is allowed in exactly one place: the compat constant.
+ORIGIN_TOKEN = "allow-same-origin"
+COMPAT_SANDBOX = "allow-scripts allow-forms allow-same-origin"
 
 
 def text_files():
@@ -26,11 +31,53 @@ class WebShellStaticTests(unittest.TestCase):
                     self.assertNotIn(token, body)
 
     def test_only_allowed_sandbox_values(self):
-        self.assertIn("allow-scripts allow-forms", self.js)
         self.assertIn('SANDBOX_STRICT = ""', self.js)
         values = re.findall(r'SANDBOX_\w+\s*=\s*"([^"]*)"', self.js)
-        self.assertEqual(sorted(values), ["", "allow-scripts allow-forms"])
+        self.assertEqual(sorted(values), sorted(["", "allow-scripts allow-forms", COMPAT_SANDBOX]))
         self.assertIn('"referrerpolicy", "no-referrer"', self.js)
+
+    def test_origin_token_only_in_the_compat_constant(self):
+        self.assertEqual(self.js.count(ORIGIN_TOKEN), 1)
+        self.assertIn('SANDBOX_COMPAT = "%s";' % COMPAT_SANDBOX, self.js)
+        for path in text_files():
+            if path.name != "app.js":
+                with self.subTest(file=path.name):
+                    self.assertNotIn(ORIGIN_TOKEN, path.read_text(encoding="utf-8"))
+        # The sandbox attribute is only ever set from sandboxFor(mode).
+        self.assertEqual(len(re.findall(r'setAttribute\("sandbox"', self.js)), 1)
+        self.assertIn('frame.setAttribute("sandbox", sandboxFor(tab.mode))', self.js)
+
+    def test_compat_guard_and_remembered_modes(self):
+        self.assertIn("compatAllowedFor", self.js)
+        self.assertIn(".ts.net", self.js)
+        self.assertRegex(self.js, r"MAX_HOST_MODES\s*=\s*100\b")
+        self.assertRegex(self.js, r"MAX_LIVE_FRAMES_NARROW\s*=\s*1\b")
+        self.assertRegex(self.js, r"MAX_LIVE_FRAMES_WIDE\s*=\s*3\b")
+        for ident in ("cfHint", "cfCompat", "cfSafari", "cfDismiss"):
+            self.assertIn('id="%s"' % ident, self.html)
+        self.assertIn('name="mobile-web-app-capable"', self.html)
+
+    def test_update_watch_and_stale_page_notice(self):
+        self.assertIn("/api/health", self.js)
+        self.assertIn("更新中… 完了後に自動で再読み込みします", self.js)
+        self.assertIn("location.reload()", self.js)
+        self.assertRegex(self.js, r"UPDATE_POLL_MS\s*=\s*2000\b")
+        self.assertRegex(self.js, r"UPDATE_WATCH_MS\s*=\s*5 \* 60 \* 1000\b")
+
+    @unittest.skipUnless(shutil.which("node"), "node not installed")
+    def test_is_tailscale_host(self):
+        match = re.search(r"function isTailscaleHost\(hostname\) \{.*?\n\}\n", self.js, re.S)
+        self.assertIsNotNone(match)
+        script = match.group(0) + """
+const yes = ["100.64.0.1", "100.100.1.2", "100.127.255.254", "myhub.tail1234.ts.net",
+  "MyHub.TS.NET", "[fd7a:115c:a1e0::1]", "fd7a:115c:a1e0:ab12::5"];
+const no = ["100.63.255.255", "100.128.0.1", "192.168.1.5", "10.0.0.1", "example.com",
+  "nots.net", "evilts.net.example.com", "[fd7a:115c:a1e1::1]", "[fd00::1]", "100.64.0", "", "999.64.0.1"];
+const bad = yes.filter(h => !isTailscaleHost(h)).concat(no.filter(h => isTailscaleHost(h)));
+if (bad.length) { console.error("mismatch: " + bad.join(",")); process.exit(1); }
+"""
+        result = subprocess.run(["node", "-e", script], capture_output=True, text=True, timeout=20)
+        self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_no_dynamic_html_or_code_execution(self):
         for token in ("innerHTML", "outerHTML", "insertAdjacentHTML", "document.write",
