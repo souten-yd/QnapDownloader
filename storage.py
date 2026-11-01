@@ -168,6 +168,32 @@ class Store:
             row = db.execute("SELECT id,state FROM link_intents WHERE url=?", (url,)).fetchone()
             return dict(id=row[0], state=row[1])
 
+    def begin_send(self, identifier):
+        if type(identifier) is not int or identifier <= 0:
+            raise ValueError("リンクIDが不正です")
+        with self._guard, self.connect() as db:
+            row = db.execute("SELECT url,state FROM link_intents WHERE id=?",
+                             (identifier,)).fetchone()
+            if row is None or row[1] != "staged":
+                raise ValueError("リンクは保留中ではありません。JD2で確認してください")
+            changed = db.execute(
+                "UPDATE link_intents SET state='sending' WHERE id=? AND state='staged'",
+                (identifier,))
+            if changed.rowcount != 1:
+                raise ValueError("リンクの送信状態が変化しました")
+            db.execute("UPDATE meta SET value=value+1 WHERE key='revision'")
+            return row[0]
+
+    def finish_send(self, identifier, state):
+        if state not in ("sent", "uncertain"):
+            raise ValueError("送信結果が不正です")
+        with self._guard, self.connect() as db:
+            updated = db.execute("UPDATE link_intents SET state=? WHERE id=? AND state='sending'",
+                                 (state, identifier))
+            if updated.rowcount != 1:
+                raise ValueError("リンク送信の結果を確定できません")
+            db.execute("UPDATE meta SET value=value+1 WHERE key='revision'")
+
     def links(self):
         with self.connect() as db:
             return [dict(id=r[0],url=r[1],state=r[2]) for r in
