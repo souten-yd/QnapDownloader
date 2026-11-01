@@ -55,10 +55,17 @@
   <button id="folderRoots" class="secondary">共有フォルダから選び直す</button>
  </section>
  <section id="updates" class="panel tab hidden">
-  <h2>アプリ更新</h2><p>QnapSelfCare方式：GitHub Releaseの新しい正式QPKGを検出し、SHA-256検証・DBバックアップ・QPKG適用・起動検証を実施します。</p>
+  <h2>アップデート</h2>
+  <h3>QnapDownloader Hubの更新</h3><p>QnapSelfCare方式：Hubの新しい正式QPKGを検出し、SHA-256検証・DBバックアップ・QPKG適用・起動検証を実施します。JDownloader 2本体の更新には影響しません。</p>
   <button id="updateCheck">更新を確認</button><p id="updateResult"></p><button id="updateApply" class="hidden">検証して更新する</button>
   <div id="updateStatus" class="muted"></div>
   <p class="muted">QNAPにQPKGとしてインストールされた環境のみ適用できます。公開Releaseがない場合は更新できません。</p>
+  <hr><h3>JDownloader 2の単独更新と推奨設定</h3>
+  <p>JD2は公式の更新機能を使用し、Hubとは独立してCore/ホストプラグインを更新します。設定が変わった場合はHub側で差分を確認し、推奨設定を再適用します。</p>
+  <p id="jd2Status" class="muted">接続アダプタの実装待ちです。現段階ではJD2の更新/設定変更は実行できません。</p>
+  <button id="jd2Update" disabled>JD2だけ更新する（接続後に有効）</button>
+  <button id="jd2Preset" class="secondary" disabled>推奨設定を確認して再適用（接続後に有効）</button>
+  <p class="muted">JD2の更新後、リンク自動開始OFF、自動解凍OFF、パッケージ別フォルダ作成OFFなどを再確認する設計です。既存キューは変更しません。</p>
  </section>
 </section>
 <div id="notice" class="notice hidden" role="status" aria-live="polite"></div>
