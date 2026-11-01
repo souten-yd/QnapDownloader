@@ -128,6 +128,9 @@ async function updateStatus(){
  $("jd2Preset").disabled=!jd.connected||!jd.can_preset;
 }
 document.addEventListener("DOMContentLoaded",()=>{
+ const plainLan = location.protocol==="http:" &&
+   !["localhost","127.0.0.1","::1","[::1]"].includes(location.hostname);
+ visible("lanSecurityWarning",plainLan);
  $("setupButton").addEventListener("click",()=>perform(async()=>{
   await api("/api/bootstrap",{token:$("bootstrapToken").value,password:$("setupPassword").value});await go();
  }));
