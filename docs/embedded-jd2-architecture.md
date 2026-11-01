@@ -37,7 +37,7 @@ QnapDownloader.qpkg
     manifest.json / LICENSES/ / SBOM
 Persistent root (QPKG install dirの外)
   /QnapDownloader-data/
-    config/                               # Hub設定・admin・PINなし
+    config/                               # Hub設定・管理者認証（トークンによる初回登録は不要）
     db/                                   # Hub SQLite + JD2との対応ID
     engine/active/                        # JD2本体の書込可能更新コード
     engine/previous/                      # ロールバック用検証済みスナップショット
@@ -114,7 +114,7 @@ PRごとにmainの実ファイル・QPKG manifest・docs・tests・UI・安全gr
 
 - QNAP TS-253Be 2/4/8GB条件でメモリガード、QTSブート/アプリ再起動/QPKGアップデート後の状態保持
 - QPKGからJD2を起動して1個のWeb UIでアカウント/ダウンロード表示、外部MyJDアカウントなしでも操作可能（内蔵エンジン認証ブリッジ合格後）
-- ダウンロード進捗・速度/ETAとJD2実状態が一致、開始/停止/再開・破壊操作確認、ホスト별エラー
+- ダウンロード進捗・速度/ETAとJD2実状態が一致、開始/停止/再開・破壊操作確認、ホスト別エラー
 - プレミアムアカウントの状態表示、資格情報のログ/API非露出、TLS無しの追加/更新拒否、cookie/API-keyログイン差異
 - JD2独立更新後もHub Webのログインと設定/保存先/アカウント/キュー維持、プラグイン整合、QPKGアップデートは独立
 - ジャーナル/失敗時の一貫性・異常終了・データ消失/過剰書込/port exposure/旧deprecated APIの未使用
