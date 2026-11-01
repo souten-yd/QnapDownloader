@@ -7,7 +7,6 @@ import json
 import os
 from pathlib import Path
 import stat
-import time
 
 # These two keys are documented by JD2; all other settings remain unsupported
 # until their exact AdvancedConfig metadata is observed on the real device.
@@ -162,6 +161,20 @@ class MyJDAdapter:
             raise MyJDUnavailable("JD2が設定変更を拒否しました")
 
 
+class UnavailableAdapter:
+    """Keep the Hub Web UI available when optional JD2 configuration is invalid."""
+    allow_update = False
+
+    def __init__(self, reason):
+        self.reason = reason
+
+    def core_revision(self):
+        raise MyJDUnavailable(self.reason)
+
+
 def configured_adapter(data_root):
-    options = load_configuration(data_root)
-    return None if options is None else MyJDAdapter(options)
+    try:
+        options = load_configuration(data_root)
+        return None if options is None else MyJDAdapter(options)
+    except (OSError, ValueError, MyJDUnavailable, json.JSONDecodeError):
+        return UnavailableAdapter("MyJD設定を確認してください（パス/権限/内容）")
