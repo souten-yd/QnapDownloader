@@ -23,6 +23,16 @@ class QpkgContractTests(unittest.TestCase):
         self.assertEqual(int(cfg["QPKG_WEB_PORT"]), webapp.PORT)
         self.assertEqual(webapp.PORT, downloader_pid.PORT)
         self.assertEqual(cfg["QPKG_SERVICE_PROGRAM"], "downloader.sh")
+        self.assertEqual(cfg["QPKG_WEBUI"], "/")
+        self.assertEqual(cfg["QPKG_WEB_PORT"], "17864")
+        self.assertEqual(cfg["QPKG_WEB_SSL_PORT"], "-2")
+        self.assertEqual(cfg["QPKG_DESKTOP_APP"], "0")
+        self.assertEqual(cfg["QPKG_SERVICE_PORT"], "17864")
+        self.assertEqual(cfg["QDK_DATA_DIR_ICONS"], "icons")
+        self.assertEqual(cfg["QDK_DATA_DIR_SHARED"], "shared")
+        self.assertIn("X-Frame-Options", (ROOT / "webapp.py").read_text())
+        self.assertIn("frame-ancestors 'none'", (ROOT / "webapp.py").read_text())
+
 
     def test_no_docker_share_needed_and_data_outside_install(self):
         script = (ROOT / "qpkg/shared/downloader.sh").read_text()
