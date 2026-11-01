@@ -138,10 +138,12 @@ class Store:
         if not isinstance(title, str) or not 1 <= len(title.strip()) <= 200:
             raise ValueError("ブックマーク名は1～200文字です")
         with self._guard, self.connect() as db:
-            cur = db.execute("INSERT INTO bookmarks(title,url,created_at) VALUES(?,?,?)",
+            cur = db.execute("INSERT OR IGNORE INTO bookmarks(title,url,created_at) VALUES(?,?,?)",
                              (title.strip(), url, time.time()))
-            db.execute("UPDATE meta SET value=value+1 WHERE key='revision'")
-            return cur.lastrowid
+            row = db.execute("SELECT id FROM bookmarks WHERE url=?", (url,)).fetchone()
+            if cur.rowcount:
+                db.execute("UPDATE meta SET value=value+1 WHERE key='revision'")
+            return row[0]
 
     def add_link(self, url):
         # Link intents are inert in v0.1: no automatic URL fetch or JD2 execution.
