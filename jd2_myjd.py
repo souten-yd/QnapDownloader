@@ -183,6 +183,18 @@ class MyJDAdapter:
                                 "current": value, "handle": logical}
         return {"jd_revision": revision, "entries": entries}
 
+    def list_downloads(self, page=0):
+        """Use explicit read-only /downloadsV2 fields and never request passwords."""
+        from jd2_downloads import (LINK_FIELDS, PACKAGE_FIELDS,
+                                   query_options, snapshot)
+        # The myjdapi 1.1.11 Downloads class exposes query_packages/links,
+        # each accepting a one-element list with queryParams.
+        packages = self._call("downloads", "query_packages",
+                              query_options(PACKAGE_FIELDS, page))
+        links = self._call("downloads", "query_links",
+                           query_options(LINK_FIELDS, page))
+        return snapshot(packages, links, page)
+
     def add_link(self, url, destination):
         # No automatic download or Packagizer overwrite. JD2 may still have
         # user-authored rules, which the transfer preflight independently checks.
