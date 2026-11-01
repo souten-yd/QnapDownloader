@@ -95,7 +95,7 @@ case "${1:-}" in
         if [ "$network_mode" = lan ]; then
             (cd "$root" && exec "$python" -B "$root/webapp.py" --lan --port 17864 --data-dir "$data_dir") < /dev/null > "$log_output" 2>&1 &
         else
-            (cd "$root" && exec "$python" -B "$root/webapp.py" --secure-cookie --port 17864 --data-dir "$data_dir") < /dev/null > "$logfile" 2>&1 &
+            (cd "$root" && exec "$python" -B "$root/webapp.py" --secure-cookie --port 17864 --data-dir "$data_dir") < /dev/null > "$log_output" 2>&1 &
         fi
         echo $! > "$pidfile"
         # SQLite initialization and QTS filesystem warm-up may take longer
