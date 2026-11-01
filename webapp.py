@@ -17,10 +17,11 @@ import self_update
 import storage
 import jd2_control
 import jd2_transfer
+import rapidgator_extract
 import jd2_myjd
 import updater
 
-VERSION = "0.1.1"
+VERSION = "0.1.2"
 PORT = 17864
 ROOT = Path(__file__).resolve().parent
 FILES = {"/": ("web/index.html", "text/html; charset=utf-8"),
@@ -181,7 +182,8 @@ class Handler(BaseHTTPRequestHandler):
         if self.headers.get("Content-Type", "").split(";")[0] != "application/json":
             raise ValueError("JSON形式で送信してください")
         size = int(self.headers.get("Content-Length", "-1"))
-        if not 0 <= size <= 16384:
+        maximum = 72000 if urlsplit(self.path).path == "/api/rapidgator/extract" else 16384
+        if not 0 <= size <= maximum:
             raise ValueError("リクエストが大きすぎます")
         value = json.loads(self.rfile.read(size))
         if not isinstance(value, dict):
@@ -323,6 +325,24 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_data(201, {"id": identifier})
             if path == "/api/links":
                 return self.send_data(201, self.store.add_link(body.get("url")))
+            if path == "/api/rapidgator/extract":
+                pasted = body.get("content")
+                limit = body.get("limit", rapidgator_extract.DEFAULT_LIMIT)
+                found = rapidgator_extract.extract(pasted, limit)
+                evidence = rapidgator_extract.digest(pasted)
+                if body.get("commit") is True:
+                    previous = body.get("digest")
+                    if (not isinstance(previous, str) or
+                            not hmac.compare_digest(previous, evidence)):
+                        raise ValueError("貼り付け内容がプレビュー後に変更されました。再確認してください")
+                    stored = self.store.add_links(found)
+                    return self.send_data(200, {
+                        "count": len(found), "staged": stored, "saved": True,
+                        "digest": evidence,
+                        "note": "Hubの保留キューに保存しました。JD2には送信していません"})
+                return self.send_data(200, {
+                    "items": found, "count": len(found), "digest": evidence,
+                    "saved": False, "limit": limit})
             if path == "/api/links/send":
                 chosen = checked_directory(self.store.settings().get("download_dir"))
                 ident = body.get("id")
