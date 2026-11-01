@@ -21,7 +21,7 @@ import rapidgator_extract
 import jd2_myjd
 import updater
 
-VERSION = "0.1.4"
+VERSION = "0.1.5"
 PORT = 17864
 ROOT = Path(__file__).resolve().parent
 FILES = {"/": ("web/index.html", "text/html; charset=utf-8"),
@@ -145,7 +145,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("X-Frame-Options", "DENY")
         self.send_header("Referrer-Policy", "no-referrer")
         self.send_header("Permissions-Policy", "geolocation=(),camera=(),microphone=(),payment=()")
-        self.send_header("Content-Security-Policy", "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'")
+        self.send_header("Content-Security-Policy", "default-src 'none'; img-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'")
         if getattr(self, "_cookie", None):
             self.send_header("Set-Cookie", self._cookie)
         self.end_headers()
