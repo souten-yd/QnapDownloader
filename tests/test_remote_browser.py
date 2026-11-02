@@ -1,4 +1,5 @@
 """Remote browser: WebSocket framing, CDP manager with a fake transport. No docker, no network."""
+import base64
 import io
 import json
 import queue
@@ -182,6 +183,8 @@ class FakeWS:
         self.eval_map = []             # (expression substring, value) overrides for Runtime.evaluate
         self.hook = None               # called with every command before it is answered
         self.history = {"currentIndex": 1, "entries": [{"id": 5}, {"id": 6}, {"id": 7}]}
+        self.layout = {"cssContentSize": {"width": 390, "height": 4000.2}}
+        self.shot_size = 100           # bytes of each captured tile
 
     def send_text(self, text):
         message = json.loads(text)
@@ -210,6 +213,12 @@ class FakeWS:
             result = {"result": {"type": "object", "value": value}}
         elif method == "Page.getNavigationHistory":
             result = self.history
+        elif method == "Page.getLayoutMetrics":
+            result = self.layout
+        elif method == "Page.captureScreenshot":
+            clip = message["params"]["clip"]
+            seed = ("%d:" % clip["y"]).encode()
+            result = {"data": base64.b64encode((seed + b"x" * self.shot_size)[:self.shot_size]).decode()}
         self.q.put(json.dumps({"id": message["id"], "result": result}))
 
     def recv(self):
@@ -2066,3 +2075,466 @@ class ProbeTests(BrowserBase):
         self.rb.stop()
         self.assertEqual((self.rb._probe_targets, self.rb._probe_sessions, self.rb._probe_popups), ({}, {}, {}))
 
+
+
+class SnapshotTests(BrowserBase):
+    """v0.1.28: fast full-page display (snapshot + lazily rendered tiles)."""
+
+    def setUp(self):
+        super().setUp()
+        self.open("https://example.com/a")
+        self.rb.set_viewport("b1", 390, 700, 2.0, "standard")      # scale 1.5, quality 55
+        self.old = (rb.TAP_NAV_WAIT, rb.TAP_SETTLE_MAX)
+        rb.TAP_NAV_WAIT = 0
+        self.addCleanup(lambda: (setattr(rb, "TAP_NAV_WAIT", self.old[0]),
+                                 setattr(rb, "TAP_SETTLE_MAX", self.old[1])))
+
+    def shots(self):
+        return [m["params"] for m in self.ws.calls("Page.captureScreenshot")]
+
+    def snap_eval(self, links=None, inputs=None):
+        self.ws.eval_map = [("__qdlMut", {"links": links or [], "inputs": inputs or []})] + \
+            [e for e in self.ws.eval_map if "__qdlMut" not in e[0]]
+
+    # --- tile math
+    def test_tile_clip_math_with_a_partial_last_tile(self):
+        self.ws.layout = {"cssContentSize": {"width": 390, "height": 4000.2}}
+        meta = self.rb.snapshot("b1")
+        self.assertEqual((meta["width"], meta["height"], meta["tile_height"], meta["tiles"]),
+                         (390, 4001, 1600, 3))
+        self.assertEqual(meta["scale"], 1.5)
+        for index in range(3):
+            self.rb.tile("b1", meta["snap_id"], index)
+        shots = self.shots()
+        self.assertEqual([(s["clip"]["y"], s["clip"]["height"]) for s in shots],
+                         [(0, 1600), (1600, 1600), (3200, 801)])
+        for shot in shots:
+            self.assertEqual((shot["clip"]["x"], shot["clip"]["width"]), (0, 390))
+            self.assertEqual(shot["format"], "jpeg")
+            self.assertEqual(shot["quality"], 55)
+            self.assertIs(shot["captureBeyondViewport"], True)
+            self.assertIs(shot["fromSurface"], True)
+            # the emulated viewport already carries the device scale factor
+            self.assertEqual(shot["clip"]["scale"], rb.SNAP_CLIP_SCALE)
+
+    def test_exact_multiple_and_tiny_pages(self):
+        self.ws.layout = {"cssContentSize": {"width": 390, "height": 3200}}
+        self.assertEqual(self.rb.snapshot("b1")["tiles"], 2)
+        self.ws.layout = {"cssContentSize": {"width": 390, "height": 0}}
+        meta = self.rb.snapshot("b1", force=True)
+        self.assertEqual((meta["height"], meta["tiles"]), (1, 1))
+
+    def test_height_is_capped_at_30000_css_pixels(self):
+        self.ws.layout = {"cssContentSize": {"width": 390, "height": 123456}}
+        meta = self.rb.snapshot("b1")
+        self.assertEqual((meta["height"], meta["tiles"]), (30000, 19))
+        self.rb.tile("b1", meta["snap_id"], 18)
+        self.assertEqual(self.shots()[-1]["clip"], {"x": 0, "y": 28800, "width": 390, "height": 1200,
+                                                    "scale": rb.SNAP_CLIP_SCALE})
+        with self.assertRaises(rb.BrowserError):
+            self.rb.tile("b1", meta["snap_id"], 19)
+
+    def test_quality_mode_picks_scale_and_jpeg_quality(self):
+        self.rb.set_viewport("b1", 390, 700, 3.0, "high")
+        meta = self.rb.snapshot("b1")
+        self.assertEqual((meta["scale"], meta["quality"]), (2.0, "high"))
+        self.rb.tile("b1", meta["snap_id"], 0)
+        self.assertEqual(self.shots()[-1]["quality"], 70)
+
+    def test_bad_layout_is_refused(self):
+        for layout in ({}, {"cssContentSize": {"height": "x"}}, {"cssContentSize": {"height": -5}},
+                       {"cssContentSize": {"height": True}}):
+            with self.subTest(layout=layout):
+                self.ws.layout = layout
+                with self.assertRaises(rb.BrowserError):
+                    self.rb.snapshot("b1", force=True)
+
+    # --- lazy capture + LRU
+    def test_tiles_are_rendered_on_demand_only_and_cached(self):
+        meta = self.rb.snapshot("b1")
+        self.assertEqual(self.shots(), [])
+        first = self.rb.tile("b1", meta["snap_id"], 1)
+        self.assertEqual(len(self.shots()), 1)
+        self.assertEqual(self.rb.tile("b1", meta["snap_id"], 1), first)
+        self.assertEqual(len(self.shots()), 1)            # served from RAM
+        self.rb.tile("b1", meta["snap_id"], 0)
+        self.assertEqual(len(self.shots()), 2)
+
+    def test_tile_cache_is_capped_by_count_and_bytes_with_lru_order(self):
+        self.ws.layout = {"cssContentSize": {"width": 390, "height": 30000}}
+        meta = self.rb.snapshot("b1")
+        tab = self.rb._tabs["b1"]
+        for index in range(min(rb.SNAP_MAX_TILES + 5, meta["tiles"])):
+            self.rb.tile("b1", meta["snap_id"], index)
+        self.assertLessEqual(len(tab.tiles), rb.SNAP_MAX_TILES)
+        old = (rb.SNAP_MAX_TILES, rb.SNAP_MAX_BYTES)
+        self.addCleanup(lambda: (setattr(rb, "SNAP_MAX_TILES", old[0]),
+                                 setattr(rb, "SNAP_MAX_BYTES", old[1])))
+        rb.SNAP_MAX_TILES, rb.SNAP_MAX_BYTES = 3, 10 ** 9
+        tab.tiles.clear()
+        tab.tile_bytes = 0
+        sid = meta["snap_id"]
+        for index in (0, 1, 2):
+            self.rb.tile("b1", sid, index)
+        self.rb.tile("b1", sid, 0)                         # 0 becomes the most recent
+        self.rb.tile("b1", sid, 3)                         # evicts 1 (least recent)
+        self.assertEqual([k[1] for k in tab.tiles], [2, 0, 3])
+        shots_before = len(self.shots())
+        self.rb.tile("b1", sid, 0)
+        self.assertEqual(len(self.shots()), shots_before)
+        self.rb.tile("b1", sid, 1)                         # evicted: rendered again
+        self.assertEqual(len(self.shots()), shots_before + 1)
+        # byte cap
+        rb.SNAP_MAX_TILES, rb.SNAP_MAX_BYTES = 40, 250
+        tab.tiles.clear()
+        tab.tile_bytes = 0
+        for index in range(4):
+            self.rb.tile("b1", sid, index)
+        self.assertEqual(len(tab.tiles), 2)                # 2 x 100 bytes <= 250
+        self.assertLessEqual(tab.tile_bytes, 250)
+
+    def test_old_snapshot_is_kept_until_the_new_one_has_a_tile(self):
+        first = self.rb.snapshot("b1")
+        self.rb.tile("b1", first["snap_id"], 0)
+        second = self.rb.snapshot("b1", force=True)
+        tab = self.rb._tabs["b1"]
+        self.assertEqual(list(tab.snaps), [first["snap_id"], second["snap_id"]])
+        self.assertEqual(self.rb.tile("b1", first["snap_id"], 0)[:2], b"0:")      # still served
+        self.rb.tile("b1", second["snap_id"], 0)
+        self.assertEqual(list(tab.snaps), [second["snap_id"]])
+        self.assertEqual({k[0] for k in tab.tiles}, {second["snap_id"]})
+        with self.assertRaises(rb.SnapshotGone):
+            self.rb.tile("b1", first["snap_id"], 0)
+        self.assertIsInstance(rb.SnapshotGone("x"), rb.TabGone)                     # HTTP 404
+
+    def test_at_most_two_snapshots_are_kept(self):
+        ids = [self.rb.snapshot("b1", force=True)["snap_id"] for _ in range(4)]
+        self.assertEqual(list(self.rb._tabs["b1"].snaps), ids[-2:])
+
+    def test_release_close_viewport_change_and_stop_free_every_tile(self):
+        meta = self.rb.snapshot("b1")
+        self.rb.tile("b1", meta["snap_id"], 0)
+        tab = self.rb._tabs["b1"]
+        self.rb.snapshot_release("b1")
+        self.assertEqual((tab.snaps, tab.tiles, tab.tile_bytes), ({}, {}, 0))
+        meta = self.rb.snapshot("b1")
+        self.rb.tile("b1", meta["snap_id"], 0)
+        self.rb.set_viewport("b1", 400, 700, 2.0)
+        self.assertEqual((tab.snaps, tab.tiles), ({}, {}))
+        meta = self.rb.snapshot("b1")
+        self.rb.tile("b1", meta["snap_id"], 0)
+        self.rb.close_tab("b1")
+        self.assertEqual((tab.snaps, tab.tiles, tab.tile_bytes), ({}, {}, 0))
+
+    def test_tile_arguments_are_validated(self):
+        meta = self.rb.snapshot("b1")
+        for snap, index in (("../x", 0), ("s", 0), (None, 0), (meta["snap_id"], -1),
+                            (meta["snap_id"], True), (meta["snap_id"], "0"), (meta["snap_id"], 99)):
+            with self.subTest(snap=snap, index=index), self.assertRaises(rb.BrowserError):
+                self.rb.tile("b1", snap, index)
+        with self.assertRaises(rb.SnapshotGone):
+            self.rb.tile("b1", "s999", 0)
+        with self.assertRaises(rb.TabGone):
+            self.rb.tile("b9", meta["snap_id"], 0)
+
+    def test_bad_screenshot_data_is_refused(self):
+        meta = self.rb.snapshot("b1")
+        for data in ("", "not base64!", None, 5):
+            self.ws.hook = None
+            original = self.ws.send_text
+
+            def fake(text, original=original, data=data):
+                message = json.loads(text)
+                if message["method"] == "Page.captureScreenshot":
+                    self.ws.sent.append(message)
+                    self.ws.q.put(json.dumps({"id": message["id"], "result": {"data": data}}))
+                else:
+                    original(text)
+            with self.subTest(data=data):
+                self.ws.send_text = fake
+                with self.assertRaises(rb.BrowserError):
+                    self.rb.tile("b1", meta["snap_id"], 0)
+                self.ws.send_text = original
+        self.assertEqual(self.rb._tabs["b1"].tiles, {})
+
+    def test_memory_guard_blocks_a_snapshot(self):
+        self.set_mem(100 * 1024)
+        with self.assertRaises(rb.BrowserError):
+            self.rb.snapshot("b1")
+        self.assertEqual(self.ws.calls("Page.getLayoutMetrics"), [])
+
+    # --- captures never overlap per tab
+    def test_captures_of_one_tab_never_run_concurrently(self):
+        meta = self.rb.snapshot("b1")
+        active = []
+        peak = [0]
+        gate = threading.Lock()
+
+        def hook(message):
+            if message["method"] == "Page.captureScreenshot":
+                with gate:
+                    active.append(1)
+                    peak[0] = max(peak[0], len(active))
+                time.sleep(0.05)
+                with gate:
+                    active.pop()
+        self.ws.hook = hook
+        threads = [threading.Thread(target=self.rb.tile, args=("b1", meta["snap_id"], i))
+                   for i in range(3)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(10)
+        self.assertEqual(peak[0], 1)
+        self.assertEqual(len(self.shots()), 3)
+
+    # --- metadata
+    def test_metadata_links_and_inputs_are_filtered_and_capped(self):
+        good = {"x": 10, "y": 20, "w": 100, "h": 18, "href": "https://example.org/a"}
+        self.snap_eval(links=[
+            good,
+            {"x": 1, "y": 1, "w": 5, "h": 5, "href": "http://plain.example/x"},
+            {"x": 1, "y": 1, "w": 5, "h": 5, "href": "javascript:alert(1)"},
+            {"x": 1, "y": 1, "w": 5, "h": 5, "href": "data:text/html,x"},
+            {"x": 1, "y": 1, "w": 5, "h": 5, "href": "ftp://x/y"},
+            {"x": 1, "y": 1, "w": 5, "h": 5, "href": "https://" + "a" * 2100},
+            {"x": 1, "y": 1, "w": 5, "h": 5},
+            {"x": "1", "y": 1, "w": 5, "h": 5, "href": "https://example.org/s"},
+            {"x": float("nan"), "y": 1, "w": 5, "h": 5, "href": "https://example.org/n"},
+            {"x": 1, "y": 1, "w": 0, "h": 5, "href": "https://example.org/z"},
+            {"x": 1, "y": 99999, "w": 5, "h": 5, "href": "https://example.org/far"},
+            {"x": 400, "y": 1, "w": 5, "h": 5, "href": "https://example.org/right"},
+            {"x": 1.6, "y": 2.4, "w": 7.5, "h": 9, "href": "https://example.org/round"},
+            "str", 5, None],
+            inputs=[{"x": 5, "y": 6, "w": 200, "h": 30, "href": "https://leak.example/"},
+                    {"x": 5, "y": 6, "w": 0, "h": 30}])
+        meta = self.rb.snapshot("b1")
+        self.assertEqual([l["href"] for l in meta["links"]],
+                         ["https://example.org/a", "http://plain.example/x", "https://example.org/round"])
+        self.assertEqual(meta["links"][2], {"x": 2, "y": 2, "w": 8, "h": 9,
+                                            "href": "https://example.org/round"})
+        # inputs carry geometry only
+        self.assertEqual(meta["inputs"], [{"x": 5, "y": 6, "w": 200, "h": 30}])
+        self.assertIsInstance(meta["url"], str)
+        self.assertIn("title", meta)
+
+    def test_link_and_input_caps(self):
+        many = [{"x": 1, "y": i % 100, "w": 5, "h": 5, "href": "https://example.org/%d" % i}
+                for i in range(rb.SNAP_LINK_CAP + 50)]
+        boxes = [{"x": 1, "y": i % 100, "w": 5, "h": 5} for i in range(rb.SNAP_INPUT_CAP + 50)]
+        self.snap_eval(links=many, inputs=boxes)
+        meta = self.rb.snapshot("b1")
+        self.assertEqual((len(meta["links"]), len(meta["inputs"])),
+                         (rb.SNAP_LINK_CAP, rb.SNAP_INPUT_CAP))
+        self.assertEqual((rb.SNAP_LINK_CAP, rb.SNAP_INPUT_CAP), (3000, 300))
+
+    def test_collection_script_is_fixed_and_filters_in_the_page_too(self):
+        self.rb.snapshot("b1")
+        expression = [m for m in self.ws.calls("Runtime.evaluate")
+                      if "__qdlMut" in m["params"]["expression"]][0]
+        self.assertEqual(expression["sessionId"], "SESSION1")
+        self.assertIn("/^https?:/i", expression["params"]["expression"])
+        self.assertIn("getBoundingClientRect", expression["params"]["expression"])
+        self.assertIn("W=390", expression["params"]["expression"])
+        self.assertTrue(expression["params"]["returnByValue"])
+
+    # --- reuse window
+    def test_unchanged_snapshot_is_reused_for_two_seconds(self):
+        first = self.rb.snapshot("b1")
+        self.assertFalse(first["reused"])
+        self.clock.now += 1.9
+        again = self.rb.snapshot("b1")
+        self.assertTrue(again["reused"])
+        self.assertEqual(again["snap_id"], first["snap_id"])
+        self.assertEqual(len(self.ws.calls("Page.getLayoutMetrics")), 1)
+        self.clock.now += 0.2
+        later = self.rb.snapshot("b1")
+        self.assertNotEqual(later["snap_id"], first["snap_id"])
+        self.assertFalse(later["reused"])
+
+    def test_force_input_and_metadata_changes_defeat_the_reuse(self):
+        first = self.rb.snapshot("b1")
+        self.assertNotEqual(self.rb.snapshot("b1", force=True)["snap_id"], first["snap_id"])
+        current = self.rb.snapshot("b1")
+        self.assertTrue(current["reused"])
+        self.rb.send_input("b1", {"type": "key", "key": "Enter"})
+        after_key = self.rb.snapshot("b1")
+        self.assertFalse(after_key["reused"])
+        self.assertTrue(self.rb.snapshot("b1")["reused"])
+        self.ws.emit("Target.targetInfoChanged", {"targetInfo": {
+            "targetId": "TARGET00001", "type": "page", "url": "https://example.com/b", "title": "B"}})
+        self.barrier()
+        after_nav = self.rb.snapshot("b1")
+        self.assertFalse(after_nav["reused"])
+        self.assertEqual((after_nav["url"], after_nav["title"]), ("https://example.com/b", "B"))
+
+    def test_scrolling_does_not_defeat_the_reuse(self):
+        self.rb.snapshot("b1")
+        self.rb.send_input("b1", {"type": "scroll", "x": 1, "y": 1, "dx": 0, "dy": 50})
+        self.assertTrue(self.rb.snapshot("b1")["reused"])
+
+    def test_if_changed_asks_the_page_for_dom_changes_after_the_window(self):
+        first = self.rb.snapshot("b1")
+        self.clock.now += 11
+        self.ws.eval_map = [("__qdlDirty===true", False)] + self.ws.eval_map
+        quiet = self.rb.snapshot("b1", if_changed=True)
+        self.assertTrue(quiet["reused"])
+        self.assertEqual(quiet["snap_id"], first["snap_id"])
+        self.ws.eval_map = [("__qdlDirty===true", True)] + self.ws.eval_map[1:]
+        changed = self.rb.snapshot("b1", if_changed=True)
+        self.assertFalse(changed["reused"])
+        self.assertNotEqual(changed["snap_id"], first["snap_id"])
+
+    # --- tap-page
+    def test_tap_page_scrolls_then_clicks_at_viewport_coordinates(self):
+        meta = self.rb.snapshot("b1")
+        self.ws.eval_map = [("scrollTo", [0, 600, 390, 700])]
+        result = self.rb.tap_page("b1", meta["snap_id"], 120.4, 1000)
+        self.assertEqual(result, {"ok": True, "navigated": False, "editable": False,
+                                  "snap_needed": True})
+        scroll = [m for m in self.ws.calls("Runtime.evaluate") if "scrollTo" in m["params"]["expression"]][0]
+        self.assertTrue(scroll["params"]["expression"].endswith("(1000.0)"))
+        self.assertIn("behavior:'instant'", scroll["params"]["expression"])
+        events = [m["params"] for m in self.ws.calls("Input.dispatchMouseEvent")]
+        self.assertEqual([e["type"] for e in events], ["mouseMoved", "mousePressed", "mouseReleased"])
+        for event in events:
+            self.assertEqual((event["x"], event["y"]), (120.4, 400.0))     # 1000 - scrollY 600
+        self.assertEqual(events[1]["button"], "left")
+
+    def test_tap_page_with_horizontal_scroll_and_editable_result(self):
+        meta = self.rb.snapshot("b1")
+        self.ws.eval_map = [("scrollTo", [10, 0, 390, 700]), ("activeElement", True)]
+        result = self.rb.tap_page("b1", meta["snap_id"], 50, 100)
+        self.assertTrue(result["editable"])
+        self.assertEqual(self.ws.calls("Input.dispatchMouseEvent")[1]["params"]["x"], 40.0)
+
+    def test_tap_page_refuses_bad_input_and_unreachable_positions(self):
+        meta = self.rb.snapshot("b1")
+        sid = meta["snap_id"]
+        self.ws.eval_map = [("scrollTo", [0, 0, 390, 700])]
+        for snap, x, y in (("../x", 1, 1), (sid, -1, 1), (sid, 1, True), (sid, "1", 1),
+                           (sid, float("nan"), 1), (sid, 391, 1), (sid, 1, 4002), (sid, None, 1)):
+            with self.subTest(snap=snap, x=x, y=y), self.assertRaises(rb.BrowserError):
+                self.rb.tap_page("b1", snap, x, y)
+        with self.assertRaises(rb.SnapshotGone):
+            self.rb.tap_page("b1", "s77", 1, 1)
+        self.assertEqual(self.ws.calls("Input.dispatchMouseEvent"), [])
+        # the scroll could not bring y into view: no click at a wrong place
+        self.ws.eval_map = [("scrollTo", [0, 0, 390, 700])]
+        with self.assertRaises(rb.BrowserError):
+            self.rb.tap_page("b1", sid, 10, 3000)
+        for state in ("x", [0, 0, 390], [0, "a", 390, 700], None):
+            self.ws.eval_map = [("scrollTo", state)]
+            with self.subTest(state=state), self.assertRaises(rb.BrowserError):
+                self.rb.tap_page("b1", sid, 10, 10)
+        self.assertEqual(self.ws.calls("Input.dispatchMouseEvent"), [])
+
+    def test_tap_page_reports_a_navigation(self):
+        meta = self.rb.snapshot("b1")
+        self.ws.eval_map = [("scrollTo", [0, 0, 390, 700])]
+        rb.TAP_NAV_WAIT = 2.0
+
+        def hook(message):
+            if message["method"] == "Input.dispatchMouseEvent" and message["params"]["type"] == "mouseReleased":
+                self.ws.emit("Page.frameStartedLoading", {"frameId": "F1"}, "SESSION1")
+                self.ws.emit("Target.targetInfoChanged", {"targetInfo": {
+                    "targetId": "TARGET00001", "type": "page", "url": "https://example.com/next", "title": "N"}})
+                self.ws.emit("Page.frameStoppedLoading", {"frameId": "F1"}, "SESSION1")
+        self.ws.hook = hook
+        result = self.rb.tap_page("b1", meta["snap_id"], 10, 10)
+        self.assertTrue(result["navigated"])
+        self.assertTrue(result["snap_needed"])
+        self.assertEqual(self.rb._tabs["b1"].url, "https://example.com/next")
+
+    # --- probe with an href from the link map
+    def test_probe_accepts_an_href_without_resolving_a_point(self):
+        hoster = "https://rapidgator.net/file/0123456789abcdef0123456789abcdef"
+        result = self.rb.probe("b1", None, None, href=hoster)
+        self.assertEqual(result["links"], [hoster])
+        self.assertEqual([m for m in self.ws.calls("Runtime.evaluate")
+                          if "elementFromPoint" in m["params"]["expression"]], [])
+
+    def test_probe_href_is_validated(self):
+        for bad in ("http://example.com/x", "https://127.0.0.1/x", "https://localhost/x",
+                    "https://192.168.1.5/x", "https://nas/x", "javascript:alert(1)", "file:///etc/passwd",
+                    "https://example.com:8443/x", "", None, 5, "https://" + "a" * 2100 + ".com/"):
+            with self.subTest(href=bad), self.assertRaises(rb.BrowserError):
+                self.rb.probe("b1", None, None, href=bad)
+        self.assertEqual(self.ws.calls("Target.createTarget")[1:], [])
+        with self.assertRaises(rb.BrowserError):          # the Hub's own origin
+            def refuse(url):
+                raise ValueError("hub")
+            self.rb.probe("b1", None, None, url_check=refuse, href="https://example.org/x")
+
+    def test_probe_href_follows_the_link_in_a_hidden_target(self):
+        hoster = "https://rapidgator.net/file/0123456789abcdef0123456789abcdef"
+
+        def hook(message):
+            if message["method"] == "Page.navigate" and message.get("sessionId") == "SESSION2":
+                self.ws.emit("Fetch.requestPaused", {"requestId": "r1", "resourceType": "Document",
+                                                     "request": {"url": hoster}}, "SESSION2")
+        self.ws.hook = hook
+        result = self.rb.probe("b1", None, None, href="https://blog.example.org/go?id=7")
+        self.assertEqual(result["links"], [hoster])
+        self.assertEqual([m["params"]["url"] for m in self.ws.calls("Page.navigate")
+                          if m.get("sessionId") == "SESSION2"], ["https://blog.example.org/go?id=7"])
+        self.assertEqual(self.rb._probe_targets, {})
+
+    # --- Cloudflare detection and tab metadata
+    def test_cloudflare_challenge_detection(self):
+        yes = (("https://example.com/", "Just a moment..."), ("https://example.com/", "JUST A MOMENT"),
+               ("https://example.com/", "しばらくお待ちください…"),
+               ("https://example.com/cdn-cgi/challenge-platform/h/b", ""),
+               ("https://example.com/x?__cf_chl_rt_tk=1/CDN-CGI/CHALLENGE", ""))
+        no = (("https://example.com/", "Example"), ("", ""), (None, None),
+              ("https://example.com/cdn-cgi/trace", "Moment"))
+        for url, title in yes:
+            with self.subTest(url=url, title=title):
+                self.assertTrue(rb.looks_like_challenge(url, title))
+        for url, title in no:
+            with self.subTest(url=url, title=title):
+                self.assertFalse(rb.looks_like_challenge(url, title))
+
+    def test_meta_snapshot_and_frame_report_the_challenge_flag(self):
+        self.assertFalse(self.rb.page_meta("b1", None)["challenge"])
+        self.ws.emit("Target.targetInfoChanged", {"targetInfo": {
+            "targetId": "TARGET00001", "type": "page", "url": "https://example.com/", "title": "Just a moment..."}})
+        self.barrier()
+        self.assertTrue(self.rb.page_meta("b1", None)["challenge"])
+        self.assertTrue(self.rb.snapshot("b1")["challenge"])
+        self.assertTrue(self.rb.frame("b1", 0, wait=0)["challenge"])
+
+    def test_page_meta_long_poll_returns_on_a_new_revision_without_a_screencast(self):
+        first = self.rb.page_meta("b1", None)
+        self.assertIsNone(first["snap"])
+        started = []
+
+        def change():
+            time.sleep(0.1)
+            self.ws.emit("Target.targetInfoChanged", {"targetInfo": {
+                "targetId": "TARGET00001", "type": "page", "url": "https://example.com/z", "title": "Z"}})
+        thread = threading.Thread(target=change)
+        thread.start()
+        result = self.rb.page_meta("b1", first["rev"], wait=5)
+        thread.join()
+        self.assertNotEqual(result["rev"], first["rev"])
+        self.assertEqual(result["url"], "https://example.com/z")
+        self.assertEqual(self.ws.calls("Page.startScreencast"), [])
+        meta = self.rb.snapshot("b1")
+        self.assertEqual(self.rb.page_meta("b1", None)["snap"], meta["snap_id"])
+        with self.assertRaises(rb.TabGone):
+            self.rb.page_meta("b9", None)
+
+    def test_only_fixed_cdp_methods_are_used_for_the_snapshot_path(self):
+        meta = self.rb.snapshot("b1")
+        self.rb.tile("b1", meta["snap_id"], 0)
+        self.ws.eval_map = [("scrollTo", [0, 0, 390, 700])]
+        self.rb.tap_page("b1", meta["snap_id"], 5, 5)
+        allowed = {"Target.setDiscoverTargets", "Browser.setDownloadBehavior", "Target.getTargets",
+                   "Target.createTarget", "Target.attachToTarget", "Page.enable",
+                   "Emulation.setFocusEmulationEnabled", "Page.navigate", "Runtime.evaluate",
+                   "Fetch.enable", "Emulation.setEmulatedMedia", "Network.enable",
+                   "Network.setBlockedURLs", "Emulation.setDeviceMetricsOverride",
+                   "Emulation.setTouchEmulationEnabled", "Target.activateTarget",
+                   "Page.getLayoutMetrics", "Page.captureScreenshot", "Input.dispatchMouseEvent"}
+        self.assertLessEqual(set(self.ws.methods()), allowed)

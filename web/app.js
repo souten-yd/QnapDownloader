@@ -52,7 +52,14 @@ const MODES = ["strict", "interactive", "compat"];
 // sandbox value. The page is rendered by Chromium in a NAS container; this
 // page only shows JPEG frames from /api/rb/frame.jpg (binary, shown through a
 // blob: object URL) and posts validated input.
-const REMOTE_MODE = "remote";
+const REMOTE_MODE = "remote";            // NAS browser, fast full-page display (default)
+const REMOTE_LIVE_MODE = "remote-live";  // NAS browser, live screencast (Cloudflare checks, logins)
+const RB_TILE_CONCURRENCY = 3;     // tile downloads in flight at once
+const RB_META_WAIT_S = 10;         // long-poll of the tab metadata; its timeout also drives the DOM check
+const RB_INPUT_SNAP_MS = 800;      // new snapshot this long after a key / text input
+const RB_PULL_PX = 90;             // pull-to-refresh distance
+const RB_SWAP_WAIT_MS = 6000;      // swap in a new snapshot after this long even if tiles are missing
+const RB_LINK_SLOP_PX = 3;
 const RB_MAX_POLL_FAILS = 3;
 const RB_TAP_MOVE_PX = 10;
 const RB_TAP_MAX_MS = 600;
@@ -68,6 +75,7 @@ const RB_RING_DELAY_MS = 150;       // the press ring appears after this (taps n
 const RB_QUALITY_KEY = "qnapdl.rbquality.v1";
 const RB_QUALITIES = ["speed", "standard", "high"];
 const RB_QUALITY_LABELS = {speed: "速度優先", standard: "標準", high: "高画質"};
+const RB_DISPLAY_LABELS = {tiles: "高速（全体表示）", live: "ライブ"};
 const RB_PERF_WINDOW_MS = 5000;
 const RB_POPUP_NEW_TAB = "new";
 const RB_KEYS = ["Enter", "Backspace", "Tab", "Escape", "Delete",
@@ -107,7 +115,7 @@ const state = {
   bootVersion: "", statusCheckedAt: 0, updateWatching: false,
   engine: null, engineTimer: null, engineBusy: false,
   https: false, tailnet: false,
-  rbPolling: "", rbGen: 0, rbStatus: null, rbTimer: null, rbBusy: false,
+  rbPolling: "", rbPollMode: "", rbGen: 0, rbStatus: null, rbTimer: null, rbBusy: false,
   rbIntercepts: [],
   rbQuality: loadRbQuality(), rbPerf: false, rbPerfSamples: [], rbPerfTimer: 0,
   rbPerfSince: 0, probeResult: null, probeResults: [], siteRules: null, waiting: null,
@@ -207,7 +215,7 @@ function readHostModes() {
     if (!Array.isArray(data)) return [];
     return data.filter(e => Array.isArray(e) && typeof e[0] === "string" && e[0].length <= 253 &&
       ((MODES.includes(e[1]) && e[1] !== "strict") || e[1] === EXTERNAL_MODE ||
-        e[1] === REMOTE_MODE)).slice(-MAX_HOST_MODES);
+        e[1] === REMOTE_MODE || e[1] === REMOTE_LIVE_MODE)).slice(-MAX_HOST_MODES);
   } catch (e) { return []; }
 }
 
@@ -223,10 +231,13 @@ function rememberedMode(host) {
   return hit ? hit[1] : null;
 }
 
-function isRemoteHost(host) { return Boolean(host) && rememberedMode(host) === REMOTE_MODE; }
+function isRemoteHost(host) {
+  const mode = host ? rememberedMode(host) : null;
+  return mode === REMOTE_MODE || mode === REMOTE_LIVE_MODE;
+}
 
 function remoteHosts() {
-  return readHostModes().filter(e => e[1] === REMOTE_MODE).map(e => e[0]);
+  return readHostModes().filter(e => e[1] === REMOTE_MODE || e[1] === REMOTE_LIVE_MODE).map(e => e[0]);
 }
 
 function isExternalHost(host) { return Boolean(host) && rememberedMode(host) === EXTERNAL_MODE; }
@@ -1129,7 +1140,9 @@ async function openRemote(tab, value, commit) {
       }
       tab.rb = {id: made.id, seq: 0, url: "", title: "", width: 0, height: 0,
         loading: true, links: [], linksTimer: 0, blocked: null,
-        rev: null, icptSeen: 0, present: 0, vp: "", popups: 0};
+        rev: null, icptSeen: 0, present: 0, vp: "", popups: 0,
+        shown: "", autoLive: false, view: null, snap: null, snapKey: "", snapBusy: false,
+        snapAgain: null, snapTimer: 0, busy: 0, scrollTop: 0, owner: tab};
     }
   } catch (e) {
     if (token === tab.token) { tab.loading = false; tab.error = e.message; updateChrome(); }
@@ -1156,8 +1169,9 @@ function releaseRemote(tab) {
   tab.rb = null;
   if (!rb) return;
   clearTimeout(rb.linksTimer);
-  if (state.rbPolling === rb.id) { state.rbPolling = ""; state.rbGen++; }
+  if (state.rbPolling === rb.id) { state.rbPolling = ""; state.rbPollMode = ""; state.rbGen++; }
   dropRemoteImage(rb);
+  dropTiles(rb);
   state.rbIntercepts = state.rbIntercepts.filter(item => item.tab !== rb.id);
   if (rbPopup.item && rbPopup.item.tab === rb.id) hidePopupToast();
   closeProbeSheet();
@@ -1168,7 +1182,7 @@ function releaseRemote(tab) {
 async function openInRemote(tab) {
   const url = tab.current || (tab.history.length ? tab.history[tab.index] : "");
   if (!url) return;
-  rememberHostMode(hostOf(url), REMOTE_MODE);
+  if (!isRemoteHost(hostOf(url))) rememberHostMode(hostOf(url), REMOTE_MODE);   // default: fast display
   renderRemoteHosts();
   unloadTab(tab);
   tab.remote = true;
@@ -1215,6 +1229,9 @@ async function rbInput(event) {
   try {
     const r = await api("/api/rb/input", Object.assign({tab: tab.rb.id}, event));
     if (r && typeof r.editable === "boolean") setEditable(tab, r.editable, true);
+    if ((event.type === "text" || event.type === "key") && tabDisplay(tab) === "tiles") {
+      scheduleSnapshot(tab, RB_INPUT_SNAP_MS);
+    }
   } catch (e) {
     if (e.status === 404) remoteLost(tab);
     else toast(e.message, "error");
@@ -1224,12 +1241,14 @@ async function rbInput(event) {
 function remoteLost(tab) {
   if (tab.rb) {
     dropRemoteImage(tab.rb);
+    dropTiles(tab.rb);
     state.rbIntercepts = state.rbIntercepts.filter(item => item.tab !== tab.rb.id);
     renderIntercept();
   }
   tab.rb = null;
   tab.error = "NASブラウザのタブが閉じられました";
   state.rbPolling = "";
+  state.rbPollMode = "";
   state.rbGen++;
   updateChrome();
 }
@@ -1287,6 +1306,7 @@ function frameHeaders(res) {
     blocked: text("X-Frame-Blocked") || null,
     popups: number("X-Frame-Popups"),
     editable: res.headers.get("X-Frame-Editable") === "1",
+    challenge: res.headers.get("X-Frame-Challenge") === "1",
   };
 }
 
@@ -1325,7 +1345,24 @@ function applyRemoteMeta(tab, f) {
   if (Number.isFinite(f.intercepts) && f.intercepts > rb.icptSeen) {
     fetchIntercepts(tab).catch(() => {});
   }
+  if (typeof f.challenge === "boolean") syncChallenge(tab, f.challenge, loading);
+  if (url !== "" && changed) applyDisplay(tab);
   if (changed) updateChrome();
+}
+
+// Cloudflare checks and logins need the live screencast: switch this tab to ライブ while
+// the page looks like a challenge, and back (to the remembered display) once it is gone.
+function syncChallenge(tab, challenge, loading) {
+  const rb = tab.rb;
+  if (!rb) return;
+  if (challenge && !rb.autoLive) {
+    rb.autoLive = true;
+    if (rb.shown === "tiles") flash("確認画面のため一時的にライブ表示にしました");
+    applyDisplay(tab);
+  } else if (!challenge && rb.autoLive && !loading) {
+    rb.autoLive = false;
+    applyDisplay(tab);
+  }
 }
 
 // The stage is the viewer's CSS viewport for the remote page.
@@ -1346,7 +1383,11 @@ async function sendViewport(tab) {
   if (key === rb.vp) return;
   rb.vp = key;
   try {
-    await api("/api/rb/viewport", Object.assign({tab: rb.id, quality: state.rbQuality}, view));
+    const r = await api("/api/rb/viewport", Object.assign({tab: rb.id, quality: state.rbQuality}, view));
+    // The tiles of the old size are gone on the Hub: take a new snapshot.
+    if (r && r.changed && rb.view && tab.rb === rb && tabDisplay(tab) === "tiles") {
+      takeSnapshot(tab, {force: true, keepScroll: true, quiet: true}).catch(() => {});
+    }
   } catch (e) {
     rb.vp = "";
     if (e.status === 404) remoteLost(tab);
@@ -1416,10 +1457,17 @@ function syncRemotePoll() {
   const want = Boolean(state.authed && tab && tab.remote && tab.rb &&
     document.visibilityState === "visible" && currentViewName() === "web");
   const id = want ? tab.rb.id : "";
-  if (id === state.rbPolling) return;
+  const mode = want ? tabDisplay(tab) : "";
+  if (id === state.rbPolling && mode === state.rbPollMode) return;
   state.rbPolling = id;
+  state.rbPollMode = mode;
   state.rbGen++;
-  if (want) remoteLoop(tab, state.rbGen);
+  if (!want) return;
+  const rb = tab.rb;
+  if (rb.shown && rb.shown !== mode) leaveDisplay(rb, rb.shown);
+  rb.shown = mode;
+  if (mode === "live") remoteLoop(tab, state.rbGen);
+  else tileLoop(tab, state.rbGen).catch(() => {});
 }
 
 function updateRemoteView(tab) {
@@ -1428,8 +1476,13 @@ function updateRemoteView(tab) {
   $("frames").hidden = remote;
   if (!remote) { closeRemoteSheet(); setShown("interceptSheet", false); return; }
   const live = Boolean(tab.rb);
-  $("remoteImg").hidden = !live || !$("remoteImg").getAttribute("src");
-  $("remoteIdle").hidden = live && !$("remoteImg").hidden;
+  const tiles = live && tabDisplay(tab) === "tiles";
+  setShown("tileScroll", tiles);
+  setShown("tileRefresh", tiles);
+  if (tiles) mountTiles(tab);
+  syncSnapProgress();
+  $("remoteImg").hidden = tiles || !live || !$("remoteImg").getAttribute("src");
+  $("remoteIdle").hidden = live && (tiles ? Boolean(tab.rb.view) : !$("remoteImg").hidden);
   $("remoteIdleText").textContent = tab.error || (live ? "画面を待っています…" :
     "NASブラウザのタブは開かれていません（メモリ節約のため自動で閉じました）。");
   setShown("remoteReopen", !live);
@@ -1734,6 +1787,480 @@ function setRbQuality(mode) {
   flash("画質: " + RB_QUALITY_LABELS[mode]);
 }
 
+// ---- fast full-page display (v0.1.28) ----
+// The Hub measures the page and renders it as JPEG tiles on demand. The phone scrolls them
+// natively (no round trip per scroll). Tiles are only images: <img> elements fed with blob:
+// object URLs of /api/rb/tile.jpg bytes. The link map is text used for hit testing; every
+// href is validated again by the Hub before it is acted on.
+const tileHost = {owner: null};
+const tileOf = new WeakMap();
+const tileQueue = [];
+let tileActive = 0;
+let tileNear = null, tileFar = null;
+
+function tabDisplay(tab) {
+  const rb = tab && tab.rb;
+  if (!rb) return "tiles";
+  if (rb.autoLive) return "live";
+  return rememberedMode(hostOf(tab.current || "")) === REMOTE_LIVE_MODE ? "live" : "tiles";
+}
+
+// 「表示: 高速 / ライブ」 from the menu: remembered per host, default 高速.
+function setUserDisplay(tab, mode) {
+  if (!tab || !tab.rb || !RB_DISPLAY_LABELS[mode]) return;
+  const host = hostOf(tab.current || "");
+  if (host) rememberHostMode(host, mode === "live" ? REMOTE_LIVE_MODE : REMOTE_MODE);
+  tab.rb.autoLive = false;
+  renderRemoteHosts();
+  applyDisplay(tab);
+  flash("表示: " + RB_DISPLAY_LABELS[mode]);
+}
+
+function applyDisplay(tab) {
+  if (!tab || !tab.rb) return;
+  syncRemotePoll();
+  if (activeWebTab() === tab) updateRemoteView(tab);
+}
+
+// Leaving a display frees what it held: tiles (phone and Hub) or the live picture.
+function leaveDisplay(rb, shown) {
+  if (shown === "tiles") {
+    dropTiles(rb);
+    api("/api/rb/snapshot/release", {tab: rb.id}).catch(() => {});
+  } else {
+    dropRemoteImage(rb);
+  }
+}
+
+function tileObservers() {
+  if (tileNear || typeof IntersectionObserver !== "function") return;
+  const root = $("tileScroll");
+  // Load what is within one screen of the viewport ...
+  tileNear = new IntersectionObserver(entries => {
+    for (const entry of entries) {
+      const t = tileOf.get(entry.target);
+      if (!t || t.view.dead || !entry.isIntersecting) continue;
+      t.want = true;
+      loadTile(t);
+    }
+  }, {root, rootMargin: "100% 0px 100% 0px"});
+  // ... and release the object URL of tiles that are three screens away.
+  tileFar = new IntersectionObserver(entries => {
+    for (const entry of entries) {
+      const t = tileOf.get(entry.target);
+      if (t && !entry.isIntersecting) { t.want = false; releaseTile(t); }
+    }
+  }, {root, rootMargin: "300% 0px 300% 0px"});
+}
+
+function buildView(rb, meta) {
+  const canvas = element("div", undefined, "tile-canvas");
+  const view = {rb, meta, canvas, tiles: [], dead: false, k: 1};
+  for (let i = 0; i < meta.tiles; i++) {
+    const img = document.createElement("img");
+    img.className = "tile-img";
+    img.alt = "";
+    img.draggable = false;
+    const t = {view, index: i, img, url: "", want: false, forced: false, promise: null, done: null};
+    tileOf.set(img, t);
+    view.tiles.push(t);
+    canvas.appendChild(img);
+  }
+  layoutView(view);
+  return view;
+}
+
+// Tile boxes in CSS pixels of the phone: page pixels times k (container width / page width).
+function layoutView(view) {
+  const width = $("tileScroll").clientWidth || view.meta.width;
+  const k = width / view.meta.width;
+  view.k = k;
+  view.canvas.style.height = Math.round(view.meta.height * k) + "px";
+  for (const t of view.tiles) {
+    const top = t.index * view.meta.tile_height;
+    const bottom = Math.min(view.meta.height, top + view.meta.tile_height);
+    const a = Math.round(top * k), b = Math.round(bottom * k);
+    t.img.style.top = a + "px";
+    t.img.style.height = Math.max(1, b - a) + "px";
+  }
+}
+
+// Lazy loading: tiles near the viewport load, tiles far away release their object URLs.
+function observeView(view) {
+  if (view.observed || view.dead) return;
+  tileObservers();
+  view.observed = true;
+  if (tileNear) {
+    for (const t of view.tiles) { tileNear.observe(t.img); tileFar.observe(t.img); }
+  } else {
+    for (const t of view.tiles) { t.want = true; loadTile(t); }   // no IntersectionObserver: load all
+  }
+}
+
+function releaseTile(t) {
+  if (!t.url) return;
+  URL.revokeObjectURL(t.url);
+  t.url = "";
+  t.img.removeAttribute("src");
+}
+
+function killView(view) {
+  if (!view || view.dead) return;
+  view.dead = true;
+  for (const t of view.tiles) {
+    if (tileNear) tileNear.unobserve(t.img);
+    if (tileFar) tileFar.unobserve(t.img);
+    t.want = false;
+    releaseTile(t);
+  }
+  view.canvas.remove();
+}
+
+function dropTiles(rb) {
+  clearTimeout(rb.snapTimer);
+  if (rb.view) killView(rb.view);
+  rb.view = null;
+  rb.snap = null;
+  rb.snapKey = "";
+  rb.snapAgain = null;
+  if (tileHost.owner === rb) { tileHost.owner = null; $("tileScroll").replaceChildren(); }
+  rb.busy = 0;
+  syncSnapProgress();
+}
+
+// The scroll container is shared by all remote tabs: only its owner's canvas is mounted.
+function mountTiles(tab) {
+  const rb = tab.rb;
+  const scroller = $("tileScroll");
+  if (!rb || tileHost.owner === rb) return;
+  if (tileHost.owner) tileHost.owner.scrollTop = scroller.scrollTop;
+  tileHost.owner = rb;
+  scroller.replaceChildren(...(rb.view ? [rb.view.canvas] : []));
+  scroller.scrollTop = rb.scrollTop || 0;
+  if (rb.view) { layoutView(rb.view); observeView(rb.view); }
+}
+
+function syncSnapProgress() {
+  const tab = activeWebTab();
+  setShown("snapProgress", Boolean(tab && tab.rb && tab.rb.busy > 0 && tabDisplay(tab) === "tiles"));
+}
+
+function snapBusy(rb, delta) {
+  rb.busy = Math.max(0, rb.busy + delta);
+  syncSnapProgress();
+}
+
+function loadTile(t) {
+  if (t.view.dead) return Promise.resolve();
+  if (t.promise) return t.promise;
+  if (t.url) return Promise.resolve();
+  t.promise = new Promise(resolve => { t.done = resolve; });
+  tileQueue.push(t);
+  pumpTiles();
+  return t.promise;
+}
+
+function settleTile(t) {
+  const done = t.done;
+  t.promise = null;
+  t.done = null;
+  if (done) done();
+}
+
+function pumpTiles() {
+  while (tileActive < RB_TILE_CONCURRENCY && tileQueue.length) {
+    const t = tileQueue.shift();
+    if (t.view.dead || (!t.want && !t.forced)) { settleTile(t); continue; }
+    tileActive++;
+    fetchTile(t).then(ok => {
+      if (!ok && !t.view.dead && t.want) setTimeout(() => { if (t.want) loadTile(t); }, 2000);
+    }).catch(() => {}).finally(() => { tileActive--; settleTile(t); pumpTiles(); });
+  }
+}
+
+// true when finished (or deliberately dropped); false to retry later.
+async function fetchTile(t) {
+  const rb = t.view.rb;
+  try {
+    const res = await fetch("/api/rb/tile.jpg?tab=" + encodeURIComponent(rb.id) +
+      "&snap=" + encodeURIComponent(t.view.meta.snap_id) + "&i=" + t.index,
+      {credentials: "same-origin", cache: "no-store"});
+    if (t.view.dead) return true;
+    if (res.status === 401 && state.authed) { state.authed = false; setTimeout(go, 0); return true; }
+    if (res.status === 404) {          // the Hub dropped this snapshot: take a new one
+      if (rb.owner) takeSnapshot(rb.owner, {force: true, keepScroll: true, quiet: true}).catch(() => {});
+      return true;
+    }
+    if (res.status !== 200) return false;
+    const blob = await res.blob();
+    if (t.view.dead || !blob.size || blob.type !== "image/jpeg") return true;
+    if (!t.want && !t.forced) return true;      // scrolled far away meanwhile
+    releaseTile(t);
+    t.url = URL.createObjectURL(blob);
+    t.img.src = t.url;
+    try { await t.img.decode(); } catch (e) { /* shown anyway */ }
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+
+const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
+
+// Measure the page on the Hub and swap the tiles in. The old view stays until the first
+// tiles of the new one are decoded, so the screen never goes blank.
+async function takeSnapshot(tab, opts = {}) {
+  const rb = tab && tab.rb;
+  if (!rb || tabDisplay(tab) !== "tiles") return;
+  if (rb.snapBusy) {
+    const again = rb.snapAgain || {};
+    rb.snapAgain = {force: again.force === true || opts.force === true,
+      ifChanged: again.ifChanged !== false && opts.ifChanged === true,
+      keepScroll: opts.keepScroll !== false, quiet: opts.quiet === true};
+    return;
+  }
+  rb.snapBusy = true;
+  snapBusy(rb, 1);
+  try {
+    const meta = await api("/api/rb/snapshot", {tab: rb.id, force: opts.force === true,
+      if_changed: opts.ifChanged === true});
+    if (tab.rb !== rb || tabDisplay(tab) !== "tiles") return;
+    if (rb.view && rb.view.meta.snap_id === meta.snap_id) { rb.view.meta = meta; rb.snap = meta; return; }
+    await swapView(tab, rb, meta, opts);
+  } catch (e) {
+    if (e.status === 404) remoteLost(tab);
+    else if (!opts.quiet) toast(e.message, "error");
+  } finally {
+    rb.snapBusy = false;
+    snapBusy(rb, -1);
+    const again = rb.snapAgain;
+    rb.snapAgain = null;
+    if (again && tab.rb === rb) takeSnapshot(tab, again).catch(() => {});
+  }
+}
+
+async function swapView(tab, rb, meta, opts) {
+  tileObservers();
+  const scroller = $("tileScroll");
+  const old = rb.view;
+  const mounted = tileHost.owner === rb;
+  const sameUrl = Boolean(old) && old.meta.url === meta.url;
+  // Same page: keep the position. A different address starts at the top.
+  const keepTop = mounted && sameUrl && opts.keepScroll !== false ? scroller.scrollTop : 0;
+  const view = buildView(rb, meta);
+  if (mounted) {
+    view.canvas.classList.add("is-staging");
+    scroller.appendChild(view.canvas);
+    layoutView(view);
+    const top = keepTop, bottom = keepTop + scroller.clientHeight;
+    const need = view.tiles.filter(t => {
+      const a = parseFloat(t.img.style.top), b = a + parseFloat(t.img.style.height);
+      return b > top && a < bottom;
+    });
+    for (const t of need) t.forced = true;
+    await Promise.race([Promise.all(need.map(loadTile)), delay(RB_SWAP_WAIT_MS)]);
+    for (const t of need) t.forced = false;
+    if (tab.rb !== rb || tileHost.owner !== rb) { killView(view); return; }
+    view.canvas.classList.remove("is-staging");
+  }
+  if (old) killView(old);
+  rb.view = view;
+  rb.snap = meta;
+  rb.snapKey = meta.url + "\n" + meta.title;
+  if (mounted) {
+    scroller.scrollTop = keepTop;
+    observeView(view);
+  }
+  updateRemoteView(tab);
+}
+
+function scheduleSnapshot(tab, ms) {
+  const rb = tab.rb;
+  if (!rb) return;
+  clearTimeout(rb.snapTimer);
+  rb.snapTimer = setTimeout(() => {
+    takeSnapshot(tab, {force: true, keepScroll: true, quiet: true}).catch(() => {});
+  }, ms);
+}
+
+// Tab metadata long-poll (no screencast). Navigation settling triggers a snapshot; a poll that
+// times out with no change checks for DOM changes about every 10 s.
+async function tileLoop(tab, gen) {
+  let fails = 0;
+  await nextPaint();
+  await nextPaint();
+  if (gen !== state.rbGen || !tab.rb) return;
+  await sendViewport(tab).catch(() => {});
+  if (gen !== state.rbGen || !tab.rb) return;
+  takeSnapshot(tab, {keepScroll: true, quiet: true}).catch(() => {});
+  while (gen === state.rbGen && tab.rb) {
+    const rb = tab.rb;
+    try {
+      let target = "/api/rb/meta?tab=" + encodeURIComponent(rb.id) + "&wait=" + RB_META_WAIT_S;
+      if (rb.rev !== null) target += "&rev=" + rb.rev;
+      const res = await fetch(target, {credentials: "same-origin", cache: "no-store"});
+      if (gen !== state.rbGen || tab.rb !== rb) return;
+      if (res.status === 401 && state.authed) {
+        state.authed = false;
+        setTimeout(go, 0);
+        return;
+      }
+      if (res.status === 404) { remoteLost(tab); return; }
+      if (res.status !== 200) throw new Error("HTTP " + res.status);
+      const meta = await res.json();
+      if (gen !== state.rbGen || tab.rb !== rb) return;
+      fails = 0;
+      const unchanged = meta.rev === rb.rev;
+      applyRemoteMeta(tab, Object.assign({}, meta, {seq: rb.seq}));
+      if (gen !== state.rbGen || tab.rb !== rb || tabDisplay(tab) !== "tiles") return;
+      if (meta.loading !== true && rb.snap !== null && rb.snapKey !== (meta.url + "\n" + meta.title)) {
+        takeSnapshot(tab, {keepScroll: true, quiet: true}).catch(() => {});
+      } else if (meta.loading !== true && unchanged && rb.snap !== null) {
+        takeSnapshot(tab, {ifChanged: true, keepScroll: true, quiet: true}).catch(() => {});
+      }
+    } catch (e) {
+      if (gen !== state.rbGen) return;
+      fails++;
+      if (fails >= RB_MAX_POLL_FAILS) {
+        state.rbPolling = "";
+        state.rbPollMode = "";
+        toast("NASブラウザの画面を取得できません: " + e.message, "error");
+        return;
+      }
+      await delay(1000);
+    }
+  }
+}
+
+// Page coordinates of a pointer: tiles are scaled by k, the container scrolls natively.
+function tilePoint(event) {
+  const tab = remoteTab();
+  const view = tab && tab.rb.view;
+  if (!view) return null;
+  const scroller = $("tileScroll");
+  const box = scroller.getBoundingClientRect();
+  const x = (event.clientX - box.left) / view.k;
+  const y = (event.clientY - box.top + scroller.scrollTop) / view.k;
+  if (!(x >= 0 && y >= 0 && x <= view.meta.width && y <= view.meta.height)) return null;
+  return {x, y};
+}
+
+// The link box under a page point (later boxes are on top).
+function linkAt(snap, x, y) {
+  const links = snap && Array.isArray(snap.links) ? snap.links : [];
+  for (let i = links.length - 1; i >= 0; i--) {
+    const l = links[i];
+    if (x >= l.x - RB_LINK_SLOP_PX && x <= l.x + l.w + RB_LINK_SLOP_PX &&
+        y >= l.y - RB_LINK_SLOP_PX && y <= l.y + l.h + RB_LINK_SLOP_PX) return l;
+  }
+  return null;
+}
+
+async function tileTap(tab, point) {
+  const rb = tab.rb;
+  if (!rb || !rb.snap) return;
+  snapBusy(rb, 1);
+  try {
+    const r = await api("/api/rb/tap-page", {tab: rb.id, snap: rb.snap.snap_id,
+      x: Math.round(point.x), y: Math.round(point.y)});
+    if (tab.rb !== rb) return;
+    if (typeof r.editable === "boolean") setEditable(tab, r.editable, true);
+    await takeSnapshot(tab, {force: true, keepScroll: true, quiet: true});
+  } catch (e) {
+    if (tab.rb !== rb) return;
+    if (e.status === 404) {         // snapshot replaced meanwhile (or the tab is gone)
+      flash("表示を更新しました。もう一度タップしてください");
+    } else {
+      toast(e.message, "error");
+    }
+    await takeSnapshot(tab, {force: true, keepScroll: true, quiet: true});
+  } finally {
+    snapBusy(rb, -1);
+  }
+}
+
+function tileLongPress(tab, clientX, clientY) {
+  const point = tilePoint({clientX, clientY});
+  const link = point && tab.rb.snap ? linkAt(tab.rb.snap, point.x, point.y) : null;
+  if (!link) { cancelPress(); flash("この位置にリンクがありません"); return; }
+  rbPress.fired = true;
+  $("remoteRing").classList.add("is-done");
+  setTimeout(() => { rbPress.fired = false; hidePressRing(); }, 350);
+  perform(() => startProbe(tab, {href: link.href}));     // known locally: the probe starts at once
+}
+
+function wireTiles() {
+  const scroller = $("tileScroll");
+  const press = {id: null, x0: 0, y0: 0, t0: 0, moved: false, pullY: null};
+  const fast = () => {
+    const tab = remoteTab();
+    return tab && tabDisplay(tab) === "tiles" && tab.rb.view ? tab : null;
+  };
+  scroller.addEventListener("pointerdown", event => {
+    const tab = fast();
+    if (!tab || press.id !== null) return;
+    press.id = event.pointerId;
+    press.x0 = event.clientX; press.y0 = event.clientY;
+    press.t0 = Date.now();
+    press.moved = false;
+    cancelPress();
+    rbPress.fired = false;
+    const x0 = event.clientX, y0 = event.clientY;
+    rbPress.ringTimer = setTimeout(() => showPressRing(x0, y0), RB_RING_DELAY_MS);
+    rbPress.timer = setTimeout(() => {
+      const current = fast();
+      if (press.id !== null && !press.moved && current) tileLongPress(current, x0, y0);
+    }, RB_LONGPRESS_MS);
+  });
+  scroller.addEventListener("pointermove", event => {
+    if (event.pointerId !== press.id) return;
+    if (Math.hypot(event.clientX - press.x0, event.clientY - press.y0) > RB_TAP_MOVE_PX) {
+      press.moved = true;
+      cancelPress();
+    }
+  });
+  scroller.addEventListener("pointerup", event => {
+    if (event.pointerId !== press.id) return;
+    press.id = null;
+    const longPressed = rbPress.fired;
+    cancelPress();
+    const tab = fast();
+    if (!tab || press.moved || longPressed) return;
+    if (Date.now() - press.t0 > RB_TAP_MAX_MS) return;
+    const point = tilePoint(event);
+    if (point) perform(() => tileTap(tab, point));
+  });
+  // Scrolling starts a pointercancel: that is not a tap.
+  scroller.addEventListener("pointercancel", event => {
+    if (event.pointerId !== press.id) return;
+    press.id = null;
+    cancelPress();
+  });
+  // Pull down at the top to refresh.
+  scroller.addEventListener("touchstart", event => {
+    press.pullY = scroller.scrollTop <= 0 && event.touches.length === 1 ? event.touches[0].clientY : null;
+  }, {passive: true});
+  scroller.addEventListener("touchend", event => {
+    const start = press.pullY;
+    press.pullY = null;
+    const tab = fast();
+    if (start === null || !tab || !event.changedTouches.length) return;
+    if (event.changedTouches[0].clientY - start > RB_PULL_PX && scroller.scrollTop <= 0) {
+      perform(() => takeSnapshot(tab, {force: true, keepScroll: true}));
+    }
+  }, {passive: true});
+  $("tileRefresh").addEventListener("click", () => {
+    const tab = fast();
+    if (tab) perform(() => takeSnapshot(tab, {force: true, keepScroll: true}));
+  });
+  if (typeof ResizeObserver === "function") {
+    new ResizeObserver(() => {
+      const tab = remoteTab();
+      if (tab && tab.rb.view && tileHost.owner === tab.rb) layoutView(tab.rb.view);
+    }).observe(scroller);
+  }
+}
+
 // ---- long press: follow the link in a hidden background page on the NAS
 const rbPress = {timer: 0, ringTimer: 0, fired: false};
 
@@ -1876,7 +2403,8 @@ async function startProbe(tab, point) {
   probeFlight.set(id, item);
   renderProbeChip();
   try {
-    const result = await api("/api/rb/probe", {tab: rb.id, x: point.x, y: point.y});
+    const result = await api("/api/rb/probe", point.href ?
+      {tab: rb.id, href: point.href} : {tab: rb.id, x: point.x, y: point.y});
     probeFlight.delete(id);
     renderProbeChip();
     if (tab.rb !== rb) return;
@@ -1938,7 +2466,8 @@ function queueScroll(x, y, dx, dy) {
 function wireRemote() {
   const stage = $("remoteStage");
   stage.addEventListener("pointerdown", event => {
-    if (!remoteTab() || rbPointer.id !== null) return;
+    const tab = remoteTab();
+    if (!tab || rbPointer.id !== null || tabDisplay(tab) !== "live") return;
     rbPointer.id = event.pointerId;
     rbPointer.startX = rbPointer.lastX = event.clientX;
     rbPointer.startY = rbPointer.lastY = event.clientY;
@@ -1985,8 +2514,10 @@ function wireRemote() {
   stage.addEventListener("pointerup", finish);
   stage.addEventListener("pointercancel", finish);
   stage.addEventListener("wheel", event => {
+    const tab = remoteTab();
+    if (!tab || tabDisplay(tab) !== "live") return;      // fast display scrolls natively
     const point = remotePoint(event);
-    if (!point || !remoteTab()) return;
+    if (!point) return;
     event.preventDefault();
     queueScroll(point.x, point.y, event.deltaX, event.deltaY);
   }, {passive: false});
@@ -2062,6 +2593,7 @@ function wireRemote() {
     if (tab) perform(() => openInRemote(tab));
   });
   document.addEventListener("visibilitychange", syncRemotePoll);
+  wireTiles();
 }
 
 function refreshAfterTabChange() {
@@ -2230,6 +2762,12 @@ function configureMenu() {
     n.textContent = (on ? "✓ " : "") + "画質: " + RB_QUALITY_LABELS[n.dataset.quality];
     n.setAttribute("aria-checked", String(on));
   });
+  const display = tab && tab.rb ? tabDisplay(tab) : "tiles";
+  $("menu").querySelectorAll("[data-display]").forEach(n => {
+    const on = n.dataset.display === display;
+    n.textContent = (on ? "✓ " : "") + "表示: " + RB_DISPLAY_LABELS[n.dataset.display];
+    n.setAttribute("aria-checked", String(on));
+  });
   $("menuPerf").textContent = state.rbPerf ? "速度表示をやめる" : "速度表示";
   $("menuMode").hidden = Boolean(tab && tab.remote) || !web;
   $("menuCompat").hidden = Boolean(tab && tab.remote) || !web;
@@ -2254,6 +2792,7 @@ async function menuAction(action) {
   else if (action === "compatMode" && tab) await setMode(tab, tab.mode === "compat" ? "strict" : "compat");
   else if (action === "remoteOpen" && tab) await (tab.remote ? leaveRemote(tab) : openInRemote(tab));
   else if (action.startsWith("quality:")) setRbQuality(action.slice(8));
+  else if (action.startsWith("display:")) setUserDisplay(tab, action.slice(8));
   else if (action === "perf") setPerf(!state.rbPerf);
   else if (action === "external" && tab) openExternal(tab);
   else if (action === "stageUrl" && tab) await stageTabUrl(tab);

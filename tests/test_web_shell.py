@@ -109,10 +109,11 @@ if (bad.length) { console.error("mismatch: " + bad.join(",")); process.exit(1); 
 
     def test_iframe_src_comes_from_validation(self):
         self.assertIn("/api/browser/validate", self.js)
-        # Exactly three assignments: the validated iframe URL and the remote-browser
+        # Exactly four assignments: the validated iframe URL, the remote-browser
         # screencast (blob: object URLs made from /api/rb/frame.jpg bytes: an
-        # off-screen probe image for decoding, then the visible image).
-        self.assertEqual(len(re.findall(r"\.src\s*=", self.js)), 3)
+        # off-screen probe image for decoding, then the visible image) and, since v0.1.28,
+        # one tile <img> (blob: object URL of /api/rb/tile.jpg bytes).
+        self.assertEqual(len(re.findall(r"\.src\s*=", self.js)), 4)
         self.assertIn("frame.src = validatedUrl", self.js)
         self.assertIn("img.src = next;", self.js)
 
@@ -291,8 +292,10 @@ if (out !== want) { console.error(JSON.stringify(out)); process.exit(1); }
 
     def test_v0122_image_source_is_only_a_blob_url_from_the_binary_api(self):
         assignments = re.findall(r"(\w+)\.src\s*=\s*(.+?);", self.js)
-        self.assertEqual(sorted(a[0] for a in assignments), ["frame", "img", "probe"])
-        self.assertEqual(dict(assignments)["img"], "next")
+        self.assertEqual(sorted(a[0] for a in assignments), ["frame", "img", "img", "probe"])
+        self.assertEqual(sorted(v for k, v in assignments if k == "img"), ["next", "t.url"])
+        self.assertIn("t.url = URL.createObjectURL(blob);", self.js)
+        self.assertIn("/api/rb/tile.jpg?tab=", self.js)
         self.assertEqual(dict(assignments)["probe"], "next")
         self.assertIn("const next = URL.createObjectURL(blob);", self.js)
         self.assertIn("/api/rb/frame.jpg?tab=", self.js)
@@ -587,6 +590,92 @@ const mixed = perfText();
 if (mixed !== "1.0 fps · 1 KB/枚 · 応答 200 ms") { console.error("mixed: " + mixed); process.exit(1); }
 })();
 """
+        result = subprocess.run(["node", "-e", script], capture_output=True, text=True, timeout=20)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    # ---- v0.1.28: fast full-page display ------------------------------------
+    def test_v0128_tiles_are_lazy_and_released(self):
+        css = (WEB / "style.css").read_text(encoding="utf-8")
+        for ident in ("tileScroll", "tileRefresh", "snapProgress"):
+            self.assertIn('id="%s"' % ident, self.html)
+        self.assertRegex(self.html, r'id="tileScroll"[^>]*\bhidden\b')
+        self.assertEqual(self.js.count("new IntersectionObserver("), 2)       # load near / release far
+        self.assertIn('rootMargin: "100% 0px 100% 0px"', self.js)
+        self.assertIn('rootMargin: "300% 0px 300% 0px"', self.js)
+        self.assertIn("releaseTile(t)", self.js)
+        self.assertRegex(self.js, r"function releaseTile\(t\) \{[^}]*URL\.revokeObjectURL\(t\.url\)")
+        self.assertIn("RB_TILE_CONCURRENCY", self.js)
+        self.assertIn(".tile-scroll{position:absolute;inset:0;overflow-x:hidden;overflow-y:auto", css)
+        self.assertIn("touch-action:pan-y", css)
+        # tiles are images only: no remote markup or script reaches the page
+        for token in ("innerHTML", "outerHTML", "insertAdjacentHTML", "eval(", "new Function"):
+            self.assertNotIn(token, self.js)
+        self.assertIn("img-src 'self' data: blob:", (WEB.parent / "webapp.py").read_text(encoding="utf-8"))
+
+    def test_v0128_display_menu_and_default(self):
+        self.assertIn('data-action="display:tiles"', self.html)
+        self.assertIn('data-action="display:live"', self.html)
+        for text in ("表示: 高速（全体表示）", "表示: ライブ"):
+            self.assertIn(text, self.html)
+        self.assertIn('RB_DISPLAY_LABELS = {tiles: "高速（全体表示）", live: "ライブ"}', self.js)
+        self.assertIn('const REMOTE_LIVE_MODE = "remote-live"', self.js)
+        # remembered in the existing per-host map; no entry means the fast display
+        self.assertIn("rememberHostMode(host, mode === \"live\" ? REMOTE_LIVE_MODE : REMOTE_MODE)", self.js)
+        self.assertRegex(self.js, r'return rememberedMode\(hostOf\(tab\.current \|\| ""\)\) === REMOTE_LIVE_MODE \? "live" : "tiles";')
+        self.assertIn("action.startsWith(\"display:\")", self.js)
+        self.assertNotIn("modes.includes(REMOTE_LIVE_MODE)", self.js)
+        modes = re.search(r"const MODES = \[([^\]]*)\]", self.js).group(1)
+        self.assertNotIn("remote", modes)
+
+    def test_v0128_hit_testing_taps_and_long_press_use_the_link_map(self):
+        for route in ("/api/rb/snapshot", "/api/rb/snapshot/release", "/api/rb/tap-page", "/api/rb/meta",
+                      "/api/rb/probe"):
+            self.assertIn(route, self.js)
+        self.assertIn("function linkAt(snap, x, y)", self.js)
+        self.assertIn("{tab: rb.id, href: point.href}", self.js)
+        self.assertIn("startProbe(tab, {href: link.href})", self.js)
+        self.assertIn("RB_PULL_PX", self.js)
+        self.assertIn("RB_INPUT_SNAP_MS = 800", self.js)
+        self.assertIn("RB_META_WAIT_S = 10", self.js)
+
+    def test_v0128_cloudflare_challenge_switches_to_live_and_back(self):
+        self.assertIn("function syncChallenge(tab, challenge, loading)", self.js)
+        self.assertIn("X-Frame-Challenge", self.js)
+        self.assertRegex(self.js, r"if \(challenge && !rb\.autoLive\) \{\s*rb\.autoLive = true;")
+        self.assertRegex(self.js, r"else if \(!challenge && rb\.autoLive && !loading\) \{\s*rb\.autoLive = false;")
+        self.assertIn("if (rb.autoLive) return \"live\";", self.js)
+
+    def test_v0128_node_behaviour_of_display_choice_and_hit_testing(self):
+        if shutil.which("node") is None:
+            self.skipTest("node missing")
+        start = self.js.index("const delay = ms =>")
+        pieces = [
+            self.js[self.js.index("function tabDisplay(tab) {"):self.js.index("// 「表示: 高速 / ライブ」 from the menu")],
+            self.js[self.js.index("// The link box under a page point"):self.js.index("async function tileTap(")],
+        ]
+        script = """
+let host = {mode: null};
+const REMOTE_LIVE_MODE = "remote-live", RB_LINK_SLOP_PX = 3;
+const hostOf = u => u ? new URL(u).hostname : "";
+const rememberedMode = h => host.mode;
+%s
+const tab = rb => ({rb, current: "https://example.com/a"});
+const eq = (a, b, m) => { if (a !== b) { console.error(m + ": " + a + " != " + b); process.exit(1); } };
+eq(tabDisplay(null), "tiles", "no rb");
+eq(tabDisplay(tab({autoLive: false})), "tiles", "default is the fast display");
+host.mode = "remote";
+eq(tabDisplay(tab({autoLive: false})), "tiles", "remote");
+host.mode = "remote-live";
+eq(tabDisplay(tab({autoLive: false})), "live", "remembered live");
+host.mode = "remote";
+eq(tabDisplay(tab({autoLive: true})), "live", "challenge forces live");
+const snap = {links: [{x: 10, y: 100, w: 50, h: 20, href: "a"}, {x: 30, y: 105, w: 50, h: 20, href: "b"}]};
+eq(linkAt(snap, 11, 101).href, "a", "first");
+eq(linkAt(snap, 40, 110).href, "b", "later box is on top");
+eq(linkAt(snap, 62, 110).href, "b", "slop");
+eq(linkAt(snap, 200, 110), null, "miss");
+eq(linkAt(null, 1, 1), null, "no snapshot");
+""" % "\n".join(pieces)
         result = subprocess.run(["node", "-e", script], capture_output=True, text=True, timeout=20)
         self.assertEqual(result.returncode, 0, result.stderr)
 

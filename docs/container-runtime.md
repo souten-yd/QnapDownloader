@@ -88,6 +88,15 @@
 >   - `popup`: `ask`（既定。従来のトースト）／`allow`（非ホスターの安全なhttps URLを、タブ数とメモリの上限内なら**新しいNASブラウザのタブ**で開くようビューアに通知＝イベント `popup_opened {where:"new"}`、上限に達していれば開いたタブ自身で開いて `where:"current"`）／`block`（何も通知せず閉じ、タブごとの件数 `popups` を増やす＝画面に「ポップアップ N件ブロック」）。ホスターのポップアップはポリシーに関わらず検出になる。
 > - **長押し確認（プローブ）**: `POST /api/rb/probe {tab,x,y}`（CSSピクセル）。Hubは対象タブで `Runtime.evaluate`（`document.elementFromPoint(x,y)` の `closest('a').href`）→ `browser_safety.validate`（https・公開DNS名のみ。Hub自身のオリジンも拒否）。URLがホスターならそのまま返す。そうでなければ `Target.createTarget {url:"about:blank", background:true}`（同じブラウザコンテキスト、**スクリーンキャストはしない**）を作り、同じ `Fetch` ホスターパターン・広告遮断（元タブのサイトルール）を入れて遷移する。`Fetch.requestPaused` のホスター、`Network.requestWillBeSent`（Document。`redirectResponse` 付きの数を `redirects` に）、そのページが開いたポップアップ（ホスターURLなら収集して閉じる）を集め、**ホスターURLが取れるまで最大15秒**（ロード完了後に4秒ナビゲーションが無ければ確定）。取れなければページ上のアンカーを `rapidgator_extract` で抽出し、`location.href` を最終URLとする。**どの経路でも `finally` でプローブのターゲットとポップアップを閉じる**。結果は `{start_url, final_url, links:[…50件まで・重複なし], redirects}`。1タブ同時1本、全体で同時2本まで、`memory_reason()`（空きメモリ2GiB・コンテナ使用率80%）を通らなければ作らない。JSダイアログは常に拒否、プローブ由来のダウンロードはどのタブにも通知しない。
 
+> **v0.1.28 高速表示（全体表示）のサーバ側（実機未検証）**
+> - **スナップショット**: `Page.getLayoutMetrics` の `cssContentSize.height`（切り上げ、最大30000 CSSピクセル、最小1）と、閲覧端末に合わせた幅（`set_viewport` の幅。未設定ならレイアウトビューポート）を測り、`Runtime.evaluate` 1回で `a[href]` の位置表（`getBoundingClientRect`＋スクロール量、httpまたはhttpsのみ、可視のみ、最大3000件）と編集可能要素（最大300件、座標のみ）を取る。Python側でも数値・http(s)・長さ・件数を再検証してから返す。ページには `MutationObserver` を1つ入れ、「DOM変更あり」フラグを `if_changed` の確認にだけ使う（変更なしならスナップショットを再利用）。
+> - **タイル**: 要求されたタイルだけ `Page.captureScreenshot {format:"jpeg", quality:品質モード(40/55/70), clip:{x:0,y:i*1600,width:幅,height:min(1600,残り),scale:1}, captureBeyondViewport:true, fromSurface:true}`。**`clip.scale` は1**にした: 端末のスケール（品質モードの 1/1.5/2 倍）は `Emulation.setDeviceMetricsOverride` ですでに掛かっており、ここにも掛けると二重（dsf²）になると判断したため。定数 `SNAP_CLIP_SCALE`（実機で寸法が合わなければ変更）。
+> - **RAMだけ**: タイルは `Tab.tiles`（LRU、1タブ40枚・24MBまで、超えたら古い順に破棄）。スナップショットは1タブ2つまで（新しい表示の最初のタイルが描画されるまで前のものを残し、描画後に古いものを破棄）。タブを閉じる・ブラウザ停止・ライブへ切替（`snapshot/release`）・ビューポート変更（幅・倍率・画質が変わる）で全部解放。ディスクには何も書かない。
+> - **排他とメモリ**: スナップショットとタイルの描画は1タブにつき `snap_lock` で直列化。スナップショット前に既存の長押し確認と同じメモリ判定（空き1GiB以上・コンテナ使用率85%未満）を通す。
+> - **タップ**: `POST /api/rb/tap-page` は `window.scrollTo({top, behavior:'instant'})` で目的のy座標が画面中央付近に来るようスクロールし、返ってきた実際のスクロール量でビューポート座標へ換算（`x - scrollX`, `y - scrollY`、ビューポート外ならクリックしない）、既存と同じ `Input.dispatchMouseEvent` を送り、ナビゲーションが始まれば最大10秒、完了を待つ。使うCDPメソッドは固定（`Page.getLayoutMetrics`・`Page.captureScreenshot`・`Runtime.evaluate`・`Input.dispatchMouseEvent` と既存のもの）。
+> - **Cloudflare**: `looks_like_challenge(url, title)`（タイトルに `just a moment`／`しばらくお待ちください`、またはURLに `/cdn-cgi/challenge`）。クライアントはこの結果でライブへ自動切替する。
+
+
 ## 5. 安全上の残余リスク
 - Hubは管理者権限でDocker CLIを使う。操作は固定関数のみ、引数はコード内定数とHubが検証した値だけ。
 - ブラウザコンテナはインターネットとLANへ出られる（ブラウザとして必要）。悪意あるページがLAN内機器へ要求を出す可能性はある（通常のブラウザと同等）。将来、LAN宛て通信の遮断を検討。

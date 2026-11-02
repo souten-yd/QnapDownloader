@@ -27,7 +27,7 @@ import engine_supervisor
 import remote_browser
 import updater
 
-VERSION = "0.1.27"
+VERSION = "0.1.28"
 PORT = 17864
 ROOT = Path(__file__).resolve().parent
 FILES = {"/": ("web/index.html", "text/html; charset=utf-8"),
@@ -623,10 +623,31 @@ class Handler(BaseHTTPRequestHandler):
                     "X-Frame-Blocked": quote((result["blocked"] or "")[:200], safe=""),
                     "X-Frame-Popups": str(result["popups"]),
                     "X-Frame-Editable": "1" if result.get("editable") else "0",
+                    "X-Frame-Challenge": "1" if result.get("challenge") else "0",
                 }
                 if result["jpeg"] is None:
                     return self.send_data(204, b"", extra=headers)
                 return self.send_data(200, result["jpeg"], "image/jpeg", extra=headers)
+            if path == "/api/rb/tile.jpg":
+                # Fast full-page display: one JPEG tile of a snapshot (image bytes only).
+                query = parse_qs(urlsplit(self.path).query)
+                index_text = query.get("i", [""])[0]
+                if not index_text.isdecimal() or len(index_text) > 5:
+                    raise ValueError("iが不正です")
+                data = self.server.rb.tile(query.get("tab", [""])[0],
+                                           query.get("snap", [""])[0], int(index_text))
+                return self.send_data(200, data, "image/jpeg")
+            if path == "/api/rb/meta":
+                query = parse_qs(urlsplit(self.path).query)
+                wait_text = query.get("wait", [str(int(remote_browser.META_WAIT_MAX))])[0]
+                if not wait_text.isdecimal() or len(wait_text) > 2 or int(wait_text) > 10:
+                    raise ValueError("waitが不正です")
+                rev_text = query.get("rev", [None])[0]
+                if rev_text is not None and (not rev_text.isdecimal() or len(rev_text) > 12):
+                    raise ValueError("revが不正です")
+                return self.send_data(200, self.server.rb.page_meta(
+                    query.get("tab", [""])[0], None if rev_text is None else int(rev_text),
+                    wait=int(wait_text)))
             if path == "/api/rb/site-rules":
                 return self.send_data(200, {"items": self.store.site_rules(),
                                             "block_ads": self.store.settings().get("block_ads", True),
@@ -881,9 +902,19 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_data(200, self.server.rb.set_viewport(
                     body.get("tab"), body.get("width"), body.get("height"), body.get("dpr"),
                     body.get("quality")))
+            if path == "/api/rb/snapshot":
+                return self.send_data(200, self.server.rb.snapshot(
+                    body.get("tab"), force=body.get("force") is True,
+                    if_changed=body.get("if_changed") is True))
+            if path == "/api/rb/snapshot/release":
+                return self.send_data(200, self.server.rb.snapshot_release(body.get("tab")))
+            if path == "/api/rb/tap-page":
+                return self.send_data(200, self.server.rb.tap_page(
+                    body.get("tab"), body.get("snap"), body.get("x"), body.get("y")))
             if path == "/api/rb/probe":
                 result = self.server.rb.probe(
-                    body.get("tab"), body.get("x"), body.get("y"), url_check=self.reject_hub_origin)
+                    body.get("tab"), body.get("x"), body.get("y"), url_check=self.reject_hub_origin,
+                    href=body.get("href"))
                 result = dict(result, probe_id=remember_probe(self.server, body.get("tab"), result.get("links")))
                 return self.send_data(200, result)
             if path == "/api/rb/probe/send":
