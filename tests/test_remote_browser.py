@@ -2781,7 +2781,7 @@ class ReaderExtractorTests(ReaderBase):
         self.assertEqual(call["sessionId"], "SESSION1")
         script = rb.READER_JS
         for needle in ("(^|[-_])(ad|ads|advert|banner|sponsor|promo|popup|cookie)([-_]|$)",
-                       "NAV:1", "ASIDE:1", "FOOTER:1", "HEADER:1", "FORM:1", "SCRIPT:1", "STYLE:1",
+                       "NAV:1", "ASIDE:1", "'HEADER'", "'FOOTER'", "shadowRoot", "assignedNodes", "::before", "SCRIPT:1", "STYLE:1",
                        "aria-hidden", "node.hidden", "cs.display==='none'", "rapidgator", "rg\\.to",
                        "/^https?:/i"):
             self.assertIn(needle, script)
