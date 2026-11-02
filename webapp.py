@@ -26,7 +26,7 @@ import engine_supervisor
 import remote_browser
 import updater
 
-VERSION = "0.1.16"
+VERSION = "0.1.17"
 PORT = 17864
 ROOT = Path(__file__).resolve().parent
 FILES = {"/": ("web/index.html", "text/html; charset=utf-8"),

@@ -68,6 +68,22 @@ MAX_OUTPUT = 1024 * 1024
 _BAD_PATH_CHARS = set(',"\'\n\r\0')
 
 
+_NOT_FOUND_RE = re.compile(r"\bnot found\b")
+
+
+def _not_found(result):
+    """True when a failed docker call means the object does not exist.
+
+    Docker variants word it differently ("No such network", Container Station's
+    "network X not found"); anything else (permission denied, daemon down) is a
+    real error and must not be treated as absence.
+    """
+    if result.returncode == 0:
+        return False
+    text = ((result.stderr or "") + " " + (result.stdout or "")).lower()
+    return "no such" in text or bool(_NOT_FOUND_RE.search(text))
+
+
 class ContainerError(RuntimeError):
     """Container Station unavailable, unsafe target, or a Docker failure."""
 
@@ -267,7 +283,7 @@ class Runtime:
             if not ok:
                 raise ContainerError("同名のネットワークがHub管理外のため使用しません: " + name)
             return False
-        if "no such" not in ((result.stderr or "") + (result.stdout or "")).lower():
+        if not _not_found(result):
             raise ContainerError("ネットワークを確認できません: " + self._tail(result))
         created = self._docker(["network", "create", "--driver", "bridge",
                                 "--label", LABEL, name], 30)
@@ -286,7 +302,7 @@ class Runtime:
         self._check_name(name)
         result = self._docker(["container", "inspect", name], 20)
         if result.returncode != 0:
-            if "no such" in ((result.stderr or "") + (result.stdout or "")).lower():
+            if _not_found(result):
                 return None
             raise ContainerError("コンテナを確認できません: " + self._tail(result))
         try:
