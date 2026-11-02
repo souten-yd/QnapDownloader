@@ -352,8 +352,8 @@ class HttpTests(unittest.TestCase):
             transfer.assert_called_once_with(adapter, "https://files.example/a.zip", str(self.allowed.resolve()),
                                              autostart=True)
             prepare.assert_called_with(adapter, str(self.allowed.resolve()))
-            # sending the same event again must not re-send
-            self.assertEqual(self.req("/api/rb/intercepts/send", {"tab": "b1", "id": 1})[0], 400)
+            # sending the same event again must not re-send; it is skipped silently (v0.1.25)
+            self.assertEqual(self.req("/api/rb/intercepts/send", {"tab": "b1", "id": 1}), (200, {"state": "dup"}))
             self.assertEqual(transfer.call_count, 1)
         links = self.req("/api/links")[1]["items"]
         self.assertEqual([(l["url"], l["state"]) for l in links], [("https://files.example/a.zip", "sent")])
@@ -400,7 +400,7 @@ class HttpTests(unittest.TestCase):
                                          headers={"Host": "192.168.68.57:17864"})
         with self.client.open(request, timeout=4) as response:
             self.assertEqual(response.status, 200)
-            self.assertEqual(json.load(response)["version"], "0.1.24")
+            self.assertEqual(json.load(response)["version"], "0.1.25")
         with self.client.open(self.url + "/icon.svg", timeout=4) as response:
             self.assertEqual(response.status, 200)
             self.assertEqual(response.headers.get_content_type(), "image/svg+xml")
@@ -1229,7 +1229,7 @@ class HttpTests(unittest.TestCase):
         self.assertFalse(info["supported"])
         code, _ = self.req("/api/update/apply", {"version": "v0.1.8"})
         self.assertEqual(code, 400)
-        self.assertEqual(self.req("/api/health")[1]["version"], "0.1.24")
+        self.assertEqual(self.req("/api/health")[1]["version"], "0.1.25")
         self.assertFalse(self.req("/api/jd2/status")[1]["connected"])
         self.assertEqual(self.req("/api/jd2/update/apply", {"confirmed": True})[0], 400)
         self.assertEqual(self.req("/api/jd2/preset/apply", {"confirmed": True})[0], 400)
@@ -1240,6 +1240,9 @@ class HttpTests(unittest.TestCase):
     V24_POST = (("/api/rb/site-rules", {"host": "example.com", "auto_send": True}),
                 ("/api/rb/site-rules/delete", {"host": "example.com"}),
                 ("/api/rb/probe", {"tab": "b1", "x": 1, "y": 1}),
+                ("/api/rb/probe/send", {"tab": "b1", "probe_id": "x"}),
+                ("/api/links/clear", {"include_staged": False}),
+                ("/api/jd2/downloads/cleanup", {"confirmed": True}),
                 ("/api/settings/options", {"send_autostart": False}),
                 ("/api/jd2/linkgrabber/start", {"confirmed": True}),
                 ("/api/jd2/downloads/start", {}),
@@ -1450,8 +1453,8 @@ class HttpTests(unittest.TestCase):
         self.rb_ws.hook = hook
         code, body = self.req("/api/rb/probe", {"tab": "b1", "x": 40, "y": 80})
         self.assertEqual(code, 200)
-        self.assertEqual(body, {"start_url": "https://blog.example.org/go?id=7", "final_url": hoster,
-                                "links": [hoster], "redirects": 0})
+        self.assertEqual(body.pop("probe_id") and body, {"start_url": "https://blog.example.org/go?id=7",
+                                                         "final_url": hoster, "links": [hoster], "redirects": 0})
         closed = [m["params"]["targetId"] for m in self.rb_ws.sent if m["method"] == "Target.closeTarget"]
         self.assertEqual(closed, ["TARGET00002"])
         for bad in ({"tab": "b1", "x": -1, "y": 0}, {"tab": "b1", "x": "a", "y": 0}, {"tab": "b1"},
@@ -1459,6 +1462,106 @@ class HttpTests(unittest.TestCase):
             with self.subTest(bad=bad):
                 self.assertEqual(self.req("/api/rb/probe", bad)[0], 400)
         self.assertEqual(self.req("/api/rb/probe", {"tab": "b9", "x": 1, "y": 1})[0], 404)
+
+    HOSTER_A = "https://rapidgator.net/file/0123456789abcdef0123456789abcdef"
+    HOSTER_B = "https://rapidgator.net/file/fedcba9876543210fedcba9876543210"
+
+    def stored_probe(self, links, now=None):
+        return webapp.remember_probe(self.server, "b1", links, now)
+
+    def test_probe_send_uses_the_stored_result_only_and_dedupes(self):
+        self.login()
+        self.req("/api/settings/folder", {"path": str(self.allowed)})
+        pid = self.stored_probe([self.HOSTER_A, self.HOSTER_B])
+        adapter = self.jd2_ready()
+        evil = "https://evil.example/x"
+        with patch.object(self.server.jd2, "_require", return_value=adapter), \
+                patch("jd2_transfer.prepare_transfer"), \
+                patch("jd2_transfer.transfer", return_value={"state": "sent"}) as transfer:
+            self.assertEqual(self.req("/api/rb/probe/send", {"tab": "b1", "probe_id": "wrong"})[0], 400)
+            self.assertEqual(self.req("/api/rb/probe/send", {"tab": "b2", "probe_id": pid})[0], 400)
+            transfer.assert_not_called()
+            code, body = self.req("/api/rb/probe/send", {"tab": "b1", "probe_id": pid,
+                                                         "links": [evil], "url": evil})
+            self.assertEqual((code, body["sent"], body["skipped"], body["error"]), (200, 2, 0, None))
+            self.assertEqual([c.args[1] for c in transfer.call_args_list], [self.HOSTER_A, self.HOSTER_B])
+            self.assertTrue(all(c.kwargs == {"autostart": True} for c in transfer.call_args_list))
+            code, body = self.req("/api/rb/probe/send", {"tab": "b1", "probe_id": pid})
+            self.assertEqual((code, body["sent"], body["skipped"]), (200, 0, 2))
+            self.assertEqual(transfer.call_count, 2)
+        self.assertNotIn(evil, [l["url"] for l in self.req("/api/links")[1]["items"]])
+
+    def test_probe_send_respects_autostart_off_and_engine_state(self):
+        self.login()
+        self.req("/api/settings/folder", {"path": str(self.allowed)})
+        self.req("/api/settings/options", {"send_autostart": False})
+        pid = self.stored_probe([self.HOSTER_A])
+        with patch.object(self.server.jd2, "_require", return_value=self.jd2_ready(False)), \
+                patch("jd2_transfer.transfer") as transfer:
+            code, body = self.req("/api/rb/probe/send", {"tab": "b1", "probe_id": pid})
+            self.assertEqual((code, body["sent"]), (200, 0))
+            self.assertIn("JD2", body["error"])
+            transfer.assert_not_called()
+        with patch.object(self.server.jd2, "_require", return_value=self.jd2_ready()), \
+                patch("jd2_transfer.prepare_transfer"), \
+                patch("jd2_transfer.transfer", return_value={"state": "sent"}) as transfer:
+            code, body = self.req("/api/rb/probe/send", {"tab": "b1", "probe_id": pid})
+            self.assertEqual((body["sent"], body["autostart"]), (1, False))
+            self.assertEqual(transfer.call_args.args[1:], (self.HOSTER_A, str(self.allowed.resolve())))
+            self.assertEqual(transfer.call_args.kwargs, {})
+
+    def test_probe_result_expires_is_capped_and_replaced(self):
+        self.login()
+        now = time.time()
+        pid = self.stored_probe([self.HOSTER_A], now - webapp.PROBE_TTL - 1)
+        self.assertEqual(self.req("/api/rb/probe/send", {"tab": "b1", "probe_id": pid})[0], 400)
+        many = ["https://rapidgator.net/file/%032x" % i for i in range(80)]
+        pid = self.stored_probe(many)
+        self.assertEqual(len(self.server.probe_results["b1"]["links"]), webapp.PROBE_MAX_LINKS)
+        self.assertIsNone(self.stored_probe([]))
+        self.assertEqual(self.req("/api/rb/probe/send", {"tab": "b1", "probe_id": pid})[0], 400)
+
+    def test_links_clear_endpoint_keeps_staged_by_default(self):
+        self.login()
+        a = self.req("/api/links", {"url": "https://example.com/a"})[1]["id"]
+        self.req("/api/links", {"url": "https://example.com/b"})
+        self.server.store.begin_send(a)
+        self.server.store.finish_send(a, "sent")
+        self.assertEqual(self.req("/api/links/clear", {"include_staged": "yes"})[0], 400)
+        code, body = self.req("/api/links/clear", {})
+        self.assertEqual((code, body), (200, {"removed": 1}))
+        self.assertEqual([l["state"] for l in self.req("/api/links")[1]["items"]], ["staged"])
+        self.assertEqual(self.req("/api/links/clear", {"include_staged": True})[1], {"removed": 1})
+        self.assertEqual(self.req("/api/links")[1]["items"], [])
+
+    def test_downloads_cleanup_needs_confirmation_and_calls_the_adapter(self):
+        self.login()
+        adapter = self.jd2_ready()
+        with patch.object(self.server.jd2, "_require", return_value=adapter):
+            self.assertEqual(self.req("/api/jd2/downloads/cleanup", {})[0], 400)
+            adapter.cleanup_finished.assert_not_called()
+            self.assertEqual(self.req("/api/jd2/downloads/cleanup", {"confirmed": True}),
+                             (200, {"cleared": True}))
+            adapter.cleanup_finished.assert_called_once_with()
+
+    def test_intercept_send_of_a_known_link_is_skipped_without_error(self):
+        self.login()
+        pid = self.stored_probe([self.HOSTER_A])
+        self.req("/api/settings/folder", {"path": str(self.allowed)})
+        with patch.object(self.server.jd2, "_require", return_value=self.jd2_ready()), \
+                patch("jd2_transfer.prepare_transfer"), \
+                patch("jd2_transfer.transfer", return_value={"state": "sent"}) as transfer:
+            self.req("/api/rb/probe/send", {"tab": "b1", "probe_id": pid})
+            self.assertEqual(transfer.call_count, 1)
+            code, body = self.req("/api/rb/probe/send", {"tab": "b1", "probe_id": pid})
+            self.assertEqual((code, body["sent"], body["skipped"], body["error"]), (200, 0, 1, None))
+            self.assertEqual(transfer.call_count, 1)
+
+    def test_probe_autosend_setting_defaults_on_and_persists(self):
+        self.login()
+        self.assertIs(self.req("/api/settings")[1]["probe_autosend"], True)
+        self.assertIs(self.req("/api/settings/options", {"probe_autosend": False})[1]["probe_autosend"], False)
+        self.assertIs(self.req("/api/settings")[1]["probe_autosend"], False)
 
     def test_probe_refuses_the_hub_origin_and_non_https_without_opening_a_page(self):
         self.login()

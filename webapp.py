@@ -27,7 +27,7 @@ import engine_supervisor
 import remote_browser
 import updater
 
-VERSION = "0.1.24"
+VERSION = "0.1.25"
 PORT = 17864
 ROOT = Path(__file__).resolve().parent
 FILES = {"/": ("web/index.html", "text/html; charset=utf-8"),
@@ -277,6 +277,60 @@ def auto_send_link(server, url):
     except AlreadySent:
         return "dup"
     return "sent"
+
+
+PROBE_TTL = 300
+PROBE_MAX_LINKS = 50
+PROBE_MAX_TABS = 16
+_PROBE_LOCK = threading.Lock()
+
+
+def remember_probe(server, tab, links, now=None):
+    """Keep the last probe result of one tab in RAM (<= 50 links, 5 minutes).
+
+    Returns the opaque probe id, or None when there are no links. The send
+    endpoint only ever uses what is stored here, never client-supplied URLs.
+    """
+    now = time.time() if now is None else now
+    with _PROBE_LOCK:
+        store = server.__dict__.setdefault("probe_results", {})
+        for key in [k for k, v in store.items() if now - v["at"] > PROBE_TTL]:
+            del store[key]
+        if not links:
+            store.pop(tab, None)
+            return None
+        if tab not in store and len(store) >= PROBE_MAX_TABS:
+            del store[min(store, key=lambda k: store[k]["at"])]
+        probe_id = secrets.token_urlsafe(12)
+        store[tab] = {"id": probe_id, "links": list(links)[:PROBE_MAX_LINKS], "at": now}
+        return probe_id
+
+
+def send_probe_links(server, tab, probe_id, now=None):
+    """Send the stored links of one probe to JD2 (deduped); never takes URLs from the client."""
+    now = time.time() if now is None else now
+    with _PROBE_LOCK:
+        entry = server.__dict__.get("probe_results", {}).get(tab) if isinstance(tab, str) else None
+        if entry is not None and (now - entry["at"] > PROBE_TTL or not isinstance(probe_id, str)
+                                  or not hmac.compare_digest(entry["id"], probe_id)):
+            entry = None
+        links = list(entry["links"]) if entry else []
+    if not links:
+        raise ValueError("確認結果の有効期限が切れました。もう一度長押ししてください")
+    sent = skipped = 0
+    error = None
+    for url in links:
+        try:
+            send_link(server, url=url, dedupe=True)
+            sent += 1
+        except AlreadySent:
+            skipped += 1
+        except ValueError as exc:
+            error = str(exc)
+            break
+    autostart = server.store.settings().get("send_autostart", True) is True
+    return {"sent": sent, "skipped": skipped, "total": len(links), "error": error,
+            "autostart": autostart}
 
 
 def wire_remote_browser(server):
@@ -745,6 +799,9 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/links/delete":
                 self.store.delete_link(body.get("id"))
                 return self.send_data(200, {"deleted": True})
+            if path == "/api/links/clear":
+                include = body.get("include_staged", False)
+                return self.send_data(200, {"removed": self.store.clear_links(include)})
             if path == "/api/rapidgator/extract":
                 pasted = body.get("content")
                 limit = body.get("limit", rapidgator_extract.DEFAULT_LIMIT)
@@ -813,8 +870,13 @@ class Handler(BaseHTTPRequestHandler):
                     body.get("tab"), body.get("width"), body.get("height"), body.get("dpr"),
                     body.get("quality")))
             if path == "/api/rb/probe":
-                return self.send_data(200, self.server.rb.probe(
-                    body.get("tab"), body.get("x"), body.get("y"), url_check=self.reject_hub_origin))
+                result = self.server.rb.probe(
+                    body.get("tab"), body.get("x"), body.get("y"), url_check=self.reject_hub_origin)
+                result = dict(result, probe_id=remember_probe(self.server, body.get("tab"), result.get("links")))
+                return self.send_data(200, result)
+            if path == "/api/rb/probe/send":
+                return self.send_data(200, send_probe_links(
+                    self.server, body.get("tab"), body.get("probe_id")))
             if path == "/api/rb/site-rules":
                 return self.send_data(200, self.store.set_site_rule(
                     body.get("host"), auto_send=body.get("auto_send"), popup=body.get("popup"),
@@ -830,7 +892,10 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/rb/intercepts/send":
                 item = self.server.rb.intercept(body.get("tab"), body.get("id"))
                 # Same path as /api/links/send; the link is staged inside the JD2 lock.
-                return self.send_data(200, self.send_staged_link(url=item["url"]))
+                try:
+                    return self.send_data(200, send_link(self.server, url=item["url"], dedupe=True))
+                except AlreadySent:
+                    return self.send_data(200, {"state": "dup"})
             if path == "/api/engine/start":
                 self.server.engine.start()
                 return self.send_data(202, {"started": True})
@@ -860,6 +925,9 @@ class Handler(BaseHTTPRequestHandler):
                     confirmed=body.get("confirmed") is True))
             if path == "/api/jd2/downloads/start":
                 return self.send_data(200, self.server.jd2.start_downloads())
+            if path == "/api/jd2/downloads/cleanup":
+                return self.send_data(200, self.server.jd2.clear_finished(
+                    confirmed=body.get("confirmed") is True))
             if path == "/api/jd2/downloads/stop":
                 return self.send_data(200, self.server.jd2.stop_downloads(
                     confirmed=body.get("confirmed") is True))

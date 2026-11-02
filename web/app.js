@@ -1491,8 +1491,9 @@ async function sendUrls(links) {
   await loadQueue(true);
   const wanted = new Set(items);
   const staged = state.queueData ? state.queueData.items.filter(l => l.state === "staged" && wanted.has(l.url)) : [];
-  if (!staged.length) { flash("送れる未送信のリンクはありません"); return; }
-  await sendLinks(staged);
+  const dup = items.length - staged.length;
+  if (!staged.length) { flash("すべて送信済み・追加済みのためスキップしました（" + dup + "件）"); return; }
+  await sendLinks(staged, {skipped: dup});
 }
 
 // ---- detected links (hoster pages / downloads stopped on the NAS browser)
@@ -1641,12 +1642,11 @@ async function interceptAction(action) {
   const item = cur.item;
   const body = {tab: item.tab, id: item.id};
   if (action === "send") {
-    if (!confirm("このリンクをJD2へ送ります。" + sendStartText() + "既存のPackagizerルールによりフォルダが変わる可能性があります。続けますか？")) return;
     const autoHost = $("interceptAuto").checked ? hostOf(remoteTab().current) : "";
-    await api("/api/rb/intercepts/send", body);
+    const sentResult = await api("/api/rb/intercepts/send", body);
     swrDrop("links");
     await loadQueue(true).catch(() => {});
-    flash(sentText());
+    flash(sentResult && sentResult.state === "dup" ? "送信済みのためスキップしました" : sentText());
     if (autoHost) {
       $("interceptAuto").checked = false;
       await setSiteRule(autoHost, {auto_send: true});
@@ -1762,6 +1762,7 @@ function renderProbe(view, tab) {
     status = "リダイレクト " + result.redirects + "回 · 最終: " + (hostLabel(result.final_url) || "不明") +
       (links.length ? "" : "（Rapidgatorのリンクは見つかりませんでした）");
   }
+  if (view.error) status = "JD2へ送信できませんでした: " + view.error + "。下のボタンから再試行できます";
   $("probeStatus").textContent = status;
   $("probeStatus").title = result ? result.final_url : "";
   const canSend = jd2CanSend();
@@ -1794,6 +1795,35 @@ function renderProbe(view, tab) {
   state.probeResult = result;
 }
 
+let probeError = "";
+
+// Long press found hoster links: hand them to JD2 without a dialog (setting probe_autosend).
+// Returns true when handled (toast shown, sheet closed); false opens the sheet as before.
+async function autoSendProbe(result, rb, seq) {
+  probeError = "";
+  if (!result.links.length || !result.probe_id) return false;
+  await Promise.all([loadSettings().catch(() => {}), loadJd2Status().catch(() => {})]);
+  if (seq !== state.probeSeq) return true;
+  if (!(state.settings && state.settings.probe_autosend !== false) || !jd2CanSend()) return false;
+  try {
+    const r = await api("/api/rb/probe/send", {tab: rb.id, probe_id: result.probe_id});
+    swrDrop("links");
+    loadQueue(true).catch(() => {});
+    if (r.error) {
+      probeError = (r.sent ? r.sent + "件送信後に停止: " : "") + r.error;
+      return false;
+    }
+    setShown("probeSheet", false);
+    if (r.sent === 0) flash("送信済みのためスキップしました（" + r.skipped + "件）");
+    else if (r.skipped) flash(r.sent + "件送信・" + r.skipped + "件は重複のためスキップ");
+    else flash("JD2へ送信しました（" + r.sent + "件・" + (r.autostart ? "開始" : "待機中") + "）");
+    return true;
+  } catch (e) {
+    probeError = e.message;
+    return false;
+  }
+}
+
 async function startProbe(tab, point) {
   const rb = tab.rb;
   if (!rb || rb.probing) { toast("リンク先を確認中です", "error"); return; }
@@ -1805,7 +1835,9 @@ async function startProbe(tab, point) {
   try {
     const result = await api("/api/rb/probe", {tab: rb.id, x: point.x, y: point.y});
     if (seq !== state.probeSeq || tab.rb !== rb) return;
-    renderProbe({result}, tab);
+    if (await autoSendProbe(result, rb, seq)) return;
+    if (seq !== state.probeSeq || tab.rb !== rb) return;
+    renderProbe({result, error: probeError}, tab);
   } catch (e) {
     if (seq === state.probeSeq) setShown("probeSheet", false);
     if (e.status === 404) remoteLost(tab);
@@ -2421,6 +2453,7 @@ function renderDownloadsShell() {
   setShown("downloadsBody", running);
   $("downloadsRefresh").hidden = !running;
   $("downloadsToggle").hidden = !running;
+  $("downloadsClear").hidden = !running;
   $("downloadsUpdated").hidden = !running;
   if (!e || running) return;
   const needSetup = !e.installed || e.phase === "setup";
@@ -2521,6 +2554,28 @@ async function startWaiting() {
   flash(result.moved + "件を開始しました");
   state.downloadsFails = 0;
   await loadDownloads(state.downloadsPage);
+}
+
+async function clearFinished() {
+  if (!confirm("完了したダウンロードを一覧から削除します。保存されたファイルは削除されません。")) return;
+  await api("/api/jd2/downloads/cleanup", {confirmed: true});
+  flash("完了したものを一覧から消しました");
+  state.downloadsFails = 0;
+  await loadDownloads(state.downloadsPage);
+}
+
+async function clearHistory() {
+  const includeStaged = $("clearStaged").checked;
+  const items = state.queueData ? state.queueData.items : [];
+  const count = items.filter(l => l.state === "sent" || l.state === "uncertain" ||
+    (includeStaged && l.state === "staged")).length;
+  if (!count) { flash("削除できる履歴はありません"); return; }
+  if (!confirm("送信履歴を" + count + "件削除します（ダウンロード済みファイルやJD2のダウンロードは削除しません）")) return;
+  const r = await api("/api/links/clear", {include_staged: includeStaged});
+  $("clearStaged").checked = false;
+  swrDrop("links");
+  await loadQueue(true);
+  flash(r.removed + "件の履歴を削除しました");
 }
 
 async function toggleDownloads() {
@@ -2693,10 +2748,11 @@ function sentText() {
 }
 
 // Sequential hand-off with one confirmation; stops at the first error.
-async function sendLinks(links) {
+async function sendLinks(links, opts = {}) {
   const many = links.length > 1;
-  if (!confirm(many ? links.length + "件のリンクをJD2へ順に送ります。" + sendStartText() + "既存のPackagizerルールによりフォルダが変わる可能性があります。続けますか？" :
-      "このリンクをJD2へ送ります。" + sendStartText() + "既存のPackagizerルールによりフォルダが変わる可能性があります。続けますか？")) return;
+  // Only the Links page "send all" (5+ links) asks; every other send was asked for explicitly.
+  if (opts.confirmMany && links.length >= 5 &&
+      !confirm(links.length + "件のリンクをJD2へ順に送ります。" + sendStartText() + "続けますか？")) return;
   let sent = 0;
   try {
     for (const link of links) {
@@ -2710,13 +2766,14 @@ async function sendLinks(links) {
   }
   swrDrop("links");
   await loadQueue(true);
+  const dupText = opts.skipped ? "・" + opts.skipped + "件は重複のためスキップ" : "";
   flash(sent + "件を" + (sendAutostartOn() ? "JD2へ送り、ダウンロードを開始しました" :
-    "JD2のLinkGrabberへ送りました（ダウンロードは未開始）"));
+    "JD2のLinkGrabberへ送りました（ダウンロードは未開始）") + dupText);
 }
 
 function sendAllStaged() {
   const items = state.queueData ? state.queueData.items.filter(l => l.state === "staged") : [];
-  return items.length ? sendLinks(items) : Promise.resolve();
+  return items.length ? sendLinks(items, {confirmMany: true}) : Promise.resolve();
 }
 
 // ---- one paste box: single https URL, or preview of extracted links
@@ -2804,6 +2861,7 @@ function showSettingsSection(section) {
 function renderDownloadDir(s) {
   state.settings = s;
   $("sendAutostart").checked = s.send_autostart !== false;
+  $("probeAutosend").checked = s.probe_autosend !== false;
   $("blockAds").checked = s.block_ads !== false;
   $("selectedFolder").textContent = s.download_dir || "未選択";
   $("folderChange").textContent = s.download_dir ? "変更" : "選ぶ";
@@ -3360,6 +3418,8 @@ function wireDownloads() {
   });
   $("waitingStart").addEventListener("click", () => perform(startWaiting));
   $("downloadsToggle").addEventListener("click", () => perform(toggleDownloads));
+  $("downloadsClear").addEventListener("click", () => perform(clearFinished));
+  $("clearHistory").addEventListener("click", () => perform(clearHistory));
   $("downloadsPrev").addEventListener("click", () => loadDownloads(state.downloadsPage - 1));
   $("downloadsNext").addEventListener("click", () => loadDownloads(state.downloadsPage + 1));
   document.querySelectorAll(".chip").forEach(c => c.addEventListener("click", () => setFilter(c.dataset.filter)));
@@ -4061,6 +4121,12 @@ function wireBrowser() {
       await saveOption("block_ads", $("blockAds").checked);
       flash($("blockAds").checked ? "広告をブロックします（次に開くタブから）" : "広告ブロックをやめました（次に開くタブから）");
     } catch (e) { $("blockAds").checked = !$("blockAds").checked; throw e; }
+  }));
+  $("probeAutosend").addEventListener("change", () => perform(async () => {
+    try {
+      await saveOption("probe_autosend", $("probeAutosend").checked);
+      flash($("probeAutosend").checked ? "長押しで見つかったリンクを自動でJD2へ送ります" : "長押しの結果はシートで確認します");
+    } catch (e) { $("probeAutosend").checked = !$("probeAutosend").checked; throw e; }
   }));
   $("sendAutostart").addEventListener("change", () => perform(async () => {
     try {

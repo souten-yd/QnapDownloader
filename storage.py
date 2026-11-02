@@ -22,8 +22,10 @@ DEFAULTS = {
     "send_autostart": True,
     # v0.1.24: block known ad / tracker / popunder requests in the NAS browser.
     "block_ads": True,
+    # v0.1.25: a long press that finds hoster links sends them to JD2 right away.
+    "probe_autosend": True,
 }
-BOOL_OPTIONS = ("send_autostart", "block_ads")
+BOOL_OPTIONS = ("send_autostart", "block_ads", "probe_autosend")
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY,value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS accounts(id INTEGER PRIMARY KEY CHECK(id=1),
@@ -315,6 +317,21 @@ class Store:
             if deleted.rowcount != 1:
                 raise ValueError("削除できるのは未送信のリンクだけです")
             db.execute("UPDATE meta SET value=value+1 WHERE key='revision'")
+
+    def clear_links(self, include_staged=False):
+        """Forget Hub link records already handed to JD2 (sent/uncertain, optionally staged).
+
+        'sending' rows stay (a hand-off is in flight). Never touches JD2 or files.
+        """
+        if type(include_staged) is not bool:
+            raise ValueError("include_stagedは真偽値で指定してください")
+        states = ("sent", "uncertain") + (("staged",) if include_staged else ())
+        with self._guard, self.connect() as db:
+            removed = db.execute("DELETE FROM link_intents WHERE state IN (%s)" %
+                                 ",".join("?" * len(states)), states).rowcount
+            if removed:
+                db.execute("UPDATE meta SET value=value+1 WHERE key='revision'")
+        return removed
 
     def add_link(self, url):
         # Link intents are inert in v0.1: no automatic URL fetch or JD2 execution.
