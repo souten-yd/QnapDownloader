@@ -185,6 +185,7 @@ class FakeWS:
         self.history = {"currentIndex": 1, "entries": [{"id": 5}, {"id": 6}, {"id": 7}]}
         self.layout = {"cssContentSize": {"width": 390, "height": 4000.2}}
         self.shot_size = 100           # bytes of each captured tile
+        self.results = {}              # method -> result dict (or callable(params) -> dict)
 
     def send_text(self, text):
         message = json.loads(text)
@@ -211,6 +212,10 @@ class FakeWS:
                     value = mapped
                     break
             result = {"result": {"type": "object", "value": value}}
+        elif method in self.results:
+            result = self.results[method]
+            if callable(result):
+                result = result(message.get("params") or {})
         elif method == "Page.getNavigationHistory":
             result = self.history
         elif method == "Page.getLayoutMetrics":
@@ -1604,8 +1609,8 @@ class ProbeTests(BrowserBase):
         # coordinates are CSS pixels of the tab and are formatted as numbers only
         expression = [m for m in self.ws.calls("Runtime.evaluate") if "elementFromPoint" in m["params"]["expression"]][0]
         self.assertEqual(expression["sessionId"], "SESSION1")
-        self.assertIn("(10.0,10.0)", expression["params"]["expression"])
-        self.assertIn("closest('a')", expression["params"]["expression"])
+        self.assertTrue(expression["params"]["expression"].endswith("(10.0,10.0,28)"))
+        self.assertIn("closest('a[href]')", expression["params"]["expression"])
 
     def test_ad_blocking_follows_the_origin_tab_site_exception(self):
         rules = FakeRules()
@@ -2558,3 +2563,714 @@ class SnapshotTests(BrowserBase):
                    "Emulation.setTouchEmulationEnabled", "Target.activateTarget",
                    "Page.getLayoutMetrics", "Page.captureScreenshot", "Input.dispatchMouseEvent"}
         self.assertLessEqual(set(self.ws.methods()), allowed)
+
+
+
+# ------------------------------------------------------- v0.1.30: viewport link map
+class ViewportLinkTests(BrowserBase):
+    def setUp(self):
+        super().setUp()
+        self.open("https://example.com/a")
+        self.rb.set_viewport("b1", 390, 700, 2.0)
+
+    def vp_eval(self, links, **extra):
+        value = {"scrollX": 0, "scrollY": 120, "width": 390, "height": 700, "links": links}
+        value.update(extra)
+        self.ws.eval_map = [("__qdlVp", value)] + [e for e in self.ws.eval_map if "__qdlVp" not in e[0]]
+
+    def vp_calls(self):
+        return [m for m in self.ws.calls("Runtime.evaluate") if "__qdlVp" in m["params"]["expression"]]
+
+    def meta(self, **kwargs):
+        return self.rb.page_meta("b1", None, wait=0, links=True, **kwargs)["viewport_links"]
+
+    def box(self, i=0, **over):
+        item = {"x": 10, "y": 20 + i, "w": 80, "h": 18, "href": "https://example.org/%d" % i}
+        item.update(over)
+        return item
+
+    def test_map_has_rev_scroll_and_links(self):
+        self.vp_eval([self.box(0), self.box(1)])
+        result = self.meta()
+        self.assertEqual(set(result), {"rev", "scrollX", "scrollY", "width", "height", "links"})
+        self.assertEqual((result["scrollX"], result["scrollY"], result["width"], result["height"]),
+                         (0, 120, 390, 700))
+        self.assertEqual([l["href"] for l in result["links"]],
+                         ["https://example.org/0", "https://example.org/1"])
+        self.assertEqual(set(result["links"][0]), {"x", "y", "w", "h", "href"})
+        self.assertIsInstance(result["rev"], int)
+
+    def test_filter_http_only_finite_ints_and_on_screen(self):
+        bad = [self.box(0, href="javascript:alert(1)"), self.box(1, href="ftp://example.org/x"),
+               self.box(2, href="data:text/html,x"), self.box(3, href=5), self.box(4, href="https://" + "a" * 2100),
+               self.box(5, w=0), self.box(6, h=-3), self.box(7, x="1"), self.box(8, y=float("nan")),
+               self.box(9, x=True), self.box(10, x=5000), self.box(11, y=700), self.box(12, x=-200),
+               self.box(13, y=-60), "text", None, {"href": "https://example.org/z"}]
+        good = [self.box(20, x=-30, w=80), self.box(21, href="http://example.org/plain"),
+                self.box(22, x=12.6, y=20.4, w=80.5, h=17.5)]
+        self.vp_eval(bad + good)
+        links = self.meta()["links"]
+        self.assertEqual([l["href"] for l in links],
+                         ["https://example.org/20", "http://example.org/plain", "https://example.org/22"])
+        self.assertEqual((links[2]["x"], links[2]["y"]), (13, 20))
+        for link in links:
+            for name in ("x", "y", "w", "h"):
+                self.assertIsInstance(link[name], int)
+
+    def test_cap_is_600_and_the_script_filters_in_the_page_too(self):
+        self.vp_eval([self.box(i % 100, href="https://example.org/%d" % i) for i in range(700)])
+        self.assertEqual(len(self.meta()["links"]), 600)
+        self.assertEqual(rb.VP_LINK_CAP, 600)
+        script = self.vp_calls()[0]["params"]["expression"]
+        self.assertTrue(script.endswith("(600,2048,true)"))
+        for needle in ("/^https?:/i", "getClientRects", "MutationObserver", "'scroll'", "},200)",
+                       "window.innerWidth", "window.__qdlVp"):
+            self.assertIn(needle, script)
+        self.assertTrue(self.vp_calls()[0]["params"]["returnByValue"])
+        self.assertEqual(self.vp_calls()[0]["sessionId"], "SESSION1")
+
+    def test_unchanged_rev_is_answered_from_the_cache_without_scanning(self):
+        self.vp_eval([self.box(0)])
+        first = self.meta()
+        self.assertEqual(len(self.vp_calls()), 1)
+        again = self.meta(vp=first["rev"])
+        self.assertEqual(again, {"rev": first["rev"], "unchanged": True})
+        full = self.meta()                                   # a viewer without a map still gets it
+        self.assertEqual(full["links"], first["links"])
+        self.assertEqual(len(self.vp_calls()), 1)
+
+    def test_rev_follows_frames_and_a_clean_page_keeps_the_map(self):
+        self.vp_eval([self.box(0)])
+        first = self.meta()
+        header = self.rb.frame("b1", 0, wait=0)["links_rev"]
+        self.feed("SESSION1")
+        self.assertGreater(self.rb.frame("b1", 0, wait=0)["links_rev"], header)
+        # the page reports no change (null): the map stays, under the new revision
+        self.ws.eval_map = [("__qdlVp", None)]
+        second = self.meta(vp=first["rev"])
+        self.assertGreater(second["rev"], first["rev"])
+        self.assertEqual(second["links"], first["links"])
+        self.assertTrue(self.vp_calls()[-1]["params"]["expression"].endswith(",false)"))
+        # a changed page replaces it
+        self.feed("SESSION1")
+        self.vp_eval([self.box(5)])
+        third = self.meta(vp=second["rev"])
+        self.assertEqual([l["href"] for l in third["links"]], ["https://example.org/5"])
+
+    def test_navigation_metadata_changes_the_rev(self):
+        self.vp_eval([self.box(0)])
+        first = self.meta()
+        self.ws.emit("Page.frameStartedLoading", {"frameId": "F1"}, "SESSION1")
+        self.barrier()
+        self.assertGreater(self.meta()["rev"], first["rev"])
+
+    def test_fresh_rescans_even_when_the_rev_is_unchanged(self):
+        self.vp_eval([self.box(0)])
+        self.meta()
+        self.vp_eval([self.box(7)])
+        result = self.meta(fresh=True)
+        self.assertEqual(result["links"][0]["href"], "https://example.org/7")
+        self.assertTrue(self.vp_calls()[-1]["params"]["expression"].endswith(",true)"))
+
+    def test_nothing_is_evaluated_unless_the_map_is_requested(self):
+        self.vp_eval([self.box(0)])
+        result = self.rb.page_meta("b1", None, wait=0)
+        self.assertNotIn("viewport_links", result)
+        self.rb.frame("b1", 0, wait=0)
+        self.assertEqual(self.vp_calls(), [])
+
+    def test_unreadable_page_gives_none_and_bad_values_give_an_empty_map(self):
+        self.ws.fail["Runtime.evaluate"] = "context destroyed"
+        self.assertIsNone(self.meta())
+        self.ws.fail.clear()
+        self.vp_eval("garbage")
+        self.assertEqual(self.meta()["links"], [])
+        self.vp_eval([self.box(0)], width="x", height=None)
+        self.assertEqual(self.meta(fresh=True)["links"], [])
+
+
+class ProbeToleranceTests(BrowserBase):
+    HOSTER = "https://rapidgator.net/file/0123456789abcdef0123456789abcdef"
+
+    def setUp(self):
+        super().setUp()
+        self.open("https://example.com/a")
+        self.rb.set_viewport("b1", 390, 700, 1.0)
+
+    def probe_calls(self):
+        return [m for m in self.ws.calls("Runtime.evaluate") if "elementFromPoint" in m["params"]["expression"]]
+
+    def test_resolver_script_is_tolerant_and_fixed(self):
+        script = rb.PROBE_JS
+        for needle in ("elementFromPoint", "closest('a[href]')", "getClientRects",
+                       "Math.max(r.left-x,0,x-r.right)", "Math.max(r.top-y,0,y-r.bottom)",
+                       "d>T", "d===bd&&ar<ba", "getComputedStyle"):
+            self.assertIn(needle, script)
+        self.assertEqual(rb.LINK_NEAR_PX, 28)
+
+    def test_coordinate_probe_uses_the_tolerance(self):
+        self.ws.eval_map = [("elementFromPoint", self.HOSTER)]
+        result = self.rb.probe("b1", 12.5, 30, url_check=None)
+        self.assertEqual(result["links"], [self.HOSTER])
+        self.assertTrue(self.probe_calls()[0]["params"]["expression"].endswith("(12.5,30.0,28)"))
+
+    def test_nothing_near_means_no_link_found(self):
+        self.ws.eval_map = [("elementFromPoint", None)]
+        with self.assertRaises(rb.BrowserError) as caught:
+            self.rb.probe("b1", 5, 5)
+        self.assertIn("リンクが見つかりません", str(caught.exception))
+
+    def test_fast_display_fallback_scrolls_then_resolves_in_viewport_coordinates(self):
+        meta = self.rb.snapshot("b1")
+        self.ws.eval_map = [("scrollTo", [0, 600, 390, 700]), ("elementFromPoint", self.HOSTER)]
+        result = self.rb.probe("b1", 120, 1000, snap=meta["snap_id"])
+        self.assertEqual(result["links"], [self.HOSTER])
+        self.assertTrue(self.probe_calls()[0]["params"]["expression"].endswith("(120.0,400.0,28)"))
+        scroll = [m for m in self.ws.calls("Runtime.evaluate") if "scrollTo" in m["params"]["expression"]]
+        self.assertTrue(scroll[0]["params"]["expression"].endswith("(1000.0)"))
+
+    def test_fallback_with_a_stale_or_bad_snapshot_is_refused(self):
+        with self.assertRaises(rb.SnapshotGone):
+            self.rb.probe("b1", 1, 1, snap="s9")
+        for bad in ("x", 5, "s1; drop"):
+            with self.subTest(snap=bad), self.assertRaises(rb.BrowserError):
+                self.rb.probe("b1", 1, 1, snap=bad)
+        self.assertEqual(self.probe_calls(), [])
+
+
+# ------------------------------------------------------------ v0.1.30: reader mode
+PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 40
+JPEG = b"\xff\xd8\xff\xe0" + b"\x00" * 40
+GIF = b"GIF89a" + b"\x00" * 40
+WEBP = b"RIFF\x10\x00\x00\x00WEBPVP8 " + b"\x00" * 20
+AVIF = b"\x00\x00\x00\x1cftypavif" + b"\x00" * 20
+SVG = b'<svg xmlns="http://www.w3.org/2000/svg"><script>alert(1)</script></svg>'
+HOSTER_A = "https://rapidgator.net/file/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/a.rar.html"
+HOSTER_B = "https://rg.to/file/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+
+
+def b64(data):
+    return base64.b64encode(data).decode()
+
+
+class ReaderBase(BrowserBase):
+    def setUp(self):
+        super().setUp()
+        self.open("https://example.com/a")
+        self.ws.emit("Target.targetInfoChanged", {"targetInfo": {
+            "targetId": "TARGET00001", "type": "page", "url": "https://example.com/a", "title": ""}})
+        self.barrier()
+
+    def extract(self, **kwargs):
+        value = {"title": "T", "blocks": [], "images": [], "hosters": [], "truncated": False}
+        value.update(kwargs)
+        self.ws.eval_map = [("document.baseURI", value)] + [e for e in self.ws.eval_map if "document.baseURI" not in e[0]]
+        return self.rb.reader("b1")
+
+    @staticmethod
+    def para(text="x", **run):
+        return {"t": "p", "runs": [dict({"text": text}, **run)]}
+
+
+class ReaderExtractorTests(ReaderBase):
+    def test_fixed_extractor_runs_in_the_page_and_returns_plain_data(self):
+        self.extract()
+        call = [m for m in self.ws.calls("Runtime.evaluate") if "document.baseURI" in m["params"]["expression"]][0]
+        self.assertEqual(call["params"]["expression"], rb.READER_JS)
+        self.assertTrue(call["params"]["returnByValue"])
+        self.assertEqual(call["sessionId"], "SESSION1")
+        script = rb.READER_JS
+        for needle in ("(^|[-_])(ad|ads|advert|banner|sponsor|promo|popup|cookie)([-_]|$)",
+                       "NAV:1", "ASIDE:1", "FOOTER:1", "HEADER:1", "FORM:1", "SCRIPT:1", "STYLE:1",
+                       "aria-hidden", "node.hidden", "cs.display==='none'", "rapidgator", "rg\\.to",
+                       "/^https?:/i"):
+            self.assertIn(needle, script)
+        for needle in ("__CAP__", "__TMAX__", "__BUDGET__", "__IMGCAP__", "__RUNCAP__"):
+            self.assertNotIn(needle, script)
+        # it only reads: no navigation, no network, no storage
+        for forbidden in ("fetch(", "XMLHttpRequest", "location.href=", "location.assign", "document.cookie",
+                          "localStorage", "eval(", "innerHTML", "window.open"):
+            self.assertNotIn(forbidden, script)
+
+    def test_output_types_and_fields_are_validated(self):
+        data = self.extract(title="  Page title\x00 ", images=["https://cdn.example.org/a.jpg"], blocks=[
+            {"t": "h", "level": 1, "text": " Heading "},
+            {"t": "p", "runs": [{"text": "Hello "}, {"text": "world", "href": "https://example.org/x"},
+                                {"text": "bad", "href": "javascript:alert(1)"}]},
+            {"t": "li", "runs": [{"text": "item"}], "depth": 2},
+            {"t": "img", "i": 0, "alt": "pic", "w": 640, "h": 480, "href": "http://example.org/big"},
+            {"t": "pre", "text": "code\n  x"},
+            {"t": "hr"},
+        ])
+        self.assertEqual(data["title"], "Page title")
+        self.assertEqual(data["host"], "example.com")
+        self.assertEqual(data["blocks"], [
+            {"t": "h", "level": 1, "text": "Heading"},
+            {"t": "p", "runs": [{"text": "Hello "}, {"text": "world", "href": "https://example.org/x"},
+                                {"text": "bad"}]},
+            {"t": "li", "runs": [{"text": "item"}], "depth": 2},
+            {"t": "img", "i": 0, "alt": "pic", "w": 640, "h": 480, "href": "http://example.org/big"},
+            {"t": "pre", "text": "code\n  x"},
+            {"t": "hr"},
+        ])
+        self.assertEqual((data["count"], data["truncated"]), (6, False))
+
+    def test_malformed_blocks_are_dropped(self):
+        data = self.extract(images=["https://cdn.example.org/a.jpg", "javascript:1"], blocks=[
+            "text", None, 5, [], {}, {"t": "script", "text": "x"}, {"t": "h", "level": 9, "text": "x"},
+            {"t": "h", "level": True, "text": "x"}, {"t": "h", "level": 1, "text": 5},
+            {"t": "h", "level": 1, "text": "   "}, {"t": "p"}, {"t": "p", "runs": "x"},
+            {"t": "p", "runs": [{"text": 5}, {"href": "https://example.org/"}, "x"]},
+            {"t": "p", "runs": [{"text": "   "}]}, {"t": "li", "runs": []}, {"t": "pre", "text": "  "},
+            {"t": "pre", "text": 5},
+            {"t": "img", "i": 5, "alt": "x", "w": 1, "h": 1},          # outside the table
+            {"t": "img", "i": 1, "alt": "x", "w": 1, "h": 1},          # its URL was refused
+            {"t": "img", "i": -1}, {"t": "img", "i": True}, {"t": "img", "i": "0"},
+            {"t": "li", "runs": [{"text": "ok"}], "depth": 99},         # bad depth -> 0
+            {"t": "img", "i": 0, "alt": 5, "w": "x", "h": -3, "href": "ftp://x/y"},
+        ])
+        self.assertEqual(data["blocks"], [
+            {"t": "li", "runs": [{"text": "ok"}], "depth": 0},
+            {"t": "img", "i": 0, "alt": "", "w": 0, "h": 0},
+        ])
+
+    def test_hrefs_are_http_or_https_only_and_bounded(self):
+        bad = ["javascript:alert(1)", "data:text/html,x", "ftp://example.org/x", "file:///etc/passwd",
+               "//example.org/x", "https://", "https://exa mple.org/", "https://example.org/\n",
+               "https://example.org/" + "a" * 2100, "", None, 5]
+        runs = [{"text": "t%d" % i, "href": h} for i, h in enumerate(bad)]
+        runs += [{"text": "ok1", "href": "https://example.org/ok"}, {"text": "ok2", "href": "http://example.org/ok"}]
+        data = self.extract(blocks=[{"t": "p", "runs": runs}])
+        got = {r["text"]: r.get("href") for r in data["blocks"][0]["runs"]}
+        self.assertEqual({k: v for k, v in got.items() if v}, {"ok1": "https://example.org/ok", "ok2": "http://example.org/ok"})
+
+    def test_text_is_capped_and_control_characters_removed(self):
+        data = self.extract(blocks=[
+            {"t": "p", "runs": [{"text": "a\x00b\x07c\x1bd\ne\tf"}]},
+            {"t": "p", "runs": [{"text": "x" * 30000}]},
+            {"t": "pre", "text": "y" * 30000},
+            {"t": "h", "level": 2, "text": "z" * 30000},
+            {"t": "p", "runs": [{"text": "r" * 15000}, {"text": "s" * 15000}]},
+        ])
+        blocks = data["blocks"]
+        self.assertEqual(blocks[0]["runs"][0]["text"], "abcd\ne\tf")
+        self.assertEqual(len(blocks[1]["runs"][0]["text"]), 20000)
+        self.assertEqual(len(blocks[2]["text"]), 20000)
+        self.assertEqual(len(blocks[3]["text"]), 20000)
+        self.assertEqual(sum(len(r["text"]) for r in blocks[4]["runs"]), 20000)
+
+    def test_block_count_is_capped_at_5000(self):
+        data = self.extract(blocks=[self.para("p%d" % i) for i in range(6000)])
+        self.assertEqual((len(data["blocks"]), data["count"], data["truncated"]), (5000, 5000, True))
+        self.assertEqual(rb.READER_BLOCK_CAP, 5000)
+
+    def test_run_count_per_block_is_capped(self):
+        data = self.extract(blocks=[{"t": "p", "runs": [{"text": "w"} for _ in range(1000)]}])
+        self.assertEqual(len(data["blocks"][0]["runs"]), rb.READER_RUNS_CAP)
+
+    def test_json_size_is_capped_at_2_mb(self):
+        blocks = [{"t": "pre", "text": ("%04d" % i) * 5000} for i in range(150)]      # ~3 MB
+        data = self.extract(blocks=blocks)
+        self.assertTrue(data["truncated"])
+        self.assertLess(len(json.dumps(data, ensure_ascii=False)), 2 * 1024 * 1024)
+        self.assertGreater(len(data["blocks"]), 50)
+
+    def test_hoster_links_are_appended_as_a_final_block_even_from_skipped_areas(self):
+        data = self.extract(blocks=[self.para("see", href=HOSTER_B)], hosters=[
+            HOSTER_A, HOSTER_B, HOSTER_A, "https://example.org/file/1", "https://evilrapidgator.net/file/1",
+            "https://rapidgator.net.evil.example/file/1", "javascript:1", "http://rapidgator.net/file/ccccccccccccccccccccccccccccccc1"])
+        self.assertEqual(data["blocks"][-2:], [
+            {"t": "li", "runs": [{"text": HOSTER_A, "href": HOSTER_A}], "depth": 0},
+            {"t": "li", "runs": [{"text": "http://rapidgator.net/file/ccccccccccccccccccccccccccccccc1",
+                                  "href": "http://rapidgator.net/file/ccccccccccccccccccccccccccccccc1"}], "depth": 0}])
+        self.assertEqual(data["blocks"][-3], {"t": "h", "level": 2, "text": "ダウンロードリンク"})
+        self.assertEqual(data["hoster_links"], 2)           # HOSTER_B is already in the content
+        # nothing to append: no extra block
+        plain = self.extract(blocks=[self.para("x")], hosters=["https://example.org/x"])
+        self.assertEqual(len(plain["blocks"]), 1)
+
+    def test_hoster_links_survive_the_block_cap(self):
+        hosters = ["https://rapidgator.net/file/%032x" % i for i in range(150)]
+        data = self.extract(blocks=[self.para("p%d" % i) for i in range(6000)], hosters=hosters)
+        self.assertLessEqual(len(data["blocks"]), 5000)
+        self.assertEqual(data["blocks"][-(rb.READER_HOSTER_CAP + 1)]["text"], "ダウンロードリンク")
+        self.assertEqual(data["hoster_links"], 100)
+        self.assertEqual(data["blocks"][-1]["runs"][0]["href"], hosters[99])
+
+    def test_image_urls_never_reach_the_client(self):
+        secret = "https://cdn.example.org/private/token-123.jpg"
+        data = self.extract(images=[secret], blocks=[{"t": "img", "i": 0, "alt": "a", "w": 1, "h": 1}])
+        self.assertNotIn(secret, json.dumps(data))
+        self.assertNotIn("images", data)
+        self.assertEqual(self.rb._tabs["b1"].reader_images, [secret])
+
+    def test_image_table_is_capped_and_invalid_urls_are_blanked(self):
+        urls = ["https://cdn.example.org/%d.jpg" % i for i in range(400)]
+        urls[1] = "javascript:1"
+        data = self.extract(images=urls, blocks=[
+            {"t": "img", "i": 299, "alt": "", "w": 1, "h": 1}, {"t": "img", "i": 300, "alt": "", "w": 1, "h": 1},
+            {"t": "img", "i": 1, "alt": "", "w": 1, "h": 1}])
+        table = self.rb._tabs["b1"].reader_images
+        self.assertEqual((len(table), table[1]), (300, None))
+        self.assertEqual([b["i"] for b in data["blocks"]], [299])
+
+    def test_non_object_result_is_refused(self):
+        for value in (None, [], "x", 5):
+            with self.subTest(value=value):
+                self.ws.eval_map = [("document.baseURI", value)]
+                with self.assertRaises(rb.BrowserError):
+                    self.rb.reader("b1")
+
+    def test_unknown_tab(self):
+        with self.assertRaises(rb.TabGone):
+            self.rb.reader("b9")
+        with self.assertRaises(rb.BrowserError):
+            self.rb.reader("../x")
+
+    def test_title_falls_back_to_the_tab_title(self):
+        self.ws.emit("Target.targetInfoChanged", {"targetInfo": {
+            "targetId": "TARGET00001", "type": "page", "url": "https://example.com/a", "title": "Tab title"}})
+        self.barrier()
+        self.assertEqual(self.extract(title="")["title"], "Tab title")
+
+
+class ReaderImageTests(ReaderBase):
+    URL = "https://cdn.example.org/pics/a.png"
+
+    def setUp(self):
+        super().setUp()
+        self.extract(images=[self.URL], blocks=[{"t": "img", "i": 0, "alt": "", "w": 1, "h": 1}])
+
+    def tree(self, url=None, type_="Image", child=False):
+        resource = {"url": url or self.URL, "type": type_, "mimeType": "image/png"}
+        frame = {"frame": {"id": "FRAME1"}, "resources": [] if child else [resource]}
+        if child:
+            frame["childFrames"] = [{"frame": {"id": "CHILD1"}, "resources": [resource]}]
+        return {"frameTree": frame}
+
+    def content(self, data, encoded=True):
+        calls = []
+
+        def answer(params):
+            calls.append(params)
+            return {"content": b64(data) if encoded else data.decode("latin-1"), "base64Encoded": encoded}
+        self.ws.results["Page.getResourceContent"] = answer
+        return calls
+
+    def fetch_calls(self):
+        return [m for m in self.ws.calls("Runtime.evaluate") if "credentials:'include'" in m["params"]["expression"]]
+
+    def test_loaded_image_comes_from_the_resource_tree(self):
+        self.ws.results["Page.getResourceTree"] = self.tree()
+        calls = self.content(PNG)
+        self.assertEqual(self.rb.reader_image("b1", 0), (PNG, "image/png"))
+        self.assertEqual(calls, [{"frameId": "FRAME1", "url": self.URL}])
+        self.assertEqual(self.fetch_calls(), [])
+        self.assertEqual(self.ws.calls("Page.getResourceTree")[0]["sessionId"], "SESSION1")
+
+    def test_resource_in_a_child_frame_uses_that_frame_id(self):
+        self.ws.results["Page.getResourceTree"] = self.tree(child=True)
+        calls = self.content(JPEG)
+        self.assertEqual(self.rb.reader_image("b1", 0), (JPEG, "image/jpeg"))
+        self.assertEqual(calls[0]["frameId"], "CHILD1")
+
+    def test_only_image_resources_with_the_exact_url_count(self):
+        for tree in (self.tree(type_="Script"), self.tree(url=self.URL + "?x=1")):
+            with self.subTest(tree=tree):
+                self.ws.results["Page.getResourceTree"] = tree
+                self.ws.eval_map = [("credentials:'include'", {"d": b64(PNG)})]
+                self.assertEqual(self.rb.reader_image("b1", 0), (PNG, "image/png"))
+                self.assertEqual(self.ws.calls("Page.getResourceContent"), [])
+
+    def test_fetch_inside_the_page_is_the_fallback(self):
+        self.ws.results["Page.getResourceTree"] = {"frameTree": {"frame": {"id": "F"}, "resources": []}}
+        self.ws.eval_map = [("credentials:'include'", {"d": b64(JPEG)})]
+        self.assertEqual(self.rb.reader_image("b1", 0), (JPEG, "image/jpeg"))
+        call = self.fetch_calls()[0]
+        self.assertTrue(call["params"]["awaitPromise"])
+        self.assertTrue(call["params"]["returnByValue"])
+        self.assertIn(json.dumps(self.URL), call["params"]["expression"])
+        self.assertIn(",%d)" % rb.IMAGE_MAX_BYTES, call["params"]["expression"])
+        self.assertIn("arrayBuffer", call["params"]["expression"])
+
+    def test_fetch_is_used_when_the_tree_call_fails(self):
+        self.ws.fail["Page.getResourceTree"] = "not supported"
+        self.ws.eval_map = [("credentials:'include'", {"d": b64(GIF)})]
+        self.assertEqual(self.rb.reader_image("b1", 0), (GIF, "image/gif"))
+
+    def test_both_paths_failing_is_unavailable(self):
+        self.ws.results["Page.getResourceTree"] = self.tree()
+        self.ws.fail["Page.getResourceContent"] = "No resource"
+        for value in ({"err": "fetch"}, {"err": "status"}, {"err": "type"}, None, "x", {}):
+            with self.subTest(value=value):
+                self.ws.eval_map = [("credentials:'include'", value)]
+                with self.assertRaises(rb.ImageUnavailable):
+                    self.rb.reader_image("b1", 0)
+
+    def test_size_cap_is_4_mb_on_both_paths(self):
+        big = JPEG + b"\x00" * (rb.IMAGE_MAX_BYTES + 1)
+        self.ws.results["Page.getResourceTree"] = self.tree()
+        self.content(big)
+        with self.assertRaises(rb.ImageRefused):
+            self.rb.reader_image("b1", 0)
+        self.content(JPEG + b"\x00" * (rb.IMAGE_MAX_BYTES - len(JPEG)))      # exactly 4 MB is fine
+        self.assertEqual(self.rb.reader_image("b1", 0)[1], "image/jpeg")
+        self.ws.results["Page.getResourceTree"] = self.tree(type_="Other")
+        self.ws.eval_map = [("credentials:'include'", {"d": b64(big)})]
+        with self.assertRaises(rb.ImageRefused):
+            self.rb.reader_image("b1", 0)
+        self.ws.eval_map = [("credentials:'include'", {"err": "size"})]
+        with self.assertRaises(rb.ImageRefused):
+            self.rb.reader_image("b1", 0)
+        self.ws.eval_map = [("credentials:'include'", {"d": "not base64 !!"})]
+        with self.assertRaises(rb.ImageRefused):
+            self.rb.reader_image("b1", 0)
+
+    def test_svg_is_refused_everywhere(self):
+        self.ws.results["Page.getResourceTree"] = self.tree()
+        self.content(SVG, encoded=False)                       # text content of a loaded SVG
+        with self.assertRaises(rb.ImageRefused):
+            self.rb.reader_image("b1", 0)
+        self.content(SVG)                                      # even if it were delivered as base64
+        with self.assertRaises(rb.ImageRefused):
+            self.rb.reader_image("b1", 0)
+        self.ws.results["Page.getResourceTree"] = self.tree(type_="Other")
+        self.ws.eval_map = [("credentials:'include'", {"d": b64(SVG)})]
+        with self.assertRaises(rb.ImageRefused):
+            self.rb.reader_image("b1", 0)
+        self.assertIn("image/svg", "image/svg+xml")
+        self.assertNotIn("svg", json.dumps(sorted(set(rb.RemoteBrowser.sniff_image(d) or "" for d in (PNG, JPEG, GIF, WEBP, AVIF)))))
+
+    def test_type_is_sniffed_from_the_bytes_not_trusted(self):
+        cases = ((JPEG, "image/jpeg"), (PNG, "image/png"), (GIF, "image/gif"), (WEBP, "image/webp"),
+                 (AVIF, "image/avif"), (b"GIF87a" + b"\x00" * 10, "image/gif"))
+        for data, kind in cases:
+            with self.subTest(kind=kind):
+                self.assertEqual(rb.RemoteBrowser.sniff_image(data), kind)
+        for data in (b"", b"<html>", SVG, b"RIFF\x00\x00\x00\x00WAVEfmt ", b"\x00" * 40, b"BM" + b"\x00" * 20,
+                     b"\x00\x00\x00\x1cftypmp42" + b"\x00" * 20):
+            with self.subTest(data=data[:12]):
+                self.assertIsNone(rb.RemoteBrowser.sniff_image(data))
+        self.ws.results["Page.getResourceTree"] = self.tree()
+        self.content(b"<html><body>not an image</body></html>")
+        with self.assertRaises(rb.ImageRefused):
+            self.rb.reader_image("b1", 0)
+        # labelled as a PNG resource, but the bytes are a JPEG: the sniffed type wins
+        self.content(JPEG)
+        self.assertEqual(self.rb.reader_image("b1", 0)[1], "image/jpeg")
+
+    def test_unknown_or_refused_index(self):
+        self.ws.results["Page.getResourceTree"] = self.tree()
+        self.content(PNG)
+        for index in (1, 299, 10 ** 6):
+            with self.subTest(index=index), self.assertRaises(rb.ReaderImageGone):
+                self.rb.reader_image("b1", index)
+        self.assertTrue(issubclass(rb.ReaderImageGone, rb.TabGone))          # HTTP 404
+        for index in (-1, True, "0", None, 1.5):
+            with self.subTest(index=index), self.assertRaises(rb.BrowserError):
+                self.rb.reader_image("b1", index)
+        with self.assertRaises(rb.TabGone):
+            self.rb.reader_image("b9", 0)
+        # a new reader run replaces the table: the old index may be gone
+        self.extract(images=[], blocks=[])
+        with self.assertRaises(rb.ReaderImageGone):
+            self.rb.reader_image("b1", 0)
+
+    def test_refused_url_in_the_table_is_not_fetched(self):
+        self.extract(images=["javascript:1"], blocks=[])
+        with self.assertRaises(rb.ReaderImageGone):
+            self.rb.reader_image("b1", 0)
+        self.assertEqual(self.fetch_calls(), [])
+
+    def test_only_fixed_cdp_methods_are_used_by_the_reader(self):
+        self.ws.results["Page.getResourceTree"] = self.tree()
+        self.content(PNG)
+        self.rb.reader_image("b1", 0)
+        self.ws.eval_map += [("credentials:'include'", {"d": b64(PNG)})]
+        self.ws.results["Page.getResourceTree"] = self.tree(type_="Other")
+        self.rb.reader_image("b1", 0)
+        allowed = {"Target.setDiscoverTargets", "Browser.setDownloadBehavior", "Target.getTargets",
+                   "Target.createTarget", "Target.attachToTarget", "Page.enable",
+                   "Emulation.setFocusEmulationEnabled", "Page.navigate", "Runtime.evaluate",
+                   "Fetch.enable", "Emulation.setEmulatedMedia", "Network.enable",
+                   "Network.setBlockedURLs", "Page.getResourceTree", "Page.getResourceContent"}
+        self.assertLessEqual(set(self.ws.methods()), allowed)
+
+
+# ------------------------------------------------------------ v0.1.30: MJPEG stream
+class StreamTests(BrowserBase):
+    def setUp(self):
+        super().setUp()
+        self.open("https://example.com/a")
+        self.parts = []
+        self.lock = threading.Lock()
+        self.threads = []
+        self.addCleanup(self.finish)
+
+    def finish(self):
+        for tab in list(self.rb._tabs):
+            try:
+                self.rb.close_tab(tab)
+            except rb.BrowserError:
+                pass
+        for t in self.threads:
+            t.join(timeout=3)
+
+    def run_stream(self, ident="b1", write=None, **kwargs):
+        out = []
+        errors = []
+
+        def writer(part):
+            with self.lock:
+                out.append(part)
+            if write:
+                write(part)
+
+        def target():
+            try:
+                self.rb.stream(ident, writer, **kwargs)
+            except Exception as error:
+                errors.append(error)
+        thread = threading.Thread(target=target, daemon=True)
+        thread.start()
+        self.threads.append(thread)
+        return out, errors, thread
+
+    def wait_for(self, condition, timeout=3.0):
+        end = time.monotonic() + timeout
+        while time.monotonic() < end:
+            if condition():
+                return True
+            time.sleep(0.01)
+        return False
+
+    def jpeg(self, data):
+        return base64.b64encode(data).decode()
+
+    @staticmethod
+    def split(part):
+        head, _, rest = part.partition(b"\r\n\r\n")
+        lines = head.split(b"\r\n")
+        length = int([l for l in lines if l.startswith(b"Content-Length:")][0].split(b":")[1])
+        return lines, rest[:length], rest[length:]
+
+    def test_parts_have_boundary_type_and_exact_lengths(self):
+        out, errors, thread = self.run_stream()
+        self.assertTrue(self.wait_for(lambda: self.rb._tabs["b1"].streams == 1))
+        for data in (b"\xff\xd8\xff-one", b"\xff\xd8\xff-second-frame"):
+            before = len(out)
+            self.feed("SESSION1", data=self.jpeg(data))
+            self.assertTrue(self.wait_for(lambda: len(out) > before))
+            lines, body, tail = self.split(out[-1])
+            self.assertEqual(lines[0], b"--qdlframe")
+            self.assertIn(b"Content-Type: image/jpeg", lines)
+            self.assertIn(b"Content-Length: %d" % len(data), lines)
+            self.assertEqual((body, tail), (data, b"\r\n"))
+        self.rb.close_tab("b1")
+        thread.join(3)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(errors, [])
+
+    def test_a_slow_writer_gets_only_the_newest_frame(self):
+        gate = threading.Event()
+        first = []
+
+        def slow_first(part):
+            if not first:
+                first.append(1)
+                gate.wait(3)
+        out, errors, thread = self.run_stream(write=slow_first)
+        self.assertTrue(self.wait_for(lambda: self.rb._tabs["b1"].streams == 1))
+        self.feed("SESSION1", data=self.jpeg(b"\xff\xd8\xff-A"))
+        self.assertTrue(self.wait_for(lambda: len(out) == 1))
+        for name in (b"B", b"C", b"D"):    # arrive while the writer is blocked
+            self.feed("SESSION1", data=self.jpeg(b"\xff\xd8\xff-" + name))
+        gate.set()
+        self.assertTrue(self.wait_for(lambda: len(out) >= 2))
+        self.assertEqual(self.split(out[1])[1], b"\xff\xd8\xff-D")
+        time.sleep(0.2)
+        self.assertEqual(len(out), 2)      # B and C were skipped, nothing is repeated early
+
+    def test_heartbeat_resends_the_last_frame(self):
+        out, errors, thread = self.run_stream(heartbeat=0.2)
+        self.assertTrue(self.wait_for(lambda: self.rb._tabs["b1"].streams == 1))
+        time.sleep(0.5)
+        self.assertEqual(out, [])          # no frame yet: nothing to repeat
+        self.feed("SESSION1", data=self.jpeg(b"\xff\xd8\xff-HB"))
+        self.assertTrue(self.wait_for(lambda: len(out) >= 3, 3.0))
+        self.assertEqual({self.split(p)[1] for p in out[:3]}, {b"\xff\xd8\xff-HB"})
+
+    def test_limits_per_tab_and_overall(self):
+        outs = [self.run_stream("b1"), self.run_stream("b1")]
+        self.assertTrue(self.wait_for(lambda: self.rb._tabs["b1"].streams == 2))
+        with self.assertRaises(rb.StreamLimit) as caught:
+            self.rb.stream("b1", lambda part: None)
+        self.assertTrue(issubclass(rb.StreamLimit, rb.ProbeQueueFull))        # HTTP 429
+        self.assertIn("同時接続", str(caught.exception))
+        self.open("https://example.com/b")
+        self.open("https://example.com/c")
+        outs += [self.run_stream("b2"), self.run_stream("b2")]
+        self.assertTrue(self.wait_for(lambda: self.rb._streams == 4))
+        with self.assertRaises(rb.StreamLimit):
+            self.rb.stream("b3", lambda part: None)
+        self.assertEqual(self.rb._tabs["b3"].streams, 0)
+        self.rb.close_tab("b2")
+        self.assertTrue(self.wait_for(lambda: self.rb._streams == 2))
+        self.rb.close_tab("b1")
+        self.assertTrue(self.wait_for(lambda: self.rb._streams == 0))
+        self.assertEqual([e for _, e, _ in outs], [[], [], [], []])
+
+    def test_ends_after_max_seconds_on_write_error_and_on_container_stop(self):
+        out, errors, thread = self.run_stream(max_seconds=0.3)
+        thread.join(3)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual((errors, self.rb._streams, self.rb._tabs["b1"].streams), ([], 0, 0))
+
+        def broken(part):
+            raise OSError("peer left")
+        out, errors, thread = self.run_stream(write=broken)
+        self.assertTrue(self.wait_for(lambda: self.rb._tabs["b1"].streams == 1))
+        self.feed("SESSION1", data=self.jpeg(b"\xff\xd8\xff-x"))
+        thread.join(3)
+        self.assertIsInstance(errors[0], OSError)
+        self.assertEqual((self.rb._streams, self.rb._tabs["b1"].streams, self.rb._tabs["b1"].pollers), (0, 0, 0))
+
+        out, errors, thread = self.run_stream()
+        self.assertTrue(self.wait_for(lambda: self.rb._tabs["b1"].streams == 1))
+        self.rb.stop()
+        thread.join(3)
+        self.assertFalse(thread.is_alive())
+
+    def test_unknown_tab_and_the_stream_counts_as_viewer_activity(self):
+        with self.assertRaises(rb.TabGone):
+            self.rb.stream("b9", lambda part: None)
+        with self.assertRaises(rb.BrowserError):
+            self.rb.stream("../x", lambda part: None)
+        out, errors, thread = self.run_stream()
+        self.assertTrue(self.wait_for(lambda: self.rb._tabs["b1"].streams == 1))
+        tab = self.rb._tabs["b1"]
+        self.assertTrue(self.wait_for(lambda: self.ws.calls("Page.startScreencast")))
+        self.assertEqual((tab.screencast, tab.pollers), (True, 1))     # idle-stop sees a viewer
+        self.clock.now += 100
+        self.feed("SESSION1", data=self.jpeg(b"\xff\xd8\xff-act"))
+        self.assertTrue(self.wait_for(lambda: len(out) == 1))
+        self.assertEqual(self.rb._last_activity, self.clock.now)
+        self.clock.now += rb.VIEWER_STOP_AFTER + 1
+        self.rb.tick()
+        self.assertTrue(tab.screencast)       # not stopped while a stream is attached
+
+    def test_meta_reports_stream_fps_and_the_links_rev(self):
+        out, errors, thread = self.run_stream()
+        self.assertTrue(self.wait_for(lambda: self.rb._tabs["b1"].streams == 1))
+        for i in range(6):
+            self.feed("SESSION1", data=self.jpeg(b"\xff\xd8\xff-%d" % i))
+            self.assertTrue(self.wait_for(lambda: len(out) >= 1))
+            time.sleep(0.02)
+        meta = self.rb.page_meta("b1", None, wait=0)
+        self.assertGreater(meta["fps"], 0)
+        self.assertEqual((meta["streams"], meta["width"], meta["height"]), (1, 1280, 2000))
+        self.assertGreater(meta["frame_bytes"], 0)
+        self.assertIn("links_rev", meta)
+        self.rb.close_tab("b1")
+        thread.join(3)
+        self.assertEqual(self.rb.page_meta.__name__, "page_meta")

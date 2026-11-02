@@ -148,7 +148,7 @@ QnapDownloaderの画面を「普段使っているWebブラウザ」と同じ感
 
 設定に「HTTPS接続」（`#/settings/https`、保存先の次）と「iPhoneから送る」（`#/settings/share`）を追加。リンク画面は `#/links?paste=<URLエンコード>` で貼り付け欄に事前入力できる（自動保存なし）。HTTP接続のWebタブのCloudflareヒントに「HTTPSで開くと通過しやすくなります」リンクを表示。詳細は [https-and-share.md](https-and-share.md)。
 
-## v0.1.14 常にSafariで開く / Webタブの簡素化
+## v0.1.14 常にSafariで開く / Webタブの簡素化（v0.1.30で「Safariで開く」系は廃止）
 
 実機（iPhone、Tailscale ServeのHTTPS、互換モード）で、Cloudflare保護のサイトが枠内で完全に空白のまま（確認の文言すら出ない）になった。サイト側が埋め込みを拒否しているため、ホスト単位で「常にSafariで開く」を選べるようにした。セキュリティ不変条件（sandbox値、`innerHTML`不使用、検証済みURLのみ、ストレージに秘密なし）は変更なし。
 
@@ -236,3 +236,34 @@ Cloudflare等で手元のブラウザ（iframe）では開けないサイトを�
 - `POST /api/rb/snapshot/release {tab}`（ライブへ切り替えたときにタイルをRAMから解放）。
 - `GET /api/rb/meta?tab=&rev=&wait=`: スクリーンキャストを始めないタブのメタデータ（URL・タイトル・読み込み・検出数・`challenge`・最新の`snap`）のロングポーリング。
 - `POST /api/rb/probe` は `href` を受け付ける（`x`,`y` の代わり）。いずれも管理者ログイン必須、POSTはCSRF＋Origin。
+
+
+## v0.1.30 NASブラウザ: リンク認識の強化・リーダー表示・表示方法の選択（実機未検証）
+
+### 表示方法（設定 › NASブラウザ「既定の表示方法」）
+- 3つ: **リーダー** / **高速（全体表示）** / **ライブ**。DB設定 `rb_default_mode`（`reader`/`fast`/`live`、既定 `fast`）。
+- サイトごとの記憶（端末のホスト別マップ）が優先。値は `remote`（設定の既定に従う）・`remote-fast`・`remote-live`・`remote-reader`。⋯メニューの「表示」で3つとも選べる。
+- Cloudflareの確認画面は従来どおり自動でライブになり、終わると選択中の表示へ戻る（ボタンは「元の表示に戻す」）。
+- 「リンクの枠を表示」（`rb_link_boxes`、既定OFF）: 高速・ライブでリンク範囲に薄い枠線を重ねる（端末側のオーバーレイ、pointer-events なし）。
+
+### リンクの認識（全表示）
+- 端末側: 長押し位置を含むリンク枠、なければ28 CSS px以内で最も近い枠（同距離は面積の小さい方）。なければHubへ座標で問い合わせ（高速表示はスナップショットIDとページ座標、Hubがスクロールして変換）。
+- Hub側の座標解決も同じ許容: `elementFromPoint`→`closest('a[href]')`、なければ全アンカーの `getClientRects()` で28px以内の最近傍。
+- ライブ表示: `GET /api/rb/meta?tab=&links=1[&vp=<rev>][&fresh=1]` が `viewport_links` `{rev, scrollX, scrollY, width, height, links:[{x,y,w,h,href}]}`（ビューポート基準CSS px、最大600件、http(s)のみ）を返す。ページに注入したフラグ（スクロール終了200msデバウンス、リサイズ、MutationObserver）が変化を示すときだけ再走査し、画面フレームごとに `X-Frame-Links-Rev` が進む。端末はライブ表示中かつ画面が見えているときだけ取得（最短500ms間隔）。長押し直前に古ければ `fresh=1` で取り直す。
+
+### リーダー表示
+- `POST /api/rb/reader {tab}`: 固定の抽出スクリプトをページ内で実行（本文を文書順にたどる）。出力ブロック `h`/`p`（runs: text, href?）/`li`（depth）/`img`（i, alt, w, h, href?）/`pre`/`hr`。script/style/nav/aside/footer/header/form・非表示・広告らしいclass/id・極小/画面外要素は除外。除外領域にあるRapidgator系リンクも最後の「ダウンロードリンク」ブロックに追加。上限: 5000ブロック、JSON 2MB、1ブロックの文字数20000。Hubが全フィールドの型・長さ・hrefを再検証する（http/https・2048文字まで）。
+- 画像URLは端末へ送らない（Hubが画像番号→URL表を持つ、1タブ300件）。`GET /api/rb/reader/img?tab=&i=`: 読み込み済みなら `Page.getResourceTree`＋`Page.getResourceContent`、なければページ内 `fetch(url,{credentials:'include'})`。4MB上限、種別はマジックバイトで判定（JPEG/PNG/GIF/WebP/AVIFのみ。SVGは拒否）、`Cache-Control: no-store`・`nosniff`。不明な番号は404、拒否は415、取得失敗は502。
+- 端末は `createElement`/`textContent` だけで組み立て（innerHTMLなし）。リンクは `<a data-href>`（実際のhrefなし）: タップでNASブラウザが遷移（読み込み後に再抽出）、長押しは正確なhrefでそのまま確認。画像はIntersectionObserverで遅延読み込み（blob URL、遠くなったら解放）。ネイティブスクロール・ピンチ・文字選択が使える。
+
+### Webタブまわりの整理
+- 表示されない場合のバーは折り返し可で「NASブラウザ」を先頭に、「互換」を続ける（各36px以上）。
+- 「Safariで開く」系（Webタブ行のボタン、バー、⋯メニュー、ホスト別の「常にSafariで開く」、設定の一覧）は廃止。保存済みの `external` は読み込み時に `remote`（NASブラウザの既定表示）へ変換。iPhoneの共有シート／ブックマークレット（設定 › iPhoneから送る）は残る。
+
+### ライブ表示のストリーム（MJPEG push）
+- `GET /api/rb/stream.mjpg?tab=ID`（ログイン必須、Host/接続元チェックは他と同じ）: `multipart/x-mixed-replace; boundary=qdlframe`、`Cache-Control: no-store`。各パートは `Content-Type: image/jpeg` と `Content-Length` 付き。最新フレームだけを即送信し、書き込みが遅いときは途中のフレームを飛ばす。15秒フレームが来なければ最後のフレームを再送（ハートビート）。書き込みエラー・タブ閉鎖・コンテナ停止・10分経過で終了。
+- 上限: 1タブ2本、全体4本、超過は429。ストリームは閲覧中としてカウントされ（アイドル停止の判定に入る）、他のリクエストを止めない（デーモンスレッド、ソケットのタイムアウト10秒）。最初のフレームが届いた時点で応答が始まる。
+- 端末: ライブ表示では `<img>` の `src` を同一オリジンのストリームURLにする。タブ情報・リンク位置表の版・fpsは `/api/rb/meta`（2秒ロングポーリング）から受け取る（fpsはHub側で直近3秒から算出）。ストリームが10秒以内に2回エラーになるか、5秒以内に画像が出ない場合は、そのタブだけ従来の `frame.jpg` ポーリングへ切り替える。タブが非表示・切替・表示方法の変更・ログアウトの際はストリームを閉じる（`src` を外す）。
+
+### 速度表示（⋯ › 速度表示）
+- 先頭に表示の種類と方式を出す。ライブ（ストリーム）: 「ライブ(ストリーム)・速度優先 · 9.8 fps · 22 KB/枚 · 応答 120 ms」（応答は最初の画像が出るまで）。ライブ（ポーリング）: 「ライブ(ポーリング)・標準 · …」。高速: 「高速(全体表示)・速度優先 · タイル 4/12 · 撮影 850 ms · 1枚 140 KB」。リーダー: 「リーダー · ブロック 230 · 画像 12/40 · 取得 600 ms」（抽出時間、画像があれば「画像取得 ○ ms」の平均を追記）。fps以外は端末側で計測。

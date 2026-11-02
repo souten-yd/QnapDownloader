@@ -93,13 +93,13 @@
      <button type="button" role="menuitem" data-action="toggleMode" data-scope="web" id="menuMode">限定操作モードに切り替え</button>
      <button type="button" role="menuitem" data-action="compatMode" data-scope="web" id="menuCompat">互換モードに切り替え</button>
      <button type="button" role="menuitem" data-action="remoteOpen" data-scope="web" id="menuRemote">NASブラウザで開く</button>
+     <button type="button" role="menuitem" data-action="display:reader" data-display="reader" data-scope="remote">表示: リーダー</button>
      <button type="button" role="menuitem" data-action="display:tiles" data-display="tiles" data-scope="remote">表示: 高速（全体表示）</button>
      <button type="button" role="menuitem" data-action="display:live" data-display="live" data-scope="remote">表示: ライブ</button>
      <button type="button" role="menuitem" data-action="quality:speed" data-quality="speed" data-scope="remote">画質: 速度優先</button>
      <button type="button" role="menuitem" data-action="quality:standard" data-quality="standard" data-scope="remote">画質: 標準</button>
      <button type="button" role="menuitem" data-action="quality:high" data-quality="high" data-scope="remote">画質: 高画質</button>
      <button type="button" role="menuitem" data-action="perf" data-scope="remote" id="menuPerf">速度表示</button>
-     <button type="button" role="menuitem" data-action="external" data-scope="web">Safari／外部ブラウザで開く</button>
      <button type="button" role="menuitem" data-action="stageUrl" data-scope="web">このURLを追加したリンクへ</button>
      <button type="button" role="menuitem" data-action="bookmark" data-scope="web">ブックマークに追加</button>
      <button type="button" role="menuitem" data-action="closeTab" data-scope="web">タブを閉じる</button>
@@ -355,6 +355,15 @@
       </details>
       <p class="muted">メモリの保護: 空きメモリが2GiB未満、またはブラウザが上限(2GiB)の80%に達しているときはタブを開きません（他のアプリは止めません）。同時に開けるのは3枚までです。</p>
       <p class="muted">自動停止: タブが0枚のまま5分、または10分間操作がないと、コンテナごと停止してメモリを解放します（次回は数秒で再起動）。Webタブを閉じると、対応するNASブラウザのタブも閉じます。</p>
+      <fieldset class="option-group">
+       <legend>既定の表示方法</legend>
+       <label class="rule-toggle"><input type="radio" name="rbDefaultMode" value="reader"> リーダー</label>
+       <label class="rule-toggle"><input type="radio" name="rbDefaultMode" value="fast" checked> 高速（全体表示）</label>
+       <label class="rule-toggle"><input type="radio" name="rbDefaultMode" value="live"> ライブ</label>
+      </fieldset>
+      <p class="muted">NASブラウザのタブを開いたときの表示です。リーダーはページの本文・見出し・画像・リンクだけをNASで取り出して、この端末で組み立て直す読みやすい表示（外部サイトのHTMLやスクリプトは届きません）。高速はページ全体を画像のタイルにして端末側でスクロール、ライブは画面をそのまま中継します。サイトごとに「⋯」メニューの「表示」で選んだ内容が優先されます。Cloudflareの確認画面は自動でライブ表示になり、終わると元の表示に戻ります。</p>
+      <label class="rule-toggle option-row"><input type="checkbox" id="rbLinkBoxes"> リンクの枠を表示</label>
+      <p class="muted">高速・ライブ表示で、リンクと認識されている範囲に薄い枠線を重ねます（タップや長押しには影響しません）。長押しが外れるときの確認用です。</p>
       <label class="rule-toggle option-row"><input type="checkbox" id="probeAutosend" checked> 長押しで見つかったリンクを自動でJD2へ送る</label>
       <p class="muted">ONのとき、長押しでRapidgatorのリンクが見つかると確認なしでJD2へ送ります（送信済みのリンクは除外）。JD2へ送れない状態や送信に失敗したときは、従来どおりシートを開きます。</p>
       <label class="rule-toggle option-row"><input type="checkbox" id="blockAds" checked> 広告をブロック</label>
@@ -440,9 +449,6 @@
        <button type="submit" id="bookmarkAdd" class="btn primary">追加</button>
       </form>
       <div id="bookmarkItems" class="items"></div>
-      <h2>常にSafariで開くサイト</h2>
-      <p class="muted">Webタブで表示できないサイトを、次回からタブを作らずSafariで開く設定です。</p>
-      <div id="externalHosts" class="items"></div>
      </section>
 
      <section class="settings-section" data-section="updates" hidden>
@@ -485,7 +491,7 @@
        <li>初期開発版です。実機（TS-253Be）でのJD2の動作は未検証です。</li>
        <li>自動ダウンロードとサイトの自動巡回はありません。追加したリンクは手動でJD2へ送ります。</li>
        <li>Rapidgatorのリンクは、貼り付けたテキストやHTMLから抽出できます。</li>
-       <li>Webの閲覧は端末側の隔離表示です。表示できないサイトはSafariで開いてください（「Safariで開く（次回から自動）」でサイトごとに記憶できます）。</li>
+       <li>Webの閲覧は端末側の隔離表示です。表示できないサイトは「NASブラウザで開く」を使ってください。</li>
        <li>枠内で遷移した先のURLは読み取れません。サイトが埋め込みを禁止している場合は空白になります。</li>
        <li>互換モードでは、そのサイト自身のCookie・ストレージを枠内で使えます（Hub自体のものではありません）。</li>
       </ul>
@@ -510,9 +516,8 @@
    <div id="webStatus" class="web-status"></div>
    <div id="cfHint" class="cf-hint" role="note" hidden>
     <span class="cf-hint-text">表示されない場合:</span>
-    <button type="button" id="cfSafari" class="btn small">Safariで開く（次回から自動）</button>
-    <button type="button" id="cfCompat" class="btn small">互換で再読み込み</button>
-    <button type="button" id="cfRemote" class="btn small">NASブラウザで開く</button>
+    <button type="button" id="cfRemote" class="btn small primary" title="NASブラウザで開く">NASブラウザ</button>
+    <button type="button" id="cfCompat" class="btn small" title="互換で再読み込み">互換</button>
     <button type="button" id="cfDismiss" class="icon-btn small" aria-label="このヒントを閉じる" title="閉じる"><svg class="icon" aria-hidden="true"><use href="#i-x"/></svg></button>
    </div>
    <div id="frames" class="frames"></div>
@@ -520,12 +525,23 @@
     <div id="remoteStage" class="remote-stage">
      <img id="remoteImg" class="remote-img" alt="NASブラウザの画面" draggable="false" hidden>
      <div id="tileScroll" class="tile-scroll" aria-label="NASブラウザのページ（全体表示）" hidden></div>
+     <div id="readerScroll" class="reader-scroll" aria-label="NASブラウザのページ（リーダー表示）" hidden>
+      <div class="reader-head">
+       <div id="readerTitle" class="reader-title" role="heading" aria-level="1"></div>
+       <div class="reader-sub">
+        <span id="readerHost" class="reader-host"></span>
+        <button type="button" id="readerOriginal" class="btn small">元のページ表示に切替</button>
+       </div>
+      </div>
+      <div id="readerBody" class="reader-body"></div>
+     </div>
+     <div id="liveBoxes" class="link-boxes live-boxes" aria-hidden="true"></div>
      <div id="remoteIdle" class="remote-idle">
       <p id="remoteIdleText" class="muted">NASブラウザのタブは開かれていません。</p>
       <button type="button" id="remoteReopen" class="btn primary">NASブラウザで開く</button>
      </div>
      <div id="remoteLoading" class="loading-bar" hidden></div>
-     <button type="button" id="autoLiveChip" class="auto-live-chip" hidden>高速表示に戻す</button>
+     <button type="button" id="autoLiveChip" class="auto-live-chip" hidden>元の表示に戻す</button>
      <div id="snapProgress" class="loading-bar snap-progress" role="progressbar" aria-label="ページを取得中" hidden></div>
      <button type="button" id="tileRefresh" class="tile-refresh" aria-label="再取得" title="再取得" hidden>⟳</button>
      <div id="remoteRing" class="press-ring" aria-hidden="true" hidden></div>

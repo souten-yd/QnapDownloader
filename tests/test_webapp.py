@@ -122,7 +122,8 @@ class HttpTests(unittest.TestCase):
         self.csrf = body["csrf"]
 
     RB_GET = ("/api/rb/status", "/api/rb/log", "/api/rb/frame?tab=b1&since=0", "/api/rb/links?tab=b1",
-              "/api/rb/frame.jpg?tab=b1&since=0&wait=0", "/api/rb/intercepts?tab=b1&since=0")
+              "/api/rb/frame.jpg?tab=b1&since=0&wait=0", "/api/rb/intercepts?tab=b1&since=0",
+              "/api/rb/stream.mjpg?tab=b1")
     RB_POST = (("/api/rb/setup", {"confirmed": True}), ("/api/rb/stop", {"confirmed": True}),
                ("/api/rb/tabs", {"url": "https://example.com/"}), ("/api/rb/tabs/close", {"id": "b1"}),
                ("/api/rb/navigate", {"tab": "b1", "url": "https://example.com/"}),
@@ -174,7 +175,8 @@ class HttpTests(unittest.TestCase):
         code, frame = self.req("/api/rb/frame?tab=b1&since=0&wait=0")
         self.assertEqual(code, 200)
         self.assertEqual(set(frame), {"seq", "jpeg_base64", "width", "height", "url", "title",
-                                      "loading", "blocked", "intercepts", "rev", "popups", "editable", "challenge"})
+                                      "loading", "blocked", "intercepts", "rev", "popups", "editable", "challenge",
+                                  "links_rev"})
         self.assertIsNone(frame["jpeg_base64"])
         self.rb_ws.emit("Page.screencastFrame", {"data": "QUJD", "sessionId": 1, "metadata": {
             "deviceWidth": 1280, "deviceHeight": 2000}}, "SESSION1")
@@ -486,7 +488,7 @@ class HttpTests(unittest.TestCase):
                                          headers={"Host": "192.168.68.57:17864"})
         with self.client.open(request, timeout=4) as response:
             self.assertEqual(response.status, 200)
-            self.assertEqual(json.load(response)["version"], "0.1.29")
+            self.assertEqual(json.load(response)["version"], "0.1.30")
         with self.client.open(self.url + "/icon.svg", timeout=4) as response:
             self.assertEqual(response.status, 200)
             self.assertEqual(response.headers.get_content_type(), "image/svg+xml")
@@ -1315,7 +1317,7 @@ class HttpTests(unittest.TestCase):
         self.assertFalse(info["supported"])
         code, _ = self.req("/api/update/apply", {"version": "v0.1.8"})
         self.assertEqual(code, 400)
-        self.assertEqual(self.req("/api/health")[1]["version"], "0.1.29")
+        self.assertEqual(self.req("/api/health")[1]["version"], "0.1.30")
         self.assertFalse(self.req("/api/jd2/status")[1]["connected"])
         self.assertEqual(self.req("/api/jd2/update/apply", {"confirmed": True})[0], 400)
         self.assertEqual(self.req("/api/jd2/preset/apply", {"confirmed": True})[0], 400)
@@ -1744,6 +1746,118 @@ class HttpTests(unittest.TestCase):
             self.assertEqual((code, body["sent"], body["skipped"], body["error"]), (200, 0, 1, None))
             self.assertEqual(transfer.call_count, 1)
 
+    # ---- v0.1.30: viewport link map, reader mode, display settings -----------------
+    V30_GET = ("/api/rb/reader/img?tab=b1&i=0", "/api/rb/meta?tab=b1&wait=0&links=1&vp=1")
+    V30_POST = (("/api/rb/reader", {"tab": "b1"}),
+                ("/api/rb/probe", {"tab": "b1", "x": 1, "y": 1, "snap": "s1"}),
+                ("/api/settings/options", {"rb_default_mode": "reader"}))
+
+    def test_v0130_endpoints_require_login_csrf_and_origin(self):
+        for path in self.V30_GET:
+            with self.subTest(path=path):
+                self.assertEqual(self.req(path)[0], 401)
+        for path, body in self.V30_POST:
+            with self.subTest(path=path):
+                self.assertIn(self.req(path, body)[0], (401, 403))
+        self.login()
+        for path, body in self.V30_POST:
+            with self.subTest(path=path, case="no csrf"):
+                self.assertEqual(self.req(path, body, csrf=False)[0], 403)
+            with self.subTest(path=path, case="no origin"):
+                self.assertEqual(self.req(path, body, origin=False)[0], 403)
+        self.assertEqual(self.rb_ws.calls("Runtime.evaluate"), [])
+
+    def test_v0130_display_settings_default_persist_and_validate(self):
+        self.login()
+        settings = self.req("/api/settings")[1]
+        self.assertEqual((settings["rb_default_mode"], settings["rb_link_boxes"]), ("fast", False))
+        for mode in ("reader", "live", "fast"):
+            code, body = self.req("/api/settings/options", {"rb_default_mode": mode})
+            self.assertEqual((code, body["rb_default_mode"]), (200, mode))
+            self.assertEqual(self.req("/api/settings")[1]["rb_default_mode"], mode)
+        self.assertIs(self.req("/api/settings/options", {"rb_link_boxes": True})[1]["rb_link_boxes"], True)
+        for bad in ({"rb_default_mode": "tiles"}, {"rb_default_mode": True}, {"rb_default_mode": 1},
+                    {"rb_default_mode": None}, {"rb_link_boxes": "yes"}, {"rb_default_mode": "reader", "x": 1}):
+            with self.subTest(bad=bad):
+                self.assertEqual(self.req("/api/settings/options", bad)[0], 400)
+        self.assertEqual(self.req("/api/settings")[1]["rb_default_mode"], "fast")
+        # written only when it changes
+        before = self.store.revision()
+        self.req("/api/settings/options", {"rb_default_mode": "fast"})
+        self.assertEqual(self.store.revision(), before)
+
+    def test_v0130_meta_carries_the_viewport_link_map_and_frames_the_links_rev(self):
+        self.login()
+        self.req("/api/rb/tabs", {"url": "https://example.com/a"})
+        self.req("/api/rb/viewport", {"tab": "b1", "width": 390, "height": 700, "dpr": 2})
+        self.rb_ws.eval_map = [("__qdlVp", {"scrollX": 0, "scrollY": 40, "width": 390, "height": 700, "links": [
+            {"x": 5, "y": 6, "w": 50, "h": 20, "href": "https://example.org/a"},
+            {"x": 5, "y": 6, "w": 50, "h": 20, "href": "javascript:1"}]})]
+        code, plain = self.req("/api/rb/meta?tab=b1&wait=0")
+        self.assertEqual(code, 200)
+        self.assertNotIn("viewport_links", plain)
+        code, meta = self.req("/api/rb/meta?tab=b1&wait=0&links=1")
+        vp = meta["viewport_links"]
+        self.assertEqual((code, vp["scrollY"], [l["href"] for l in vp["links"]]), (200, 40, ["https://example.org/a"]))
+        code, again = self.req("/api/rb/meta?tab=b1&wait=0&links=1&vp=%d" % vp["rev"])
+        self.assertEqual(again["viewport_links"], {"rev": vp["rev"], "unchanged": True})
+        self.assertEqual(self.req("/api/rb/meta?tab=b1&wait=0&links=1&fresh=1")[0], 200)
+        for bad in ("vp=x", "vp=-1", "vp=" + "1" * 13):
+            self.assertEqual(self.req("/api/rb/meta?tab=b1&wait=0&links=1&" + bad)[0], 400)
+        self.feed_rb()
+        code, headers, _ = self.get_raw("/api/rb/frame.jpg?tab=b1&since=0&wait=0")
+        self.assertEqual(code, 200)
+        self.assertGreater(int(headers["X-Frame-Links-Rev"]), vp["rev"] - 1)
+        self.assertEqual(self.req("/api/rb/meta?tab=b9&wait=0&links=1")[0], 404)
+
+    def test_v0130_probe_by_coordinates_in_the_fast_display_uses_the_snapshot(self):
+        self.login()
+        self.req("/api/rb/tabs", {"url": "https://example.com/a"})
+        self.req("/api/rb/viewport", {"tab": "b1", "width": 390, "height": 700, "dpr": 2})
+        code, meta = self.req("/api/rb/snapshot", {"tab": "b1"})
+        hoster = "https://rapidgator.net/file/0123456789abcdef0123456789abcdef"
+        self.rb_ws.eval_map = [("scrollTo", [0, 600, 390, 700]), ("elementFromPoint", hoster)]
+        code, body = self.req("/api/rb/probe", {"tab": "b1", "x": 100, "y": 900, "snap": meta["snap_id"]})
+        self.assertEqual((code, body["links"]), (200, [hoster]))
+        self.assertEqual(self.req("/api/rb/probe", {"tab": "b1", "x": 1, "y": 1, "snap": "s99"})[0], 404)
+        self.assertEqual(self.req("/api/rb/probe", {"tab": "b1", "x": 1, "y": 1, "snap": 5})[0], 400)
+
+    def test_v0130_reader_flow_and_image_endpoint(self):
+        self.login()
+        self.req("/api/rb/tabs", {"url": "https://example.com/a"})
+        secret = "https://cdn.example.org/private/pic.png"
+        self.rb_ws.eval_map = [("document.baseURI", {
+            "title": "Hello", "images": [secret], "hosters": ["https://rapidgator.net/file/0123456789abcdef0123456789abcdef"],
+            "blocks": [{"t": "h", "level": 1, "text": "Head"},
+                       {"t": "p", "runs": [{"text": "a", "href": "https://example.org/x"}, {"text": "b", "href": "javascript:1"}]},
+                       {"t": "img", "i": 0, "alt": "", "w": 10, "h": 10}]})]
+        code, data = self.req("/api/rb/reader", {"tab": "b1"})
+        self.assertEqual(code, 200)
+        self.assertEqual([b["t"] for b in data["blocks"]], ["h", "p", "img", "h", "li"])
+        self.assertEqual(data["blocks"][3]["text"], "ダウンロードリンク")
+        self.assertNotIn(secret, json.dumps(data))
+        self.assertEqual(self.req("/api/rb/reader", {"tab": "b9"})[0], 404)
+        self.assertEqual(self.req("/api/rb/reader", {})[0], 400)
+        png = b"\x89PNG\r\n\x1a\n" + b"\x00" * 30
+        self.rb_ws.results["Page.getResourceTree"] = {"frameTree": {"frame": {"id": "F"}, "resources": [
+            {"url": secret, "type": "Image"}]}}
+        self.rb_ws.results["Page.getResourceContent"] = {
+            "content": base64.b64encode(png).decode(), "base64Encoded": True}
+        code, headers, raw = self.get_raw("/api/rb/reader/img?tab=b1&i=0")
+        self.assertEqual((code, raw, headers["Content-Type"]), (200, png, "image/png"))
+        self.assertEqual(headers["Cache-Control"], "no-store")
+        self.assertEqual(headers["X-Content-Type-Options"], "nosniff")
+        self.assertEqual(self.get_raw("/api/rb/reader/img?tab=b1&i=5")[0], 404)
+        self.assertEqual(self.get_raw("/api/rb/reader/img?tab=b9&i=0")[0], 404)
+        for bad in ("i=x", "i=-1", "i=" + "1" * 5, "i="):
+            self.assertEqual(self.get_raw("/api/rb/reader/img?tab=b1&" + bad)[0], 400)
+        # SVG is refused; an unreadable image is a 502
+        self.rb_ws.results["Page.getResourceContent"] = {"content": "<svg></svg>", "base64Encoded": False}
+        self.assertEqual(self.get_raw("/api/rb/reader/img?tab=b1&i=0")[0], 415)
+        self.rb_ws.results["Page.getResourceTree"] = {"frameTree": {"frame": {"id": "F"}, "resources": []}}
+        self.rb_ws.eval_map = [("credentials:'include'", {"err": "fetch"})]
+        self.assertEqual(self.get_raw("/api/rb/reader/img?tab=b1&i=0")[0], 502)
+
     def test_probe_autosend_setting_defaults_on_and_persists(self):
         self.login()
         self.assertIs(self.req("/api/settings")[1]["probe_autosend"], True)
@@ -1798,6 +1912,73 @@ class HttpTests(unittest.TestCase):
             adapter.stop_downloads.assert_called_once_with()
         for path in ("/api/jd2/linkgrabber/start", "/api/jd2/downloads/start"):
             self.assertEqual(self.req(path, {"confirmed": True})[0], 400)     # no engine: refused
+
+
+    def stream_open(self, path="/api/rb/stream.mjpg?tab=b1"):
+        import http.client
+        cookie = "; ".join("%s=%s" % (c.name, c.value) for c in self.cookie)
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        conn.request("GET", path, headers={"Host": self.host, "Cookie": cookie})
+        return conn, conn.getresponse()
+
+    @staticmethod
+    def stream_part(response):
+        boundary = response.readline()
+        kind = response.readline()
+        length = response.readline()
+        blank = response.readline()
+        size = int(length.split(b":")[1])
+        body = response.read(size)
+        tail = response.readline()
+        return boundary, kind, length, blank, body, tail
+
+    def test_rb_stream_mjpg_parts_limits_auth_and_close(self):
+        # auth first (a stream is never anonymous), then the usual Host check
+        self.assertEqual(self.raw("/api/rb/stream.mjpg?tab=b1")[0], 401)
+        self.login()
+        self.assertEqual(self.get_raw("/api/rb/stream.mjpg?tab=b9")[0], 404)
+        self.assertEqual(self.raw("/api/rb/stream.mjpg?tab=b1", host="evil.example")[0], 403)
+        self.req("/api/rb/tabs", {"url": "https://example.com/a"})
+        jpeg = b"\xff\xd8\xff\xe0JFIF-stream"
+        # the response starts with the first frame, so one is fed while the request is open
+        feeder = threading.Timer(0.3, lambda: self.rb_ws.emit("Page.screencastFrame", {
+            "data": base64.b64encode(jpeg).decode(), "sessionId": 1,
+            "metadata": {"deviceWidth": 390, "deviceHeight": 700}}, "SESSION1"))
+        feeder.start()
+        self.addCleanup(feeder.cancel)
+        conn, response = self.stream_open()
+        try:
+            self.assertEqual(response.status, 200)
+            self.assertEqual(response.getheader("Content-Type"), "multipart/x-mixed-replace; boundary=qdlframe")
+            self.assertEqual(response.getheader("Cache-Control"), "no-store")
+            self.assertEqual(response.getheader("X-Content-Type-Options"), "nosniff")
+            boundary, kind, length, blank, body, tail = self.stream_part(response)
+            self.assertEqual((boundary, kind, blank, body, tail), (
+                b"--qdlframe\r\n", b"Content-Type: image/jpeg\r\n", b"\r\n", jpeg, b"\r\n"))
+            self.assertEqual(length, b"Content-Length: %d\r\n" % len(jpeg))
+            meta = self.req("/api/rb/meta?tab=b1&wait=0")[1]
+            self.assertEqual(meta["streams"], 1)
+            self.assertIn("fps", meta)
+            # per-tab limit: the third stream gets 429 while two are open
+            conn2, second = self.stream_open()
+            try:
+                for _ in range(200):
+                    if self.server.rb._tabs["b1"].streams == 2:
+                        break
+                    time.sleep(0.01)
+                code, headers, data = self.get_raw("/api/rb/stream.mjpg?tab=b1")
+                self.assertEqual(code, 429)
+            finally:
+                conn2.close()
+            # closing the tab ends the stream
+            self.assertEqual(self.req("/api/rb/tabs/close", {"id": "b1"})[0], 200)
+            for _ in range(300):
+                if self.server.rb._streams == 0:
+                    break
+                time.sleep(0.01)
+            self.assertEqual(self.server.rb._streams, 0)
+        finally:
+            conn.close()
 
 
 if __name__ == "__main__":

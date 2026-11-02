@@ -183,9 +183,8 @@ label{display:block;margin:12px 0;color:var(--muted);font-size:13px}
 .web-status .btn.small,.web-status .icon-btn{flex:none;min-height:28px}
 .mode-badge{flex:none;border:0;font:inherit;cursor:pointer;padding:1px 8px;border-radius:10px;background:var(--ok-soft);color:var(--ok);font-weight:700}
 .mode-badge.interactive{background:var(--danger-soft);color:var(--danger)}
-.mode-badge.external{background:var(--surface);color:var(--text);box-shadow:inset 0 0 0 1px var(--border)}
 .mode-badge.compat{background:var(--accent-soft);color:var(--accent)}
-.cf-hint{display:flex;flex-wrap:nowrap;overflow:hidden;white-space:nowrap;align-items:center;gap:6px;padding:3px 12px;background:var(--accent-soft);border-bottom:1px solid var(--border);font-size:12px;color:var(--text)}
+.cf-hint{display:flex;flex-wrap:wrap;white-space:nowrap;align-items:center;gap:6px;padding:3px 12px;background:var(--accent-soft);border-bottom:1px solid var(--border);font-size:12px;color:var(--text)}
 .btn.small{min-height:28px;padding:2px 10px;font-size:12px;font-weight:600}
 .cf-hint .icon-btn.small{margin-left:auto}
 .frames{flex:1;min-height:0;position:relative}
@@ -361,7 +360,8 @@ label{display:block;margin:12px 0;color:var(--muted);font-size:13px}
 .share-new p{margin:0 0 6px}
 
 /* ---- v0.1.14: compact web row / external mode ---- */
-.cf-hint .btn.small{flex:none}
+.cf-hint .btn.small{flex:none;min-height:36px}
+@media (max-width:600px){.cf-hint-text{display:none}}
 .cf-hint-text{flex:none}
 
 /* ---- NASブラウザ (remote browser, v0.1.16) */
@@ -491,3 +491,34 @@ label{display:block;margin:12px 0;color:var(--muted);font-size:13px}
 @media (prefers-reduced-motion:reduce){
   .swipe-body{transition:none!important}
 }
+
+/* ---- v0.1.30: reader mode, link outlines, display setting ---- */
+.reader-scroll{position:absolute;inset:0;overflow-x:hidden;overflow-y:auto;-webkit-overflow-scrolling:touch;overscroll-behavior-y:contain;
+  touch-action:pan-x pan-y pinch-zoom;background:var(--page);color:var(--text);user-select:text;-webkit-user-select:text;
+  padding:0 16px calc(24px + env(safe-area-inset-bottom));font-size:16px;line-height:1.75;overflow-wrap:anywhere}
+.reader-scroll[hidden]{display:none}
+.reader-head{position:sticky;top:0;z-index:1;margin:0 -16px 12px;padding:10px 16px;background:var(--surface);border-bottom:1px solid var(--border)}
+.reader-title{font-size:17px;font-weight:700;line-height:1.4;max-height:4.2em;overflow:hidden}
+.reader-sub{display:flex;align-items:center;gap:10px;margin-top:6px}
+.reader-host{flex:1;min-width:0;font-size:12px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.reader-body{max-width:46em;margin:0 auto}
+.reader-p{margin:0 0 .9em;white-space:pre-wrap}
+.reader-h{margin:1.3em 0 .5em;line-height:1.4;font-size:1.2em}
+h5.reader-h,h6.reader-h{font-size:1em}
+.reader-li{margin:0 0 .35em;white-space:pre-wrap;position:relative}
+.reader-li::before{content:"・";position:absolute;left:-1.1em}
+.reader-pre{margin:0 0 .9em;padding:10px;overflow-x:auto;background:var(--surface-2);border:1px solid var(--border);border-radius:var(--radius);font:13px/1.5 ui-monospace,monospace;white-space:pre}
+.reader-hr{margin:1.2em 0}
+.reader-empty{color:var(--muted);font-size:14px}
+.reader-fig{margin:0 0 1em}
+.reader-img{display:block;max-width:100%;width:auto;height:auto;min-height:48px;background:var(--surface-2);border-radius:4px}
+.reader-img.is-failed{min-height:64px;outline:1px dashed var(--border-strong)}
+.reader-link{color:var(--accent);text-decoration:underline;cursor:pointer;-webkit-touch-callout:none;-webkit-user-select:none;user-select:none}
+.reader-imglink{display:block;text-decoration:none}
+.link-boxes{position:absolute;left:0;top:0;width:100%;height:100%;pointer-events:none;overflow:hidden}
+.link-boxes:empty{display:none}
+.link-box{position:absolute;border:1px solid rgba(26,102,214,.55);background:rgba(26,102,214,.07);border-radius:2px;pointer-events:none}
+.live-boxes{z-index:3}
+.option-group{margin:12px 0 4px;padding:8px 12px;border:1px solid var(--border);border-radius:var(--radius)}
+.option-group legend{padding:0 6px;font-weight:600}
+.option-group .rule-toggle{display:flex;margin:6px 0;min-height:32px}
