@@ -31,7 +31,6 @@ const AUTO_REFRESH_MS = 5000;     // downloads view: local data, refreshed while
 const BADGE_REFRESH_MS = 30000;   // header badge: only while the engine is running
 const FRAME_LOAD_TIMEOUT_MS = 12000;
 const HINT_DELAY_MS = 6000;         // offer the "not showing?" bar after this long
-const EXTERNAL_TOAST_MS = 8000;
 const PAGE_SIZE = 30;
 const WAITING_MAX = 50;
 // Remote pages never get popups, downloads, modals or top navigation.
@@ -52,14 +51,27 @@ const MODES = ["strict", "interactive", "compat"];
 // sandbox value. The page is rendered by Chromium in a NAS container; this
 // page only shows JPEG frames from /api/rb/frame.jpg (binary, shown through a
 // blob: object URL) and posts validated input.
-const REMOTE_MODE = "remote";            // NAS browser, fast full-page display (default)
-const REMOTE_LIVE_MODE = "remote-live";  // NAS browser, live screencast (Cloudflare checks, logins)
+// NAS browser modes in the per-host map. "remote" = use the NAS browser with the display chosen in
+// Settings (rb_default_mode); the other three are an explicit per-site display choice (v0.1.30).
+const REMOTE_MODE = "remote";
+const REMOTE_FAST_MODE = "remote-fast";      // fast full-page display (JPEG tiles)
+const REMOTE_LIVE_MODE = "remote-live";      // live screencast (Cloudflare checks, logins)
+const REMOTE_READER_MODE = "remote-reader";  // reader: text rebuilt from validated data
+const REMOTE_MODES = [REMOTE_MODE, REMOTE_FAST_MODE, REMOTE_LIVE_MODE, REMOTE_READER_MODE];
+const DISPLAY_OF_MODE = {[REMOTE_FAST_MODE]: "tiles", [REMOTE_LIVE_MODE]: "live", [REMOTE_READER_MODE]: "reader"};
+const MODE_OF_DISPLAY = {tiles: REMOTE_FAST_MODE, live: REMOTE_LIVE_MODE, reader: REMOTE_READER_MODE};
+const DISPLAY_OF_SETTING = {reader: "reader", fast: "tiles", live: "live"};
 const RB_TILE_CONCURRENCY = 3;     // tile downloads in flight at once
 const RB_META_WAIT_S = 10;         // long-poll of the tab metadata; its timeout also drives the DOM check
 const RB_INPUT_SNAP_MS = 800;      // new snapshot this long after a key / text input
 const RB_PULL_PX = 90;             // pull-to-refresh distance
 const RB_SWAP_WAIT_MS = 6000;      // swap in a new snapshot after this long even if tiles are missing
-const RB_LINK_SLOP_PX = 3;
+const RB_LINK_NEAR_PX = 28;        // a press this close (remote CSS px) to a link box still hits it
+const RB_VP_DEBOUNCE_MS = 200;     // live link map: refresh this long after the picture changed
+const RB_VP_MIN_MS = 500;          // ... and at most this often
+const RB_VP_WAIT_MS = 1500;        // a long press waits at most this long for a fresh live link map
+const RB_BOX_CAP = 800;            // link outlines drawn at most
+const RB_READER_IMG_CONCURRENCY = 3;
 const RB_MAX_POLL_FAILS = 3;
 const RB_TAP_MOVE_PX = 10;
 const RB_TAP_MAX_MS = 600;
@@ -75,15 +87,20 @@ const RB_RING_DELAY_MS = 150;       // the press ring appears after this (taps n
 const RB_QUALITY_KEY = "qnapdl.rbquality.v1";
 const RB_QUALITIES = ["speed", "standard", "high"];
 const RB_QUALITY_LABELS = {speed: "速度優先", standard: "標準", high: "高画質"};
-const RB_DISPLAY_LABELS = {tiles: "高速（全体表示）", live: "ライブ"};
+const RB_DISPLAY_LABELS = {reader: "リーダー", tiles: "高速（全体表示）", live: "ライブ"};
 const RB_PERF_WINDOW_MS = 5000;
+const RB_STREAM_FIRST_MS = 5000;
+const RB_STREAM_ERR_WINDOW_MS = 10000;
+const RB_STREAM_META_S = 2;
+const RB_STREAM_RECONNECT_MS = 9 * 60 * 1000;
+const RB_STREAM_STALL_MS = 6000;
 const RB_POPUP_NEW_TAB = "new";
 const RB_KEYS = ["Enter", "Backspace", "Tab", "Escape", "Delete",
   "ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown"];
 const MODE_LABELS = {strict: "強い制限", interactive: "限定操作", compat: "互換"};
-// Per-host "always open in Safari". Stored in the same hostname->mode map as the
-// isolation modes, but it is NOT a tab mode (never in MODES / tab.mode / sandbox).
-const EXTERNAL_MODE = "external";
+// v0.1.30: the old per-host "external" (always open in Safari) mode was removed; a stored entry
+// is converted to the NAS browser default mode on load.
+const LEGACY_EXTERNAL_MODE = "external";
 const SHELL_KEY = "qnapdl.shell.v1";
 const HOST_MODE_KEY = "qnapdl.hostmodes.v1";
 const TAB_STORAGE_KEY = "qnapdl.webtabs.v1";
@@ -117,7 +134,7 @@ const state = {
   https: false, tailnet: false,
   rbPolling: "", rbPollMode: "", rbGen: 0, rbStatus: null, rbTimer: null, rbBusy: false,
   rbIntercepts: [],
-  rbQuality: loadRbQuality(), rbPerf: false, rbPerfSamples: [], rbPerfTimer: 0,
+  rbQuality: loadRbQuality(), rbStream: null, rbPerf: false, rbPerfSamples: [], rbPerfTimer: 0,
   rbPerfSince: 0, probeResult: null, probeResults: [], siteRules: null, waiting: null,
   accounts: null, accountsTruncated: false, accountHosts: [], accountBusy: false, accountEditId: "",
 };
@@ -213,10 +230,20 @@ function readHostModes() {
   try {
     const data = JSON.parse(readLocal(HOST_MODE_KEY) || "[]");
     if (!Array.isArray(data)) return [];
-    return data.filter(e => Array.isArray(e) && typeof e[0] === "string" && e[0].length <= 253 &&
-      ((MODES.includes(e[1]) && e[1] !== "strict") || e[1] === EXTERNAL_MODE ||
-        e[1] === REMOTE_MODE || e[1] === REMOTE_LIVE_MODE)).slice(-MAX_HOST_MODES);
+    return data.map(e => (Array.isArray(e) && e[1] === LEGACY_EXTERNAL_MODE) ? [e[0], REMOTE_MODE] : e)
+      .filter(e => Array.isArray(e) && typeof e[0] === "string" && e[0].length <= 253 &&
+        ((MODES.includes(e[1]) && e[1] !== "strict") || REMOTE_MODES.includes(e[1]))).slice(-MAX_HOST_MODES);
   } catch (e) { return []; }
+}
+
+// One-time rewrite of stored "external" entries (readHostModes already maps them when reading).
+function migrateHostModes() {
+  try {
+    const raw = readLocal(HOST_MODE_KEY);
+    if (raw && raw.includes('"' + LEGACY_EXTERNAL_MODE + '"')) {
+      writeLocal(HOST_MODE_KEY, JSON.stringify(readHostModes()));
+    }
+  } catch (e) { /* ignore: reads still map the old value */ }
 }
 
 function rememberHostMode(host, mode) {
@@ -233,22 +260,14 @@ function rememberedMode(host) {
 
 function isRemoteHost(host) {
   const mode = host ? rememberedMode(host) : null;
-  return mode === REMOTE_MODE || mode === REMOTE_LIVE_MODE;
+  return REMOTE_MODES.includes(mode);
 }
 
 function remoteHosts() {
-  return readHostModes().filter(e => e[1] === REMOTE_MODE || e[1] === REMOTE_LIVE_MODE).map(e => e[0]);
+  return readHostModes().filter(e => REMOTE_MODES.includes(e[1])).map(e => e[0]);
 }
 
-function isExternalHost(host) { return Boolean(host) && rememberedMode(host) === EXTERNAL_MODE; }
-
-function externalHosts() {
-  return readHostModes().filter(e => e[1] === EXTERNAL_MODE).map(e => e[0]);
-}
-
-function clearExternalHost(host) {
-  if (isExternalHost(host)) rememberHostMode(host, "strict");   // strict = store nothing
-}
+migrateHostModes();
 
 // ------------------------------------------------- stale-while-revalidate
 // Views paint cached data immediately, refresh in the background when the
@@ -594,15 +613,14 @@ function renderWebTabs() {
   updateMobileBar();
 }
 
-// One compact row per web tab (single line, ellipsis): [mode chip] host ... [Safari] [...]
+// One compact row per web tab (single line, ellipsis): [mode chip] host ... [...]
 function updateWebStatus(tab) {
   const box = $("webStatus");
   box.replaceChildren();
   if (!tab || !tab.history.length) return;
-  const external = Boolean(tab.external);
   const remote = Boolean(tab.remote);
-  const chip = element("button", remote ? "NASブラウザ" : external ? "Safari固定" : (MODE_LABELS[tab.mode] || MODE_LABELS.strict),
-    "mode-badge " + (remote ? "remote" : external ? "external" : tab.mode));
+  const chip = element("button", remote ? "NASブラウザ" : (MODE_LABELS[tab.mode] || MODE_LABELS.strict),
+    "mode-badge " + (remote ? "remote" : tab.mode));
   chip.type = "button";
   chip.title = "表示されない場合のヒントを表示";
   chip.addEventListener("click", () => {
@@ -619,13 +637,6 @@ function updateWebStatus(tab) {
   const label = element("span", text, "web-status-text");
   label.title = tab.current || text;
   box.appendChild(label);
-  const safari = element("button", "Safari", "btn small");
-  safari.type = "button";
-  safari.title = "Safariで開く（今回のみ）";
-  safari.setAttribute("aria-label", "Safariで開く（今回のみ）");
-  safari.disabled = !tab.current;
-  safari.addEventListener("click", () => openExternal(tab));
-  box.appendChild(safari);
   const more = element("button", undefined, "icon-btn small");
   more.type = "button";
   more.title = "メニュー";
@@ -638,7 +649,7 @@ function updateWebStatus(tab) {
 // Slim one-line bar: shown 6 s after a load starts (or when the chip is tapped).
 // Cross-origin load failure cannot be detected, so this is a timing heuristic.
 function updateCfHint(tab) {
-  const show = Boolean(tab && tab.current && !tab.external && !tab.remote && tab.showHint && !tab.hintDismissed);
+  const show = Boolean(tab && tab.current && !tab.remote && tab.showHint && !tab.hintDismissed);
   $("cfHint").hidden = !show;
   $("cfCompat").hidden = !tab || tab.mode === "compat";
 }
@@ -826,7 +837,7 @@ async function addBookmark(title, url) {
 function newTabRecord(id) {
   return {id, history: [], index: -1, mode: "strict", current: "",
     loaded: false, loading: false, token: 0, frame: null, error: "",
-    lastUsed: 0, hintDismissed: false, showHint: false, hintTimer: 0, external: false,
+    lastUsed: 0, hintDismissed: false, showHint: false, hintTimer: 0,
     remote: false, rb: null};
 }
 
@@ -1010,76 +1021,14 @@ function applyHostMode(tab, url) {
   else if (tab.mode === "compat") tab.mode = "strict";
 }
 
-// ---- always-open-in-Safari (external mode) ----
-// iOS only allows window.open() inside the user-gesture call stack, and
-// /api/browser/validate is async, so we cannot validate first and open after
-// (nor open a blank window first: that leaves an opener-linked popup). A host
-// is only in external mode because the user chose it for a page that already
-// passed server validation, so for such a host we run a cheap client-side
-// sanity check (https, no credentials/port, public-looking hostname equal to
-// the stored host) and call window.open synchronously with noopener. The
-// server stays authoritative: /api/browser/validate is still called right
-// afterwards and a rejection is surfaced (and the host's external mode cleared).
-function externalSanityUrl(value) {
-  let parsed;
-  try { parsed = new URL(value); } catch (e) { return ""; }
-  const host = parsed.hostname.toLowerCase();
-  const hub = location.hostname.toLowerCase().replace(/^\[|\]$/g, "");
-  const ok = parsed.protocol === "https:" && !parsed.username && !parsed.password && !parsed.port &&
-    host.length <= 253 && host.includes(".") && host !== hub &&
-    !/^[\d.]+$/.test(host) && !host.includes(":") && !host.startsWith("[") &&
-    !/(^|\.)(localhost|local|internal|lan|home|ts\.net)$/.test(host) &&
-    parsed.href.length <= 2048 && isExternalHost(hostOf(parsed.href));
-  return ok ? parsed.href : "";
-}
-
-function showExternalToast(host, href) {
-  stickyToast("external", "Safariで開きました（このサイトは常に外部で開きます）", "success", [{
-    label: "タブで開く",
-    run: () => {
-      clearExternalHost(host);
-      dropExternalToast();
-      renderExternalHosts();
-      perform(() => openWebUrl(href));
-    },
-  }]);
-  setTimeout(dropExternalToast, EXTERNAL_TOAST_MS);
-}
-
-function dropExternalToast() {
-  for (const old of Array.from($("notice").children)) {
-    if (old.dataset.sticky === "external") old.remove();
-  }
-}
-
-// Returns true when the navigation was handed to Safari (no iframe is created).
-function tryExternalOpen(value, tab) {
-  const href = externalSanityUrl(value);
-  if (!href) return false;
-  const host = hostOf(href);
-  window.open(href, "_blank", "noopener,noreferrer");
-  validateUrl(href).catch(e => {
-    clearExternalHost(host);
-    renderExternalHosts();
-    toast("このサイトは開けません: " + e.message, "error");
-  });
-  showExternalToast(host, href);
-  // A blank/new tab would only show an empty page: close it. A tab showing
-  // another page is left as it is.
-  if (tab && state.tabs.includes(tab) && !tab.history.length) closeTab(tab.id);
-  return true;
-}
-
 // Validate `value`, let `commit` update the history, then (re)load the iframe.
-// opts.restore: not a user gesture (lazy load of a restored tab), so an
-// external host is shown without a frame instead of calling window.open.
+// opts.restore: lazy load of a restored tab (a remote tab is never opened automatically).
 async function openInTab(tab, value, commit, opts = {}) {
   if (tab.remote || (!opts.restore && isRemoteHost(hostOf(value)))) {
     if (opts.restore) { tab.loaded = true; refreshAfterTabChange(); return; }   // never auto-open on restore
     await openRemote(tab, value, commit);
     return;
   }
-  if (!opts.restore && isExternalHost(hostOf(value)) && tryExternalOpen(value, tab)) return;
   const token = ++tab.token;
   tab.error = "";
   tab.loading = true;
@@ -1097,16 +1046,7 @@ async function openInTab(tab, value, commit, opts = {}) {
   if (!previous || hostOf(previous) !== hostOf(url)) applyHostMode(tab, url);
   tab.current = url;
   tab.loaded = true;
-  if (isExternalHost(hostOf(url))) {
-    // No iframe for an external host; the compact row offers the Safari button.
-    if (tab.frame) tab.frame.remove();
-    tab.frame = null;
-    tab.loading = false;
-    tab.external = true;
-  } else {
-    tab.external = false;
-    mountFrame(tab, url);
-  }
+  mountFrame(tab, url);
   saveTabs();
   refreshAfterTabChange();
 }
@@ -1123,6 +1063,8 @@ async function openRemote(tab, value, commit) {
   let url;
   try {
     url = await validateUrl(value);
+    if (token !== tab.token || !state.tabs.includes(tab)) return;
+    if (!state.settings) await loadSettings().catch(() => {});   // the default display comes from Settings
     if (token !== tab.token || !state.tabs.includes(tab)) return;
     if (tab.rb) {
       try {
@@ -1143,7 +1085,10 @@ async function openRemote(tab, value, commit) {
         rev: null, icptSeen: 0, present: 0, vp: "", popups: 0,
         shown: "", autoLive: false, autoSince: 0, autoClean: 0, autoChip: false,
         autoTimer: 0, autoBusy: false, autoOff: "", view: null, snap: null, snapKey: "", snapBusy: false,
-        snapAgain: null, snapTimer: 0, busy: 0, scrollTop: 0, owner: tab};
+        snapAgain: null, snapTimer: 0, busy: 0, scrollTop: 0, owner: tab,
+        vmap: null, vmapRev: -1, vmapTimer: 0, vmapBusy: false, vmapAt: 0, linksRev: -1,
+        reader: null, readerBusy: false, readerPending: false, readerAgain: false,
+        stream: null, streamFailed: false, perf: {}};
     }
   } catch (e) {
     if (token === tab.token) { tab.loading = false; tab.error = e.message; updateChrome(); }
@@ -1152,7 +1097,6 @@ async function openRemote(tab, value, commit) {
   if (tab.frame) { tab.frame.remove(); tab.frame = null; }
   commit(url);
   tab.remote = true;
-  tab.external = false;
   tab.current = url;
   tab.loaded = true;
   tab.loading = false;
@@ -1173,6 +1117,8 @@ function releaseRemote(tab) {
   if (state.rbPolling === rb.id) { state.rbPolling = ""; state.rbPollMode = ""; state.rbGen++; }
   dropRemoteImage(rb);
   dropTiles(rb);
+  dropReader(rb);
+  clearTimeout(rb.vmapTimer);
   state.rbIntercepts = state.rbIntercepts.filter(item => item.tab !== rb.id);
   if (rbPopup.item && rbPopup.item.tab === rb.id) hidePopupToast();
   closeProbeSheet();
@@ -1243,6 +1189,8 @@ function remoteLost(tab) {
   if (tab.rb) {
     dropRemoteImage(tab.rb);
     dropTiles(tab.rb);
+    dropReader(tab.rb);
+    clearTimeout(tab.rb.vmapTimer);
     state.rbIntercepts = state.rbIntercepts.filter(item => item.tab !== tab.rb.id);
     renderIntercept();
   }
@@ -1260,6 +1208,7 @@ const rbShown = {url: "", owner: null};
 
 function dropRemoteImage(rb) {
   rb.present++;
+  if (state.rbStream && state.rbStream.rb === rb) closeStream();
   if (rbShown.owner !== rb) return;
   if (rbShown.url) URL.revokeObjectURL(rbShown.url);
   rbShown.url = ""; rbShown.owner = null;
@@ -1308,6 +1257,7 @@ function frameHeaders(res) {
     popups: number("X-Frame-Popups"),
     editable: res.headers.get("X-Frame-Editable") === "1",
     challenge: res.headers.get("X-Frame-Challenge") === "1",
+    linksRev: res.headers.has("X-Frame-Links-Rev") ? number("X-Frame-Links-Rev") : NaN,
   };
 }
 
@@ -1348,6 +1298,7 @@ function applyRemoteMeta(tab, f) {
     fetchIntercepts(tab).catch(() => {});
   }
   if (typeof f.challenge === "boolean") syncChallenge(tab, f.challenge, loading);
+  if (Number.isFinite(f.linksRev)) noteLinksRev(tab, f.linksRev);
   if (url !== "" && changed) applyDisplay(tab);
   if (changed) updateChrome();
 }
@@ -1383,14 +1334,14 @@ function challengeStep(rb, challenge, loading, now, userLive) {
 }
 
 function userPrefersLive(tab) {
-  return rememberedMode(hostOf(tab.current || "")) === REMOTE_LIVE_MODE;
+  return userDisplay(tab) === "live";
 }
 
 function syncChallenge(tab, challenge, loading) {
   const rb = tab.rb;
   if (!rb || rb.autoLive || rb.autoOff === rb.url) return;   // the poll below owns the way back
   if (challengeStep(rb, challenge, loading, Date.now(), userPrefersLive(tab)) === "enter") {
-    if (rb.shown === "tiles") flash("確認画面のため一時的にライブ表示にしました");
+    if (rb.shown === "tiles" || rb.shown === "reader") flash("確認画面のため一時的にライブ表示にしました");
     startAutoPoll(tab);
     applyDisplay(tab);
   }
@@ -1472,6 +1423,149 @@ async function sendViewport(tab) {
 
 const nextPaint = () => new Promise(resolve => requestAnimationFrame(() => resolve()));
 
+// ---- live display over MJPEG push (v0.1.30) ----
+// The <img> points at /api/rb/stream.mjpg (same origin, cookie sent); the Hub pushes the newest frame.
+// Metadata (address, title, loading, link-map revision, fps) still comes from the /api/rb/meta
+// long-poll. Two stream errors within 10 s, or no picture within 5 s, fall back to frame.jpg
+// polling for that tab. The stream is closed whenever the tab is hidden, switched or the mode changes.
+let streamNonce = 0;
+function streamUrl(rb) {
+  return "/api/rb/stream.mjpg?tab=" + encodeURIComponent(rb.id) + "&n=" + (++streamNonce);
+}
+
+// The Hub ends a stream after 10 min and an <img> may not report that: reconnect every 9 min
+// while visible, and when the Hub says the stream delivers 0 fps for 6 s on a settled page.
+// The old picture stays until the new stream's first frame replaces it.
+function reconnectStream(rb) {
+  const s = rb.stream;
+  if (!s || state.rbStream !== s) return;
+  s.opened = performance.now();
+  s.loaded = false;
+  s.stalledSince = 0;
+  s.arm();
+  $("remoteImg").src = streamUrl(rb);
+}
+
+function checkStream(rb, meta) {
+  const s = rb.stream;
+  if (!s || state.rbStream !== s || document.visibilityState !== "visible") return;
+  const now = performance.now();
+  if (now - s.opened >= RB_STREAM_RECONNECT_MS) { reconnectStream(rb); return; }
+  if (!s.loaded || meta.loading === true || !Number.isFinite(meta.fps) || meta.fps > 0) { s.stalledSince = 0; return; }
+  if (!s.stalledSince) s.stalledSince = now;
+  else if (now - s.stalledSince >= RB_STREAM_STALL_MS) reconnectStream(rb);
+}
+
+function closeStream() {
+  const s = state.rbStream;
+  if (!s) return;
+  state.rbStream = null;
+  s.rb.stream = null;
+  clearTimeout(s.timer);
+  clearTimeout(s.retry);
+  const img = $("remoteImg");
+  img.onload = null;
+  img.onerror = null;
+  if (rbShown.owner === s.rb) {
+    rbShown.owner = null;
+    rbShown.url = "";
+    img.removeAttribute("src");
+    img.hidden = true;
+  }
+}
+
+function streamFallback(tab, rb) {
+  rb.streamFailed = true;
+  closeStream();
+  state.rbPollMode = "";             // make syncRemotePoll restart this tab with frame.jpg polling
+  syncRemotePoll();
+}
+
+function openStream(tab, rb) {
+  closeStream();
+  dropRemoteImage(rb);
+  const img = $("remoteImg");
+  const s = {rb, opened: performance.now(), loaded: false, errors: [], timer: 0, retry: 0, stalledSince: 0, arm: null};
+  state.rbStream = s;
+  rb.stream = s;
+  rbShown.owner = rb;
+  rbShown.url = "";
+  const arm = () => {
+    clearTimeout(s.timer);
+    s.timer = setTimeout(() => {
+      if (state.rbStream === s && !s.loaded) streamFallback(tab, rb);
+    }, RB_STREAM_FIRST_MS);
+  };
+  s.arm = arm;
+  img.onload = () => {
+    if (state.rbStream !== s) return;
+    if (!s.loaded) {
+      s.loaded = true;
+      clearTimeout(s.timer);
+      rb.perf.streamMs = performance.now() - s.opened;
+    }
+    img.hidden = false;
+    $("remoteIdle").hidden = true;
+  };
+  img.onerror = () => {
+    if (state.rbStream !== s) return;
+    const now = performance.now();
+    s.errors = s.errors.filter(t => now - t < RB_STREAM_ERR_WINDOW_MS);
+    s.errors.push(now);
+    if (s.errors.length >= 2) { streamFallback(tab, rb); return; }
+    s.loaded = false;
+    s.opened = now;
+    arm();
+    s.retry = setTimeout(() => { if (state.rbStream === s) img.src = streamUrl(rb); }, 500);
+  };
+  arm();
+  img.src = streamUrl(rb);
+}
+
+async function streamLoop(tab, gen) {
+  let fails = 0, first = true;
+  await nextPaint();
+  await nextPaint();
+  if (gen !== state.rbGen || !tab.rb) return;
+  await sendViewport(tab).catch(() => {});
+  if (gen !== state.rbGen || !tab.rb) return;
+  openStream(tab, tab.rb);
+  while (gen === state.rbGen && tab.rb) {
+    const rb = tab.rb;
+    try {
+      let target = "/api/rb/meta?tab=" + encodeURIComponent(rb.id) + "&wait=" + (first ? 0 : RB_STREAM_META_S);
+      if (!first && rb.rev !== null) target += "&rev=" + rb.rev;
+      first = false;
+      const res = await fetch(target, {credentials: "same-origin", cache: "no-store"});
+      if (gen !== state.rbGen || tab.rb !== rb) return;
+      if (res.status === 401 && state.authed) {
+        state.authed = false;
+        setTimeout(go, 0);
+        return;
+      }
+      if (res.status === 404) { remoteLost(tab); return; }
+      if (res.status !== 200) throw new Error("HTTP " + res.status);
+      const meta = await res.json();
+      if (gen !== state.rbGen || tab.rb !== rb) return;
+      fails = 0;
+      if (Number.isFinite(meta.fps)) rb.perf.fps = meta.fps;
+      if (Number.isFinite(meta.frame_bytes)) rb.perf.frameBytes = meta.frame_bytes;
+      applyRemoteMeta(tab, Object.assign({}, meta, {seq: rb.seq, linksRev: meta.links_rev}));
+      checkStream(rb, meta);
+    } catch (e) {
+      if (gen !== state.rbGen) return;
+      fails++;
+      if (fails >= RB_MAX_POLL_FAILS) {
+        state.rbPolling = "";
+        state.rbPollMode = "";
+        toast("NASブラウザの画面を取得できません: " + e.message, "error");
+        return;
+      }
+      await delay(1000);
+    }
+  }
+}
+
 async function remoteLoop(tab, gen) {
   let fails = 0;
   // Size the remote page to this device before the first frame is requested.
@@ -1534,6 +1628,7 @@ function syncRemotePoll() {
   const id = want ? tab.rb.id : "";
   const mode = want ? tabDisplay(tab) : "";
   if (id === state.rbPolling && mode === state.rbPollMode) return;
+  closeStream();
   state.rbPolling = id;
   state.rbPollMode = mode;
   state.rbGen++;
@@ -1541,8 +1636,15 @@ function syncRemotePoll() {
   const rb = tab.rb;
   if (rb.shown && rb.shown !== mode) leaveDisplay(rb, rb.shown);
   rb.shown = mode;
-  if (mode === "live") remoteLoop(tab, state.rbGen);
-  else tileLoop(tab, state.rbGen).catch(() => {});
+  if (mode === "live") {
+    if (rb.streamFailed || typeof Image !== "function") remoteLoop(tab, state.rbGen);
+    else streamLoop(tab, state.rbGen).catch(() => {});
+    scheduleViewportLinks(tab, true);      // the link map of the live picture (v0.1.30)
+  } else if (mode === "reader") {
+    readerLoop(tab, state.rbGen).catch(() => {});
+  } else {
+    tileLoop(tab, state.rbGen).catch(() => {});
+  }
 }
 
 function updateRemoteView(tab) {
@@ -1551,13 +1653,19 @@ function updateRemoteView(tab) {
   $("frames").hidden = remote;
   if (!remote) { closeRemoteSheet(); setShown("interceptSheet", false); return; }
   const live = Boolean(tab.rb);
-  const tiles = live && tabDisplay(tab) === "tiles";
+  const display = live ? tabDisplay(tab) : "tiles";
+  const tiles = live && display === "tiles";
+  const reader = live && display === "reader";
   setShown("tileScroll", tiles);
-  setShown("tileRefresh", tiles);
+  setShown("readerScroll", reader);
+  setShown("tileRefresh", tiles || reader);
   if (tiles) mountTiles(tab);
+  if (reader) mountReader(tab);
   syncSnapProgress();
-  $("remoteImg").hidden = tiles || !live || !$("remoteImg").getAttribute("src");
-  $("remoteIdle").hidden = live && (tiles ? Boolean(tab.rb.view) : !$("remoteImg").hidden);
+  $("remoteImg").hidden = tiles || reader || !live || !$("remoteImg").getAttribute("src");
+  $("remoteIdle").hidden = live && (tiles ? Boolean(tab.rb.view) :
+    reader ? Boolean(tab.rb.reader && tab.rb.reader.data) : !$("remoteImg").hidden);
+  if (!live || display !== "live") paintLiveBoxes(null);
   $("remoteIdleText").textContent = tab.error || (live ? "画面を待っています…" :
     "NASブラウザのタブは開かれていません（メモリ節約のため自動で閉じました）。");
   setShown("remoteReopen", !live);
@@ -1822,7 +1930,30 @@ function recordPerf(bytes, latency) {
   while (state.rbPerfSamples.length && state.rbPerfSamples[0].t < cutoff) state.rbPerfSamples.shift();
 }
 
-function perfText() {
+function perfText(tab = remoteTab()) {
+  const rb = tab && tab.rb;
+  const p = (rb && rb.perf) || {};
+  const quality = RB_QUALITY_LABELS[state.rbQuality] || "";
+  const kb = n => (n / 1024).toFixed(0) + " KB";
+  const display = rb ? tabDisplay(tab) : "live";
+  if (display === "tiles") {
+    const tiles = rb.view ? rb.view.tiles : [];
+    const loaded = tiles.filter(t => t.url).length;
+    const each = p.tiles ? p.tileBytes / p.tiles : 0;
+    return "高速(全体表示)・" + quality + " · タイル " + loaded + "/" + tiles.length +
+      " · 撮影 " + Math.round(p.snapMs || 0) + " ms · 1枚 " + kb(each);
+  }
+  if (display === "reader") {
+    const blocks = rb.reader && rb.reader.data ? rb.reader.data.blocks : [];
+    const total = blocks.filter(b => b.t === "img").length;
+    const each = p.imgs ? p.imgMs / p.imgs : 0;
+    return "リーダー · ブロック " + blocks.length + " · 画像 " + (p.imgs || 0) + "/" + total +
+      " · 取得 " + Math.round(p.extractMs || 0) + " ms" + (p.imgs ? " · 画像取得 " + Math.round(each) + " ms" : "");
+  }
+  if (rb && rb.stream && !rb.streamFailed) {
+    return "ライブ(ストリーム)・" + quality + " · " + (p.fps || 0).toFixed(1) + " fps · " +
+      kb(p.frameBytes || 0) + "/枚 · 応答 " + Math.round(p.streamMs || 0) + " ms";
+  }
   const now = performance.now();
   const recent = state.rbPerfSamples.filter(x => x.t >= now - RB_PERF_WINDOW_MS);
   const frames = recent.filter(x => x.bytes > 0);
@@ -1830,7 +1961,8 @@ function perfText() {
   const fps = frames.length / elapsed;
   const bytes = frames.length ? frames.reduce((sum, x) => sum + x.bytes, 0) / frames.length : 0;
   const wait = recent.length ? recent.reduce((sum, x) => sum + x.latency, 0) / recent.length : 0;
-  return fps.toFixed(1) + " fps · " + (bytes / 1024).toFixed(0) + " KB/枚 · 応答 " + Math.round(wait) + " ms";
+  return "ライブ(ポーリング)・" + quality + " · " + fps.toFixed(1) + " fps · " + kb(bytes) +
+    "/枚 · 応答 " + Math.round(wait) + " ms";
 }
 
 function renderPerf() {
@@ -1874,18 +2006,27 @@ const tileQueue = [];
 let tileActive = 0;
 let tileNear = null, tileFar = null;
 
+// The display the user chose: the site's remembered choice, else the Settings default (高速).
+function userDisplay(tab) {
+  const remembered = DISPLAY_OF_MODE[rememberedMode(hostOf(tab.current || ""))];
+  if (remembered) return remembered;
+  const setting = state.settings && state.settings.rb_default_mode;
+  return DISPLAY_OF_SETTING[setting] || "tiles";
+}
+
+// What is shown now: "tiles" (fast), "live" or "reader". A Cloudflare check forces "live" meanwhile.
 function tabDisplay(tab) {
   const rb = tab && tab.rb;
   if (!rb) return "tiles";
   if (rb.autoLive) return "live";
-  return rememberedMode(hostOf(tab.current || "")) === REMOTE_LIVE_MODE ? "live" : "tiles";
+  return userDisplay(tab);
 }
 
-// 「表示: 高速 / ライブ」 from the menu: remembered per host, default 高速.
+// 「表示: リーダー / 高速 / ライブ」 from the menu: remembered per host.
 function setUserDisplay(tab, mode) {
   if (!tab || !tab.rb || !RB_DISPLAY_LABELS[mode]) return;
   const host = hostOf(tab.current || "");
-  if (host) rememberHostMode(host, mode === "live" ? REMOTE_LIVE_MODE : REMOTE_MODE);
+  if (host) rememberHostMode(host, MODE_OF_DISPLAY[mode]);
   stopAutoPoll(tab.rb);
   tab.rb.autoLive = false; tab.rb.autoChip = false;   // a manual choice is respected
   renderRemoteHosts();
@@ -1904,7 +2045,12 @@ function leaveDisplay(rb, shown) {
   if (shown === "tiles") {
     dropTiles(rb);
     api("/api/rb/snapshot/release", {tab: rb.id}).catch(() => {});
+  } else if (shown === "reader") {
+    dropReader(rb);
   } else {
+    clearTimeout(rb.vmapTimer);
+    rb.vmap = null; rb.vmapRev = -1; rb.linksRev = -1;
+    paintLiveBoxes(rb.owner);
     dropRemoteImage(rb);
   }
 }
@@ -1943,6 +2089,9 @@ function buildView(rb, meta) {
     view.tiles.push(t);
     canvas.appendChild(img);
   }
+  view.boxes = element("div", undefined, "link-boxes");     // optional outlines (setting), no pointer events
+  view.boxes.setAttribute("aria-hidden", "true");
+  canvas.appendChild(view.boxes);
   layoutView(view);
   return view;
 }
@@ -1960,6 +2109,7 @@ function layoutView(view) {
     t.img.style.top = a + "px";
     t.img.style.height = Math.max(1, b - a) + "px";
   }
+  paintBoxes(view.boxes, view.meta.links, k, 0, 0);
 }
 
 // Lazy loading: tiles near the viewport load, tiles far away release their object URLs.
@@ -2019,7 +2169,7 @@ function mountTiles(tab) {
 
 function syncSnapProgress() {
   const tab = activeWebTab();
-  setShown("snapProgress", Boolean(tab && tab.rb && tab.rb.busy > 0 && tabDisplay(tab) === "tiles"));
+  setShown("snapProgress", Boolean(tab && tab.rb && tab.rb.busy > 0 && tabDisplay(tab) !== "live"));
 }
 
 function snapBusy(rb, delta) {
@@ -2058,6 +2208,7 @@ function pumpTiles() {
 // true when finished (or deliberately dropped); false to retry later.
 async function fetchTile(t) {
   const rb = t.view.rb;
+  const began = performance.now();
   try {
     const res = await fetch("/api/rb/tile.jpg?tab=" + encodeURIComponent(rb.id) +
       "&snap=" + encodeURIComponent(t.view.meta.snap_id) + "&i=" + t.index,
@@ -2072,6 +2223,9 @@ async function fetchTile(t) {
     const blob = await res.blob();
     if (t.view.dead || !blob.size || blob.type !== "image/jpeg") return true;
     if (!t.want && !t.forced) return true;      // scrolled far away meanwhile
+    rb.perf.tiles = (rb.perf.tiles || 0) + 1;
+    rb.perf.tileBytes = (rb.perf.tileBytes || 0) + blob.size;
+    rb.perf.tileMs = performance.now() - began;
     releaseTile(t);
     t.url = URL.createObjectURL(blob);
     t.img.src = t.url;
@@ -2099,8 +2253,10 @@ async function takeSnapshot(tab, opts = {}) {
   rb.snapBusy = true;
   snapBusy(rb, 1);
   try {
+    const started = performance.now();
     const meta = await api("/api/rb/snapshot", {tab: rb.id, force: opts.force === true,
       if_changed: opts.ifChanged === true});
+    rb.perf.snapMs = performance.now() - started;
     if (tab.rb !== rb || tabDisplay(tab) !== "tiles") return;
     if (rb.view && rb.view.meta.snap_id === meta.snap_id) { rb.view.meta = meta; rb.snap = meta; return; }
     await swapView(tab, rb, meta, opts);
@@ -2222,15 +2378,30 @@ function tilePoint(event) {
   return {x, y};
 }
 
-// The link box under a page point (later boxes are on top).
-function linkAt(snap, x, y) {
-  const links = snap && Array.isArray(snap.links) ? snap.links : [];
-  for (let i = links.length - 1; i >= 0; i--) {
-    const l = links[i];
-    if (x >= l.x - RB_LINK_SLOP_PX && x <= l.x + l.w + RB_LINK_SLOP_PX &&
-        y >= l.y - RB_LINK_SLOP_PX && y <= l.y + l.h + RB_LINK_SLOP_PX) return l;
+// Link hit testing (all displays, v0.1.30). Boxes are {x, y, w, h, href} in remote CSS pixels.
+// Distance from a point to a box (0 inside): a press slightly off a link still counts.
+function boxDistance(l, x, y) {
+  const dx = Math.max(l.x - x, 0, x - (l.x + l.w));
+  const dy = Math.max(l.y - y, 0, y - (l.y + l.h));
+  return Math.hypot(dx, dy);
+}
+
+// The box that contains the point; else the nearest one within `near` px. Equal distance: the
+// smaller box wins. null when nothing is that close (the Hub then resolves it by coordinates).
+function pickLink(links, x, y, near = RB_LINK_NEAR_PX) {
+  if (!Array.isArray(links)) return null;
+  let best = null, bestD = Infinity, bestA = Infinity;
+  for (const l of links) {
+    const d = boxDistance(l, x, y);
+    if (d > near) continue;
+    const a = l.w * l.h;
+    if (d < bestD - 1e-9 || (Math.abs(d - bestD) <= 1e-9 && a < bestA)) { best = l; bestD = d; bestA = a; }
   }
-  return null;
+  return best;
+}
+
+function linkAt(snap, x, y) {
+  return pickLink(snap && snap.links, x, y);
 }
 
 async function tileTap(tab, point) {
@@ -2258,17 +2429,35 @@ async function tileTap(tab, point) {
 
 function tileLongPress(tab, clientX, clientY) {
   const point = tilePoint({clientX, clientY});
-  const link = point && tab.rb.snap ? linkAt(tab.rb.snap, point.x, point.y) : null;
-  if (!link) { cancelPress(); flash("この位置にリンクがありません"); return; }
+  const snap = tab.rb.snap;
+  if (!point || !snap) { cancelPress(); flash("この位置にリンクがありません"); return; }
+  const link = linkAt(snap, point.x, point.y);
   rbPress.fired = true;
   $("remoteRing").classList.add("is-done");
   setTimeout(() => { rbPress.fired = false; hidePressRing(); }, 350);
-  perform(() => startProbe(tab, {href: link.href}));     // known locally: the probe starts at once
+  // Known locally: the probe starts at once. Otherwise the Hub resolves the point itself (it also
+  // looks for the nearest link within the same tolerance).
+  perform(() => startProbe(tab, link ? {href: link.href} :
+    {x: Math.round(point.x), y: Math.round(point.y), snap: snap.snap_id}));
+}
+
+// Pull down at the top of a scroller to refresh (tiles and reader).
+function wirePull(scroller, onRefresh) {
+  let startY = null;
+  scroller.addEventListener("touchstart", event => {
+    startY = scroller.scrollTop <= 0 && event.touches.length === 1 ? event.touches[0].clientY : null;
+  }, {passive: true});
+  scroller.addEventListener("touchend", event => {
+    const start = startY;
+    startY = null;
+    if (start === null || !event.changedTouches.length) return;
+    if (event.changedTouches[0].clientY - start > RB_PULL_PX && scroller.scrollTop <= 0) onRefresh();
+  }, {passive: true});
 }
 
 function wireTiles() {
   const scroller = $("tileScroll");
-  const press = {id: null, x0: 0, y0: 0, t0: 0, moved: false, pullY: null};
+  const press = {id: null, x0: 0, y0: 0, t0: 0, moved: false};
   const fast = () => {
     const tab = remoteTab();
     return tab && tabDisplay(tab) === "tiles" && tab.rb.view ? tab : null;
@@ -2314,21 +2503,15 @@ function wireTiles() {
     cancelPress();
   });
   // Pull down at the top to refresh.
-  scroller.addEventListener("touchstart", event => {
-    press.pullY = scroller.scrollTop <= 0 && event.touches.length === 1 ? event.touches[0].clientY : null;
-  }, {passive: true});
-  scroller.addEventListener("touchend", event => {
-    const start = press.pullY;
-    press.pullY = null;
-    const tab = fast();
-    if (start === null || !tab || !event.changedTouches.length) return;
-    if (event.changedTouches[0].clientY - start > RB_PULL_PX && scroller.scrollTop <= 0) {
-      perform(() => takeSnapshot(tab, {force: true, keepScroll: true}));
-    }
-  }, {passive: true});
-  $("tileRefresh").addEventListener("click", () => {
+  wirePull(scroller, () => {
     const tab = fast();
     if (tab) perform(() => takeSnapshot(tab, {force: true, keepScroll: true}));
+  });
+  $("tileRefresh").addEventListener("click", () => {
+    const tab = remoteTab();
+    if (!tab) return;
+    if (tabDisplay(tab) === "reader") perform(() => runReader(tab, {keepScroll: true}));
+    else if (fast()) perform(() => takeSnapshot(tab, {force: true, keepScroll: true}));
   });
   if (typeof ResizeObserver === "function") {
     new ResizeObserver(() => {
@@ -2336,6 +2519,484 @@ function wireTiles() {
       if (tab && tab.rb.view && tileHost.owner === tab.rb) layoutView(tab.rb.view);
     }).observe(scroller);
   }
+}
+
+// ---- optional link outlines (setting rb_link_boxes, v0.1.30) ----
+// A client overlay of thin outlines over the link boxes; pointer-events none, nothing from the page.
+function boxesWanted() { return Boolean(state.settings && state.settings.rb_link_boxes === true); }
+
+function paintBoxes(layer, links, k, dx, dy) {
+  if (!layer) return;
+  layer.replaceChildren();
+  if (!boxesWanted() || !Array.isArray(links)) return;
+  const frag = document.createDocumentFragment();
+  for (let i = 0; i < links.length && i < RB_BOX_CAP; i++) {
+    const l = links[i];
+    const box = document.createElement("div");
+    box.className = "link-box";
+    box.style.left = Math.round(l.x * k + dx) + "px";
+    box.style.top = Math.round(l.y * k + dy) + "px";
+    box.style.width = Math.max(1, Math.round(l.w * k)) + "px";
+    box.style.height = Math.max(1, Math.round(l.h * k)) + "px";
+    frag.appendChild(box);
+  }
+  layer.appendChild(frag);
+}
+
+function paintLiveBoxes(tab) {
+  const layer = $("liveBoxes");
+  const rb = tab && tab.rb;
+  if (!rb || !rb.vmap || !boxesWanted() || tabDisplay(tab) !== "live" || activeWebTab() !== tab) {
+    layer.replaceChildren();
+    return;
+  }
+  const img = $("remoteImg").getBoundingClientRect();
+  const stage = $("remoteStage").getBoundingClientRect();
+  if (!img.width || !rb.width) { layer.replaceChildren(); return; }
+  paintBoxes(layer, rb.vmap.links, img.width / rb.width, img.left - stage.left, img.top - stage.top);
+}
+
+// The setting changed (this or another device): redraw the outlines and re-evaluate the display.
+function syncRemoteSettings() {
+  for (const tab of state.tabs) {
+    if (tab.rb && tab.rb.view) paintBoxes(tab.rb.view.boxes, tab.rb.view.meta.links, tab.rb.view.k, 0, 0);
+  }
+  const tab = remoteTab();
+  if (tab) { paintLiveBoxes(tab); applyDisplay(tab); }
+}
+
+// ---- live display link map (v0.1.30) ----
+// The Hub reports the links of the visible viewport ({rev, scrollX, scrollY, links:[{x,y,w,h,href}]},
+// CSS px relative to the viewport). Every live frame carries X-Frame-Links-Rev; when it differs from
+// the revision held here the map is refreshed (throttled), and only while the live display is shown.
+function cleanViewportMap(vl) {
+  if (!vl || !Array.isArray(vl.links)) return null;
+  const num = v => typeof v === "number" && Number.isFinite(v);
+  const links = [];
+  for (const l of vl.links) {
+    if (links.length >= 600) break;
+    if (l && num(l.x) && num(l.y) && num(l.w) && num(l.h) && l.w > 0 && l.h > 0 &&
+        typeof l.href === "string" && /^https?:\/\//i.test(l.href)) {
+      links.push({x: l.x, y: l.y, w: l.w, h: l.h, href: l.href});
+    }
+  }
+  return {rev: vl.rev, scrollX: num(vl.scrollX) ? vl.scrollX : 0, scrollY: num(vl.scrollY) ? vl.scrollY : 0, links};
+}
+
+function noteLinksRev(tab, rev) {
+  const rb = tab && tab.rb;
+  if (!rb || tabDisplay(tab) !== "live") return;
+  rb.linksRev = rev;
+  if (rev !== rb.vmapRev) scheduleViewportLinks(tab, false);
+}
+
+function scheduleViewportLinks(tab, immediate) {
+  const rb = tab && tab.rb;
+  if (!rb || rb.vmapTimer || tabDisplay(tab) !== "live") return;
+  // The page flags a scroll end 200 ms after the last scroll event: ask a little later than that.
+  const wait = Math.max(immediate ? 0 : RB_VP_DEBOUNCE_MS, rb.vmapAt + RB_VP_MIN_MS - Date.now());
+  rb.vmapTimer = setTimeout(() => {
+    rb.vmapTimer = 0;
+    if (tab.rb !== rb || tabDisplay(tab) !== "live" || state.rbPolling !== rb.id ||
+        document.visibilityState !== "visible") return;
+    fetchViewportLinks(tab, false).catch(() => {});
+  }, wait);
+}
+
+function fetchViewportLinks(tab, fresh) {
+  const rb = tab && tab.rb;
+  if (!rb) return Promise.resolve(null);
+  if (rb.vmapBusy && !fresh) return rb.vmapBusy;
+  rb.vmapAt = Date.now();
+  const job = (async () => {
+    try {
+      let target = "/api/rb/meta?tab=" + encodeURIComponent(rb.id) + "&wait=0&links=1";
+      if (rb.vmap && rb.vmapRev >= 0) target += "&vp=" + rb.vmapRev;
+      if (fresh) target += "&fresh=1";
+      const res = await fetch(target, {credentials: "same-origin", cache: "no-store"});
+      if (res.status !== 200 || tab.rb !== rb) return rb.vmap;
+      const meta = await res.json();
+      const vl = meta && meta.viewport_links;
+      if (tab.rb !== rb || !vl || !Number.isFinite(vl.rev)) return rb.vmap;
+      if (vl.unchanged === true) {
+        rb.vmapRev = vl.rev;
+      } else {
+        const map = cleanViewportMap(vl);
+        if (map) { rb.vmap = map; rb.vmapRev = vl.rev; paintLiveBoxes(tab); }
+      }
+      return rb.vmap;
+    } catch (e) {
+      return rb.vmap;       // transient: the next frame change asks again
+    } finally {
+      if (rb.vmapBusy === job) rb.vmapBusy = null;
+    }
+  })();
+  rb.vmapBusy = job;
+  return job;
+}
+
+// ---- reader mode (v0.1.30) ----
+// The Hub runs a fixed extractor in the NAS browser and returns validated blocks (headings,
+// paragraphs with link runs, list items, images, preformatted text). Everything is built here with
+// createElement/textContent: no remote HTML, script or style reaches this page. Links are <a> elements
+// carrying data-href (never a real href); images are blob: URLs of /api/rb/reader/img bytes.
+const readerHost = {owner: null, entries: new Set(), near: null, far: null, map: new WeakMap()};
+const readerQueue = [];
+let readerActive = 0;
+const READER_TYPES = ["h", "p", "li", "img", "pre", "hr"];
+
+function readerRunsOk(runs) {
+  return Array.isArray(runs) && runs.every(r => r && typeof r.text === "string" &&
+    (r.href === undefined || (typeof r.href === "string" && /^https?:\/\//i.test(r.href) && r.href.length <= 2048)));
+}
+
+// The Hub validated these already; the page checks types again before building anything.
+function cleanReaderData(data) {
+  if (!data || !Array.isArray(data.blocks)) return null;
+  const blocks = data.blocks.filter(b => {
+    if (!b || !READER_TYPES.includes(b.t)) return false;
+    if (b.t === "h") return typeof b.text === "string" && Number.isInteger(b.level);
+    if (b.t === "p" || b.t === "li") return readerRunsOk(b.runs);
+    if (b.t === "pre") return typeof b.text === "string";
+    if (b.t === "img") return Number.isInteger(b.i) && b.i >= 0;
+    return true;
+  }).slice(0, 5000);
+  return {title: typeof data.title === "string" ? data.title : "", host: typeof data.host === "string" ? data.host : "",
+    url: typeof data.url === "string" ? data.url : "", blocks, truncated: data.truncated === true};
+}
+
+function readerObservers() {
+  if (readerHost.near || typeof IntersectionObserver !== "function") return;
+  const root = $("readerScroll");
+  readerHost.near = new IntersectionObserver(entries => {
+    for (const entry of entries) {
+      const e = readerHost.map.get(entry.target);
+      if (e && entry.isIntersecting) { e.want = true; queueReaderImage(e); }
+    }
+  }, {root, rootMargin: "100% 0px 100% 0px"});
+  readerHost.far = new IntersectionObserver(entries => {
+    for (const entry of entries) {
+      const e = readerHost.map.get(entry.target);
+      if (e && !entry.isIntersecting) { e.want = false; releaseReaderImage(e); }
+    }
+  }, {root, rootMargin: "300% 0px 300% 0px"});
+}
+
+function releaseReaderImage(e) {
+  if (!e.url) return;
+  if (!e.img.style.aspectRatio) e.img.style.height = e.img.offsetHeight + "px";   // keep the layout stable
+  URL.revokeObjectURL(e.url);
+  e.url = "";
+  e.img.removeAttribute("src");
+}
+
+function clearReaderBody() {
+  for (const e of readerHost.entries) {
+    e.dead = true;
+    e.want = false;
+    if (readerHost.near) { readerHost.near.unobserve(e.img); readerHost.far.unobserve(e.img); }
+    if (e.url) { URL.revokeObjectURL(e.url); e.url = ""; }
+  }
+  readerHost.entries.clear();
+  readerQueue.length = 0;
+  $("readerBody").replaceChildren();
+}
+
+function dropReader(rb) {
+  rb.reader = null;
+  rb.readerPending = false;
+  rb.readerAgain = false;
+  if (readerHost.owner === rb) {
+    readerHost.owner = null;
+    clearReaderBody();
+    $("readerTitle").textContent = "";
+    $("readerHost").textContent = "";
+  }
+  rb.busy = 0;
+  syncSnapProgress();
+}
+
+function queueReaderImage(e) {
+  if (e.dead || e.url || e.queued) return;
+  if (e.failedAt && Date.now() - e.failedAt < 10000) return;
+  e.queued = true;
+  readerQueue.push(e);
+  pumpReaderImages();
+}
+
+function pumpReaderImages() {
+  while (readerActive < RB_READER_IMG_CONCURRENCY && readerQueue.length) {
+    const e = readerQueue.shift();
+    e.queued = false;
+    if (e.dead || !e.want || e.url) continue;
+    readerActive++;
+    fetchReaderImage(e).catch(() => {}).finally(() => { readerActive--; pumpReaderImages(); });
+  }
+}
+
+async function fetchReaderImage(e) {
+  const began = performance.now();
+  try {
+    const res = await fetch("/api/rb/reader/img?tab=" + encodeURIComponent(e.rb.id) + "&i=" + e.index,
+      {credentials: "same-origin", cache: "no-store"});
+    if (e.dead) return;
+    if (res.status === 401 && state.authed) { state.authed = false; setTimeout(go, 0); return; }
+    if (res.status !== 200) { e.failedAt = Date.now(); e.img.classList.add("is-failed"); return; }
+    const blob = await res.blob();
+    if (e.dead || !e.want || e.url) return;
+    if (!blob.size || !/^image\/(jpeg|png|gif|webp|avif)$/.test(blob.type)) {
+      e.failedAt = Date.now();
+      e.img.classList.add("is-failed");
+      return;
+    }
+    e.rb.perf.imgs = (e.rb.perf.imgs || 0) + 1;
+    e.rb.perf.imgMs = (e.rb.perf.imgMs || 0) + (performance.now() - began);
+    e.url = URL.createObjectURL(blob);
+    e.img.classList.remove("is-failed");
+    e.img.style.height = "";
+    e.img.src = e.url;
+  } catch (err) {
+    e.failedAt = Date.now();
+  }
+}
+
+function readerLink(text, href) {
+  const a = document.createElement("a");
+  a.textContent = text;
+  a.dataset.href = href;          // never a real href: a tap goes to the NAS browser, not this page
+  a.className = "reader-link";
+  a.tabIndex = 0;
+  a.setAttribute("role", "link");
+  return a;
+}
+
+function readerRuns(parent, runs) {
+  for (const run of runs) {
+    if (run.href) parent.appendChild(readerLink(run.text, run.href));
+    else parent.appendChild(document.createTextNode(run.text));
+  }
+}
+
+function readerImage(rb, block) {
+  const figure = element("figure", undefined, "reader-fig");
+  const img = document.createElement("img");
+  img.className = "reader-img";
+  img.alt = typeof block.alt === "string" ? block.alt : "";
+  img.draggable = false;
+  img.decoding = "async";
+  if (Number.isFinite(block.w) && Number.isFinite(block.h) && block.w > 0 && block.h > 0) {
+    img.style.aspectRatio = Math.min(block.w, 20000) + " / " + Math.min(block.h, 20000);
+  }
+  const entry = {rb, img, index: block.i, url: "", want: false, dead: false, queued: false, failedAt: 0};
+  readerHost.map.set(img, entry);
+  readerHost.entries.add(entry);
+  readerObservers();
+  if (readerHost.near) { readerHost.near.observe(img); readerHost.far.observe(img); }
+  else { entry.want = true; queueReaderImage(entry); }
+  if (typeof block.href === "string" && /^https?:\/\//i.test(block.href)) {
+    const a = readerLink("", block.href);
+    a.classList.add("reader-imglink");
+    a.appendChild(img);
+    figure.appendChild(a);
+  } else {
+    figure.appendChild(img);
+  }
+  return figure;
+}
+
+function readerNode(rb, block) {
+  if (block.t === "h") {
+    return element("h" + Math.min(6, Math.max(2, block.level + 1)), block.text, "reader-h");
+  }
+  if (block.t === "p") {
+    const p = element("p", undefined, "reader-p");
+    readerRuns(p, block.runs);
+    return p;
+  }
+  if (block.t === "li") {
+    const li = element("div", undefined, "reader-li");
+    li.style.marginLeft = (1.2 + 1.4 * Math.max(0, Math.min(8, Number(block.depth) || 0))) + "em";
+    readerRuns(li, block.runs);
+    return li;
+  }
+  if (block.t === "pre") return element("pre", block.text, "reader-pre");
+  if (block.t === "img") return readerImage(rb, block);
+  return element("hr", undefined, "reader-hr");
+}
+
+function renderReaderBody(rb) {
+  clearReaderBody();
+  const data = rb.reader && rb.reader.data;
+  $("readerTitle").textContent = data ? (data.title || data.host) : "";
+  $("readerHost").textContent = data ? data.host : "";
+  if (!data) return;
+  const body = $("readerBody");
+  if (!data.blocks.length) {
+    body.appendChild(element("p", "本文を取り出せませんでした。「元のページ表示に切替」をお試しください。", "reader-empty"));
+    return;
+  }
+  const frag = document.createDocumentFragment();
+  for (const block of data.blocks) frag.appendChild(readerNode(rb, block));
+  if (data.truncated) frag.appendChild(element("p", "長いページのため、途中までを表示しています。", "reader-empty"));
+  body.appendChild(frag);
+}
+
+// The reader container is shared by all remote tabs; only its owner's content is built.
+function mountReader(tab) {
+  const rb = tab.rb;
+  if (!rb || readerHost.owner === rb) return;
+  const scroller = $("readerScroll");
+  if (readerHost.owner) readerHost.owner.readerTop = scroller.scrollTop;
+  readerHost.owner = rb;
+  renderReaderBody(rb);
+  scroller.scrollTop = rb.readerTop || 0;
+}
+
+async function runReader(tab, opts = {}) {
+  const rb = tab && tab.rb;
+  if (!rb || tabDisplay(tab) !== "reader") return;
+  if (rb.readerBusy) { rb.readerAgain = true; return; }
+  rb.readerBusy = true;
+  snapBusy(rb, 1);
+  try {
+    const started = performance.now();
+    const raw = await api("/api/rb/reader", {tab: rb.id});
+    rb.perf.extractMs = performance.now() - started;
+    rb.perf.imgs = 0; rb.perf.imgMs = 0;
+    const data = cleanReaderData(raw);
+    if (tab.rb !== rb || tabDisplay(tab) !== "reader") return;
+    if (!data) throw new Error("本文を取り出せませんでした");
+    const scroller = $("readerScroll");
+    const mounted = readerHost.owner === rb;
+    const sameUrl = Boolean(rb.reader && rb.reader.data) && rb.reader.data.url === data.url;
+    const keepTop = mounted && sameUrl && opts.keepScroll !== false ? scroller.scrollTop : 0;
+    rb.reader = {data, url: data.url};
+    rb.readerPending = false;
+    if (mounted) { renderReaderBody(rb); scroller.scrollTop = keepTop; }
+    updateRemoteView(tab);
+  } catch (e) {
+    if (tab.rb !== rb) return;
+    if (e.status === 404) remoteLost(tab);
+    else if (!opts.quiet) toast(e.message, "error");
+  } finally {
+    rb.readerBusy = false;
+    snapBusy(rb, -1);
+    if (rb.readerAgain && tab.rb === rb) {
+      rb.readerAgain = false;
+      runReader(tab, {quiet: true}).catch(() => {});
+    }
+  }
+}
+
+// Metadata long-poll like the fast display's: when a page finishes loading (or the address changed)
+// the reader data is fetched again.
+async function readerLoop(tab, gen) {
+  let fails = 0, first = true;
+  await nextPaint();
+  await nextPaint();
+  if (gen !== state.rbGen || !tab.rb) return;
+  await sendViewport(tab).catch(() => {});
+  while (gen === state.rbGen && tab.rb) {
+    const rb = tab.rb;
+    try {
+      let target = "/api/rb/meta?tab=" + encodeURIComponent(rb.id) + "&wait=" + (first ? 0 : RB_META_WAIT_S);
+      if (!first && rb.rev !== null) target += "&rev=" + rb.rev;
+      first = false;
+      const res = await fetch(target, {credentials: "same-origin", cache: "no-store"});
+      if (gen !== state.rbGen || tab.rb !== rb) return;
+      if (res.status === 401 && state.authed) {
+        state.authed = false;
+        setTimeout(go, 0);
+        return;
+      }
+      if (res.status === 404) { remoteLost(tab); return; }
+      if (res.status !== 200) throw new Error("HTTP " + res.status);
+      const meta = await res.json();
+      if (gen !== state.rbGen || tab.rb !== rb) return;
+      fails = 0;
+      applyRemoteMeta(tab, Object.assign({}, meta, {seq: rb.seq}));
+      if (gen !== state.rbGen || tab.rb !== rb || tabDisplay(tab) !== "reader") return;
+      if (meta.loading === true) {
+        rb.readerPending = true;
+      } else if (!rb.reader || rb.reader.url !== meta.url || rb.readerPending) {
+        runReader(tab, {quiet: true}).catch(() => {});
+      }
+    } catch (e) {
+      if (gen !== state.rbGen) return;
+      fails++;
+      if (fails >= RB_MAX_POLL_FAILS) {
+        state.rbPolling = "";
+        state.rbPollMode = "";
+        toast("NASブラウザの画面を取得できません: " + e.message, "error");
+        return;
+      }
+      await delay(1000);
+    }
+  }
+}
+
+// Tap on a link: the NAS browser goes there (the Hub validates the address); the loop reads the
+// new page when it finishes loading.
+async function readerNavigate(tab, href) {
+  const rb = tab && tab.rb;
+  if (!rb) return;
+  try {
+    await api("/api/rb/navigate", {tab: rb.id, url: href});
+    rb.readerPending = true;
+  } catch (e) {
+    if (e.status === 404) remoteLost(tab);
+    else throw e;
+  }
+}
+
+function wireReader() {
+  const body = $("readerBody");
+  const press = {timer: 0, a: null, x: 0, y: 0, id: null, fired: false};
+  const stop = () => { clearTimeout(press.timer); press.timer = 0; };
+  const anchor = event => (event.target && event.target.closest) ? event.target.closest("a[data-href]") : null;
+  body.addEventListener("pointerdown", event => {
+    stop();
+    press.fired = false;
+    const a = anchor(event);
+    if (!a || (event.pointerType === "mouse" && event.button !== 0)) return;
+    press.a = a; press.x = event.clientX; press.y = event.clientY; press.id = event.pointerId;
+    press.timer = setTimeout(() => {
+      press.timer = 0;
+      const tab = remoteTab();
+      if (!press.a || !tab || tabDisplay(tab) !== "reader") return;
+      press.fired = true;
+      showPressRing(press.x, press.y);
+      $("remoteRing").classList.add("is-done");
+      setTimeout(hidePressRing, 350);
+      const href = press.a.dataset.href;
+      perform(() => startProbe(tab, {href}));      // the exact address is known: no hit test needed
+    }, RB_LONGPRESS_MS);
+  });
+  body.addEventListener("pointermove", event => {
+    if (press.timer && event.pointerId === press.id &&
+        Math.hypot(event.clientX - press.x, event.clientY - press.y) > RB_LONGPRESS_MOVE_PX) stop();
+  });
+  body.addEventListener("pointerup", stop);
+  body.addEventListener("pointercancel", stop);
+  body.addEventListener("contextmenu", event => { if (anchor(event)) event.preventDefault(); });
+  const open = event => {
+    const a = anchor(event);
+    if (!a) return;
+    event.preventDefault();
+    if (press.fired) { press.fired = false; return; }       // the long press already started a probe
+    const tab = remoteTab();
+    if (tab && tabDisplay(tab) === "reader") perform(() => readerNavigate(tab, a.dataset.href));
+  };
+  body.addEventListener("click", open);
+  body.addEventListener("keydown", event => { if (event.key === "Enter") open(event); });
+  wirePull($("readerScroll"), () => {
+    const tab = remoteTab();
+    if (tab && tabDisplay(tab) === "reader") perform(() => runReader(tab, {keepScroll: true}));
+  });
+  $("readerOriginal").addEventListener("click", () => {
+    const tab = remoteTab();
+    if (tab) setUserDisplay(tab, "tiles");
+  });
 }
 
 // ---- long press: follow the link in a hidden background page on the NAS
@@ -2369,7 +3030,17 @@ function longPress(clientX, clientY) {
   rbPress.fired = true;
   $("remoteRing").classList.add("is-done");
   setTimeout(() => { rbPress.fired = false; hidePressRing(); }, 350);
-  perform(() => startProbe(tab, point));
+  // Live display: hit test against the viewport link map (refreshed first when the picture
+  // changed since); no link near the point -> the Hub resolves the coordinates itself.
+  perform(async () => {
+    const rb = tab.rb;
+    if (rb && (!rb.vmap || rb.vmapRev !== rb.linksRev)) {
+      await Promise.race([fetchViewportLinks(tab, true), delay(RB_VP_WAIT_MS)]);
+    }
+    if (tab.rb !== rb || !rb) return;
+    const link = rb.vmap ? pickLink(rb.vmap.links, point.x, point.y) : null;
+    await startProbe(tab, link ? {href: link.href} : point);
+  });
 }
 
 // ---- parallel long-press probes (v0.1.27) ----
@@ -2480,8 +3151,8 @@ async function startProbe(tab, point) {
   probeFlight.set(id, item);
   renderProbeChip();
   try {
-    const result = await api("/api/rb/probe", point.href ?
-      {tab: rb.id, href: point.href} : {tab: rb.id, x: point.x, y: point.y});
+    const result = await api("/api/rb/probe", point.href ? {tab: rb.id, href: point.href} :
+      point.snap ? {tab: rb.id, x: point.x, y: point.y, snap: point.snap} : {tab: rb.id, x: point.x, y: point.y});
     probeFlight.delete(id);
     renderProbeChip();
     if (tab.rb !== rb) return;
@@ -2559,7 +3230,9 @@ function wireRemote() {
       if (rbPointer.id !== null && !rbPointer.moved) longPress(startX, startY);
     }, RB_LONGPRESS_MS);
   });
-  stage.addEventListener("contextmenu", event => event.preventDefault());
+  stage.addEventListener("contextmenu", event => {
+    if (!event.target.closest || !event.target.closest("#readerScroll")) event.preventDefault();
+  });
   stage.addEventListener("pointermove", event => {
     if (event.pointerId !== rbPointer.id) return;
     if (Math.hypot(event.clientX - rbPointer.startX, event.clientY - rbPointer.startY) >
@@ -2671,6 +3344,7 @@ function wireRemote() {
   });
   document.addEventListener("visibilitychange", syncRemotePoll);
   wireTiles();
+  wireReader();
 }
 
 function refreshAfterTabChange() {
@@ -2728,7 +3402,6 @@ async function stepHistory(tab, delta) {
 async function openWebUrl(value) {
   const tab = activeWebTab();
   if (tab) { await navigateTab(tab, value); return; }
-  if (isExternalHost(hostOf(value)) && tryExternalOpen(value, null)) return;
   if (tabLimitReached()) return;
   const url = await validateUrl(value);
   const fresh = createTab();
@@ -2736,8 +3409,7 @@ async function openWebUrl(value) {
   applyHostMode(fresh, url);
   fresh.current = url;
   fresh.loaded = true;
-  if (isExternalHost(hostOf(url))) fresh.external = true;
-  else mountFrame(fresh, url);
+  mountFrame(fresh, url);
   saveTabs();
   navigate("#/tab/" + fresh.id);
 }
@@ -2745,7 +3417,7 @@ async function openWebUrl(value) {
 const COMPAT_CONFIRM = "互換モードに切り替えます。\n\n" +
   "・このサイト自身のCookie・ストレージを枠内で使えるようにします（Hub自体のものではありません）。\n" +
   "・Cloudflareの確認を回避する機能ではありません。\n" +
-  "・iPhoneのSafariではサードパーティCookieのブロックにより動作しない場合があります。その場合は「Safariで開く」を使ってください。\n\n" +
+  "・iPhoneのSafariではサードパーティCookieのブロックにより動作しない場合があります。その場合は「NASブラウザ」を使ってください。\n\n" +
   "続けますか？";
 
 async function setMode(tab, target) {
@@ -2825,7 +3497,7 @@ function configureMenu() {
   const web = Boolean(tab && tab.history.length);
   $("menu").querySelectorAll("[data-scope='web']").forEach(n => { n.hidden = !web; });
   const usable = Boolean(tab && tab.current);
-  for (const action of ["remoteOpen", "external", "stageUrl", "bookmark"]) {
+  for (const action of ["remoteOpen", "stageUrl", "bookmark"]) {
     $("menu").querySelector("[data-action='" + action + "']").disabled = !usable;
   }
   $("menu").querySelector("[data-action='reopen']").disabled = state.closed.length === 0;
@@ -2871,50 +3543,12 @@ async function menuAction(action) {
   else if (action.startsWith("quality:")) setRbQuality(action.slice(8));
   else if (action.startsWith("display:")) setUserDisplay(tab, action.slice(8));
   else if (action === "perf") setPerf(!state.rbPerf);
-  else if (action === "external" && tab) openExternal(tab);
   else if (action === "stageUrl" && tab) await stageTabUrl(tab);
   else if (action === "bookmark" && tab) await bookmarkTab(tab);
   else if (action === "closeTab" && tab) closeTab(tab.id);
   else if (action === "bookmarks") navigate("#/settings/bookmarks");
   else if (action === "settings") navigate(settingsHash());
   else if (action === "logout") await logout();
-}
-
-function openExternal(tab) {
-  if (!tab.current) return;   // only a URL that passed /api/browser/validate
-  window.open(tab.current, "_blank", "noopener,noreferrer");
-}
-
-// "Safariで開く（次回から自動）": open now (inside the click gesture) and remember the host.
-function alwaysExternal(tab) {
-  if (!tab.current) return;
-  const host = hostOf(tab.current);
-  rememberHostMode(host, EXTERNAL_MODE);
-  window.open(tab.current, "_blank", "noopener,noreferrer");
-  showExternalToast(host, tab.current);
-  renderExternalHosts();
-}
-
-// Settings: hosts set to "always open in Safari", each with a release button.
-function renderExternalHosts() {
-  const box = $("externalHosts");
-  if (!box) return;
-  const hosts = externalHosts();
-  if (!hosts.length) {
-    box.replaceChildren(element("p", "設定されたサイトはありません。", "empty-state"));
-    return;
-  }
-  const nodes = [];
-  for (const host of hosts) {
-    const row = element("div", undefined, "item");
-    row.appendChild(element("span", host));
-    const off = element("button", "解除", "btn small");
-    off.type = "button";
-    off.addEventListener("click", () => { clearExternalHost(host); renderExternalHosts(); });
-    row.appendChild(off);
-    nodes.push(row);
-  }
-  box.replaceChildren(...nodes);
 }
 
 async function stageTabUrl(tab) {
@@ -3978,9 +4612,13 @@ function renderDownloadDir(s) {
   $("sendAutostart").checked = s.send_autostart !== false;
   $("probeAutosend").checked = s.probe_autosend !== false;
   $("blockAds").checked = s.block_ads !== false;
+  const displayMode = DISPLAY_OF_SETTING[s.rb_default_mode] ? s.rb_default_mode : "fast";
+  document.querySelectorAll('input[name="rbDefaultMode"]').forEach(radio => { radio.checked = radio.value === displayMode; });
+  $("rbLinkBoxes").checked = s.rb_link_boxes === true;
   $("selectedFolder").textContent = s.download_dir || "未選択";
   $("folderChange").textContent = s.download_dir ? "変更" : "選ぶ";
   renderHome();
+  syncRemoteSettings();
 }
 
 function setPicker(open) {
@@ -4022,7 +4660,6 @@ async function enterSettings(section, force = false) {
     renderShareStatic();
     await swr("share-tokens", "/api/share/tokens", renderShareDevices, {force});
   } else if (section === "bookmarks") {
-    renderExternalHosts();
     await loadBookmarks(force);
   } else if (section === "updates") {
     await Promise.all([loadStatus(force), updateStatus(force)]);
@@ -4287,6 +4924,7 @@ function teardownSession() {
   state.siteRules = null;
   state.waiting = null;
   cancelPress();
+  closeStream();
   $("remoteImg").removeAttribute("src");
   $("frames").replaceChildren();   // unload every external page
   state.tabs = [];
@@ -4438,10 +5076,6 @@ function wireShell() {
   $("cfCompat").addEventListener("click", () => {
     const tab = activeWebTab();
     if (tab) perform(() => setMode(tab, "compat"));
-  });
-  $("cfSafari").addEventListener("click", () => {
-    const tab = activeWebTab();
-    if (tab) alwaysExternal(tab);
   });
   $("cfDismiss").addEventListener("click", () => {
     const tab = activeWebTab();
@@ -5110,7 +5744,8 @@ function renderRemoteHosts() {
   const nodes = [];
   for (const host of hosts) {
     const row = element("div", undefined, "item");
-    row.appendChild(element("span", host));
+    const shown = DISPLAY_OF_MODE[rememberedMode(host)];
+    row.appendChild(element("span", host + "（" + (shown ? RB_DISPLAY_LABELS[shown] : "既定の表示") + "）"));
     const off = element("button", "解除", "btn small");
     off.type = "button";
     off.addEventListener("click", () => { rememberHostMode(host, "strict"); renderRemoteHosts(); });
@@ -5182,6 +5817,7 @@ async function saveOption(key, value) {
   swrDrop("settings", "status");
   state.settings = saved;
   renderHome();
+  syncRemoteSettings();
   return saved;
 }
 
@@ -5238,6 +5874,24 @@ function wireBrowser() {
       await saveOption("block_ads", $("blockAds").checked);
       flash($("blockAds").checked ? "広告をブロックします（次に開くタブから）" : "広告ブロックをやめました（次に開くタブから）");
     } catch (e) { $("blockAds").checked = !$("blockAds").checked; throw e; }
+  }));
+  document.querySelectorAll('input[name="rbDefaultMode"]').forEach(radio => {
+    radio.addEventListener("change", () => perform(async () => {
+      if (!radio.checked) return;
+      try {
+        await saveOption("rb_default_mode", radio.value);
+        flash("既定の表示方法: " + RB_DISPLAY_LABELS[DISPLAY_OF_SETTING[radio.value]]);
+      } catch (e) {
+        renderDownloadDir(state.settings || {});
+        throw e;
+      }
+    }));
+  });
+  $("rbLinkBoxes").addEventListener("change", () => perform(async () => {
+    try {
+      await saveOption("rb_link_boxes", $("rbLinkBoxes").checked);
+      flash($("rbLinkBoxes").checked ? "リンクの枠を表示します" : "リンクの枠を隠しました");
+    } catch (e) { $("rbLinkBoxes").checked = !$("rbLinkBoxes").checked; throw e; }
   }));
   $("probeAutosend").addEventListener("change", () => perform(async () => {
     try {

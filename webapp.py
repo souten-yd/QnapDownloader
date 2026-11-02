@@ -27,7 +27,7 @@ import engine_supervisor
 import remote_browser
 import updater
 
-VERSION = "0.1.29"
+VERSION = "0.1.30"
 PORT = 17864
 ROOT = Path(__file__).resolve().parent
 FILES = {"/": ("web/index.html", "text/html; charset=utf-8"),
@@ -362,6 +362,39 @@ class Handler(BaseHTTPRequestHandler):
             return
         super().log_message(format, *args)
 
+    def security_headers(self):
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("Permissions-Policy", "geolocation=(),camera=(),microphone=(),payment=()")
+        self.send_header("Content-Security-Policy", "default-src 'none'; img-src 'self' data: blob:; script-src 'self'; style-src 'self'; connect-src 'self'; frame-src https:; base-uri 'none'; frame-ancestors 'none'; form-action 'self'")
+
+    def stream_mjpeg(self, tab_id):
+        """Live display push stream (multipart/x-mixed-replace). Runs until the viewer leaves."""
+        started = []
+
+        def write(part):
+            if not started:
+                self.send_response(200)
+                self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=" + remote_browser.STREAM_BOUNDARY)
+                self.send_header("Connection", "close")
+                self.security_headers()
+                self.end_headers()
+                started.append(True)
+            self.wfile.write(part)
+            self.wfile.flush()
+
+        self.connection.settimeout(10)        # a stalled viewer must not hold the thread
+        self.close_connection = True
+        try:
+            self.server.rb.stream(tab_id, write)
+        except OSError:
+            pass
+        if not started:
+            # Ended before the first part (tab closed or container stopped).
+            raise remote_browser.TabGone("このタブはすでに閉じられています")
+
     def send_data(self, status, data, content_type="application/json; charset=utf-8", extra=None):
         raw = json.dumps(data, ensure_ascii=False).encode("utf-8") if not isinstance(data, bytes) else data
         self.send_response(status)
@@ -645,6 +678,7 @@ class Handler(BaseHTTPRequestHandler):
                     "X-Frame-Popups": str(result["popups"]),
                     "X-Frame-Editable": "1" if result.get("editable") else "0",
                     "X-Frame-Challenge": "1" if result.get("challenge") else "0",
+                    "X-Frame-Links-Rev": str(result["links_rev"]),
                 }
                 if result["jpeg"] is None:
                     return self.send_data(204, b"", extra=headers)
@@ -666,9 +700,25 @@ class Handler(BaseHTTPRequestHandler):
                 rev_text = query.get("rev", [None])[0]
                 if rev_text is not None and (not rev_text.isdecimal() or len(rev_text) > 12):
                     raise ValueError("revが不正です")
+                vp_text = query.get("vp", [None])[0]
+                if vp_text is not None and (not vp_text.isdecimal() or len(vp_text) > 12):
+                    raise ValueError("vpが不正です")
                 return self.send_data(200, self.server.rb.page_meta(
                     query.get("tab", [""])[0], None if rev_text is None else int(rev_text),
-                    wait=int(wait_text)))
+                    wait=int(wait_text), links=query.get("links", ["0"])[0] == "1",
+                    vp=None if vp_text is None else int(vp_text),
+                    fresh=query.get("fresh", ["0"])[0] == "1"))
+            if path == "/api/rb/stream.mjpg":
+                query = parse_qs(urlsplit(self.path).query)
+                return self.stream_mjpeg(query.get("tab", [""])[0])
+            if path == "/api/rb/reader/img":
+                # Reader mode: one image, read through the NAS browser (never a remote URL).
+                query = parse_qs(urlsplit(self.path).query)
+                index_text = query.get("i", [""])[0]
+                if not index_text.isdecimal() or len(index_text) > 4:
+                    raise ValueError("iが不正です")
+                data, kind = self.server.rb.reader_image(query.get("tab", [""])[0], int(index_text))
+                return self.send_data(200, data, kind)
             if path == "/api/rb/site-rules":
                 return self.send_data(200, {"items": self.store.site_rules(),
                                             "block_ads": self.store.settings().get("block_ads", True),
@@ -703,6 +753,10 @@ class Handler(BaseHTTPRequestHandler):
             return self.reject(str(exc), 404)
         except remote_browser.ProbeQueueFull as exc:
             return self.reject(str(exc), 429)
+        except remote_browser.ImageRefused as exc:
+            return self.reject(str(exc), 415)
+        except remote_browser.ImageUnavailable as exc:
+            return self.reject(str(exc), 502)
         except (OSError, ValueError, RuntimeError, KeyError, sqlite3.Error) as exc:
             return self.reject(str(exc))
         self.reject("APIが存在しません", 404)
@@ -828,8 +882,9 @@ class Handler(BaseHTTPRequestHandler):
                     raise ValueError("フォルダに書き込み権限がありません")
                 return self.send_data(200, self.store.set_download_dir(str(chosen)))
             if path == "/api/settings/options":
-                known = [key for key in storage.BOOL_OPTIONS if key in body]
-                if not known or set(body) - set(storage.BOOL_OPTIONS):
+                options = storage.BOOL_OPTIONS + tuple(storage.ENUM_OPTIONS)
+                known = [key for key in options if key in body]
+                if not known or set(body) - set(options):
                     raise ValueError("変更できる設定項目を指定してください")
                 for key in known:
                     self.store.set_option(key, body[key])
@@ -932,10 +987,12 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/rb/tap-page":
                 return self.send_data(200, self.server.rb.tap_page(
                     body.get("tab"), body.get("snap"), body.get("x"), body.get("y")))
+            if path == "/api/rb/reader":
+                return self.send_data(200, self.server.rb.reader(body.get("tab")))
             if path == "/api/rb/probe":
                 result = self.server.rb.probe(
                     body.get("tab"), body.get("x"), body.get("y"), url_check=self.reject_hub_origin,
-                    href=body.get("href"))
+                    href=body.get("href"), snap=body.get("snap"))
                 result = dict(result, probe_id=remember_probe(self.server, body.get("tab"), result.get("links")))
                 return self.send_data(200, result)
             if path == "/api/rb/probe/send":

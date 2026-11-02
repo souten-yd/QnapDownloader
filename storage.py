@@ -24,8 +24,13 @@ DEFAULTS = {
     "block_ads": True,
     # v0.1.25: a long press that finds hoster links sends them to JD2 right away.
     "probe_autosend": True,
+    # v0.1.30: how a NAS browser tab is displayed unless the site has its own remembered choice
+    # (reader / fast = full-page tiles / live = screencast), and the optional link-box outlines.
+    "rb_default_mode": "fast",
+    "rb_link_boxes": False,
 }
-BOOL_OPTIONS = ("send_autostart", "block_ads", "probe_autosend")
+BOOL_OPTIONS = ("send_autostart", "block_ads", "probe_autosend", "rb_link_boxes")
+ENUM_OPTIONS = {"rb_default_mode": ("reader", "fast", "live")}
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY,value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS accounts(id INTEGER PRIMARY KEY CHECK(id=1),
@@ -145,15 +150,18 @@ class Store:
         return self.settings()
 
     def set_option(self, key, value):
-        """Boolean option in the settings table; written only when it changes."""
-        if key not in BOOL_OPTIONS or type(value) is not bool:
+        """Boolean (or fixed-choice) option in the settings table; written only when it changes."""
+        if key in ENUM_OPTIONS:
+            if not isinstance(value, str) or value not in ENUM_OPTIONS[key]:
+                raise ValueError("設定の項目または値が不正です")
+        elif key not in BOOL_OPTIONS or type(value) is not bool:
             raise ValueError("設定の項目または値が不正です")
         with self._guard, self.connect() as db:
             row = db.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
             current = json.loads(row[0]) if row else DEFAULTS[key]
-            if row is not None and current is value:
+            if row is not None and current == value and type(current) is type(value):
                 return self.settings()
-            if row is None and value is DEFAULTS[key]:
+            if row is None and value == DEFAULTS[key] and type(value) is type(DEFAULTS[key]):
                 return self.settings()
             db.execute("INSERT OR REPLACE INTO settings VALUES(?,?)", (key, json.dumps(value)))
             db.execute("UPDATE meta SET value=value+1 WHERE key='revision'")

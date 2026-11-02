@@ -65,7 +65,7 @@ class WebShellStaticTests(unittest.TestCase):
         self.assertRegex(self.js, r"MAX_HOST_MODES\s*=\s*100\b")
         self.assertRegex(self.js, r"MAX_LIVE_FRAMES_NARROW\s*=\s*1\b")
         self.assertRegex(self.js, r"MAX_LIVE_FRAMES_WIDE\s*=\s*3\b")
-        for ident in ("cfHint", "cfCompat", "cfSafari", "cfDismiss"):
+        for ident in ("cfHint", "cfCompat", "cfRemote", "cfDismiss"):
             self.assertIn('id="%s"' % ident, self.html)
         self.assertIn('name="mobile-web-app-capable"', self.html)
 
@@ -109,11 +109,13 @@ if (bad.length) { console.error("mismatch: " + bad.join(",")); process.exit(1); 
 
     def test_iframe_src_comes_from_validation(self):
         self.assertIn("/api/browser/validate", self.js)
-        # Exactly four assignments: the validated iframe URL, the remote-browser
+        # Exactly five assignments: the validated iframe URL, the remote-browser
         # screencast (blob: object URLs made from /api/rb/frame.jpg bytes: an
-        # off-screen probe image for decoding, then the visible image) and, since v0.1.28,
-        # one tile <img> (blob: object URL of /api/rb/tile.jpg bytes).
-        self.assertEqual(len(re.findall(r"\.src\s*=", self.js)), 4)
+        # off-screen probe image for decoding, then the visible image), since v0.1.28
+        # one tile <img> (blob: object URL of /api/rb/tile.jpg bytes) and, since v0.1.30,
+        # one reader <img> (blob: object URL of /api/rb/reader/img bytes) and the two places
+        # that point the live <img> at the same-origin MJPEG stream URL.
+        self.assertEqual(len(re.findall(r"\.src\s*=", self.js)), 8)
         self.assertIn("frame.src = validatedUrl", self.js)
         self.assertIn("img.src = next;", self.js)
 
@@ -132,8 +134,71 @@ if (bad.length) { console.error("mismatch: " + bad.join(",")); process.exit(1); 
             self.assertIn("try", before)
         self.assertNotRegex(self.js, r"(?i)(session|local)Storage\.setItem\([^)]*csrf")
 
-    def test_external_open_uses_noopener(self):
-        self.assertIn('window.open(tab.current, "_blank", "noopener,noreferrer")', self.js)
+    def test_v0130_reader_renderer_builds_dom_without_remote_html(self):
+        start = self.js.index("// ---- reader mode (v0.1.30) ----")
+        end = self.js.index("// ---- long press: follow the link in a hidden background page")
+        reader = self.js[start:end]
+        for token in ("innerHTML", "outerHTML", "insertAdjacentHTML", "document.write", "eval(", "new Function",
+                      "DOMParser", "createContextualFragment", "location.", "window.open", "srcdoc"):
+            self.assertNotIn(token, reader)
+        for token in ("document.createElement", "textContent", "createTextNode", "dataset.href"):
+            self.assertIn(token, reader)
+        self.assertNotRegex(reader, r"(?<!dataset)\.href\s*=(?!=)")       # links never get a real href
+        self.assertIn("e.url = URL.createObjectURL(blob);", reader)
+        self.assertIn("/api/rb/reader/img?tab=", reader)
+        self.assertIn('id="readerScroll"', self.html)
+        css = (WEB / "style.css").read_text(encoding="utf-8")
+        self.assertRegex(css, r"\.reader-scroll\{[^}]*touch-action:pan-x pan-y pinch-zoom")
+        self.assertRegex(css, r"\.reader-scroll\{[^}]*user-select:text")
+        self.assertRegex(css, r"\.link-boxes\{[^}]*pointer-events:none")
+        for text in ("既定の表示方法", "リンクの枠を表示", "元のページ表示に切替", "表示: リーダー"):
+            self.assertIn(text, self.html)
+        self.assertIn('name="rbDefaultMode"', self.html)
+
+    def test_safari_open_options_are_gone(self):
+        for path in text_files():
+            if path.parent.name != "web":
+                continue
+            text = path.read_text(encoding="utf-8")
+            with self.subTest(file=path.name):
+                self.assertNotIn("Safariで開く", text)
+                self.assertNotIn("常にSafari", text)
+                self.assertNotIn("externalHosts", text)
+                self.assertNotIn("cfSafari", text)
+        for token in ("alwaysExternal", "openExternal", "tryExternalOpen", "showExternalToast",
+                      "externalSanityUrl", "isExternalHost"):
+            self.assertNotIn(token, self.js)
+        self.assertNotRegex(self.js, r"\bEXTERNAL_MODE\b")
+        self.assertNotIn('data-action="external"', self.html)
+        # the iPhone share sheet / bookmarklet settings stay
+        self.assertIn('data-section="share"', self.html)
+
+    def test_stored_external_host_mode_migrates_to_the_nas_browser_default(self):
+        if shutil.which("node") is None:
+            self.skipTest("node missing")
+        pieces = [self.js[self.js.index("function readHostModes() {"):self.js.index("function rememberHostMode(")],
+                  self.js[self.js.index("// One-time rewrite of stored"):self.js.index("migrateHostModes();\n\n// ----")]]
+        script = """
+const MODES = ["strict", "interactive", "compat"], MAX_HOST_MODES = 100, HOST_MODE_KEY = "k";
+const REMOTE_MODE = "remote", REMOTE_FAST_MODE = "remote-fast", REMOTE_LIVE_MODE = "remote-live",
+  REMOTE_READER_MODE = "remote-reader";
+const REMOTE_MODES = [REMOTE_MODE, REMOTE_FAST_MODE, REMOTE_LIVE_MODE, REMOTE_READER_MODE];
+const LEGACY_EXTERNAL_MODE = "external";
+let store = null, broken = false;
+const readLocal = () => { if (broken) throw new Error("x"); return store; };
+const writeLocal = (k, v) => { store = v; };
+%s
+const eq = (a, b, m) => { if (JSON.stringify(a) !== JSON.stringify(b)) { console.error(m + ": " + JSON.stringify(a)); process.exit(1); } };
+store = JSON.stringify([["a.example", "external"], ["b.example", "compat"], ["c.example", "remote-live"], ["d.example", "bogus"]]);
+eq(readHostModes(), [["a.example", "remote"], ["b.example", "compat"], ["c.example", "remote-live"]], "read maps external");
+migrateHostModes();
+eq(JSON.parse(store), [["a.example", "remote"], ["b.example", "compat"], ["c.example", "remote-live"]], "stored copy rewritten");
+broken = true;
+migrateHostModes();
+eq(readHostModes(), [], "unreadable storage is harmless");
+""" % "\n".join(pieces)
+        result = subprocess.run(["node", "-e", script], capture_output=True, text=True, timeout=20)
+        self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_engine_section_and_alias(self):
         for ident in ("engineSetup", "engineStart", "engineStop", "engineAutostart",
@@ -239,27 +304,15 @@ if (out !== want) { console.error(JSON.stringify(out)); process.exit(1); }
         result = subprocess.run(["node", "-e", script], capture_output=True, text=True, timeout=20)
         self.assertEqual(result.returncode, 0, result.stderr)
 
-    def test_v0114_external_mode_storage(self):
-        self.assertIn('EXTERNAL_MODE = "external"', self.js)
-        self.assertRegex(self.js, r"e\[1\] === EXTERNAL_MODE")
-        self.assertIn("rememberHostMode(host, EXTERNAL_MODE)", self.js)
-        # external is a host preference, never a tab mode / sandbox value.
+    def test_v0114_host_mode_storage_is_guarded_and_capped(self):
         modes = re.search(r"const MODES = \[(.*?)\];", self.js).group(1)
         self.assertNotIn("external", modes)
-        # Reads/writes of the map stay guarded and capped.
         for fn in ("readLocal", "writeLocal", "removeLocal"):
             body = re.search(r"function %s\(.*?\n\}\n" % fn, self.js, re.S).group(0)
             self.assertIn("try", body)
             self.assertIn("catch", body)
         self.assertRegex(self.js, r"\.slice\(-MAX_HOST_MODES\)")
-        # Opens externally with noopener, synchronously, then validates.
-        self.assertIn('window.open(href, "_blank", "noopener,noreferrer")', self.js)
-        self.assertIn("externalSanityUrl", self.js)
-        self.assertIn("renderExternalHosts", self.js)
-        self.assertIn('id="externalHosts"', self.html)
-        self.assertIn("常にSafariで開くサイト", self.html)
         self.assertRegex(self.js, r"HINT_DELAY_MS\s*=\s*6000\b")
-        self.assertIn("Safariで開きました（このサイトは常に外部で開きます）", self.js)
 
     def test_v0114_long_tab_copy_removed(self):
         for gone in ("隔離表示中", "枠内の遷移先URLは", "Cloudflareの確認が進まない場合",
@@ -273,7 +326,6 @@ if (out !== want) { console.error(JSON.stringify(out)); process.exit(1); }
         view_web = re.search(r'<section id="view-web".*?</section>', self.html, re.S).group(0)
         self.assertNotIn("HTTPSで開くと", view_web)
         self.assertIn("表示されない場合", view_web)
-        self.assertIn("Safariで開く（次回から自動）", view_web)
         self.assertIn("互換で再読み込み", view_web)
 
     def test_v0116_remote_mode_is_a_host_preference_not_a_sandbox_mode(self):
@@ -290,11 +342,29 @@ if (out !== want) { console.error(JSON.stringify(out)); process.exit(1); }
             self.assertIn(route, self.js)
         self.assertIn('"/api/rapidgator/extract"', self.js)
 
+    def test_v0130_fallback_bar_wraps_and_leads_with_the_nas_browser(self):
+        css = (WEB / "style.css").read_text(encoding="utf-8")
+        bar = self.html[self.html.index('id="cfHint"'):self.html.index('id="frames"')]
+        ids = re.findall(r'<button[^>]*id="(cf\w+)"', bar)
+        self.assertEqual(ids[:2], ["cfRemote", "cfCompat"])       # NASブラウザ first, then 互換
+        for label in ("NASブラウザ</button>", "互換</button>"):
+            self.assertIn(label, bar)
+        self.assertRegex(bar, r'id="cfRemote" class="btn small primary" title="NASブラウザで開く"')
+        self.assertIn('title="互換で再読み込み"', bar)
+        rule = re.search(r"\.cf-hint\{([^}]*)\}", css).group(1)
+        self.assertIn("flex-wrap:wrap", rule)
+        self.assertNotIn("overflow:hidden", rule)
+        self.assertIn(".cf-hint .btn.small{flex:none;min-height:36px}", css)
+        self.assertRegex(css, r"@media \(max-width:600px\)\{\.cf-hint-text\{display:none\}\}")
+
     def test_v0122_image_source_is_only_a_blob_url_from_the_binary_api(self):
         assignments = re.findall(r"(\w+)\.src\s*=\s*(.+?);", self.js)
-        self.assertEqual(sorted(a[0] for a in assignments), ["frame", "img", "img", "probe"])
-        self.assertEqual(sorted(v for k, v in assignments if k == "img"), ["next", "t.url"])
+        self.assertEqual(sorted(a[0] for a in assignments), ["frame", "img", "img", "img", "img", "img", "probe"])
+        # the only other <img> sources are the same-origin MJPEG stream URLs (v0.1.30)
+        self.assertEqual(sorted(v for k, v in assignments if k == "img"),
+                         ["e.url", "next", "streamUrl(rb)", "streamUrl(rb)", "t.url"])
         self.assertIn("t.url = URL.createObjectURL(blob);", self.js)
+        self.assertIn("e.url = URL.createObjectURL(blob);", self.js)       # reader image (v0.1.30)
         self.assertIn("/api/rb/tile.jpg?tab=", self.js)
         self.assertEqual(dict(assignments)["probe"], "next")
         self.assertIn("const next = URL.createObjectURL(blob);", self.js)
@@ -565,11 +635,14 @@ if (out !== want) { console.error(JSON.stringify(out)); process.exit(1); }
     @unittest.skipUnless(shutil.which("node"), "node not installed")
     def test_v0124_perf_overlay_math(self):
         record = re.search(r"function recordPerf\(bytes, latency\) \{.*?\n\}\n", self.js, re.S).group(0)
-        text = re.search(r"function perfText\(\) \{.*?\n\}\n", self.js, re.S).group(0)
+        text = re.search(r"function perfText\(tab = remoteTab\(\)\) \{.*?\n\}\n", self.js, re.S).group(0)
         script = """
 (function (performance) {
 const RB_PERF_WINDOW_MS = 5000;
-const state = {rbPerf: true, rbPerfSamples: [], rbPerfSince: 0};
+const state = {rbPerf: true, rbPerfSamples: [], rbPerfSince: 0, rbQuality: "standard"};
+const RB_QUALITY_LABELS = {speed: "速度優先", standard: "標準", high: "高画質"};
+const remoteTab = () => null;
+const tabDisplay = tab => tab.display;
 """ + record + text + """
 let t = 0;
 const mk = () => ({now: () => t});
@@ -577,21 +650,74 @@ performance = mk();
 for (let i = 0; i < 10; i++) { t = 500 * (i + 1); recordPerf(20480, 100); }
 t = 5000;
 const out = perfText();
-if (out !== "2.0 fps · 20 KB/枚 · 応答 100 ms") { console.error("bad: " + out); process.exit(1); }
+if (out !== "ライブ(ポーリング)・標準 · 2.0 fps · 20 KB/枚 · 応答 100 ms") { console.error("bad: " + out); process.exit(1); }
 // samples older than 5 s drop out; an idle page reports 0 fps
 t = 20000; state.rbPerfSince = 15000;
 const idle = perfText();
-if (!idle.startsWith("0.0 fps")) { console.error("idle: " + idle); process.exit(1); }
+if (!idle.startsWith("ライブ(ポーリング)・標準 · 0.0 fps")) { console.error("idle: " + idle); process.exit(1); }
 // 204 responses (no frame) count for latency but not for fps or bytes
 t = 21000; state.rbPerfSamples = []; state.rbPerfSince = 20500;
 recordPerf(0, 300); recordPerf(1024, 100);
 t = 21500;
 const mixed = perfText();
-if (mixed !== "1.0 fps · 1 KB/枚 · 応答 200 ms") { console.error("mixed: " + mixed); process.exit(1); }
+if (mixed !== "ライブ(ポーリング)・標準 · 1.0 fps · 1 KB/枚 · 応答 200 ms") { console.error("mixed: " + mixed); process.exit(1); }
+// per display kind and transport (v0.1.30)
+state.rbQuality = "speed";
+const live = {display: "live", rb: {stream: {}, streamFailed: false,
+  perf: {fps: 9.84, frameBytes: 22528, streamMs: 120}}};
+let o = perfText(live);
+if (o !== "ライブ(ストリーム)・速度優先 · 9.8 fps · 22 KB/枚 · 応答 120 ms") { console.error("stream: " + o); process.exit(1); }
+live.rb.streamFailed = true;
+if (!perfText(live).startsWith("ライブ(ポーリング)・速度優先 · ")) { console.error("fallback: " + perfText(live)); process.exit(1); }
+const fast = {display: "tiles", rb: {view: {tiles: [{url: "a"}, {url: "b"}, {url: ""}, {url: "c"}]},
+  perf: {snapMs: 850, tiles: 2, tileBytes: 2 * 143360}}};
+o = perfText(fast);
+if (o !== "高速(全体表示)・速度優先 · タイル 3/4 · 撮影 850 ms · 1枚 140 KB") { console.error("fast: " + o); process.exit(1); }
+const reader = {display: "reader", rb: {reader: {data: {blocks: [{t: "p"}, {t: "img"}, {t: "img"}]}},
+  perf: {extractMs: 600, imgs: 1, imgMs: 80}}};
+o = perfText(reader);
+if (o !== "リーダー · ブロック 3 · 画像 1/2 · 取得 600 ms · 画像取得 80 ms") { console.error("reader: " + o); process.exit(1); }
 })();
 """
         result = subprocess.run(["node", "-e", script], capture_output=True, text=True, timeout=20)
         self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_v0130_overlay_names_the_mode_and_live_uses_the_stream(self):
+        text = re.search(r"function perfText\(tab = remoteTab\(\)\) \{.*?\n\}\n", self.js, re.S).group(0)
+        for label in ("ライブ(ストリーム)", "ライブ(ポーリング)", "高速(全体表示)", "リーダー"):
+            self.assertIn(label, text)
+        # live display: the <img> points at the stream; metadata still comes from the meta long-poll
+        self.assertIn("/api/rb/stream.mjpg?tab=", self.js)
+        loop = re.search(r"async function streamLoop\(.*?\n\}\n", self.js, re.S).group(0)
+        self.assertIn("openStream(tab, tab.rb)", loop)
+        self.assertIn("/api/rb/meta?tab=", loop)
+        self.assertNotIn("frame.jpg", loop)
+        # live prefers the stream unless this tab already fell back to frame.jpg polling
+        self.assertRegex(self.js, r"if \(rb\.streamFailed \|\| typeof Image !== \"function\"\) remoteLoop\(tab, state\.rbGen\);\s+else streamLoop")
+        # fallback: two errors within 10 s, or no picture within 5 s
+        self.assertIn("RB_STREAM_FIRST_MS = 5000", self.js)
+        self.assertIn("RB_STREAM_ERR_WINDOW_MS = 10000", self.js)
+        self.assertIn("s.errors.length >= 2", self.js)
+        self.assertRegex(self.js, r"function streamFallback\(tab, rb\) \{\s+rb\.streamFailed = true;")
+        # closed when hidden / switched / mode changes / the picture is dropped / logout
+        sync = re.search(r"function syncRemotePoll\(\) \{.*?\n\}\n", self.js, re.S).group(0)
+        self.assertIn("closeStream();", sync)
+        self.assertIn("document.addEventListener(\"visibilitychange\", syncRemotePoll)", self.js)
+        drop = re.search(r"function dropRemoteImage\(rb\) \{.*?\n\}\n", self.js, re.S).group(0)
+        self.assertIn("closeStream()", drop)
+        close = re.search(r"function closeStream\(\) \{.*?\n\}\n", self.js, re.S).group(0)
+        self.assertIn('img.removeAttribute("src")', close)
+        # proactive reconnect: every 9 min while visible, and after 6 s of 0 fps on a settled page
+        self.assertIn("RB_STREAM_RECONNECT_MS = 9 * 60 * 1000", self.js)
+        self.assertIn("RB_STREAM_STALL_MS = 6000", self.js)
+        self.assertIn('"&n=" + (++streamNonce)', self.js)
+        check = re.search(r"function checkStream\(rb, meta\) \{.*?\n\}\n", self.js, re.S).group(0)
+        for token in ('document.visibilityState !== "visible"', "RB_STREAM_RECONNECT_MS",
+                      "meta.loading === true", "meta.fps > 0", "RB_STREAM_STALL_MS"):
+            self.assertIn(token, check)
+        self.assertIn("checkStream(rb, meta);", loop)
+        # the stream is same-origin: the CSP needs no new source
+        self.assertNotIn("stream.mjpg", (WEB / "style.css").read_text(encoding="utf-8"))
 
     # ---- v0.1.28: fast full-page display ------------------------------------
     def test_v0128_tiles_are_lazy_and_released(self):
@@ -599,7 +725,8 @@ if (mixed !== "1.0 fps · 1 KB/枚 · 応答 200 ms") { console.error("mixed: " 
         for ident in ("tileScroll", "tileRefresh", "snapProgress"):
             self.assertIn('id="%s"' % ident, self.html)
         self.assertRegex(self.html, r'id="tileScroll"[^>]*\bhidden\b')
-        self.assertEqual(self.js.count("new IntersectionObserver("), 2)       # load near / release far
+        # load near / release far: tiles (2) and, since v0.1.30, reader images (2)
+        self.assertEqual(self.js.count("new IntersectionObserver("), 4)
         self.assertIn('rootMargin: "100% 0px 100% 0px"', self.js)
         self.assertIn('rootMargin: "300% 0px 300% 0px"', self.js)
         self.assertIn("releaseTile(t)", self.js)
@@ -617,11 +744,11 @@ if (mixed !== "1.0 fps · 1 KB/枚 · 応答 200 ms") { console.error("mixed: " 
         self.assertIn('data-action="display:live"', self.html)
         for text in ("表示: 高速（全体表示）", "表示: ライブ"):
             self.assertIn(text, self.html)
-        self.assertIn('RB_DISPLAY_LABELS = {tiles: "高速（全体表示）", live: "ライブ"}', self.js)
+        self.assertIn('RB_DISPLAY_LABELS = {reader: "リーダー", tiles: "高速（全体表示）", live: "ライブ"}', self.js)
         self.assertIn('const REMOTE_LIVE_MODE = "remote-live"', self.js)
-        # remembered in the existing per-host map; no entry means the fast display
-        self.assertIn("rememberHostMode(host, mode === \"live\" ? REMOTE_LIVE_MODE : REMOTE_MODE)", self.js)
-        self.assertRegex(self.js, r'return rememberedMode\(hostOf\(tab\.current \|\| ""\)\) === REMOTE_LIVE_MODE \? "live" : "tiles";')
+        # remembered in the existing per-host map; no entry follows the Settings default (v0.1.30)
+        self.assertIn("rememberHostMode(host, MODE_OF_DISPLAY[mode])", self.js)
+        self.assertIn("DISPLAY_OF_SETTING[setting] || \"tiles\"", self.js)
         self.assertIn("action.startsWith(\"display:\")", self.js)
         self.assertNotIn("modes.includes(REMOTE_LIVE_MODE)", self.js)
         modes = re.search(r"const MODES = \[([^\]]*)\]", self.js).group(1)
@@ -633,7 +760,7 @@ if (mixed !== "1.0 fps · 1 KB/枚 · 応答 200 ms") { console.error("mixed: " 
             self.assertIn(route, self.js)
         self.assertIn("function linkAt(snap, x, y)", self.js)
         self.assertIn("{tab: rb.id, href: point.href}", self.js)
-        self.assertIn("startProbe(tab, {href: link.href})", self.js)
+        self.assertIn("startProbe(tab, link ? {href: link.href} :", self.js)
         self.assertIn("RB_PULL_PX", self.js)
         self.assertIn("RB_INPUT_SNAP_MS = 800", self.js)
         self.assertIn("RB_META_WAIT_S = 10", self.js)
@@ -649,14 +776,17 @@ if (mixed !== "1.0 fps · 1 KB/枚 · 応答 200 ms") { console.error("mixed: " 
     def test_v0128_node_behaviour_of_display_choice_and_hit_testing(self):
         if shutil.which("node") is None:
             self.skipTest("node missing")
-        start = self.js.index("const delay = ms =>")
         pieces = [
-            self.js[self.js.index("function tabDisplay(tab) {"):self.js.index("// 「表示: 高速 / ライブ」 from the menu")],
-            self.js[self.js.index("// The link box under a page point"):self.js.index("async function tileTap(")],
+            self.js[self.js.index("// The display the user chose"):self.js.index("// 「表示: リーダー / 高速 / ライブ」 from the menu")],
+            self.js[self.js.index("// Link hit testing (all displays"):self.js.index("async function tileTap(")],
         ]
         script = """
 let host = {mode: null};
-const REMOTE_LIVE_MODE = "remote-live", RB_LINK_SLOP_PX = 3;
+const state = {settings: null};
+const REMOTE_MODE = "remote", REMOTE_FAST_MODE = "remote-fast", REMOTE_LIVE_MODE = "remote-live",
+  REMOTE_READER_MODE = "remote-reader", RB_LINK_NEAR_PX = 28;
+const DISPLAY_OF_MODE = {[REMOTE_FAST_MODE]: "tiles", [REMOTE_LIVE_MODE]: "live", [REMOTE_READER_MODE]: "reader"};
+const DISPLAY_OF_SETTING = {reader: "reader", fast: "tiles", live: "live"};
 const hostOf = u => u ? new URL(u).hostname : "";
 const rememberedMode = h => host.mode;
 %s
@@ -664,19 +794,55 @@ const tab = rb => ({rb, current: "https://example.com/a"});
 const eq = (a, b, m) => { if (a !== b) { console.error(m + ": " + a + " != " + b); process.exit(1); } };
 eq(tabDisplay(null), "tiles", "no rb");
 eq(tabDisplay(tab({autoLive: false})), "tiles", "default is the fast display");
+// the Settings default applies where the site has no explicit choice (plain "remote" or none)
+state.settings = {rb_default_mode: "reader"};
+eq(tabDisplay(tab({autoLive: false})), "reader", "settings: reader");
 host.mode = "remote";
-eq(tabDisplay(tab({autoLive: false})), "tiles", "remote");
+eq(tabDisplay(tab({autoLive: false})), "reader", "plain remote follows the setting");
+state.settings = {rb_default_mode: "live"};
+eq(tabDisplay(tab({autoLive: false})), "live", "settings: live");
+state.settings = {rb_default_mode: "bogus"};
+eq(tabDisplay(tab({autoLive: false})), "tiles", "unknown setting -> fast");
+// a per-host choice overrides the setting
+state.settings = {rb_default_mode: "reader"};
+host.mode = "remote-fast";
+eq(tabDisplay(tab({autoLive: false})), "tiles", "host: fast beats reader");
 host.mode = "remote-live";
-eq(tabDisplay(tab({autoLive: false})), "live", "remembered live");
-host.mode = "remote";
+eq(tabDisplay(tab({autoLive: false})), "live", "host: live");
+state.settings = {rb_default_mode: "fast"};
+host.mode = "remote-reader";
+eq(tabDisplay(tab({autoLive: false})), "reader", "host: reader beats fast");
+eq(userDisplay(tab({autoLive: true})), "reader", "userDisplay ignores the automatic switch");
+// a Cloudflare check forces live meanwhile, whatever the choice
 eq(tabDisplay(tab({autoLive: true})), "live", "challenge forces live");
-const snap = {links: [{x: 10, y: 100, w: 50, h: 20, href: "a"}, {x: 30, y: 105, w: 50, h: 20, href: "b"}]};
-eq(linkAt(snap, 11, 101).href, "a", "first");
-eq(linkAt(snap, 40, 110).href, "b", "later box is on top");
-eq(linkAt(snap, 62, 110).href, "b", "slop");
-eq(linkAt(snap, 200, 110), null, "miss");
+// hit testing: inside, near (<= 28), outside, ties
+const links = [{x: 10, y: 100, w: 50, h: 20, href: "a"}, {x: 30, y: 105, w: 50, h: 20, href: "b"}];
+eq(pickLink(links, 11, 101).href, "a", "inside the first box only");
+eq(pickLink(links, 40, 110).href, "a", "inside both: equal area -> the first");
+eq(pickLink([{x: 0, y: 0, w: 200, h: 100, href: "big"}, {x: 50, y: 40, w: 20, h: 10, href: "small"}], 55, 45).href,
+  "small", "inside both: smaller area wins");
+eq(pickLink(links, 62, 110).href, "b", "right of b by 0 is inside b");
+eq(pickLink(links, 80 + 28, 110).href, "b", "exactly 28 px away is near");
+eq(pickLink(links, 80 + 29, 110), null, "29 px away is outside");
+eq(pickLink([links[0]], 20, 120 + 20).href, "a", "20 px below a is near a");
+eq(pickLink([links[0]], 20, 120 + 28).href, "a", "28 px below a is near a");
+eq(pickLink([links[0]], 20, 120 + 29), null, "29 px below a is outside");
+eq(pickLink([links[0]], 20, 100 - 28).href, "a", "28 px above a is near a");
+eq(pickLink([links[0]], 10 - 28, 110).href, "a", "28 px left of a is near a");
+eq(pickLink(links, 200, 300), null, "far away -> none (server resolves by coordinates)");
+// nearest wins over a farther one
+eq(pickLink([{x: 0, y: 0, w: 10, h: 10, href: "far"}, {x: 40, y: 0, w: 10, h: 10, href: "near"}], 30, 5).href,
+  "near", "nearest box");
+// equal distance: the smaller box wins
+eq(pickLink([{x: 0, y: 0, w: 20, h: 20, href: "big"}, {x: 60, y: 0, w: 10, h: 10, href: "small"}], 40, 5).href,
+  "small", "tie -> smaller area");
+// corner distance is euclidean, not per axis
+eq(pickLink([{x: 0, y: 0, w: 10, h: 10, href: "c"}], 10 + 25, 10 + 25), null, "corner at ~35 px is outside");
+eq(pickLink([{x: 0, y: 0, w: 10, h: 10, href: "c"}], 10 + 15, 10 + 15).href, "c", "corner at ~21 px is near");
+eq(pickLink(null, 1, 1), null, "no links");
+eq(linkAt({links}, 11, 101).href, "a", "linkAt wraps pickLink");
 eq(linkAt(null, 1, 1), null, "no snapshot");
-""" % "\n".join(pieces)
+"""  % "\n".join(pieces)
         result = subprocess.run(["node", "-e", script], capture_output=True, text=True, timeout=20)
         self.assertEqual(result.returncode, 0, result.stderr)
 
@@ -732,7 +898,7 @@ class ItemActionStaticTests(unittest.TestCase):
         self.assertNotIn("rememberHostMode", region)
         self.assertIn("returnToFast", region)
         self.assertIn('id="autoLiveChip"', self.html)
-        self.assertIn("高速表示に戻す", self.html)
+        self.assertIn("元の表示に戻す", self.html)
         self.assertIn("wait=0", region)
         self.assertIn("document.visibilityState", region)
 

@@ -231,6 +231,22 @@ class SiteRuleTests(unittest.TestCase):
         self.assertIs(settings["probe_autosend"], True)
         self.assertIs(settings["block_ads"], True)
 
+    def test_v0130_display_options_default_and_validate(self):
+        settings = self.s.settings()
+        self.assertEqual((settings["rb_default_mode"], settings["rb_link_boxes"]), ("fast", False))
+        before = self.revision()
+        self.s.set_option("rb_default_mode", "fast")             # default: no write
+        self.assertEqual(self.revision(), before)
+        self.assertEqual(self.s.set_option("rb_default_mode", "reader")["rb_default_mode"], "reader")
+        self.assertEqual(self.revision(), before + 1)
+        self.s.set_option("rb_default_mode", "reader")
+        self.assertEqual(self.revision(), before + 1)
+        for bad in ("tiles", "", None, True, 1):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                self.s.set_option("rb_default_mode", bad)
+        with self.assertRaises(ValueError):
+            self.s.set_option("rb_link_boxes", "yes")
+
     def test_options_persist_and_are_written_only_on_change(self):
         before = self.revision()
         self.s.set_option("send_autostart", True)            # already the default: no write

@@ -77,10 +77,22 @@ PROBE_TIMEOUT = 15.0           # give up waiting for a hoster URL after this lon
 PROBE_SETTLE = 4.0             # a loaded page with no navigation for this long is final
 PROBE_LINK_CAP = 50
 PROBE_CDP_TIMEOUT = 8.0
+LINK_NEAR_PX = 28              # a press this close to a link box (CSS px) still counts as on the link
+# Long-press resolver (v0.1.30): the link under the point, else the nearest anchor box (every client
+# rect) within LINK_NEAR_PX; equal distance -> the smaller box. Fixed script, numbers only.
 PROBE_JS = (
-    "(function(x,y){var e=document.elementFromPoint(x,y);"
-    "var a=e&&e.closest?e.closest('a'):null;"
-    "return a&&typeof a.href==='string'?a.href:null;})(%.1f,%.1f)")
+    "(function(x,y,T){var e=document.elementFromPoint(x,y);"
+    "var a=e&&e.closest?e.closest('a[href]'):null;"
+    "if(a&&typeof a.href==='string')return a.href;"
+    "var l=document.querySelectorAll('a[href]'),b=null,bd=1e9,ba=1e18;"
+    "for(var i=0;i<l.length&&i<5000;i++){var h=l[i].href;if(typeof h!=='string')continue;"
+    "var rs=l[i].getClientRects(),c=null;"
+    "for(var j=0;j<rs.length;j++){var r=rs[j];if(r.width<2||r.height<2)continue;"
+    "var dx=Math.max(r.left-x,0,x-r.right),dy=Math.max(r.top-y,0,y-r.bottom),"
+    "d=Math.sqrt(dx*dx+dy*dy);if(d>T)continue;"
+    "if(c===null)c=getComputedStyle(l[i]);if(c.visibility==='hidden'||c.display==='none')break;"
+    "var ar=r.width*r.height;if(d<bd||(d===bd&&ar<ba)){b=h;bd=d;ba=ar;}}}"
+    "return b;})(%.1f,%.1f,%d)")
 LOCATION_JS = "String(location.href)"
 EDITABLE_JS = ("(()=>{const e=document.activeElement;return !!e&&(e.isContentEditable||"
                "/^(INPUT|TEXTAREA|SELECT)$/.test(e.tagName))})()")
@@ -172,6 +184,225 @@ SCROLL_JS = (
     "window.scrollTo({top:t,left:0,behavior:'instant'});"
     "return [window.scrollX,window.scrollY,window.innerWidth,ih];})(%.1f)")
 
+# ---- v0.1.30: viewport link map (live display) and reader mode ---------------------------
+STREAM_PER_TAB = 2             # concurrent MJPEG streams per tab / overall (v0.1.30)
+STREAM_TOTAL = 4
+STREAM_MAX_SECONDS = 600.0     # a stream ends after this long (the viewer reconnects)
+STREAM_HEARTBEAT = 15.0        # no new frame for this long: the last frame is sent again
+STREAM_FPS_WINDOW = 3.0
+STREAM_BOUNDARY = "qdlframe"
+VP_LINK_CAP = 600              # link boxes of the visible viewport (CSS px relative to the viewport)
+# Injected once per document: flags that the map may have changed after a scroll ends (200 ms
+# debounce), a resize or any DOM mutation. A navigation is a new document, hence dirty again.
+# Returns null while nothing changed since the last map (unless `force`).
+VP_LINKS_JS = (
+    "(function(cap,max,force){var s=window.__qdlVp;"
+    "if(!s){s=window.__qdlVp={dirty:true,t:0};"
+    "var mark=function(){clearTimeout(s.t);s.t=setTimeout(function(){s.dirty=true},200)};"
+    "window.addEventListener('scroll',mark,{passive:true,capture:true});"
+    "window.addEventListener('resize',mark,{passive:true});"
+    "try{new MutationObserver(function(){s.dirty=true}).observe(document.documentElement,"
+    "{subtree:true,childList:true,attributes:true,characterData:true})}catch(e){}}"
+    "if(!s.dirty&&!force)return null;s.dirty=false;"
+    "var W=window.innerWidth,H=window.innerHeight,L=[],a=document.querySelectorAll('a[href]');"
+    "for(var i=0;i<a.length&&L.length<cap;i++){var h=a[i].href;"
+    "if(typeof h!=='string'||!/^https?:/i.test(h)||h.length>max)continue;"
+    "var rs=a[i].getClientRects(),c=null;"
+    "for(var j=0;j<rs.length&&L.length<cap;j++){var r=rs[j];"
+    "if(r.width<2||r.height<2||r.right<=0||r.bottom<=0||r.left>=W||r.top>=H)continue;"
+    "if(c===null)c=getComputedStyle(a[i]);if(c.visibility==='hidden'||c.display==='none')break;"
+    "L.push({x:Math.round(r.left),y:Math.round(r.top),w:Math.round(r.width),"
+    "h:Math.round(r.height),href:h});}}"
+    "return {scrollX:Math.round(window.scrollX),scrollY:Math.round(window.scrollY),"
+    "width:W,height:H,links:L};})(%d,%d,%s)")
+
+READER_BLOCK_CAP = 5000
+READER_MAX_JSON = 2 * 1024 * 1024
+READER_TEXT_MAX = 20000
+READER_RUNS_CAP = 400
+READER_IMAGE_CAP = 300
+READER_HOSTER_CAP = 100
+READER_ALT_MAX = 300
+READER_TITLE_MAX = 300
+READER_URL_MAX = 2048
+READER_TIMEOUT = 20.0
+READER_HOSTS = ("rapidgator.net", "www.rapidgator.net", "rg.to", "www.rg.to")
+READER_HOSTER_TITLE = "ダウンロードリンク"
+IMAGE_MAX_BYTES = 4 * 1024 * 1024
+IMAGE_CDP_TIMEOUT = 12.0
+CONTROL_CHARS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+# Fixed extractor, run in the NAS browser's page (Runtime.evaluate, returnByValue). It only reads the
+# DOM and returns plain data; the Hub validates every field again. Image URLs go to the Hub only.
+READER_JS = r"""
+(function(){
+var CAP=__CAP__,TMAX=__TMAX__,BUDGET=__BUDGET__,IMGCAP=__IMGCAP__,RUNCAP=__RUNCAP__,NODES=60000;
+var AD=/(^|[-_])(ad|ads|advert|banner|sponsor|promo|popup|cookie)([-_]|$)/i;
+var SKIP={SCRIPT:1,STYLE:1,NOSCRIPT:1,TEMPLATE:1,NAV:1,ASIDE:1,FOOTER:1,HEADER:1,FORM:1,SVG:1,
+IFRAME:1,OBJECT:1,EMBED:1,CANVAS:1,SELECT:1,BUTTON:1,INPUT:1,TEXTAREA:1,AUDIO:1,VIDEO:1,MAP:1,DIALOG:1};
+var INLINE={'inline':1,'inline-block':1,'inline-flex':1,'inline-grid':1,'inline-table':1,
+'contents':1,'ruby':1,'table-cell':1};
+var blocks=[],images=[],imgIndex={},size=0,trunc=false,visited=0,depth=0,inA=0,anchorImgs=[];
+var buf=[],ctx={kind:'p',depth:0,level:0};
+function norm(s){return s.replace(/[ \t\r\n\f ]+/g,' ');}
+function addRun(text,href){
+ if(!text)return;
+ var last=buf.length?buf[buf.length-1]:null;
+ if(last&&!last.href&&!href){last.text+=text;return;}
+ buf.push(href?{text:text,href:href}:{text:text});
+}
+function addText(t){
+ if(!t)return;
+ var last=buf.length?buf[buf.length-1]:null;
+ if(last&&last.text.charAt(last.text.length-1)==='\n'&&t.charAt(0)===' ')t=t.slice(1);
+ addRun(t,null);
+}
+function push(b,len){
+ if(blocks.length>=CAP||size>BUDGET){trunc=true;return false;}
+ blocks.push(b);size+=len+40;return true;
+}
+function flush(){
+ if(inA)return;
+ var runs=buf;buf=[];
+ var all='';for(var i=0;i<runs.length;i++)all+=runs[i].text;
+ if(!all.replace(/[\s ]+/g,''))return;
+ var first=runs[0],last=runs[runs.length-1];
+ first.text=first.text.replace(/^[\s ]+/,'');last.text=last.text.replace(/[\s ]+$/,'');
+ var out=[],total=0;
+ for(var k=0;k<runs.length&&out.length<RUNCAP&&total<TMAX;k++){
+  var r=runs[k];if(!r.text)continue;
+  if(total+r.text.length>TMAX)r={text:r.text.slice(0,TMAX-total),href:r.href};
+  total+=r.text.length;out.push(r.href?{text:r.text,href:r.href}:{text:r.text});
+ }
+ if(!out.length)return;
+ var len=total;for(var m=0;m<out.length;m++)if(out[m].href)len+=out[m].href.length;
+ if(ctx.kind==='h'){
+  var text='';for(var n=0;n<out.length;n++)text+=out[n].text;
+  push({t:'h',level:ctx.level,text:text.replace(/\s+/g,' ').trim()},len);
+ }else if(ctx.kind==='li'){push({t:'li',runs:out,depth:ctx.depth},len);}
+ else push({t:'p',runs:out},len);
+}
+function adLike(el){
+ var id=el.id;if(typeof id==='string'&&id&&AD.test(id))return true;
+ var c=el.getAttribute&&el.getAttribute('class');
+ if(c){var tk=c.split(/\s+/);for(var i=0;i<tk.length;i++)if(tk[i]&&AD.test(tk[i]))return true;}
+ return false;
+}
+function absUrl(v){
+ try{var u=new URL(v,document.baseURI).href;return /^https?:/i.test(u)&&u.length<=2048?u:null;}catch(e){return null;}
+}
+function image(el,href){
+ var src=el.currentSrc||el.getAttribute('src')||'';
+ if(!src||/^data:/i.test(src)){
+  src=el.getAttribute('data-src')||el.getAttribute('data-original')||el.getAttribute('data-lazy-src')||
+  el.getAttribute('data-lazy')||(/^data:/i.test(src)?'':src);
+ }
+ if(!src)return;
+ var abs=absUrl(src);if(!abs)return;
+ var r=el.getBoundingClientRect(),rw=Math.round(r.width),rh=Math.round(r.height);
+ var w=el.naturalWidth||rw,h=el.naturalHeight||rh;
+ if((rw>0&&rw<24)||(rh>0&&rh<24)||(w===1&&h===1))return;
+ var idx=imgIndex[abs];
+ if(idx===undefined){if(images.length>=IMGCAP)return;idx=images.length;images.push(abs);imgIndex[abs]=idx;}
+ var b={t:'img',i:idx,alt:(el.getAttribute('alt')||'').slice(0,300),w:Math.min(w,20000),h:Math.min(h,20000)};
+ if(href)b.href=href;
+ push(b,60+(href?href.length:0));
+}
+function walkChildren(node){
+ for(var c=node.firstChild;c&&!trunc;c=c.nextSibling)walk(c);
+}
+function walk(node){
+ if(trunc)return;
+ if(node.nodeType===3){addText(norm(node.nodeValue));return;}
+ if(node.nodeType!==1)return;
+ if(++visited>NODES){trunc=true;return;}
+ var tag=node.tagName.toUpperCase();
+ if(SKIP[tag]||node.hidden||node.getAttribute('aria-hidden')==='true'||adLike(node))return;
+ var cs=getComputedStyle(node);
+ if(cs.display==='none'||cs.visibility==='hidden')return;
+ var disp=cs.display;
+ if(!INLINE[disp]){
+  var r=node.getBoundingClientRect();
+  if((r.width<3&&r.height<3)||r.right+window.scrollX<-200||r.bottom+window.scrollY<-200)return;
+ }
+ if(tag==='BR'){addRun('\n',null);return;}
+ if(tag==='HR'){flush();push({t:'hr'},4);return;}
+ if(tag==='IMG'){
+  if(inA){anchorImgs.push(node);return;}
+  flush();image(node,null);return;
+ }
+ if(tag==='PRE'){
+  flush();var pt=(node.innerText||node.textContent||'').slice(0,TMAX);
+  if(pt.replace(/\s+/g,''))push({t:'pre',text:pt},pt.length);return;
+ }
+ if(tag==='A'){
+  var href=node.href;
+  if(typeof href!=='string'||!/^https?:/i.test(href)||href.length>2048){walkChildren(node);return;}
+  var savedBuf=buf,savedImgs=anchorImgs;buf=[];anchorImgs=[];inA++;
+  walkChildren(node);
+  inA--;var inner=buf,imgs=anchorImgs;buf=savedBuf;anchorImgs=savedImgs;
+  var text='';for(var i=0;i<inner.length;i++)text+=inner[i].text;
+  text=norm(text);
+  if(text.replace(/[\s ]+/g,''))addRun(text,href);
+  else if(text)addText(' ');
+  if(imgs.length&&!inA){flush();for(var j=0;j<imgs.length&&!trunc;j++)image(imgs[j],href);}
+  else for(var q=0;q<imgs.length;q++)anchorImgs.push(imgs[q]);
+  return;
+ }
+ var hm=/^H([1-6])$/.exec(tag);
+ if(hm){
+  flush();var sh=ctx;ctx={kind:'h',level:parseInt(hm[1],10),depth:0};
+  walkChildren(node);flush();ctx=sh;return;
+ }
+ if(tag==='UL'||tag==='OL'){flush();depth++;walkChildren(node);flush();depth--;return;}
+ if(tag==='LI'){
+  flush();var sl=ctx;ctx={kind:'li',level:0,depth:Math.max(0,Math.min(depth-1,8))};
+  walkChildren(node);flush();ctx=sl;return;
+ }
+ if(INLINE[disp]){
+  if(disp==='table-cell'&&node.previousElementSibling)addText(' | ');
+  walkChildren(node);return;
+ }
+ if(inA){addText(' ');walkChildren(node);addText(' ');return;}
+ flush();walkChildren(node);flush();
+}
+var out={title:'',blocks:[],images:[],hosters:[],truncated:false};
+try{
+ var body=document.body||document.documentElement;
+ var root=document.querySelector('main,[role=main]');
+ if(!root){
+  var best=null,bl=0,arts=document.querySelectorAll('article');
+  for(var a=0;a<arts.length;a++){var l=(arts[a].innerText||'').length;if(l>bl){bl=l;best=arts[a];}}
+  root=best;
+ }
+ var rl=root?(root.innerText||'').length:0;
+ if(!root||(rl<200&&(body.innerText||'').length>rl*2))root=body;
+ walk(root);flush();
+}catch(e){trunc=true;}
+try{
+ var as=document.querySelectorAll('a[href]'),seen={};
+ for(var z=0;z<as.length&&out.hosters.length<200;z++){
+  var hh=as[z].href;
+  if(typeof hh==='string'&&hh.length<=2048&&!seen[hh]&&
+   /^https?:\/\/([a-z0-9-]+\.)?(rapidgator\.net|rg\.to)([\/?#:]|$)/i.test(hh)){seen[hh]=1;out.hosters.push(hh);}
+ }
+}catch(e){}
+out.title=String(document.title||'').slice(0,300);
+out.blocks=blocks;out.images=images;out.truncated=trunc;
+return out;
+})()
+""".replace("__CAP__", str(READER_BLOCK_CAP)).replace(
+    "__TMAX__", str(READER_TEXT_MAX)).replace(
+    "__BUDGET__", str(READER_MAX_JSON - 256 * 1024)).replace(
+    "__IMGCAP__", str(READER_IMAGE_CAP)).replace("__RUNCAP__", str(READER_RUNS_CAP))
+IMAGE_FETCH_JS = (
+    "(function(u,cap){return fetch(u,{credentials:'include'}).then(function(r){"
+    "if(!r.ok)return {err:'status'};var ct=(r.headers.get('content-type')||'').toLowerCase();"
+    "if(ct.indexOf('image/')!==0)return {err:'type'};"
+    "return r.arrayBuffer().then(function(b){if(b.byteLength>cap)return {err:'size'};"
+    "var a=new Uint8Array(b),s='',i=0;"
+    "for(;i<a.length;i+=32768)s+=String.fromCharCode.apply(null,a.subarray(i,i+32768));"
+    "return {d:btoa(s)};});}).catch(function(){return {err:'fetch'};});})(%s,%d)")
+
 
 def looks_like_challenge(url, title):
     """True while the page is a Cloudflare check (it needs the live screencast to complete)."""
@@ -204,6 +435,22 @@ class ProbeQueueFull(BrowserError):
 
 class SnapshotGone(TabGone):
     """The requested snapshot was replaced or released: take a new one."""
+
+
+class StreamLimit(ProbeQueueFull):
+    """Too many live streams (per tab or overall): HTTP 429."""
+
+
+class ReaderImageGone(TabGone):
+    """Unknown reader image index (the reader was run again): HTTP 404."""
+
+
+class ImageUnavailable(BrowserError):
+    """The image could not be read from the NAS browser: HTTP 502."""
+
+
+class ImageRefused(BrowserError):
+    """Not an allowed image (SVG, not an image, too large): HTTP 415."""
 
 
 class WebSocketError(Exception):
@@ -569,6 +816,13 @@ class Tab:
         self.snap_lock = threading.Lock()    # one capture at a time per tab
         self.tiles = {}            # (snapshot id, index) -> JPEG bytes, in LRU order (oldest first)
         self.tile_bytes = 0
+        self.streams = 0           # MJPEG streams being written now
+        self.stream_times = deque(maxlen=128)    # monotonic send times (fps for the viewer's overlay)
+        self.stream_bytes = 0      # size of the last part sent
+        self.vp_rev = 0            # bumped by every screencast frame (the live picture changed)
+        self.vp_cache = None       # {"token": vp_rev + rev, "map": viewport link map}
+        self.vp_lock = threading.Lock()
+        self.reader_images = []    # reader image index -> absolute http(s) URL (None = refused); Hub only
 
 
 class Snapshot:
@@ -660,6 +914,7 @@ class RemoteBrowser:
         self.auto_send = auto_send
         self._spawn = spawn if spawn is not None else self._spawn_thread
         self._auto_inflight = set()
+        self._streams = 0
         self._probes = 0
         self._probe_queue = []     # FIFO of waiting probe tickets (dicts with the tab)
         self._probe_targets = {}   # probe target id -> Probe
@@ -1356,6 +1611,7 @@ class RemoteBrowser:
                 # Only the newest frame is kept; older ones are simply replaced.
                 tab.frame = data
                 tab.seq += 1
+                tab.vp_rev += 1      # the picture changed: the viewport link map may be stale
                 meta = params.get("metadata") if isinstance(params.get("metadata"), dict) else {}
                 width, height = meta.get("deviceWidth"), meta.get("deviceHeight")
                 if (isinstance(width, (int, float)) and isinstance(height, (int, float)) and
@@ -1679,6 +1935,7 @@ class RemoteBrowser:
                     "loading": bool(tab.loading), "blocked": tab.blocked,
                     "intercepts": tab.intercept_seq, "rev": tab.rev,
                     "popups": tab.popups_blocked, "editable": tab.editable,
+                    "links_rev": tab.vp_rev + tab.rev,
                 }
             result["challenge"] = self._challenge(tab)
             self._touch()
@@ -1687,6 +1944,77 @@ class RemoteBrowser:
             with self._lock:
                 tab.pollers -= 1
                 tab.last_poll = self._clock()
+
+    def stream(self, ident, write, max_seconds=STREAM_MAX_SECONDS, heartbeat=STREAM_HEARTBEAT):
+        """Push the tab's screencast to `write(bytes)` as multipart/x-mixed-replace parts.
+
+        Always the newest frame (a slow writer simply skips the ones in between); the last frame is
+        repeated after `heartbeat` seconds without a new one. Ends when `write` raises OSError (the
+        viewer left), when the tab or the container goes away, or after `max_seconds`.
+        """
+        tab = self._tab(ident)
+        with self._lock:
+            if tab.streams >= STREAM_PER_TAB or self._streams >= STREAM_TOTAL:
+                raise StreamLimit("ライブ表示の同時接続が多すぎます")
+            tab.streams += 1
+            self._streams += 1
+            tab.pollers += 1
+            tab.last_poll = self._clock()
+            starting = not tab.screencast
+            tab.screencast = True
+        try:
+            self._touch()
+            if starting:
+                try:
+                    self._start_screencast(tab)
+                except BrowserError:
+                    with self._lock:
+                        tab.screencast = False
+                    raise
+            started = last_sent = time.monotonic()
+            end = started + max_seconds
+            since, last = 0, None
+            while time.monotonic() < end:
+                with self._cv:
+                    while (tab.seq <= since and self._tabs.get(tab.id) is tab and
+                           self._state == "running"):
+                        now = time.monotonic()
+                        remaining = min(1.0, heartbeat - (now - last_sent), end - now)
+                        if remaining <= 0:
+                            break
+                        self._cv.wait(remaining)
+                        tab.last_poll = self._last_activity = self._clock()
+                    if self._tabs.get(tab.id) is not tab or self._state != "running":
+                        return
+                    fresh = tab.seq > since
+                    since = tab.seq
+                    text = tab.frame
+                if fresh and text:
+                    last = base64.b64decode(text)
+                elif last is None or time.monotonic() - last_sent < heartbeat:
+                    if last is None:
+                        last_sent = time.monotonic()       # nothing to repeat yet: keep waiting
+                    continue
+                part = ("--%s\r\nContent-Type: image/jpeg\r\nContent-Length: %d\r\n\r\n"
+                        % (STREAM_BOUNDARY, len(last))).encode("ascii") + last + b"\r\n"
+                write(part)
+                last_sent = time.monotonic()
+                with self._lock:
+                    tab.stream_times.append(last_sent)
+                    tab.stream_bytes = len(last)
+                    tab.last_poll = self._last_activity = self._clock()
+        finally:
+            with self._lock:
+                tab.streams -= 1
+                self._streams -= 1
+                tab.pollers -= 1
+                tab.last_poll = self._clock()
+
+    def stream_fps(self, tab):
+        now = time.monotonic()
+        with self._lock:
+            count = sum(1 for t in tab.stream_times if now - t <= STREAM_FPS_WINDOW)
+        return round(count / STREAM_FPS_WINDOW, 1)
 
     def frame_image(self, ident, since, wait=FRAME_WAIT_MAX, rev=None):
         """Like frame() but the JPEG is returned as bytes (None when nothing newer)."""
@@ -1985,9 +2313,8 @@ class RemoteBrowser:
                             self._snap_drop(tab, old)       # the new snapshot has its first tile
             return data
 
-    def tap_page(self, ident, snap_id, x, y):
-        """Click at page coordinates (x, y) of a snapshot: scroll there, click, wait to settle."""
-        tab = self._tab(ident)
+    def _viewport_point(self, tab, snap_id, x, y):
+        """Scroll the page so snapshot point (x, y) is visible; the point in viewport coordinates."""
         if not isinstance(snap_id, str) or not SNAP_ID.match(snap_id):
             raise BrowserError("スナップショットの指定が不正です")
         x = self._number(x, 0, MAX_COORD, "x")
@@ -1999,10 +2326,9 @@ class RemoteBrowser:
         if x > snap.width or y > snap.height:
             raise BrowserError("タップ位置がページの外です")
         self._touch()
-        session = tab.session
         state = (self._call("Runtime.evaluate", {
             "expression": SCROLL_JS % y, "returnByValue": True, "timeout": 3000},
-            session=session, timeout=PROBE_CDP_TIMEOUT).get("result") or {}).get("value")
+            session=tab.session, timeout=PROBE_CDP_TIMEOUT).get("result") or {}).get("value")
         if (not isinstance(state, list) or len(state) != 4 or
                 any(isinstance(v, bool) or not isinstance(v, (int, float)) or v != v
                     for v in state)):
@@ -2011,6 +2337,13 @@ class RemoteBrowser:
         vx, vy = x - scroll_x, y - scroll_y
         if not (0 <= vx <= inner_w and 0 <= vy <= inner_h):
             raise BrowserError("タップ位置を表示できません。画面を更新してください")
+        return vx, vy
+
+    def tap_page(self, ident, snap_id, x, y):
+        """Click at page coordinates (x, y) of a snapshot: scroll there, click, wait to settle."""
+        tab = self._tab(ident)
+        vx, vy = self._viewport_point(tab, snap_id, x, y)
+        session = tab.session
         with self._lock:
             before_url, before_rev = tab.url, tab.rev
             tab.snap_gen += 1
@@ -2046,8 +2379,12 @@ class RemoteBrowser:
                 self._cv.wait(min(remaining, 0.25))
         return started
 
-    def page_meta(self, ident, rev=None, wait=META_WAIT_MAX):
-        """Long-poll of tab metadata (no screencast): returns when `rev` is out of date."""
+    def page_meta(self, ident, rev=None, wait=META_WAIT_MAX, links=False, vp=None, fresh=False):
+        """Long-poll of tab metadata (no screencast): returns when `rev` is out of date.
+
+        With `links` the visible viewport's link map is added (live display); `vp` is the map
+        revision the viewer already holds and `fresh` rescans the page even if nothing is flagged.
+        """
         tab = self._tab(ident)
         wait = max(0.0, min(float(wait), META_WAIT_MAX))
         self._touch()
@@ -2066,10 +2403,99 @@ class RemoteBrowser:
                 "url": tab.url, "title": tab.title, "loading": bool(tab.loading),
                 "blocked": tab.blocked, "intercepts": tab.intercept_seq, "rev": tab.rev,
                 "popups": tab.popups_blocked, "editable": tab.editable, "snap": newest,
+                "width": tab.size[0], "height": tab.size[1], "links_rev": tab.vp_rev + tab.rev,
+                "streams": tab.streams, "frame_bytes": tab.stream_bytes,
             }
+        result["fps"] = self.stream_fps(tab) if tab.streams else 0.0
         result["challenge"] = self._challenge(tab)
+        if links:
+            result["viewport_links"] = self._viewport_links(tab, vp, fresh)
         self._touch()
         return result
+
+    @staticmethod
+    def _vp_boxes(raw, width, height):
+        """Sanitised viewport link boxes: finite ints, http(s) hrefs only, on screen, bounded."""
+        out = []
+        if not isinstance(raw, list):
+            return out
+        for item in raw:
+            if len(out) >= VP_LINK_CAP:
+                break
+            if not isinstance(item, dict):
+                continue
+            box = {}
+            for name in ("x", "y", "w", "h"):
+                value = item.get(name)
+                if (isinstance(value, bool) or not isinstance(value, (int, float)) or
+                        value != value or not -MAX_COORD <= value <= MAX_COORD):
+                    box = None
+                    break
+                box[name] = int(round(value))
+            if (box is None or box["w"] < 1 or box["h"] < 1 or box["x"] + box["w"] <= 0 or
+                    box["y"] + box["h"] <= 0 or box["x"] >= width or box["y"] >= height):
+                continue
+            href = item.get("href")
+            if (not isinstance(href, str) or len(href) > SNAP_URL_MAX or
+                    not (href.startswith("https://") or href.startswith("http://"))):
+                continue
+            box["href"] = href
+            out.append(box)
+        return out
+
+    def _viewport_links(self, tab, known, fresh=False):
+        """{rev, scrollX, scrollY, width, height, links} of the visible viewport.
+
+        `rev` changes whenever a screencast frame or the tab metadata changed. The page keeps a
+        dirty flag (scroll end, resize, DOM mutation), so an unchanged page is not scanned again.
+        Returns {"rev", "unchanged": True} when the viewer already holds this revision, and None
+        when the page cannot be read right now.
+        """
+        if not tab.session:
+            return None
+        with tab.vp_lock:
+            with self._lock:
+                token = tab.vp_rev + tab.rev
+                cache = tab.vp_cache
+            if cache is None or cache["token"] != token or fresh:
+                try:
+                    value = (self._call("Runtime.evaluate", {
+                        "expression": VP_LINKS_JS % (VP_LINK_CAP, SNAP_URL_MAX,
+                                                     "true" if cache is None or fresh else "false"),
+                        "returnByValue": True, "timeout": 3000},
+                        session=tab.session, timeout=PROBE_CDP_TIMEOUT).get("result") or {}).get("value")
+                except BrowserError:
+                    return None
+                if isinstance(value, dict):
+                    size = []
+                    for name in ("width", "height"):
+                        item = value.get(name)
+                        size.append(int(item) if (isinstance(item, (int, float)) and
+                                                  not isinstance(item, bool) and item == item and
+                                                  1 <= item <= 20000) else 0)
+                    scroll = []
+                    for name in ("scrollX", "scrollY"):
+                        item = value.get(name)
+                        scroll.append(int(item) if (isinstance(item, (int, float)) and
+                                                    not isinstance(item, bool) and item == item and
+                                                    0 <= item <= MAX_COORD) else 0)
+                    if size[0] and size[1]:
+                        links = self._vp_boxes(value.get("links"), size[0], size[1])
+                    else:
+                        links = []
+                    cache = {"token": token, "map": {
+                        "scrollX": scroll[0], "scrollY": scroll[1], "width": size[0],
+                        "height": size[1], "links": links}}
+                elif cache is not None:
+                    cache = {"token": token, "map": cache["map"]}      # nothing changed on the page
+                else:
+                    cache = {"token": token, "map": {"scrollX": 0, "scrollY": 0, "width": 0,
+                                                     "height": 0, "links": []}}
+                with self._lock:
+                    tab.vp_cache = cache
+            if known == cache["token"]:
+                return {"rev": cache["token"], "unchanged": True}
+            return dict(cache["map"], rev=cache["token"])
 
     # ---------------------------------------------------------------- links
     @staticmethod
@@ -2105,6 +2531,269 @@ class RemoteBrowser:
         hrefs = value if isinstance(value, list) else []
         items = self.extract_links(hrefs[:LINK_CAP])
         return {"items": items, "count": len(items), "scanned": min(len(hrefs), LINK_CAP)}
+
+    # ---------------------------------------------------------------- reader mode (v0.1.30)
+    # A fixed extractor runs in the page and returns plain data (headings, paragraphs with link
+    # runs, list items, images, preformatted text). The Hub validates every field again; the phone
+    # builds its own DOM from that data with createElement/textContent. No remote HTML, script or
+    # style reaches the phone, and image URLs never leave the Hub (only an index does).
+    @staticmethod
+    def _http_url(value):
+        if (not isinstance(value, str) or not 1 <= len(value) <= READER_URL_MAX or
+                not (value.startswith("https://") or value.startswith("http://")) or
+                any(ord(c) < 33 or ord(c) == 127 for c in value)):
+            return None
+        try:
+            if not urlsplit(value).hostname:
+                return None
+        except ValueError:
+            return None
+        return value
+
+    @staticmethod
+    def _clean_text(value, limit=READER_TEXT_MAX):
+        return CONTROL_CHARS.sub("", value)[:limit]
+
+    @staticmethod
+    def _small_int(value, low, high):
+        if (isinstance(value, bool) or not isinstance(value, int) or not low <= value <= high):
+            return None
+        return value
+
+    def _reader_runs(self, raw):
+        if not isinstance(raw, list):
+            return None
+        runs, total = [], 0
+        for item in raw[:READER_RUNS_CAP]:
+            if not isinstance(item, dict) or not isinstance(item.get("text"), str):
+                continue
+            text = self._clean_text(item["text"], READER_TEXT_MAX - total)
+            if not text:
+                continue
+            run = {"text": text}
+            href = self._http_url(item.get("href"))
+            if href is not None:
+                run["href"] = href
+            runs.append(run)
+            total += len(text)
+            if total >= READER_TEXT_MAX:
+                break
+        if not any(r["text"].strip() for r in runs):
+            return None
+        return runs
+
+    def _reader_block(self, item, images):
+        if not isinstance(item, dict):
+            return None
+        kind = item.get("t")
+        if kind == "hr":
+            return {"t": "hr"}
+        if kind == "h":
+            level = self._small_int(item.get("level"), 1, 6)
+            text = item.get("text")
+            if level is None or not isinstance(text, str):
+                return None
+            text = self._clean_text(text).strip()
+            return {"t": "h", "level": level, "text": text} if text else None
+        if kind in ("p", "li"):
+            runs = self._reader_runs(item.get("runs"))
+            if runs is None:
+                return None
+            if kind == "p":
+                return {"t": "p", "runs": runs}
+            depth = self._small_int(item.get("depth", 0), 0, 8)
+            return {"t": "li", "runs": runs, "depth": depth if depth is not None else 0}
+        if kind == "pre":
+            text = item.get("text")
+            if not isinstance(text, str):
+                return None
+            text = self._clean_text(text)
+            return {"t": "pre", "text": text} if text.strip() else None
+        if kind == "img":
+            index = self._small_int(item.get("i"), 0, READER_IMAGE_CAP - 1)
+            if index is None or index >= len(images) or images[index] is None:
+                return None
+            alt = item.get("alt")
+            block = {"t": "img", "i": index,
+                     "alt": self._clean_text(alt, READER_ALT_MAX) if isinstance(alt, str) else "",
+                     "w": self._small_int(item.get("w"), 0, 20000) or 0,
+                     "h": self._small_int(item.get("h"), 0, 20000) or 0}
+            href = self._http_url(item.get("href"))
+            if href is not None:
+                block["href"] = href
+            return block
+        return None
+
+    def _reader_hosters(self, raw, present):
+        out = []
+        if not isinstance(raw, list):
+            return out
+        for value in raw:
+            href = self._http_url(value)
+            if href is None or href in present or href in out:
+                continue
+            try:
+                host = (urlsplit(href).hostname or "").lower()
+            except ValueError:
+                continue
+            if host in READER_HOSTS:
+                out.append(href)
+                if len(out) >= READER_HOSTER_CAP:
+                    break
+        return out
+
+    def _reader_clean(self, value):
+        """(public data, image table) from the extractor output, or BrowserError."""
+        if not isinstance(value, dict):
+            raise BrowserError("本文を取り出せませんでした")
+        raw_images = value.get("images")
+        images = [self._http_url(u) for u in (raw_images[:READER_IMAGE_CAP]
+                                              if isinstance(raw_images, list) else [])]
+        blocks = []
+        raw_blocks = value.get("blocks")
+        raw_blocks = raw_blocks if isinstance(raw_blocks, list) else []
+        present = set()
+        for item in raw_blocks:
+            for run in (item.get("runs") if isinstance(item, dict) and
+                        isinstance(item.get("runs"), list) else []):
+                if isinstance(run, dict) and isinstance(run.get("href"), str):
+                    present.add(run["href"])
+        hosters = self._reader_hosters(value.get("hosters"), present)
+        reserve = len(hosters) + 1 if hosters else 0
+        truncated = value.get("truncated") is True
+        size = 0
+        for item in raw_blocks:
+            block = self._reader_block(item, images)
+            if block is None:
+                continue
+            cost = len(json.dumps(block, ensure_ascii=False))
+            if len(blocks) >= READER_BLOCK_CAP - reserve or size + cost > READER_MAX_JSON - 64 * 1024:
+                truncated = True
+                break
+            blocks.append(block)
+            size += cost
+        if hosters:
+            blocks.append({"t": "h", "level": 2, "text": READER_HOSTER_TITLE})
+            blocks.extend({"t": "li", "runs": [{"text": href, "href": href}], "depth": 0}
+                          for href in hosters)
+        title = value.get("title")
+        title = self._clean_text(title, READER_TITLE_MAX).strip() if isinstance(title, str) else ""
+        return {"title": title, "blocks": blocks, "count": len(blocks), "truncated": truncated,
+                "hoster_links": len(hosters)}, images
+
+    def reader(self, ident):
+        """Reader data of the page: validated blocks (see the section comment)."""
+        tab = self._tab(ident)
+        self._touch()
+        result = self._call("Runtime.evaluate", {
+            "expression": READER_JS, "returnByValue": True, "timeout": 15000},
+            session=tab.session, timeout=READER_TIMEOUT)
+        value = (result.get("result") or {}).get("value")
+        data, images = self._reader_clean(value)
+        with self._lock:
+            if self._tabs.get(tab.id) is not tab:
+                raise TabGone("このタブはすでに閉じられています")
+            tab.reader_images = images
+            data.update({"url": tab.url, "host": self._host_of(tab.url)})
+            if not data["title"]:
+                data["title"] = tab.title[:READER_TITLE_MAX]
+        self._touch()
+        return data
+
+    @staticmethod
+    def sniff_image(data):
+        """MIME type from the magic bytes: JPEG, PNG, GIF, WebP or AVIF only (never SVG)."""
+        if data[:3] == b"\xff\xd8\xff":
+            return "image/jpeg"
+        if data[:8] == b"\x89PNG\r\n\x1a\n":
+            return "image/png"
+        if data[:6] in (b"GIF87a", b"GIF89a"):
+            return "image/gif"
+        if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+            return "image/webp"
+        if data[4:8] == b"ftyp" and data[8:12] in (b"avif", b"avis"):
+            return "image/avif"
+        return None
+
+    @staticmethod
+    def _find_resource_frame(node, url, budget):
+        """frameId of the frame whose resource list holds `url` (an Image), searching child frames."""
+        if not isinstance(node, dict) or budget[0] <= 0:
+            return None
+        budget[0] -= 1
+        frame = node.get("frame") if isinstance(node.get("frame"), dict) else {}
+        for resource in node.get("resources") if isinstance(node.get("resources"), list) else []:
+            if (isinstance(resource, dict) and resource.get("url") == url and
+                    resource.get("type") == "Image" and isinstance(frame.get("id"), str)):
+                return frame["id"]
+        for child in node.get("childFrames") if isinstance(node.get("childFrames"), list) else []:
+            found = RemoteBrowser._find_resource_frame(child, url, budget)
+            if found is not None:
+                return found
+        return None
+
+    @staticmethod
+    def _decode_image(text):
+        if (not isinstance(text, str) or not text or len(text) > IMAGE_MAX_BYTES * 4 // 3 + 8 or
+                not BASE64.match(text)):
+            raise ImageRefused("画像が大きすぎるか、形式が対応していません")
+        data = base64.b64decode(text)
+        if len(data) > IMAGE_MAX_BYTES:
+            raise ImageRefused("画像が大きすぎます")
+        return data
+
+    def _image_from_resources(self, tab, url):
+        """Bytes of an already loaded image (Page.getResourceTree + getResourceContent), else None."""
+        try:
+            tree = self._call("Page.getResourceTree", session=tab.session, timeout=PROBE_CDP_TIMEOUT)
+            frame_id = self._find_resource_frame(tree.get("frameTree"), url, [64])
+            if frame_id is None:
+                return None
+            content = self._call("Page.getResourceContent", {"frameId": frame_id, "url": url},
+                                 session=tab.session, timeout=PROBE_CDP_TIMEOUT)
+        except BrowserError:
+            return None
+        if content.get("base64Encoded") is not True:
+            raise ImageRefused("画像が大きすぎるか、形式が対応していません")   # text, e.g. SVG
+        return self._decode_image(content.get("content"))
+
+    def _image_from_page(self, tab, url):
+        """Fetch inside the page (its cookies and referrer apply). None when that fails."""
+        try:
+            value = (self._call("Runtime.evaluate", {
+                "expression": IMAGE_FETCH_JS % (json.dumps(url), IMAGE_MAX_BYTES),
+                "returnByValue": True, "awaitPromise": True, "timeout": 10000},
+                session=tab.session, timeout=IMAGE_CDP_TIMEOUT).get("result") or {}).get("value")
+        except BrowserError:
+            return None
+        if not isinstance(value, dict):
+            return None
+        if value.get("err") == "size":
+            raise ImageRefused("画像が大きすぎます")
+        if value.get("err") or "d" not in value:
+            return None
+        return self._decode_image(value.get("d"))
+
+    def reader_image(self, ident, index):
+        """(bytes, mime type) of reader image `index`, read through the NAS browser."""
+        tab = self._tab(ident)
+        if isinstance(index, bool) or not isinstance(index, int) or index < 0:
+            raise BrowserError("画像の番号が不正です")
+        with self._lock:
+            images = tab.reader_images
+            url = images[index] if index < len(images) else None
+        if url is None:
+            raise ReaderImageGone("この画像は見つかりません。読み込み直してください")
+        self._touch()
+        data = self._image_from_resources(tab, url)
+        if data is None:
+            data = self._image_from_page(tab, url)
+        if data is None:
+            raise ImageUnavailable("画像を取得できません")
+        kind = self.sniff_image(data)
+        if kind is None:
+            raise ImageRefused("対応していない画像形式です")
+        return data, kind
 
     # ------------------------------------------------------------ intercepts
     @staticmethod
@@ -2363,7 +3052,7 @@ class RemoteBrowser:
             self._probes -= 1
             self._cv.notify_all()
 
-    def probe(self, ident, x, y, url_check=None, href=None):
+    def probe(self, ident, x, y, url_check=None, href=None, snap=None):
         """Follow the link under (x, y) in a hidden target; see the section comment.
 
         `url_check(url)` may raise ValueError to refuse a start URL (the Hub's own
@@ -2382,9 +3071,13 @@ class RemoteBrowser:
         else:
             x = self._number(x, 0, MAX_COORD, "x")
             y = self._number(y, 0, MAX_COORD, "y")
-            # The link under the finger is resolved right away, before any queueing.
+            if snap is not None:
+                # Fast display: (x, y) are page coordinates of that snapshot.
+                x, y = self._viewport_point(tab, snap, x, y)
+            # The link under (or, within LINK_NEAR_PX, next to) the finger is resolved right away,
+            # before any queueing.
             result = self._call("Runtime.evaluate", {
-                "expression": PROBE_JS % (x, y), "returnByValue": True, "timeout": 5000},
+                "expression": PROBE_JS % (x, y, LINK_NEAR_PX), "returnByValue": True, "timeout": 5000},
                 session=tab.session, timeout=PROBE_CDP_TIMEOUT)
             href = (result.get("result") or {}).get("value")
             if not isinstance(href, str) or not href:
