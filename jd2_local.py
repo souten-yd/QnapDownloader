@@ -17,7 +17,7 @@ import os
 import re
 import urllib.parse
 
-from jd2_policy import KNOWN_BOOLEAN_KEYS, REQUIRED
+from jd2_policy import KNOWN_KEYS, REQUIRED, valid_value
 
 API_PORT = 3128
 TIMEOUT = 5.0
@@ -298,11 +298,11 @@ class LocalAdapter:
             storage = entry.get("storage")
             if not isinstance(interface, str) or not isinstance(key, str):
                 continue
-            for logical, (family, expected_key) in KNOWN_BOOLEAN_KEYS.items():
-                if (family not in interface.lower() or key.lower() != expected_key or
+            for logical, spec in KNOWN_KEYS.items():
+                if (interface != spec["interface"] or key.lower() != spec["key"] or
                         logical in found):
                     continue
-                if type(entry.get("value")) is not bool:
+                if not valid_value(logical, entry.get("value")):
                     continue
                 if storage is not None and not isinstance(storage, str):
                     continue
@@ -315,13 +315,13 @@ class LocalAdapter:
                 entries[logical] = {"supported": False, "writable": False}
                 continue
             value = self._call("config", "get", *handle)
-            entries[logical] = {"supported": type(value) is bool,
-                                "writable": type(value) is bool,
+            ok = valid_value(logical, value)
+            entries[logical] = {"supported": ok, "writable": ok,
                                 "current": value, "handle": logical}
         return {"jd_revision": revision, "entries": entries}
 
     def update_preset(self, logical, value):
-        if logical not in KNOWN_BOOLEAN_KEYS or type(value) is not bool:
+        if logical not in KNOWN_KEYS or not valid_value(logical, value):
             raise LocalUnavailable("未検証のJD2設定を変更できません")
         handle = self._handles.get(logical)
         if not handle:
@@ -359,7 +359,8 @@ class LocalAdapter:
         return snapshot(packages, links, page)
 
     def add_link(self, url, destination):
-        # No auto-start and no Packagizer overwrite.
+        # No auto-start. This adapter only ever talks to the Hub-owned engine, so
+        # the explicit destination wins over any Packagizer rule (flat layout).
         if not isinstance(url, str) or not url.startswith("https://"):
             raise LocalUnavailable("HTTPSリンクのみ転送できます")
         if not isinstance(destination, str) or not destination.startswith("/"):
@@ -368,6 +369,6 @@ class LocalAdapter:
             "links": url,
             "autostart": False,
             "destinationFolder": destination,
-            "overwritePackagizerRules": False,
+            "overwritePackagizerRules": True,
             "priority": "DEFAULT",
         })

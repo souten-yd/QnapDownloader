@@ -160,7 +160,7 @@ class AdapterTests(unittest.TestCase):
         self.assertEqual(sent["links"], "https://example.com/a?b=1&c=2")
         self.assertEqual(sent["destinationFolder"], "/share/Download/日本語 dir")
         self.assertIs(sent["autostart"], False)
-        self.assertIs(sent["overwritePackagizerRules"], False)
+        self.assertIs(sent["overwritePackagizerRules"], True)   # Hub-owned engine: flat layout wins
 
     def test_add_link_rejects_non_https_and_relative(self):
         with self.assertRaises(jl.LocalUnavailable):
@@ -170,11 +170,13 @@ class AdapterTests(unittest.TestCase):
         self.assertEqual(self.server.paths, [])
 
     def test_multiple_args_and_preset_flow(self):
+        lg = "org.jdownloader.gui.views.linkgrabber.addlinksdialog.LinkgrabberSettings"
         entries = [
+            {"interfaceName": lg, "key": "LinkgrabberAutoConfirmEnabled", "storage": "cfg/x", "value": True},
+            {"interfaceName": lg, "key": "LinkgrabberAutoStartEnabled", "storage": None, "value": False},
+            # same key name under a look-alike interface must NOT match
             {"interfaceName": "org.jdownloader.gui.views.linkgrabber.LinkgrabberSettings",
-             "key": "LinkgrabberAutoConfirmEnabled", "storage": "cfg/x", "value": True},
-            {"interfaceName": "org.jdownloader.gui.views.linkgrabber.LinkgrabberSettings",
-             "key": "LinkgrabberAutoStartEnabled", "storage": None, "value": False},
+             "key": "AutoExtractionEnabled", "storage": None, "value": True},
         ]
         self.server.responses["/jd/getCoreRevision"] = {"data": 7}
         self.server.responses["/config/list"] = {"data": entries}
@@ -182,16 +184,36 @@ class AdapterTests(unittest.TestCase):
         info = self.adapter.inspect_preset()
         self.assertTrue(info["entries"]["linkgrabber.auto_confirm"]["supported"])
         self.assertFalse(info["entries"]["extraction.auto_extract"]["supported"])
+        self.assertFalse(info["entries"]["downloads.auto_start"]["supported"])
         get_path = [p for p in self.server.paths if p.startswith("/config/get")][0]
         args = [json.loads(urllib.parse.unquote(a)) for a in get_path.split("?")[1].split("&")]
-        self.assertEqual(args, ["org.jdownloader.gui.views.linkgrabber.LinkgrabberSettings",
-                                "cfg/x", "LinkgrabberAutoConfirmEnabled"])
+        self.assertEqual(args, [lg, "cfg/x", "LinkgrabberAutoConfirmEnabled"])
         preview = jd2_policy.build_preview(self.adapter)
         self.assertFalse(preview["applicable"])  # unknown keys stay unsupported
         self.server.responses["/config/set"] = {"data": True}
         self.adapter.update_preset("linkgrabber.auto_confirm", False)
         with self.assertRaises(jl.LocalUnavailable):
-            self.adapter.update_preset("downloads.auto_start", False)
+            self.adapter.update_preset("downloads.auto_start", False)   # enum, not bool
+        with self.assertRaises(jl.LocalUnavailable):
+            self.adapter.update_preset("packagizer.package_subfolders", False)
+
+    def test_enum_entry_is_inspected_and_written_as_a_string(self):
+        gs = "org.jdownloader.settings.GeneralSettings"
+        entries = [{"interfaceName": gs, "key": "AutoStartDownloadOption", "storage": None,
+                    "value": "ALWAYS"}]
+        self.server.responses["/jd/getCoreRevision"] = {"data": 7}
+        self.server.responses["/config/list"] = {"data": entries}
+        self.server.responses["/config/get"] = {"data": "ALWAYS"}
+        info = self.adapter.inspect_preset()
+        self.assertEqual(info["entries"]["downloads.auto_start"]["current"], "ALWAYS")
+        self.assertTrue(info["entries"]["downloads.auto_start"]["supported"])
+        self.server.responses["/config/set"] = {"data": True}
+        self.adapter.update_preset("downloads.auto_start", "ONLY_IF_EXIT_WITH_RUNNING_DOWNLOADS")
+        path = [p for p in self.server.paths if p.startswith("/config/set")][-1]
+        args = [json.loads(urllib.parse.unquote(a)) for a in path.split("?")[1].split("&")]
+        self.assertEqual(args, [gs, None, "AutoStartDownloadOption", "ONLY_IF_EXIT_WITH_RUNNING_DOWNLOADS"])
+        with self.assertRaises(jl.LocalUnavailable):
+            self.adapter.update_preset("downloads.auto_start", "SOMETIMES")
 
     def test_config_list_uses_five_arg_form_then_falls_back(self):
         self.server.responses["/config/list"] = {"data": []}

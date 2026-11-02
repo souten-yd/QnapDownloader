@@ -92,6 +92,7 @@
      <hr data-scope="web">
      <button type="button" role="menuitem" data-action="toggleMode" data-scope="web" id="menuMode">限定操作モードに切り替え</button>
      <button type="button" role="menuitem" data-action="compatMode" data-scope="web" id="menuCompat">互換モードに切り替え</button>
+     <button type="button" role="menuitem" data-action="remoteOpen" data-scope="web" id="menuRemote">NASブラウザで開く</button>
      <button type="button" role="menuitem" data-action="external" data-scope="web">Safari／外部ブラウザで開く</button>
      <button type="button" role="menuitem" data-action="stageUrl" data-scope="web">このURLを追加したリンクへ</button>
      <button type="button" role="menuitem" data-action="bookmark" data-scope="web">ブックマークに追加</button>
@@ -199,6 +200,7 @@
    <div class="settings-layout">
     <nav class="settings-nav" aria-label="設定の項目">
      <a href="#/settings/engine" data-section="engine">エンジン</a>
+     <a href="#/settings/browser" data-section="browser">NASブラウザ</a>
      <a href="#/settings/storage" data-section="storage">保存先</a>
      <a href="#/settings/https" data-section="https">HTTPS接続</a>
      <a href="#/settings/share" data-section="share">iPhoneから送る</a>
@@ -245,6 +247,9 @@
        <div id="engineComponents" class="items"></div>
        <p id="engineMeta" class="muted"></p>
        <p class="muted">JD2とJavaはQPKGに同梱されません。公式の固定URLから取得し、SHA-256で検証して永続データ領域に置きます。コンテナ方式ではJavaはダイジェスト固定の公式イメージに含まれます。</p>
+       <div id="engineNativeRow" class="engine-row" hidden>
+        <button type="button" id="engineNativeRemove" class="btn small">従来方式のJavaを削除</button>
+       </div>
        <button type="button" id="engineSetupNative" class="btn small" hidden>QTS直接実行で初期設定（非推奨・Container Stationなし用）</button>
        <button type="button" id="engineResetup" class="btn small" hidden>初期設定をやり直す</button>
        <div id="engineKeysRow" hidden>
@@ -257,6 +262,30 @@
        <summary>ログ</summary>
        <pre id="engineLog" class="update-log">開くと表示します</pre>
       </details>
+     </section>
+
+     <section class="settings-section" data-section="browser" hidden>
+      <h1>NASブラウザ</h1>
+      <p class="muted">Cloudflareなどで手元のブラウザでは開けないサイトを、NAS上のコンテナ内ブラウザ（Chromium）で開き、画面だけを受け取って操作します。外部サイトの通信やスクリプトは端末に届きません。ファイルのダウンロードは無効です。</p>
+      <div class="engine-head">
+       <p id="rbState" class="engine-state" role="status" aria-live="polite">確認しています…</p>
+       <div class="engine-actions">
+        <button type="button" id="rbSetup" class="btn primary" hidden>初期設定（イメージ作成）</button>
+        <button type="button" id="rbStop" class="btn quiet" hidden>停止</button>
+       </div>
+      </div>
+      <p id="rbMemory" class="muted"></p>
+      <p id="rbNoContainer" class="engine-error" hidden>QTSのApp CenterでContainer Stationをインストールしてください（NASブラウザはコンテナ内でのみ動かします）</p>
+      <p id="rbReason" class="muted" hidden></p>
+      <p id="rbError" class="engine-error" hidden></p>
+      <details id="rbStepsBox" class="fold" hidden>
+       <summary id="rbStepsSummary">初期設定の進行状況</summary>
+       <ol id="rbSteps" class="engine-steps"></ol>
+      </details>
+      <p class="muted">メモリの保護: 空きメモリが2GiB未満、またはブラウザが上限(2GiB)の80%に達しているときはタブを開きません（他のアプリは止めません）。同時に開けるのは3枚までです。</p>
+      <p class="muted">自動停止: タブが0枚のまま5分、または10分間操作がないと、コンテナごと停止してメモリを解放します（次回は数秒で再起動）。Webタブを閉じると、対応するNASブラウザのタブも閉じます。</p>
+      <h2 class="sub-h">NASブラウザで開くサイト</h2>
+      <div id="remoteHosts" class="items"></div>
      </section>
 
      <section class="settings-section" data-section="storage" hidden>
@@ -403,9 +432,39 @@
     <span class="cf-hint-text">表示されない場合:</span>
     <button type="button" id="cfSafari" class="btn small">Safariで開く（次回から自動）</button>
     <button type="button" id="cfCompat" class="btn small">互換で再読み込み</button>
+    <button type="button" id="cfRemote" class="btn small">NASブラウザで開く</button>
     <button type="button" id="cfDismiss" class="icon-btn small" aria-label="このヒントを閉じる" title="閉じる"><svg class="icon" aria-hidden="true"><use href="#i-x"/></svg></button>
    </div>
    <div id="frames" class="frames"></div>
+   <div id="remoteView" class="remote-view" hidden>
+    <div id="remoteStage" class="remote-stage">
+     <img id="remoteImg" class="remote-img" alt="NASブラウザの画面" draggable="false" hidden>
+     <div id="remoteIdle" class="remote-idle">
+      <p id="remoteIdleText" class="muted">NASブラウザのタブは開かれていません。</p>
+      <button type="button" id="remoteReopen" class="btn primary">NASブラウザで開く</button>
+     </div>
+     <div id="remoteLoading" class="loading-bar" hidden></div>
+    </div>
+    <div class="remote-tools">
+     <button type="button" id="remoteKbdBtn" class="btn small">キーボード</button>
+     <button type="button" id="remoteKeyEnter" class="btn small">Enter</button>
+     <button type="button" id="remoteKeyBack" class="btn small">⌫</button>
+     <button type="button" id="remoteKeyTab" class="btn small">Tab</button>
+     <input id="remoteKbd" class="remote-kbd" type="text" inputmode="text" autocapitalize="off" autocomplete="off" autocorrect="off" spellcheck="false" aria-label="NASブラウザへ文字を入力">
+    </div>
+    <button type="button" id="remoteLinks" class="remote-badge" hidden>リンク 0件</button>
+    <div id="remoteSheet" class="remote-sheet" role="dialog" aria-label="見つかったリンク" hidden>
+     <div class="remote-sheet-head">
+      <strong id="remoteSheetTitle">見つかったリンク</strong>
+      <button type="button" id="remoteSheetClose" class="btn small">閉じる</button>
+     </div>
+     <div id="remoteSheetList" class="remote-sheet-list"></div>
+     <div class="remote-sheet-actions">
+      <button type="button" id="remoteAdd" class="btn primary">0件を追加</button>
+      <button type="button" id="remoteSend" class="btn" hidden>JD2へ送る</button>
+     </div>
+    </div>
+   </div>
   </section>
  </main>
 

@@ -23,9 +23,10 @@ import rapidgator_extract
 import browser_safety
 import runtime_diagnostics
 import engine_supervisor
+import remote_browser
 import updater
 
-VERSION = "0.1.15"
+VERSION = "0.1.16"
 PORT = 17864
 ROOT = Path(__file__).resolve().parent
 FILES = {"/": ("web/index.html", "text/html; charset=utf-8"),
@@ -236,7 +237,11 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("X-Frame-Options", "DENY")
         self.send_header("Referrer-Policy", "no-referrer")
         self.send_header("Permissions-Policy", "geolocation=(),camera=(),microphone=(),payment=()")
-        self.send_header("Content-Security-Policy", "default-src 'none'; img-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; frame-src https:; base-uri 'none'; frame-ancestors 'none'; form-action 'self'")
+        # img-src data: is needed ONLY for the remote-browser screencast: the UI
+        # sets one <img> to data:image/jpeg;base64,... built from /api/rb/frame
+        # (Hub-controlled bytes). 'self' alone cannot display it; blob: is not
+        # allowed. No other directive changes (default-src 'none', no inline).
+        self.send_header("Content-Security-Policy", "default-src 'none'; img-src 'self' data:; script-src 'self'; style-src 'self'; connect-src 'self'; frame-src https:; base-uri 'none'; frame-ancestors 'none'; form-action 'self'")
         if getattr(self, "_cookie", None):
             self.send_header("Set-Cookie", self._cookie)
         self.end_headers()
@@ -414,6 +419,21 @@ class Handler(BaseHTTPRequestHandler):
                 # Admin-authenticated, bounded tail; never expose an arbitrary
                 # caller-provided file path or the updater's internal directory.
                 return self.send_data(200, {"log": self.server.updates.log_tail()})
+            if path == "/api/rb/status":
+                return self.send_data(200, self.server.rb.status())
+            if path == "/api/rb/frame":
+                query = parse_qs(urlsplit(self.path).query)
+                since_text = query.get("since", ["0"])[0]
+                if not since_text.isdecimal() or len(since_text) > 12:
+                    raise ValueError("sinceが不正です")
+                wait_text = query.get("wait", [str(remote_browser.FRAME_WAIT_MAX)])[0]
+                if not wait_text.isdecimal() or len(wait_text) > 2 or int(wait_text) > 10:
+                    raise ValueError("waitが不正です")
+                return self.send_data(200, self.server.rb.frame(
+                    query.get("tab", [""])[0], int(since_text), wait=int(wait_text)))
+            if path == "/api/rb/links":
+                query = parse_qs(urlsplit(self.path).query)
+                return self.send_data(200, self.server.rb.links(query.get("tab", [""])[0]))
             if path == "/api/browser/validate":
                 query = parse_qs(urlsplit(self.path).query)
                 value = query.get("url", [""])[0]
@@ -428,6 +448,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_data(200, {"available": release is not None,
                   "release": {"version": release["version"], "size": release["size"]}
                             if release else None, "current": VERSION, "channel": channel})
+        except remote_browser.TabGone as exc:
+            return self.reject(str(exc), 404)
         except (OSError, ValueError, RuntimeError, KeyError, sqlite3.Error) as exc:
             return self.reject(str(exc))
         self.reject("APIが存在しません", 404)
@@ -618,6 +640,34 @@ class Handler(BaseHTTPRequestHandler):
                 except engine_supervisor.SetupBusy as exc:
                     return self.reject(str(exc), 409)
                 return self.send_data(202, {"started": True})
+            if path == "/api/engine/native/remove":
+                if body.get("confirmed") is not True:
+                    raise ValueError("従来方式のJava資産の削除には確認が必要です")
+                return self.send_data(200, self.server.engine.remove_native_leftovers())
+            if path == "/api/rb/setup":
+                if body.get("confirmed") is not True:
+                    raise ValueError("初期設定の開始には確認が必要です")
+                try:
+                    self.server.rb.start_setup()
+                except remote_browser.SetupBusy as exc:
+                    return self.reject(str(exc), 409)
+                return self.send_data(202, {"started": True})
+            if path == "/api/rb/stop":
+                if body.get("confirmed") is not True:
+                    raise ValueError("NASブラウザの停止には確認が必要です")
+                return self.send_data(200, {"stopped": self.server.rb.stop()})
+            if path == "/api/rb/tabs":
+                checked = browser_safety.validate(body.get("url"))
+                self.reject_hub_origin(checked)
+                return self.send_data(201, self.server.rb.open_tab(checked))
+            if path == "/api/rb/tabs/close":
+                return self.send_data(200, {"closed": self.server.rb.close_tab(body.get("id"))})
+            if path == "/api/rb/navigate":
+                checked = browser_safety.validate(body.get("url"))
+                self.reject_hub_origin(checked)
+                return self.send_data(200, self.server.rb.navigate(body.get("tab"), checked))
+            if path == "/api/rb/input":
+                return self.send_data(200, self.server.rb.send_input(body.get("tab"), body))
             if path == "/api/engine/start":
                 self.server.engine.start()
                 return self.send_data(202, {"started": True})
@@ -638,6 +688,8 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/jd2/preset/apply":
                 return self.send_data(200, self.server.jd2.preset_reapply(
                     confirmed=body.get("confirmed") is True))
+        except remote_browser.TabGone as exc:
+            return self.reject(str(exc), 404)
         except (OSError, ValueError, KeyError, RuntimeError, json.JSONDecodeError, sqlite3.Error) as exc:
             return self.reject(str(exc))
         self.reject("APIが存在しません", 404)
@@ -674,6 +726,10 @@ def main():
     server.updates = self_update.UpdateManager(data, ROOT, VERSION, "x86_64", args.port)
     server.engine = engine_supervisor.EngineManager(data, store)
     server.jd2 = jd2_control.JD2Controller(server.engine.adapter)
+    server.rb = remote_browser.RemoteBrowser(
+        server.engine.runtime, ROOT / "container" / "browser")
+    # A labelled browser container surviving a Hub crash would hold memory.
+    threading.Thread(target=server.rb.startup_cleanup, daemon=True).start()
     runtime_diagnostics.event("web_started")
 
     def request_shutdown(signum, frame):
@@ -688,6 +744,7 @@ def main():
         server.serve_forever(poll_interval=0.5)
     finally:
         server.server_close()
+        server.rb.shutdown()
         server.engine.shutdown()
         store.close()
 

@@ -55,9 +55,10 @@ def prepare_transfer(adapter, nas_directory):
         knob = state.get("entries", {}).get(key)
         if not isinstance(knob, dict) or knob.get("supported") is not True or knob.get("current") is not False:
             raise TransferBlocked("JD2の自動確定・自動開始OFFが確認できません")
-    # Packagizer cannot be asserted flat until its real rules are inspected.
-    # An explicit separate opt-in is required to allow manual link handoff
-    # with pre-existing custom rules. This does not change those rules.
+    # Package subfolders are not a setting: the Hub-owned engine (always the
+    # case for LocalAdapter) sends addLinks with overwritePackagizerRules=true
+    # and the explicit destinationFolder, so the flat layout wins. An adapter
+    # that cannot guarantee that must not opt in via allow_unverified_packagizer.
     if options.get("allow_unverified_packagizer") is not True:
         raise TransferBlocked("Packagizer未検証のため転送を停止しました。JD2側のルールを確認してください")
     return destination
@@ -69,4 +70,4 @@ def transfer(adapter, url, nas_directory):
     result = adapter.add_link(url, destination)
     if result is False:
         raise TransferBlocked("JD2がリンク登録を拒否しました。JD2の状態を確認してください")
-    return {"state": "sent", "note": "JD2 LinkGrabberへ自動開始OFFで送信。既存ルールは変更しません"}
+    return {"state": "sent", "note": "JD2 LinkGrabberへ自動開始OFFで送信。保存先を明示し、Packagizerのパッケージ別フォルダは上書きします（ルール自体は変更しません）"}

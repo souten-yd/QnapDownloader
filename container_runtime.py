@@ -9,9 +9,11 @@ listed or touched. Real Container Station behaviour is unverified.
 
 Stdlib only; Python 3.8 compatible. The command runner is injectable.
 """
+import hashlib
 import ipaddress
 import json
 import os
+import re
 import subprocess
 from types import SimpleNamespace
 
@@ -27,8 +29,12 @@ LABEL = LABEL_KEY + "=" + LABEL_VALUE
 NAME_PREFIX = "qnapdl-"
 JD2_NAME = "qnapdl-jd2"
 JD2_NET = "qnapdl-jd2-net"
-ALLOWED_NAMES = frozenset((JD2_NAME,))
-ALLOWED_NETWORKS = frozenset((JD2_NET,))
+BROWSER_NAME = "qnapdl-browser"
+BROWSER_NET = "qnapdl-browser-net"
+BROWSER_REPO = "qnapdl-browser"
+ALLOWED_NAMES = frozenset((JD2_NAME, BROWSER_NAME))
+ALLOWED_NETWORKS = frozenset((JD2_NET, BROWSER_NET))
+NAME_NETWORK = {JD2_NAME: JD2_NET, BROWSER_NAME: BROWSER_NET}
 
 GETCFG = "/sbin/getcfg"
 QPKG_CONF = "/etc/config/qpkg.conf"
@@ -43,6 +49,20 @@ CONTAINER_DOWNLOADS = "/downloads"
 CONTAINER_JD2 = "/jd2"
 DEFAULT_UID = 1000
 DEFAULT_GID = 1000
+
+# Remote browser container (docs/container-runtime.md section 4).
+BROWSER_MEMORY = "2g"
+BROWSER_SHM = "512m"
+BROWSER_PIDS = "1024"
+BROWSER_STOP_GRACE = 5
+BROWSER_CDP_PORT = 9223
+BROWSER_UID = 1000
+BROWSER_MIN_AVAILABLE_KIB = 2 * 1024 * 1024   # MemAvailable >= 2 GiB to open a tab
+BROWSER_CONTEXT_FILES = frozenset(("Dockerfile", "entrypoint.sh"))
+BROWSER_EXIT_NO_USERNS = 78    # entrypoint exit code: user namespaces unavailable
+BROWSER_EXIT_CAPS = 79         # entrypoint exit code: process has effective capabilities
+BROWSER_TAG = re.compile(r"qnapdl-browser:[0-9a-f]{12}\Z")
+BROWSER_BUILD_TIMEOUT = 3600
 
 MAX_OUTPUT = 1024 * 1024
 _BAD_PATH_CHARS = set(',"\'\n\r\0')
@@ -284,6 +304,7 @@ class Runtime:
                 "running": state.get("Running") is True,
                 "networks": settings.get("Networks") or {},
                 "published": bool((item.get("HostConfig") or {}).get("PortBindings")),
+                "exit_code": state.get("ExitCode") if isinstance(state.get("ExitCode"), int) else None,
             }
         except (ValueError, IndexError, AttributeError, TypeError):
             raise ContainerError("コンテナ情報を解析できません") from None
@@ -293,7 +314,7 @@ class Runtime:
         if info is None:
             return {"exists": False, "managed": False, "running": False, "status": "absent"}
         return {"exists": True, "managed": info["managed"], "running": info["running"],
-                "status": info["status"]}
+                "status": info["status"], "exit_code": info["exit_code"]}
 
     def _require_ours(self, name):
         info = self._inspect(name)
@@ -303,7 +324,7 @@ class Runtime:
 
     def inspect_ip(self, name, network):
         """IP of our running container on our network; verified on every call."""
-        if network not in ALLOWED_NETWORKS:
+        if network not in ALLOWED_NETWORKS or NAME_NETWORK.get(name) != network:
             raise ContainerError("許可されていないネットワーク名です")
         info = self._inspect(name)
         if info is None or not info["running"]:
@@ -375,13 +396,13 @@ class Runtime:
             raise ContainerError("コンテナを起動できません: " + self._tail(result))
         return (result.stdout or "").strip()[:80]
 
-    def stop(self, name):
+    def stop(self, name, grace=JD2_STOP_GRACE):
         info = self._require_ours(name)
         if info is None:
             return False
         if not info["running"]:
             return False
-        result = self._docker(["stop", "-t", str(JD2_STOP_GRACE), name], JD2_STOP_GRACE + 30)
+        result = self._docker(["stop", "-t", str(int(grace)), name], int(grace) + 30)
         if result.returncode != 0:
             raise ContainerError("コンテナを停止できません: " + self._tail(result))
         return True
@@ -396,3 +417,196 @@ class Runtime:
         if result.returncode != 0:
             raise ContainerError("コンテナを削除できません: " + self._tail(result))
         return True
+
+    # ------------------------------------------------- remote browser image
+    @staticmethod
+    def browser_context_files(context_dir):
+        """(Dockerfile bytes, entrypoint bytes) of the shipped build context.
+
+        The directory must hold exactly the shipped files: nothing else can
+        reach `docker build`, and the context is never a client-supplied path.
+        """
+        try:
+            names = set(os.listdir(context_dir))
+            if names != set(BROWSER_CONTEXT_FILES):
+                raise ContainerError("ブラウザイメージのビルド用ファイルが想定と異なります")
+            data = []
+            for name in ("Dockerfile", "entrypoint.sh"):
+                path = os.path.join(context_dir, name)
+                if os.path.islink(path) or not os.path.isfile(path):
+                    raise ContainerError("ブラウザイメージのビルド用ファイルが不正です")
+                with open(path, "rb") as handle:
+                    data.append(handle.read(1024 * 1024))
+            return data[0], data[1]
+        except OSError:
+            raise ContainerError("ブラウザイメージのビルド用ファイルを読めません") from None
+
+    def browser_tag(self, context_dir):
+        dockerfile, entrypoint = self.browser_context_files(context_dir)
+        digest = hashlib.sha256(dockerfile + entrypoint).hexdigest()[:12]
+        return BROWSER_REPO + ":" + digest
+
+    @staticmethod
+    def _check_browser_tag(tag):
+        if not isinstance(tag, str) or not BROWSER_TAG.match(tag):
+            raise ContainerError("許可されていないブラウザイメージです")
+
+    def browser_image_present(self, tag):
+        self._check_browser_tag(tag)
+        return self._docker(["image", "inspect", "--format", "{{.Id}}", tag], 20).returncode == 0
+
+    def browser_build_args(self, tag, context_dir):
+        self._check_browser_tag(tag)
+        _safe_path(context_dir, "ビルド用フォルダ")
+        return ["build", "--label", LABEL, "--tag", tag, context_dir]
+
+    def browser_build(self, context_dir):
+        tag = self.browser_tag(context_dir)
+        args = self.browser_build_args(tag, context_dir)
+        result = self._docker(args, BROWSER_BUILD_TIMEOUT)
+        if result.returncode != 0:
+            raise ContainerError("ブラウザイメージを作成できません: " + self._tail(result))
+        if not self.browser_image_present(tag):
+            raise ContainerError("作成したイメージを確認できません")
+        return tag
+
+    def browser_prune_old(self, keep_tag):
+        """Remove older Hub-built browser images (label + repository checked)."""
+        self._check_browser_tag(keep_tag)
+        result = self._docker(["images", "--filter", "label=" + LABEL,
+                               "--filter", "reference=" + BROWSER_REPO + ":*",
+                               "--format", "{{.Repository}}:{{.Tag}}"], 30)
+        removed = 0
+        if result.returncode != 0:
+            return removed
+        for line in (result.stdout or "").split():
+            if BROWSER_TAG.match(line) and line != keep_tag:
+                if self._docker(["rmi", line], 60).returncode == 0:
+                    removed += 1
+        return removed
+
+    @staticmethod
+    def _browser_hardening():
+        """Shared hardening for the browser container and its selftest.
+
+        WHY `--cap-drop ALL` IS FOLLOWED BY `--cap-add SYS_ADMIN` (browser only,
+        never JD2): Chromium's sandbox needs unprivileged user namespaces
+        (clone/unshare with CLONE_NEWUSER etc.). Docker's default seccomp
+        profile allows those namespace flags only when the container's
+        capability set includes CAP_SYS_ADMIN; the rule is evaluated from the
+        capability set given at container creation. Without it the sandbox
+        cannot start and the only "fix" would be switching the sandbox off, which is
+        forbidden here.
+
+        Why this does not give the browser real privileges: the process runs as
+        uid 1000 (--user) with no-new-privileges. For a non-root user Docker
+        puts SYS_ADMIN into the *bounding* set only; the effective, permitted
+        and ambient sets stay empty, and with no-new-privileges (and no setuid
+        or file-capability binary able to raise them) they cannot be raised
+        later. The process can therefore only create *unprivileged* user
+        namespaces, which is exactly what Chromium's namespace sandbox uses.
+        Everything else stays dropped (ALL minus SYS_ADMIN), the default
+        seccomp profile stays on, and the root filesystem is read-only.
+
+        entrypoint.sh enforces the assumption at runtime: it exits 79 if
+        CapEff in /proc/self/status is not all zero, so Chromium never runs
+        with real capabilities even if a Docker version behaves differently.
+        Residual risk: SYS_ADMIN in the bounding set widens what a process
+        could do if it ever obtained capabilities (for example through a kernel
+        bug), compared with an empty set. See docs/container-runtime.md.
+        """
+        return [
+            "--read-only",
+            "--log-driver", "none",
+            "--memory", BROWSER_MEMORY, "--memory-swap", BROWSER_MEMORY,
+            "--shm-size", BROWSER_SHM,
+            "--pids-limit", BROWSER_PIDS,
+            "--cap-drop", "ALL",
+            "--cap-add", "SYS_ADMIN",
+            "--security-opt", "no-new-privileges",
+            "--user", "%d:%d" % (BROWSER_UID, BROWSER_UID),
+            "--tmpfs", "/profile:size=512m",
+            "--tmpfs", "/tmp:size=256m",
+        ]
+
+    def browser_run_args(self, tag):
+        """Exact `docker run` list: no -p, no mounts, default seccomp."""
+        self._check_browser_tag(tag)
+        return (["run", "-d", "--name", BROWSER_NAME, "--label", LABEL,
+                 "--network", BROWSER_NET, "--restart", "no"] +
+                self._browser_hardening() + [tag])
+
+    def browser_selftest_args(self, tag):
+        self._check_browser_tag(tag)
+        return ["run", "--rm", "--label", LABEL, "--network", "none"] + \
+            self._browser_hardening() + [tag, "selftest"]
+
+    def browser_selftest(self, tag):
+        """Can Chromium's sandbox start here? Raises a clear error if not."""
+        result = self._docker(self.browser_selftest_args(tag), 90)
+        if result.returncode == BROWSER_EXIT_NO_USERNS:
+            raise ContainerError(NO_USERNS_MESSAGE)
+        if result.returncode == BROWSER_EXIT_CAPS:
+            raise ContainerError(CAPS_MESSAGE)
+        if result.returncode != 0:
+            raise ContainerError("サンドボックスの確認に失敗しました: " + self._tail(result))
+        return True
+
+    def run_browser(self, tag):
+        args = self.browser_run_args(tag)
+        if self._inspect(BROWSER_NAME) is not None:
+            raise ContainerError("同名のコンテナが残っています。停止してから起動してください")
+        if not self.browser_image_present(tag):
+            raise ContainerError("ブラウザイメージがありません。初期設定を実行してください")
+        check_memory(self._meminfo, BROWSER_MIN_AVAILABLE_KIB)
+        result = self._docker(args, 120)
+        if result.returncode != 0:
+            raise ContainerError("コンテナを起動できません: " + self._tail(result))
+        return (result.stdout or "").strip()[:80]
+
+    def stats(self, name):
+        """Memory use of our own named container: {used_bytes, limit_bytes, percent}."""
+        self._check_name(name)
+        result = self._docker(["stats", "--no-stream", "--format",
+                               "{{.MemUsage}}|{{.MemPerc}}", name], 30)
+        if result.returncode != 0:
+            raise ContainerError("コンテナのメモリ使用量を取得できません")
+        return parse_stats((result.stdout or "").strip())
+
+
+NO_USERNS_MESSAGE = (
+    "このNASのカーネルまたはContainer Stationではユーザー名前空間が使えず、Chromiumのサンドボックスを"
+    "有効にできません。安全のためサンドボックスを無効にする方法へは切り替えません。"
+    "カーネル設定（ユーザー名前空間）またはContainer Stationのseccomp設定を確認してください")
+CAPS_MESSAGE = (
+    "ブラウザのプロセスが実効的な権限(capability)を持っていたため、安全のため起動を中止しました"
+    "（CapEffが0であることを起動時に確認しています）。Container Station/Dockerの権限の扱いを確認してください。"
+    "ユーザー名前空間が使えない場合も同様に中止します")
+
+_UNITS = {"b": 1, "kb": 1000, "mb": 1000 ** 2, "gb": 1000 ** 3, "kib": 1024,
+          "mib": 1024 ** 2, "gib": 1024 ** 3}
+
+
+def _bytes(text):
+    match = re.fullmatch(r"\s*([0-9]+(?:\.[0-9]+)?)\s*([A-Za-z]+)\s*", text)
+    if not match or match.group(2).lower() not in _UNITS:
+        raise ValueError("size")
+    return int(float(match.group(1)) * _UNITS[match.group(2).lower()])
+
+
+def parse_stats(line):
+    """Parse '512.3MiB / 2GiB|25.00%' (docker stats --format) defensively."""
+    try:
+        usage, _, perc = line.partition("|")
+        used_text, _, limit_text = usage.partition("/")
+        used, limit = _bytes(used_text), _bytes(limit_text)
+        if limit <= 0:
+            raise ValueError("limit")
+        percent = used * 100.0 / limit
+        try:
+            percent = max(percent, float(perc.strip().rstrip("%")))
+        except ValueError:
+            pass
+        return {"used_bytes": used, "limit_bytes": limit, "percent": round(percent, 1)}
+    except ValueError:
+        raise ContainerError("メモリ使用量の形式を解析できません") from None

@@ -62,3 +62,6 @@ JD2は公式アップデート機構によって小さなホストプラグイ�
 - 既存Packagizerカスタムルール、既存の保存先、稼働中ジョブに影響がない。
 - JD2更新中はapply拒否、更新失敗・タイムアウト時に状態を誤表示しない。
 - 不明キーと不完全な型は黙って上書きせず適用停止。
+
+## v0.1.16 追加（実機のキー名）
+必須項目は4つに確定: `LinkgrabberSettings` の自動確定・追加後の自動開始・自動解凍（いずれもfalse）、`GeneralSettings.AutoStartDownloadOption`（`ALWAYS` 以外ならOK）。パッケージ別フォルダは設定ではなく、送信時の `overwritePackagizerRules: true` ＋明示の `destinationFolder` で強制する。詳細は [engine-setup.md](engine-setup.md)。

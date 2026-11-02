@@ -17,6 +17,7 @@ import platform
 import re
 import shutil
 import signal
+import stat as stat_module
 import subprocess
 import sys
 import threading
@@ -50,16 +51,19 @@ MODE_CONTAINER = "container"
 CONTAINER_STATE_TTL = 2.0
 CONTAINER_IP_TTL = 10.0
 AVAILABLE_TTL = 60.0
+NATIVE_LEFTOVER_TTL = 60.0
 NO_CONTAINER_STATION = ("Container Stationが見つかりません。"
                         "App CenterでContainer Stationをインストールしてください")
 API_CONFIG_NAME = "org.jdownloader.api.RemoteAPIConfig.json"
+MYJD_CONFIG_NAME = "org.jdownloader.api.myjdownloader.MyJDownloaderSettings.json"
+MYJD_CONFIG = {"autoconnectenabledv2": False}
 
 STEP_DEFS = (
     ("precheck", "事前確認"),
     ("java_fetch", "Javaの取得と検証"),
     ("java_extract", "Javaの展開と動作確認"),
     ("jd2_fetch", "JD2の取得・検証・配置"),
-    ("api_config", "ローカル接続設定の作成"),
+    ("api_config", "ローカル接続設定の作成・MyJDownloader自動接続の無効化"),
     ("first_run", "初回起動・公式アップデート"),
     ("resident", "常駐起動"),
     ("verify", "ローカル接続の安全確認"),
@@ -73,7 +77,7 @@ STEP_DEFS_CONTAINER = (
     ("image", "JD2イメージの取得"),
     ("network", "専用ネットワークの作成"),
     ("jd2_fetch", "JD2の取得・検証・配置"),
-    ("api_config", "ローカル接続設定の作成"),
+    ("api_config", "ローカル接続設定の作成・MyJDownloader自動接続の無効化"),
     ("first_run", "初回起動・公式アップデート"),
     ("resident", "常駐起動"),
     ("verify", "接続確認（コンテナの検証）"),
@@ -187,6 +191,7 @@ class EngineManager:
         self._c_checked = None
         self._ip_cache = None
         self._avail = None
+        self._leftover_cache = None
         self.adapter = jd2_local.LocalAdapter(self)
         self._saved = None
         self._state = self._load_state()
@@ -349,6 +354,7 @@ class EngineManager:
                               "network": container_runtime.JD2_NET,
                               "image": container_runtime.IMAGE_JD2.split("@")[0],
                               "mounted_dir": (self._state.get("container") or {}).get("mounted_dir")},
+                "native_leftovers": self.native_leftovers(),
                 "can_migrate": bool(native_installed and cs_version and not self._setup_active),
                 "phase": phase,
                 "installed": self.installed,
@@ -364,6 +370,77 @@ class EngineManager:
                 "core_revision": self._core_revision,
                 "restart_count": self._restart_count,
             }
+
+    # ------------------------------------------------- native leftovers
+    def _leftover_dirs(self):
+        """Native-only artifacts: the extracted JRE and download leftovers.
+
+        engine/jd2 is NEVER listed here: the container bind-mounts and reuses it.
+        """
+        return (self.java_root, self.download_dir)
+
+    @staticmethod
+    def _tree_bytes(path):
+        """Sum of regular-file sizes below path; symlinks are never followed."""
+        total = 0
+        try:
+            if os.path.islink(path):
+                return 0
+            for base, dirs, files in os.walk(path, followlinks=False):
+                for name in files:
+                    try:
+                        info = os.lstat(os.path.join(base, name))
+                    except OSError:
+                        continue
+                    if stat_module.S_ISREG(info.st_mode):
+                        total += info.st_size
+        except OSError:
+            pass
+        return total
+
+    def native_leftovers(self, refresh=False):
+        now = self._now()
+        with self._lock:
+            cached = self._leftover_cache
+        if cached is not None and not refresh and now - cached[0] < NATIVE_LEFTOVER_TTL:
+            return dict(cached[1])
+        present = any(os.path.lexists(str(d)) for d in self._leftover_dirs())
+        size = sum(self._tree_bytes(str(d)) for d in self._leftover_dirs()) if present else 0
+        value = {"present": present, "bytes": size}
+        with self._lock:
+            self._leftover_cache = (now, value)
+        return dict(value)
+
+    def remove_native_leftovers(self):
+        with self._lock:
+            if self._setup_active:
+                raise EngineError("初期設定の実行中は削除できません")
+            mode = self._state.get("mode")
+            pid, ticks = self._pid, self._ticks
+        if mode != MODE_CONTAINER or not self.installed:
+            raise EngineError("コンテナ方式の初期設定が完了していないため削除できません")
+        if pid is not None and self._identity_ok(pid, ticks):
+            raise EngineError("QTS直接実行のエンジンが動作中のため削除できません")
+        for target in self._leftover_dirs():
+            if os.path.islink(str(target)):
+                raise EngineError("%s がシンボリックリンクのため削除しません" % target.name)
+        before = self.native_leftovers(refresh=True)
+        failures = []
+
+        def collect(function, path, excinfo):
+            failures.append(str(path))
+        for target in self._leftover_dirs():
+            if os.path.isdir(str(target)) and not os.path.islink(str(target)):
+                shutil.rmtree(str(target), onerror=collect)
+        with self._lock:
+            self._leftover_cache = None
+            if self._state.get("java") is not None:
+                self._state["java"] = None
+                self._save_state()
+        if failures:
+            raise EngineError("一部を削除できませんでした（%d件）" % len(failures))
+        self.log("[hub] 従来方式のJava資産を削除しました（engine/jd2は保持）")
+        return {"removed": True, "freed_bytes": before["bytes"]}
 
     # --------------------------------------------------------- process facts
     def _read_proc(self, pid, name):
@@ -568,6 +645,45 @@ class EngineManager:
             pass
 
     def switch_api_config(self, mode):
+        """RemoteAPIConfig for `mode`, then the MyJDownloader auto-connect switch-off."""
+        action = self._switch_api_config(mode)
+        self.disable_myjd_autoconnect(mode)
+        return action
+
+    def disable_myjd_autoconnect(self, mode):
+        """Merge autoconnectenabledv2=false into the MyJDownloader settings file.
+
+        Headless JD2 otherwise asks for MyJDownloader logins on a console that
+        does not exist (IllegalStateException: No Console Available!). Only that
+        one key is set; other keys are preserved and no credential key is ever
+        written. Same refusal rules as the API config. Returns "created",
+        "same" or "rewritten". Unverified on a real JD2.
+        """
+        path = self.jd2_dir / "cfg" / MYJD_CONFIG_NAME
+        name = "cfg/" + MYJD_CONFIG_NAME
+        if not (path.exists() or path.is_symlink()):
+            durability.write_json(path, MYJD_CONFIG)
+            if mode == MODE_CONTAINER:
+                self._match_owner(path.parent, path)
+            return "created"
+        if path.is_symlink() or not path.is_file():
+            raise SetupFailure("MyJDownloader設定を安全に更新できないため中止しました（通常のファイルではありません）: " + name)
+        try:
+            current = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            raise SetupFailure("MyJDownloader設定を安全に更新できないため中止しました（JSONとして読めません）: " + name) from None
+        if not isinstance(current, dict):
+            raise SetupFailure("MyJDownloader設定を安全に更新できないため中止しました（JSONオブジェクトではありません）: " + name)
+        if current.get("autoconnectenabledv2") is False:
+            return "same"
+        merged = dict(current)
+        merged.update(MYJD_CONFIG)
+        durability.write_json(path, merged)
+        if mode == MODE_CONTAINER:
+            self._match_owner(path.parent, path)
+        return "rewritten"
+
+    def _switch_api_config(self, mode):
         """Create or update cfg/RemoteAPIConfig.json for `mode`.
 
         JD2 rewrites its cfg files with extra keys after the first start, so

@@ -167,3 +167,17 @@ QnapDownloaderの画面を「普段使っているWebブラウザ」と同じ感
 
 ### 設定
 - 設定 › ブックマーク の下に「常にSafariで開くサイト」一覧（ホスト名＋「解除」）。
+
+## v0.1.16 NASブラウザ（リモートブラウザ）
+
+Cloudflare等で手元のブラウザ（iframe）では開けないサイトを、NAS上のコンテナ内Chromiumで開く第3のモード。設計・安全性は [container-runtime.md](container-runtime.md) §4。端末には外部サイトの通信もスクリプトも届かず、HubのJPEGフレームと入力だけがやり取りされる。
+
+- モード: `"remote"` はホスト別の記憶値（`external` と同じ `qnapdl.hostmodes.v1`）とタブのフラグ `tab.remote` で、`MODES`/sandbox値ではない（sandbox定数は3つのまま）。Cloudflareヒントのバーとメニューの「NASブラウザで開く」を選ぶと、そのホストが「NASブラウザで開くサイト」（設定 › NASブラウザ）に記憶される（解除可）。メニューの「NASブラウザをやめる（通常表示へ）」で戻せる。
+- 表示: `#remoteView` の `<img>` に、`GET /api/rb/frame?tab=&since=` のロングポーリング結果から `data:image/jpeg;base64,…` を設定する（`.src =` は iframe の `validatedUrl` とこの1箇所だけ。base64は形式検査してから使う）。ポーリングは「リモートタブが表示中かつページが可視」のときだけ1本。外れるとHubが5秒でスクリーンキャストを止める。
+- 入力: タップ→`tap`、ドラッグ→`scroll`（約80msに1回）、PCのホイール→`scroll`。座標はHubが返すフレームの幅・高さ（CSSピクセル）に換算。「キーボード」ボタンで非表示の入力欄にフォーカス（iOSのキーボード用）、IMEは `compositionend` で確定文字だけ送る。Enter/Backspace/Tab/矢印/Esc/Delete は `key`。戻る/進む/再読み込みは `back`/`forward`/`reload`。
+- 「リンク N件」バッジ: ページ読み込み完了の1.2秒後に `GET /api/rb/links` で更新。タップで下からのシート（URL一覧）、「N件を追加」は既存の `/api/rapidgator/extract`（プレビュー→digest付きcommit）で追加したリンクへ、「JD2へ送る」（エンジンの `can_send` のときだけ）は追加後に既存の `sendLinks`（確認ダイアログあり）。
+- 復元: 再読み込み後、リモートタブのURL履歴は復元するが、NAS側のタブは自動では開かない（「NASブラウザで開く」ボタン）。Webタブを閉じる／ログアウトすると対応するNASタブを閉じる。コンテナが自動停止していたら404で検知して案内する。
+- 設定 › NASブラウザ（エンジンの次）: 状態（停止中/起動中/稼働中）、メモリ使用量とNAS空きメモリ、「初期設定（イメージ作成）」（確認ダイアログ→段階表示、エンジンの初期設定と同じ表示）、「停止」、メモリ保護と自動停止の説明、Container Station未導入の案内。
+- 設定 › エンジン › 詳細: 従来方式のJava削除（`native_leftovers.present` のときだけ表示）。
+- CSP: `img-src 'self' data:`（スクリーンキャスト表示にだけ必要。`blob:` は許可しない。他のディレクティブは不変）。
+- 既知の制約（実機未検証）: ページは1280×2000のデスクトップ表示のままiPhoneの幅に縮小して見せる。ピンチ拡大は未対応（操作はタップ/ドラッグ/キーボード）。

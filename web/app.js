@@ -1,6 +1,6 @@
 "use strict";
 /*
- * QnapDownloader browser-style shell (v0.1.15).
+ * QnapDownloader browser-style shell (v0.1.16).
  * Spec: docs/browser-shell-ui.md. Single file, no build step.
  *
  * Security notes (see "Security invariants" in the spec):
@@ -47,6 +47,19 @@ const SANDBOX_INTERACTIVE = "allow-scripts allow-forms";
 // cookies/storage and cannot reach the Hub's session or storage.
 const SANDBOX_COMPAT = "allow-scripts allow-forms allow-same-origin";
 const MODES = ["strict", "interactive", "compat"];
+// NAS remote browser (v0.1.16): a host preference and a per-tab flag, never a
+// sandbox value. The page is rendered by Chromium in a NAS container; this
+// page only shows JPEG frames from /api/rb/frame and posts validated input.
+const REMOTE_MODE = "remote";
+const RB_MAX_POLL_FAILS = 3;
+const RB_SCROLL_MS = 80;
+const RB_TAP_MOVE_PX = 10;
+const RB_TAP_MAX_MS = 600;
+const RB_LINKS_DELAY_MS = 1200;
+const RB_STATUS_POLL_MS = 1500;
+const RB_JPEG_PREFIX = "data:image/jpeg;base64,";
+const RB_KEYS = ["Enter", "Backspace", "Tab", "Escape", "Delete",
+  "ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown"];
 const MODE_LABELS = {strict: "強い制限", interactive: "限定操作", compat: "互換"};
 // Per-host "always open in Safari". Stored in the same hostname->mode map as the
 // isolation modes, but it is NOT a tab mode (never in MODES / tab.mode / sandbox).
@@ -55,7 +68,7 @@ const SHELL_KEY = "qnapdl.shell.v1";
 const HOST_MODE_KEY = "qnapdl.hostmodes.v1";
 const TAB_STORAGE_KEY = "qnapdl.webtabs.v1";
 const LEGACY_AUTO_KEY = "qnapdl.downloads.auto";   // v0.1.11 switch; removed silently
-const SETTINGS_SECTIONS = ["engine", "storage", "https", "share", "bookmarks", "updates", "diagnostics", "about"];
+const SETTINGS_SECTIONS = ["engine", "browser", "storage", "https", "share", "bookmarks", "updates", "diagnostics", "about"];
 const SECTION_ALIASES = {jd2: "engine"};   // old #/settings/jd2 links
 const ENGINE_POLL_MS = 1500;
 const SVG_NS = "http://www.w3.org/2000/svg";
@@ -82,6 +95,7 @@ const state = {
   bootVersion: "", statusCheckedAt: 0, updateWatching: false,
   engine: null, engineTimer: null, engineBusy: false,
   https: false, tailnet: false,
+  rbPolling: "", rbGen: 0, rbStatus: null, rbTimer: null, rbBusy: false,
 };
 
 // ------------------------------------------------------------------ helpers
@@ -172,7 +186,8 @@ function readHostModes() {
     const data = JSON.parse(readLocal(HOST_MODE_KEY) || "[]");
     if (!Array.isArray(data)) return [];
     return data.filter(e => Array.isArray(e) && typeof e[0] === "string" && e[0].length <= 253 &&
-      ((MODES.includes(e[1]) && e[1] !== "strict") || e[1] === EXTERNAL_MODE)).slice(-MAX_HOST_MODES);
+      ((MODES.includes(e[1]) && e[1] !== "strict") || e[1] === EXTERNAL_MODE ||
+        e[1] === REMOTE_MODE)).slice(-MAX_HOST_MODES);
   } catch (e) { return []; }
 }
 
@@ -186,6 +201,12 @@ function rememberHostMode(host, mode) {
 function rememberedMode(host) {
   const hit = readHostModes().find(e => e[0] === host);
   return hit ? hit[1] : null;
+}
+
+function isRemoteHost(host) { return Boolean(host) && rememberedMode(host) === REMOTE_MODE; }
+
+function remoteHosts() {
+  return readHostModes().filter(e => e[1] === REMOTE_MODE).map(e => e[0]);
 }
 
 function isExternalHost(host) { return Boolean(host) && rememberedMode(host) === EXTERNAL_MODE; }
@@ -264,7 +285,11 @@ async function api(path, body = null) {
     setTimeout(go, 0);
     throw new Error("セッションが切れました。再度ログインしてください");
   }
-  if (!res.ok) throw new Error(data.error || "HTTP " + res.status);
+  if (!res.ok) {
+    const failure = new Error(data.error || "HTTP " + res.status);
+    failure.status = res.status;
+    throw failure;
+  }
   return data;
 }
 
@@ -402,6 +427,8 @@ function applyRoute() {
   syncAutoRefresh();
   syncEnginePoll();
   syncBadgeTimer();
+  syncRemotePoll();
+  syncBrowserPoll();
   // Last route (a hash, never a secret) lets a reloaded iOS web app resume.
   writeSession(SHELL_KEY, JSON.stringify({v: 1, hash: location.hash || "#/home"}));
   perform(() => enterView(route));
@@ -441,8 +468,8 @@ function updateChrome() {
       display = tab.current || tab.history[tab.index] || "";
       iconName = tab.current ? "lock" : "globe";
     }
-    back = tab.index > 0;
-    forward = tab.index >= 0 && tab.index < tab.history.length - 1;
+    back = tab.remote ? Boolean(tab.rb) : tab.index > 0;
+    forward = tab.remote ? Boolean(tab.rb) : (tab.index >= 0 && tab.index < tab.history.length - 1);
   } else if (route.view === "downloads") {
     display = "qnap://downloads"; iconName = "download";
   } else if (route.view === "links") {
@@ -472,6 +499,7 @@ function updateChrome() {
   $("webLoading").hidden = !(tab && tab.loading);
   updateWebStatus(tab);
   updateCfHint(tab);
+  updateRemoteView(tab);
   updatePinnedTabs();
   updateMobileBar();
 }
@@ -530,8 +558,9 @@ function updateWebStatus(tab) {
   box.replaceChildren();
   if (!tab || !tab.history.length) return;
   const external = Boolean(tab.external);
-  const chip = element("button", external ? "Safari固定" : (MODE_LABELS[tab.mode] || MODE_LABELS.strict),
-    "mode-badge " + (external ? "external" : tab.mode));
+  const remote = Boolean(tab.remote);
+  const chip = element("button", remote ? "NASブラウザ" : external ? "Safari固定" : (MODE_LABELS[tab.mode] || MODE_LABELS.strict),
+    "mode-badge " + (remote ? "remote" : external ? "external" : tab.mode));
   chip.type = "button";
   chip.title = "表示されない場合のヒントを表示";
   chip.addEventListener("click", () => {
@@ -542,8 +571,9 @@ function updateWebStatus(tab) {
   box.appendChild(chip);
   const host = hostOf(tab.history[tab.index]);
   let text = host;
+  if (tab.remote && tab.rb && tab.rb.title) text = tab.rb.title;
   if (tab.error) text = host + " — 読み込めませんでした: " + tab.error;
-  else if (!tab.current) text = host + " — 読み込み中…";
+  else if (!tab.current && !tab.remote) text = host + " — 読み込み中…";
   const label = element("span", text, "web-status-text");
   label.title = tab.current || text;
   box.appendChild(label);
@@ -566,7 +596,7 @@ function updateWebStatus(tab) {
 // Slim one-line bar: shown 6 s after a load starts (or when the chip is tapped).
 // Cross-origin load failure cannot be detected, so this is a timing heuristic.
 function updateCfHint(tab) {
-  const show = Boolean(tab && tab.current && !tab.external && tab.showHint && !tab.hintDismissed);
+  const show = Boolean(tab && tab.current && !tab.external && !tab.remote && tab.showHint && !tab.hintDismissed);
   $("cfHint").hidden = !show;
   $("cfCompat").hidden = !tab || tab.mode === "compat";
 }
@@ -740,13 +770,15 @@ async function addBookmark(title, url) {
 function newTabRecord(id) {
   return {id, history: [], index: -1, mode: "strict", current: "",
     loaded: false, loading: false, token: 0, frame: null, error: "",
-    lastUsed: 0, hintDismissed: false, showHint: false, hintTimer: 0, external: false};
+    lastUsed: 0, hintDismissed: false, showHint: false, hintTimer: 0, external: false,
+    remote: false, rb: null};
 }
 
 function saveTabs() {
   // Only id / url history / index / mode. No tokens, cookies or page data.
   const data = {v: 1, next: state.nextTabId, tabs: state.tabs.map(t => ({
-    id: t.id, history: t.history.slice(), index: t.index, mode: t.mode}))};
+    id: t.id, history: t.history.slice(), index: t.index, mode: t.mode,
+    remote: t.remote === true}))};
   writeSession(TAB_STORAGE_KEY, JSON.stringify(data));
 }
 
@@ -764,6 +796,7 @@ function restoreTabs() {
     const idx = Number.isInteger(raw.index) ? raw.index : tab.history.length - 1;
     tab.index = tab.history.length ? Math.min(Math.max(idx, 0), tab.history.length - 1) : -1;
     tab.mode = normalizeMode(raw.mode);
+    tab.remote = raw.remote === true;   // the remote tab itself is NOT reopened automatically
     state.tabs.push(tab);   // loaded=false: validated and loaded lazily on selection
     maxId = Math.max(maxId, Number(raw.id.slice(1)));
   }
@@ -801,6 +834,7 @@ function closeTab(id) {
   tab.token++;
   clearTimeout(tab.hintTimer);
   if (tab.frame) tab.frame.remove();
+  releaseRemote(tab);   // closing the web tab closes the NAS browser tab (frees memory)
   state.tabs.splice(idx, 1);
   saveTabs();
   if (state.lastWebTabId === id) state.lastWebTabId = null;
@@ -984,6 +1018,11 @@ function tryExternalOpen(value, tab) {
 // opts.restore: not a user gesture (lazy load of a restored tab), so an
 // external host is shown without a frame instead of calling window.open.
 async function openInTab(tab, value, commit, opts = {}) {
+  if (tab.remote || (!opts.restore && isRemoteHost(hostOf(value)))) {
+    if (opts.restore) { tab.loaded = true; refreshAfterTabChange(); return; }   // never auto-open on restore
+    await openRemote(tab, value, commit);
+    return;
+  }
   if (!opts.restore && isExternalHost(hostOf(value)) && tryExternalOpen(value, tab)) return;
   const token = ++tab.token;
   tab.error = "";
@@ -1016,6 +1055,388 @@ async function openInTab(tab, value, commit, opts = {}) {
   refreshAfterTabChange();
 }
 
+// ---------------------------------------------------------- NAS remote browser
+// The Hub validates every URL (/api/browser/validate rules) and forwards a fixed
+// set of inputs. The only image source is a data:image/jpeg;base64 URL built from
+// the Hub's /api/rb/frame answer; it is never a remote URL.
+async function openRemote(tab, value, commit) {
+  const token = ++tab.token;
+  tab.error = "";
+  tab.loading = true;
+  updateChrome();
+  let url;
+  try {
+    url = await validateUrl(value);
+    if (token !== tab.token || !state.tabs.includes(tab)) return;
+    if (tab.rb) {
+      try {
+        await api("/api/rb/navigate", {tab: tab.rb.id, url});
+      } catch (e) {
+        if (e.status !== 404) throw e;
+        tab.rb = null;   // closed on the NAS meanwhile (idle stop): open a fresh one
+      }
+    }
+    if (!tab.rb) {
+      const made = await api("/api/rb/tabs", {url});
+      if (token !== tab.token || !state.tabs.includes(tab)) {
+        api("/api/rb/tabs/close", {id: made.id}).catch(() => {});
+        return;
+      }
+      tab.rb = {id: made.id, seq: 0, url: "", title: "", width: 0, height: 0,
+        loading: true, links: [], linksTimer: 0, blocked: null};
+    }
+  } catch (e) {
+    if (token === tab.token) { tab.loading = false; tab.error = e.message; updateChrome(); }
+    throw e;
+  }
+  if (tab.frame) { tab.frame.remove(); tab.frame = null; }
+  commit(url);
+  tab.remote = true;
+  tab.external = false;
+  tab.current = url;
+  tab.loaded = true;
+  tab.loading = false;
+  tab.rb.seq = 0;
+  saveTabs();
+  swrDrop("rb-status");
+  refreshAfterTabChange();
+}
+
+// Free the NAS-side tab (renderer memory). Fire-and-forget; the Hub also
+// stops the whole container after a few idle minutes.
+function releaseRemote(tab) {
+  const rb = tab.rb;
+  tab.rb = null;
+  if (!rb) return;
+  clearTimeout(rb.linksTimer);
+  if (state.rbPolling === rb.id) { state.rbPolling = ""; state.rbGen++; }
+  api("/api/rb/tabs/close", {id: rb.id}).catch(() => {});
+}
+
+async function openInRemote(tab) {
+  const url = tab.current || (tab.history.length ? tab.history[tab.index] : "");
+  if (!url) return;
+  rememberHostMode(hostOf(url), REMOTE_MODE);
+  renderRemoteHosts();
+  unloadTab(tab);
+  tab.remote = true;
+  await openRemote(tab, url, u => { tab.history[tab.index] = u; });
+}
+
+async function leaveRemote(tab) {
+  const url = tab.current || (tab.history.length ? tab.history[tab.index] : "");
+  const host = hostOf(url);
+  if (isRemoteHost(host)) rememberHostMode(host, "strict");
+  releaseRemote(tab);
+  tab.remote = false;
+  tab.loaded = false;
+  renderRemoteHosts();
+  if (url) await reloadTab(tab);
+  else refreshAfterTabChange();
+}
+
+function remoteTab() {
+  const tab = activeWebTab();
+  return tab && tab.remote && tab.rb ? tab : null;
+}
+
+async function rbInput(event) {
+  const tab = remoteTab();
+  if (!tab) return;
+  try {
+    await api("/api/rb/input", Object.assign({tab: tab.rb.id}, event));
+  } catch (e) {
+    if (e.status === 404) remoteLost(tab);
+    else toast(e.message, "error");
+  }
+}
+
+function remoteLost(tab) {
+  tab.rb = null;
+  tab.error = "NASブラウザのタブが閉じられました";
+  state.rbPolling = "";
+  state.rbGen++;
+  updateChrome();
+}
+
+function validJpeg(text) {
+  return typeof text === "string" && text.length > 0 && text.length < 8 * 1024 * 1024 &&
+    /^[A-Za-z0-9+/]+={0,2}$/.test(text);
+}
+
+function applyRemoteFrame(tab, f) {
+  const rb = tab.rb;
+  if (!rb || typeof f.seq !== "number") return;
+  rb.seq = Math.max(rb.seq, f.seq);
+  let changed = false;
+  if (validJpeg(f.jpeg_base64)) {
+    const img = $("remoteImg");
+    img.src = RB_JPEG_PREFIX + f.jpeg_base64;
+    img.hidden = false;
+    $("remoteIdle").hidden = true;
+    if (Number.isFinite(f.width) && Number.isFinite(f.height) && f.width > 0 && f.height > 0) {
+      rb.width = f.width; rb.height = f.height;
+    }
+  }
+  const url = typeof f.url === "string" ? f.url : "";
+  const title = typeof f.title === "string" ? f.title : "";
+  const loading = f.loading === true;
+  if (url !== rb.url) {
+    rb.url = url;
+    changed = true;
+    if (url.startsWith("https://") && url.length <= 2048) {
+      tab.current = url;
+      if (tab.history.length) tab.history[tab.index] = url;
+      saveTabs();
+    }
+  }
+  if (title !== rb.title) { rb.title = title; changed = true; }
+  if (loading !== rb.loading) {
+    rb.loading = loading;
+    changed = true;
+    if (!loading) scheduleRemoteLinks(tab);
+  }
+  if (f.blocked && f.blocked !== rb.blocked) toast(String(f.blocked), "error");
+  rb.blocked = f.blocked || null;
+  tab.loading = loading;
+  if (changed) updateChrome();
+}
+
+async function remoteLoop(tab, gen) {
+  let fails = 0;
+  while (gen === state.rbGen && tab.rb) {
+    try {
+      const f = await api("/api/rb/frame?tab=" + encodeURIComponent(tab.rb.id) + "&since=" + tab.rb.seq);
+      if (gen !== state.rbGen || !tab.rb) return;
+      fails = 0;
+      applyRemoteFrame(tab, f);
+    } catch (e) {
+      if (gen !== state.rbGen) return;
+      if (e.status === 404) { remoteLost(tab); return; }
+      fails++;
+      if (fails >= RB_MAX_POLL_FAILS) {
+        state.rbPolling = "";
+        toast("NASブラウザの画面を取得できません: " + e.message, "error");
+        return;
+      }
+      await new Promise(resolve => setTimeout(resolve, 1000));
+    }
+  }
+}
+
+// One long-poll loop, only for the visible remote tab while the page is visible.
+// Stopping the loop lets the Hub stop the screencast (5 s) and later the container.
+function syncRemotePoll() {
+  const tab = activeWebTab();
+  const want = Boolean(state.authed && tab && tab.remote && tab.rb &&
+    document.visibilityState === "visible" && currentViewName() === "web");
+  const id = want ? tab.rb.id : "";
+  if (id === state.rbPolling) return;
+  state.rbPolling = id;
+  state.rbGen++;
+  if (want) remoteLoop(tab, state.rbGen);
+}
+
+function updateRemoteView(tab) {
+  const remote = Boolean(tab && tab.remote && tab.history.length);
+  setShown("remoteView", remote);
+  $("frames").hidden = remote;
+  if (!remote) { closeRemoteSheet(); return; }
+  const live = Boolean(tab.rb);
+  $("remoteImg").hidden = !live || !$("remoteImg").getAttribute("src");
+  $("remoteIdle").hidden = live && !$("remoteImg").hidden;
+  $("remoteIdleText").textContent = tab.error || (live ? "画面を待っています…" :
+    "NASブラウザのタブは開かれていません（メモリ節約のため自動で閉じました）。");
+  setShown("remoteReopen", !live);
+  setShown("remoteLoading", Boolean(tab.loading));
+  const count = live ? tab.rb.links.length : 0;
+  setShown("remoteLinks", count > 0);
+  $("remoteLinks").textContent = "リンク " + count + "件";
+}
+
+function scheduleRemoteLinks(tab) {
+  const rb = tab.rb;
+  if (!rb) return;
+  clearTimeout(rb.linksTimer);
+  rb.linksTimer = setTimeout(() => { refreshRemoteLinks(tab).catch(() => {}); }, RB_LINKS_DELAY_MS);
+}
+
+async function refreshRemoteLinks(tab) {
+  const rb = tab.rb;
+  if (!rb || state.rbPolling !== rb.id) return;
+  const data = await api("/api/rb/links?tab=" + encodeURIComponent(rb.id));
+  if (!tab.rb || tab.rb !== rb) return;
+  rb.links = Array.isArray(data.items) ? data.items.filter(u => typeof u === "string").slice(0, 100) : [];
+  if (activeWebTab() === tab) updateRemoteView(tab);
+  if (!$("remoteSheet").hidden) renderRemoteSheet(tab);
+}
+
+function closeRemoteSheet() { setShown("remoteSheet", false); }
+
+function renderRemoteSheet(tab) {
+  const links = tab.rb ? tab.rb.links : [];
+  $("remoteSheetList").replaceChildren(...links.map(u => element("span", u, "link-url")));
+  $("remoteAdd").textContent = links.length + "件を追加";
+  $("remoteAdd").disabled = links.length === 0;
+  setShown("remoteSend", jd2CanSend() && links.length > 0);
+}
+
+async function openRemoteSheet() {
+  const tab = remoteTab();
+  if (!tab) return;
+  await refreshRemoteLinks(tab).catch(() => {});
+  renderRemoteSheet(tab);
+  setShown("remoteSheet", true);
+  loadJd2Status().then(() => { if (!$("remoteSheet").hidden) renderRemoteSheet(tab); }).catch(() => {});
+}
+
+// Stage through the existing extract/commit path (the Hub re-validates every URL).
+async function stageRemoteLinks(tab) {
+  const items = tab.rb.links.slice();
+  if (!items.length) return items;
+  const content = items.join("\n");
+  const preview = await api("/api/rapidgator/extract", {content, limit: items.length});
+  await api("/api/rapidgator/extract", {content, limit: items.length, commit: true, digest: preview.digest});
+  swrDrop("links");
+  return items;
+}
+
+async function remoteAdd() {
+  const tab = remoteTab();
+  if (!tab) return;
+  const items = await stageRemoteLinks(tab);
+  flash(items.length + "件を追加したリンクに入れました（JD2へは未送信）");
+}
+
+async function remoteSend() {
+  const tab = remoteTab();
+  if (!tab) return;
+  const items = await stageRemoteLinks(tab);
+  await loadQueue(true);
+  const wanted = new Set(items);
+  const staged = state.queueData ? state.queueData.items.filter(l => l.state === "staged" && wanted.has(l.url)) : [];
+  if (!staged.length) { flash("送れる未送信のリンクはありません"); return; }
+  await sendLinks(staged);
+}
+
+// Pointer to page coordinates: scaled to the frame size reported by the Hub.
+function remotePoint(event) {
+  const tab = remoteTab();
+  const img = $("remoteImg");
+  const box = img.getBoundingClientRect();
+  if (!tab || !box.width || !box.height || !tab.rb.width || !tab.rb.height) return null;
+  const x = (event.clientX - box.left) / box.width * tab.rb.width;
+  const y = (event.clientY - box.top) / box.height * tab.rb.height;
+  if (!(x >= 0 && y >= 0 && x <= tab.rb.width && y <= tab.rb.height)) return null;
+  return {x: Math.round(x), y: Math.round(y), scale: tab.rb.width / box.width};
+}
+
+const rbPointer = {id: null, startX: 0, startY: 0, lastY: 0, lastX: 0, t0: 0, moved: false, sentAt: 0, dx: 0, dy: 0};
+
+function sendRemoteScroll(point) {
+  if (!point || (!rbPointer.dx && !rbPointer.dy)) return;
+  const dx = Math.max(-5000, Math.min(5000, Math.round(rbPointer.dx)));
+  const dy = Math.max(-5000, Math.min(5000, Math.round(rbPointer.dy)));
+  rbPointer.dx = 0; rbPointer.dy = 0;
+  rbInput({type: "scroll", x: point.x, y: point.y, dx, dy});
+}
+
+function wireRemote() {
+  const stage = $("remoteStage");
+  stage.addEventListener("pointerdown", event => {
+    if (!remoteTab() || rbPointer.id !== null) return;
+    rbPointer.id = event.pointerId;
+    rbPointer.startX = rbPointer.lastX = event.clientX;
+    rbPointer.startY = rbPointer.lastY = event.clientY;
+    rbPointer.t0 = Date.now();
+    rbPointer.moved = false;
+    rbPointer.dx = 0; rbPointer.dy = 0;
+    try { stage.setPointerCapture(event.pointerId); } catch (e) { /* not supported */ }
+  });
+  stage.addEventListener("pointermove", event => {
+    if (event.pointerId !== rbPointer.id) return;
+    if (Math.hypot(event.clientX - rbPointer.startX, event.clientY - rbPointer.startY) > RB_TAP_MOVE_PX) {
+      rbPointer.moved = true;
+    }
+    if (!rbPointer.moved) return;
+    const point = remotePoint(event);
+    if (!point) return;
+    // Dragging the finger up scrolls the page down (positive wheel delta).
+    rbPointer.dx += (rbPointer.lastX - event.clientX) * point.scale;
+    rbPointer.dy += (rbPointer.lastY - event.clientY) * point.scale;
+    rbPointer.lastX = event.clientX;
+    rbPointer.lastY = event.clientY;
+    if (Date.now() - rbPointer.sentAt >= RB_SCROLL_MS) {
+      rbPointer.sentAt = Date.now();
+      sendRemoteScroll(point);
+    }
+  });
+  const finish = event => {
+    if (event.pointerId !== rbPointer.id) return;
+    rbPointer.id = null;
+    const point = remotePoint(event);
+    if (event.type === "pointercancel" || !point) return;
+    if (!rbPointer.moved && Date.now() - rbPointer.t0 <= RB_TAP_MAX_MS) {
+      rbInput({type: "tap", x: point.x, y: point.y});
+    } else {
+      sendRemoteScroll(point);
+    }
+  };
+  stage.addEventListener("pointerup", finish);
+  stage.addEventListener("pointercancel", finish);
+  stage.addEventListener("wheel", event => {
+    const point = remotePoint(event);
+    if (!point || !remoteTab()) return;
+    event.preventDefault();
+    if (Date.now() - rbPointer.sentAt < RB_SCROLL_MS) return;
+    rbPointer.sentAt = Date.now();
+    rbInput({type: "scroll", x: point.x, y: point.y,
+      dx: Math.max(-5000, Math.min(5000, Math.round(event.deltaX))),
+      dy: Math.max(-5000, Math.min(5000, Math.round(event.deltaY)))});
+  }, {passive: false});
+
+  // Hidden text input: iOS only shows its keyboard for a focused real input.
+  const kbd = $("remoteKbd");
+  let composing = false, skipInput = false;
+  const sendText = text => {
+    kbd.value = "";
+    if (text) rbInput({type: "text", text: text.slice(0, 500)});
+  };
+  $("remoteKbdBtn").addEventListener("click", () => kbd.focus());
+  kbd.addEventListener("compositionstart", () => { composing = true; });
+  kbd.addEventListener("compositionend", event => {
+    composing = false;
+    skipInput = true;   // the input event that follows must not send the text twice
+    setTimeout(() => { skipInput = false; }, 0);
+    sendText(event.data || "");
+  });
+  kbd.addEventListener("input", event => {
+    if (composing || event.isComposing || skipInput) { if (skipInput) kbd.value = ""; return; }
+    sendText(kbd.value);
+  });
+  kbd.addEventListener("keydown", event => {
+    if (composing || event.isComposing || !RB_KEYS.includes(event.key)) return;
+    event.preventDefault();
+    rbInput({type: "key", key: event.key});
+  });
+  $("remoteKeyEnter").addEventListener("click", () => rbInput({type: "key", key: "Enter"}));
+  $("remoteKeyBack").addEventListener("click", () => rbInput({type: "key", key: "Backspace"}));
+  $("remoteKeyTab").addEventListener("click", () => rbInput({type: "key", key: "Tab"}));
+  $("remoteLinks").addEventListener("click", () => perform(openRemoteSheet));
+  $("remoteSheetClose").addEventListener("click", closeRemoteSheet);
+  $("remoteAdd").addEventListener("click", () => perform(remoteAdd));
+  $("remoteSend").addEventListener("click", () => perform(remoteSend));
+  $("remoteReopen").addEventListener("click", () => {
+    const tab = activeWebTab();
+    if (tab) perform(() => openInRemote(tab));
+  });
+  $("cfRemote").addEventListener("click", () => {
+    const tab = activeWebTab();
+    if (tab) perform(() => openInRemote(tab));
+  });
+  document.addEventListener("visibilitychange", syncRemotePoll);
+}
+
 function refreshAfterTabChange() {
   if (state.route.view === "tab") {
     const shown = currentViewName();
@@ -1024,6 +1445,7 @@ function refreshAfterTabChange() {
   syncFrameVisibility();
   renderWebTabs();
   updateChrome();
+  syncRemotePoll();
 }
 
 function pushHistory(tab, url) {
@@ -1034,15 +1456,30 @@ function pushHistory(tab, url) {
 }
 
 const navigateTab = (tab, value) => openInTab(tab, value, url => pushHistory(tab, url));
-const reloadTab = tab => openInTab(tab, tab.history[tab.index],
-  url => { tab.history[tab.index] = url; });
+const reloadTab = tab => (tab.remote && tab.rb) ?
+  rbInputFor(tab, {type: "reload"}) :
+  openInTab(tab, tab.history[tab.index], url => { tab.history[tab.index] = url; });
+
+async function rbInputFor(tab, event) {
+  try {
+    await api("/api/rb/input", Object.assign({tab: tab.rb.id}, event));
+  } catch (e) {
+    if (e.status === 404) remoteLost(tab);
+    else throw e;
+  }
+}
 
 function ensureLoaded(tab) {
   if (!tab || !tab.history.length || tab.loaded || tab.loading) return Promise.resolve();
+  if (tab.remote) { tab.loaded = true; return Promise.resolve(); }   // remote tabs are opened on request only
   return openInTab(tab, tab.history[tab.index], url => { tab.history[tab.index] = url; }, {restore: true});
 }
 
 async function stepHistory(tab, delta) {
+  if (tab.remote) {
+    if (tab.rb) await rbInputFor(tab, {type: delta < 0 ? "back" : "forward"});
+    return;
+  }
   const target = tab.index + delta;
   if (target < 0 || target >= tab.history.length) return;
   await openInTab(tab, tab.history[target], url => {
@@ -1152,12 +1589,15 @@ function configureMenu() {
   const web = Boolean(tab && tab.history.length);
   $("menu").querySelectorAll("[data-scope='web']").forEach(n => { n.hidden = !web; });
   const usable = Boolean(tab && tab.current);
-  for (const action of ["external", "stageUrl", "bookmark"]) {
+  for (const action of ["remoteOpen", "external", "stageUrl", "bookmark"]) {
     $("menu").querySelector("[data-action='" + action + "']").disabled = !usable;
   }
   $("menu").querySelector("[data-action='reopen']").disabled = state.closed.length === 0;
   $("menuMode").textContent = tab && tab.mode === "interactive" ?
     "強い制限モードに戻す" : "限定操作モードに切り替え";
+  $("menuRemote").textContent = tab && tab.remote ? "NASブラウザをやめる（通常表示へ）" : "NASブラウザで開く";
+  $("menuMode").hidden = Boolean(tab && tab.remote) || !web;
+  $("menuCompat").hidden = Boolean(tab && tab.remote) || !web;
   $("menuCompat").textContent = tab && tab.mode === "compat" ?
     "互換モードをやめる（強い制限へ）" : "互換モードに切り替え";
 }
@@ -1177,6 +1617,7 @@ async function menuAction(action) {
   else if (action === "reopen") reopenClosedTab();
   else if (action === "toggleMode" && tab) await setMode(tab, tab.mode === "interactive" ? "strict" : "interactive");
   else if (action === "compatMode" && tab) await setMode(tab, tab.mode === "compat" ? "strict" : "compat");
+  else if (action === "remoteOpen" && tab) await (tab.remote ? leaveRemote(tab) : openInRemote(tab));
   else if (action === "external" && tab) openExternal(tab);
   else if (action === "stageUrl" && tab) await stageTabUrl(tab);
   else if (action === "bookmark" && tab) await bookmarkTab(tab);
@@ -1238,6 +1679,7 @@ async function bookmarkTab(tab) {
 }
 
 async function logout() {
+  for (const tab of state.tabs) releaseRemote(tab);
   await api("/api/logout", {});
   writeSession(TAB_STORAGE_KEY, null);
   writeSession(SHELL_KEY, null);
@@ -1769,6 +2211,9 @@ async function enterSettings(section, force = false) {
       await loadJd2Status(force);
       checkConnection();
     }
+  } else if (section === "browser") {
+    renderRemoteHosts();
+    await loadBrowserStatus(force);
   } else if (section === "https") {
     renderHttps();
   } else if (section === "share") {
@@ -2029,7 +2474,12 @@ function teardownSession() {
   state.pickerOpen = false;
   state.stepsMode = "";
   state.downloadsFails = 0;
-  for (const tab of state.tabs) tab.token++;
+  for (const tab of state.tabs) { tab.token++; clearTimeout(tab.rb && tab.rb.linksTimer); tab.rb = null; }
+  state.rbPolling = "";
+  state.rbGen++;
+  state.rbStatus = null;
+  clearTimeout(state.rbTimer);
+  $("remoteImg").removeAttribute("src");
   $("frames").replaceChildren();   // unload every external page
   state.tabs = [];
   state.closed = [];
@@ -2387,6 +2837,13 @@ function renderEngine(e) {
   $("engineStart").hidden = !(e.installed && !running && !busy);
   $("engineStop").hidden = !running || phase === "setup";
   setShown("engineResetup", e.installed && !running && !busy);
+  // Leftover QTS-direct Java (container mode only); hidden when nothing is left.
+  const left = e.native_leftovers || {};
+  const canClean = left.present === true && e.mode === "container" && e.installed && !busy;
+  setShown("engineNativeRow", canClean);
+  if (canClean) {
+    $("engineNativeRemove").textContent = "従来方式のJava（約" + Math.max(1, Math.round((left.bytes || 0) / 1048576)) + " MB）を削除";
+  }
   setShown("engineKeysRow", running);
   const progress = $("engineProgress");
   const showProgress = busy;
@@ -2545,12 +3002,147 @@ async function startEngine() {
   applyEngine(await api("/api/engine/status"));
 }
 
+// ---- Settings › NASブラウザ (v0.1.16)
+const RB_PHASE_LABELS = {stopped: "停止中", starting: "起動中…", running: "稼働中",
+  stopping: "停止処理中…", setup: "初期設定中"};
+
+function browserSectionVisible() {
+  return state.route.view === "settings" && state.route.section === "browser";
+}
+
+function rbPollWanted() {
+  const e = state.rbStatus;
+  return Boolean(state.authed && browserSectionVisible() && document.visibilityState === "visible" &&
+    e && (e.phase === "setup" || e.phase === "starting" || e.phase === "stopping"));
+}
+
+function syncBrowserPoll() {
+  clearTimeout(state.rbTimer);
+  state.rbTimer = null;
+  if (!rbPollWanted() || state.rbBusy) return;
+  state.rbTimer = setTimeout(browserTick, RB_STATUS_POLL_MS);
+}
+
+async function browserTick() {
+  state.rbTimer = null;
+  if (!rbPollWanted() || state.rbBusy) return;
+  state.rbBusy = true;
+  try {
+    renderBrowserStatus(await api("/api/rb/status"));
+  } catch (e) {
+    state.rbBusy = false;
+    return;
+  }
+  state.rbBusy = false;
+  syncBrowserPoll();
+}
+
+function renderRemoteHosts() {
+  const box = $("remoteHosts");
+  if (!box) return;
+  const hosts = remoteHosts();
+  if (!hosts.length) {
+    box.replaceChildren(element("p", "設定されたサイトはありません。Webタブの表示がうまくいかないとき「NASブラウザで開く」を選ぶと追加されます。", "empty-state"));
+    return;
+  }
+  const nodes = [];
+  for (const host of hosts) {
+    const row = element("div", undefined, "item");
+    row.appendChild(element("span", host));
+    const off = element("button", "解除", "btn small");
+    off.type = "button";
+    off.addEventListener("click", () => { rememberHostMode(host, "strict"); renderRemoteHosts(); });
+    row.appendChild(off);
+    nodes.push(row);
+  }
+  box.replaceChildren(...nodes);
+}
+
+function renderBrowserStatus(r) {
+  state.rbStatus = r;
+  const cs = r.container_station || {};
+  const setup = r.phase === "setup";
+  $("rbState").textContent = !r.image_ready && !setup ? "未設定" : RB_PHASE_LABELS[r.phase] || r.phase;
+  $("rbState").classList.toggle("is-ok", r.phase === "running");
+  setShown("rbNoContainer", cs.available === false);
+  $("rbSetup").hidden = setup || cs.available === false || r.phase !== "stopped";
+  $("rbSetup").textContent = r.image_ready ? "イメージを再作成" : "初期設定（イメージ作成）";
+  $("rbStop").hidden = !(r.phase === "running" || r.phase === "starting");
+  const parts = [];
+  if (r.memory) parts.push("ブラウザのメモリ " + r.memory.used_mib + " / " + r.memory.limit_mib + " MiB（" + r.memory.percent + "%）");
+  if (typeof r.available_mib === "number") parts.push("NAS空きメモリ " + r.available_mib + " MiB");
+  parts.push("タブ " + (r.tabs || []).length + " / " + r.max_tabs);
+  $("rbMemory").textContent = parts.join(" · ");
+  const reason = r.image_ready && r.reason ? r.reason : "";
+  $("rbReason").hidden = !reason;
+  $("rbReason").textContent = reason ? "いまは開けません: " + reason : "";
+  $("rbError").hidden = !r.error;
+  $("rbError").textContent = r.error || "";
+  const steps = r.steps || [];
+  const active = steps.some(x => x.status !== "pending");
+  setShown("rbStepsBox", active);
+  if (setup || r.error) $("rbStepsBox").open = true;
+  $("rbSteps").replaceChildren(...steps.map(step => {
+    const li = element("li", undefined, "engine-step is-" + step.status);
+    li.appendChild(element("span", STEP_MARKS[step.status] || "?", "step-mark"));
+    const body = element("span", undefined, "step-body");
+    body.appendChild(element("b", step.label));
+    body.appendChild(element("span", " — " + (STEP_TEXT[step.status] || step.status) +
+      (step.detail ? "：" + step.detail : ""), "step-detail"));
+    li.appendChild(body);
+    return li;
+  }));
+  syncBrowserPoll();
+}
+
+async function loadBrowserStatus(force = false) {
+  await swr("rb-status", "/api/rb/status", renderBrowserStatus, {force});
+}
+
+function wireBrowser() {
+  $("rbSetup").addEventListener("click", () => perform(async () => {
+    if (!confirm("NASブラウザの初期設定を始めます。\n\n" +
+        "・Container Station上で、同梱のDockerfileからイメージ qnapdl-browser を作ります（Debian bookworm-slim をダイジェスト固定で取得し、Chromium・Xvfb・日本語フォントをaptで導入。数分かかり、約1GBのディスクを使います）\n" +
+        "・Chromiumのサンドボックスは有効のままです。このNASのカーネルがユーザー名前空間を許可しない場合は、設定を中止します（サンドボックスを無効にはしません）\n" +
+        "・ポートは公開せず、非root・読み取り専用・メモリ上限2GBで動かします。タブを開いたときだけ起動し、使わなければ自動で停止します\n\nよろしいですか？")) return;
+    await api("/api/rb/setup", {confirmed: true});
+    swrDrop("rb-status");
+    flash("NASブラウザの初期設定を開始しました");
+    renderBrowserStatus(await api("/api/rb/status"));
+  }));
+  $("rbStop").addEventListener("click", () => perform(async () => {
+    if (!confirm("NASブラウザを停止します。開いているNASブラウザのタブはすべて閉じられます。よろしいですか？")) return;
+    $("rbStop").disabled = true;
+    try {
+      await api("/api/rb/stop", {confirmed: true});
+    } finally {
+      $("rbStop").disabled = false;
+    }
+    for (const tab of state.tabs) { tab.rb = null; }
+    state.rbPolling = ""; state.rbGen++;
+    swrDrop("rb-status");
+    renderBrowserStatus(await api("/api/rb/status"));
+    updateChrome();
+    flash("NASブラウザを停止しました");
+  }));
+  document.addEventListener("visibilitychange", syncBrowserPoll);
+}
+
 function wireEngine() {
   $("engineSetup").addEventListener("click", () => perform(() => startEngineSetup()));
   $("engineResetup").addEventListener("click", () => perform(() => startEngineSetup()));
   $("homeEngineSetup").addEventListener("click", () => perform(() => startEngineSetup()));
   $("engineSetupNative").addEventListener("click", () => perform(() => startEngineSetup("native")));
   $("engineMigrate").addEventListener("click", () => perform(migrateEngine));
+  $("engineNativeRemove").addEventListener("click", () => perform(async () => {
+    if (!confirm("QTS直接実行用のJava（engine/java）とダウンロードの残骸（engine/.download）を削除します。\n\n" +
+        "・JD2の設定・キュー・ダウンロード途中のファイル（engine/jd2）は残ります。コンテナ方式のJD2はそのまま使えます\n" +
+        "・削除後はQTS直接実行には戻せなくなります（戻したいときは、もう一度初期設定を実行すればJavaを取得し直せます）\n\nよろしいですか？")) return;
+    const done = await api("/api/engine/native/remove", {confirmed: true});
+    swrDrop("engine", "status");
+    flash("従来方式のJavaを削除しました（" + Math.round((done.freed_bytes || 0) / 1048576) + " MB）");
+    applyEngine(await api("/api/engine/status"));
+  }));
   $("engineStart").addEventListener("click", () => perform(startEngine));
   $("homeEngineStart").addEventListener("click", () => perform(startEngine));
   $("downloadsEngineAction").addEventListener("click", () => {
@@ -2684,6 +3276,8 @@ document.addEventListener("DOMContentLoaded", () => {
   wireDownloads();
   wireLinks();
   wireSettings();
+  wireRemote();
+  wireBrowser();
   paintShellEarly();
   fetchHealthVersion().then(v => { if (v && !state.bootVersion) state.bootVersion = v; });
   go();

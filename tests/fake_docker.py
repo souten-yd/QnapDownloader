@@ -16,6 +16,11 @@ class FakeDocker:
         self.containers = {}    # name -> dict
         self.fail_pull = False
         self.mem_ok = True
+        self.selftest_code = 0
+        self.build_fail = False
+        self.stats_out = "512MiB / 2GiB|25.00%"
+        self.stats_fail = False
+        self.run_exits = None     # exit code: the started container is already exited
 
     def isfile(self, path):
         return self.has_cs and path == DOCKER
@@ -59,6 +64,23 @@ class FakeDocker:
             if box is None:
                 return self.result(1, "[]", "Error: No such container: " + a[2])
             return self.result(0, json.dumps([self.inspect_doc(a[2], box)]))
+        if a[0] == "build":
+            if self.build_fail:
+                return self.result(1, "", "E: unable to locate package")
+            self.images.add(a[a.index("--tag") + 1])
+            return self.result(0, "built")
+        if a[0] == "images":
+            return self.result(0, "\n".join(sorted(i for i in self.images if i.startswith("qnapdl-browser:"))))
+        if a[0] == "rmi":
+            self.images.discard(a[1])
+            return self.result(0, a[1])
+        if a[0] == "stats":
+            if self.stats_fail or a[-1] not in self.containers:
+                return self.result(1, "", "no such container")
+            return self.result(0, self.stats_out + "\n")
+        if a[0] == "run" and "--rm" in a:
+            return self.result(self.selftest_code, "", "unshare: Operation not permitted"
+                               if self.selftest_code else "")
         if a[0] == "run":
             name = a[a.index("--name") + 1]
             if name in self.containers:
@@ -70,7 +92,10 @@ class FakeDocker:
                     labels[k] = v
             self.containers[name] = {"labels": labels, "running": True,
                                      "net": a[a.index("--network") + 1],
-                                     "ip": "172.30.0.2", "ports": {}, "extra_nets": []}
+                                     "ip": "172.30.0.2", "ports": {}, "extra_nets": [],
+                                     "exit": self.run_exits or 0}
+            if self.run_exits is not None:
+                self.containers[name]["running"] = False
             return self.result(0, "abcdef123456\n")
         if a[0] == "stop":
             self.containers[a[-1]]["running"] = False
@@ -87,7 +112,7 @@ class FakeDocker:
             nets[extra] = {"IPAddress": "172.31.0.2"}
         return {"Name": "/" + name, "Config": {"Labels": box["labels"]},
                 "State": {"Status": "running" if box["running"] else "exited",
-                          "Running": box["running"]},
+                          "Running": box["running"], "ExitCode": box.get("exit", 0)},
                 "HostConfig": {"PortBindings": box["ports"]},
                 "NetworkSettings": {"Networks": nets}}
 

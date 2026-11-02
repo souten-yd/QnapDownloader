@@ -104,3 +104,18 @@ Container Station検出と事前確認 → 内蔵エンジンの停止（移行�
 
 ### 画面
 設定 › エンジンに実行方式（「コンテナ (Container Station)」/「QTS直接実行」）を表示。Container Stationが無いときは「QTSのApp CenterでContainer Stationをインストールしてください」と案内し（リンクなし）、「詳細」から非推奨のネイティブ初期設定を選べる。
+
+## v0.1.16 追加
+
+### MyJDownloaderの自動接続を無効化（実機未検証）
+ヘッドレスのJD2は起動時に `IllegalStateException: No Console Available!`（`MyJDownloaderController.askLoginsOnConsole`）を出す。MyJDownloaderの資格情報をコンソールで尋ねようとするため。対策として、ネイティブ・コンテナのどちらでも、初期設定の「ローカル接続設定の作成・MyJDownloader自動接続の無効化」段階と**毎回の起動前**に、`cfg/org.jdownloader.api.myjdownloader.MyJDownloaderSettings.json` へ `"autoconnectenabledv2": false` だけをマージ書き込みする（無ければ作成、他のキーは保持、JSONオブジェクトでない/読めない/シンボリックリンクなら上書きせず中止、アトミック書き込み。メールアドレス・パスワード系のキーは一切書かない）。**未検証**: このキー名が実機で効かず、JD2が引き続きコンソールを要求する場合は別のキー（設定一覧の `config-keys` で確認）が必要になる。
+
+### 推奨設定（実機のキー名で確定）
+`config-keys` で確認した実名に合わせ、`jd2_policy.KNOWN_KEYS` はインターフェース名の完全一致＋キー名の大文字小文字無視で照合する。
+- `LinkgrabberSettings`（`org.jdownloader.gui.views.linkgrabber.addlinksdialog.LinkgrabberSettings`）: `LinkgrabberAutoConfirmEnabled`（→false、「リンク自動確定」）、`LinkgrabberAutoStartEnabled`（→false、「追加後の自動開始」）、`AutoExtractionEnabled`（→false、「自動解凍」）
+- `GeneralSettings`（`org.jdownloader.settings.GeneralSettings`）: `AutoStartDownloadOption`（enum `ALWAYS` / `ONLY_IF_EXIT_WITH_RUNNING_DOWNLOADS` / `NEVER`）。「起動時の自動開始（『常に』以外ならOK）」。`ALWAYS` のときだけ `ONLY_IF_EXIT_WITH_RUNNING_DOWNLOADS` に変更（再起動後の再開は残し、新規リンクは開始しない）。enumは文字列で `config/set` する。
+- パッケージ別フォルダは設定キーに対応させない。Hub管理のエンジンへの送信時に `linkgrabberv2/addLinks` へ `overwritePackagizerRules: true` と明示の `destinationFolder` を渡し、フラットな保存先を優先する（`packagizer.package_subfolders` / `general.package_subfolders` は必須項目から外し、「送信時に強制」として扱う）。Packagizerのルール自体は変更しない。
+- 4項目が確認でき適用されると、段階8は成功し `can_send` が真になる想定（実機未検証）。
+
+### 従来方式（QTS直接実行）の残骸の削除
+コンテナ方式で初期設定が完了し、ネイティブのプロセスが動いておらず、初期設定が実行中でないときだけ、`engine/java/`（展開済みJRE）と `engine/.download/` を削除できる（設定 › エンジン › 詳細）。`engine/jd2/`（JDownloader.jar・cfg・キュー・部分ファイル）は**絶対に消さない**（コンテナがバインドマウントして使う）。`engine/java` がシンボリックリンクなら拒否。状態ファイルの `java` 項目も消す。QTS直接実行には戻せなくなるが、再度初期設定すれば取得し直せる。`/api/engine/status` の `native_leftovers: {present, bytes}`（60秒キャッシュ、リンクは辿らずサイズ計算）、`POST /api/engine/native/remove {confirmed:true}`。

@@ -363,3 +363,26 @@ label{display:block;margin:12px 0;color:var(--muted);font-size:13px}
 /* ---- v0.1.14: compact web row / external mode ---- */
 .cf-hint .btn.small{flex:none}
 .cf-hint-text{flex:none}
+
+/* ---- NASブラウザ (remote browser, v0.1.16) */
+.sub-h{font-size:14px;margin:18px 0 6px}
+.mode-badge.remote{background:var(--accent-soft);color:var(--accent)}
+.remote-view{flex:1;min-height:0;position:relative;display:flex;flex-direction:column;background:#111}
+.remote-view[hidden]{display:none}
+.remote-stage{flex:1;min-height:0;position:relative;overflow:hidden;touch-action:none;user-select:none;-webkit-user-select:none;display:flex;align-items:flex-start;justify-content:center}
+.remote-img{width:100%;height:auto;max-height:none;display:block;background:#fff;-webkit-touch-callout:none}
+.remote-img[hidden]{display:none}
+.remote-idle{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px;padding:16px;background:var(--page);text-align:center}
+.remote-idle[hidden]{display:none}
+.remote-stage .loading-bar{position:absolute;left:0;right:0;top:0}
+.remote-tools{display:flex;gap:6px;padding:6px 10px calc(6px + env(safe-area-inset-bottom));background:var(--surface-2);border-top:1px solid var(--border);flex-wrap:wrap}
+.remote-kbd{position:absolute;left:-9999px;top:auto;width:1px;height:1px;opacity:0}
+.remote-badge{position:absolute;right:12px;bottom:64px;z-index:5;border:0;border-radius:20px;padding:8px 14px;font:inherit;font-weight:700;background:var(--accent);color:#fff;box-shadow:0 2px 8px rgba(0,0,0,.35);cursor:pointer}
+.remote-badge[hidden]{display:none}
+.remote-sheet{position:absolute;left:0;right:0;bottom:0;z-index:6;max-height:70%;display:flex;flex-direction:column;background:var(--surface);border-top:1px solid var(--border);border-radius:14px 14px 0 0;box-shadow:0 -4px 16px rgba(0,0,0,.3)}
+.remote-sheet[hidden]{display:none}
+.remote-sheet-head{display:flex;align-items:center;gap:8px;padding:10px 14px}
+.remote-sheet-head strong{flex:1}
+.remote-sheet-list{flex:1;overflow:auto;padding:0 14px;font-size:12px;word-break:break-all}
+.remote-sheet-list .link-url{display:block;padding:4px 0;border-bottom:1px solid var(--border)}
+.remote-sheet-actions{display:flex;gap:8px;padding:10px 14px calc(10px + env(safe-area-inset-bottom))}
