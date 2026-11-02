@@ -9,7 +9,7 @@ MAX_PAGE = 20
 LINK_FIELDS = {
     "name": True, "host": True, "bytesLoaded": True, "bytesTotal": True,
     "speed": True, "eta": True, "status": True, "running": True,
-    "finished": True, "enabled": True, "packageUUID": True
+    "finished": True, "enabled": True, "packageUUID": True, "uuid": True
 }
 PACKAGE_FIELDS = {
     "name": True, "bytesLoaded": True, "bytesTotal": True,
@@ -79,6 +79,7 @@ def _normalize(entry, is_package=False):
         item["id"] = _uuid(entry.get("uuid"))
     else:
         item["host"] = _string(entry.get("host"), 120)
+        item["id"] = _uuid(entry.get("uuid"))
         item["package_id"] = _uuid(entry.get("packageUUID"))
         item["enabled"] = _boolean(entry.get("enabled"))
     return item
@@ -96,7 +97,7 @@ def snapshot(packages, links, page):
         "packages": [_normalize(entry, True) for entry in packages],
         "links": [_normalize(entry) for entry in links],
         "has_more": len(packages) == PAGE_SIZE or len(links) == PAGE_SIZE,
-        "notice": "JD2実データの表示です。全体の開始・停止はできますが、個別の削除は未実装です",
+        "notice": "JD2実データの表示です。全体の開始・停止と、項目ごとの開始・停止・削除ができます",
     }
 
 

@@ -641,8 +641,9 @@ if (mixed !== "1.0 fps · 1 KB/枚 · 応答 200 ms") { console.error("mixed: " 
     def test_v0128_cloudflare_challenge_switches_to_live_and_back(self):
         self.assertIn("function syncChallenge(tab, challenge, loading)", self.js)
         self.assertIn("X-Frame-Challenge", self.js)
-        self.assertRegex(self.js, r"if \(challenge && !rb\.autoLive\) \{\s*rb\.autoLive = true;")
-        self.assertRegex(self.js, r"else if \(!challenge && rb\.autoLive && !loading\) \{\s*rb\.autoLive = false;")
+        # v0.1.29: the way back is a dedicated poll with two clean checks (challengeStep).
+        self.assertIn("function challengeStep(rb, challenge, loading, now, userLive)", self.js)
+        self.assertIn("AUTO_CLEAN_NEEDED = 2", self.js)
         self.assertIn("if (rb.autoLive) return \"live\";", self.js)
 
     def test_v0128_node_behaviour_of_display_choice_and_hit_testing(self):
@@ -676,6 +677,100 @@ eq(linkAt(snap, 62, 110).href, "b", "slop");
 eq(linkAt(snap, 200, 110), null, "miss");
 eq(linkAt(null, 1, 1), null, "no snapshot");
 """ % "\n".join(pieces)
+        result = subprocess.run(["node", "-e", script], capture_output=True, text=True, timeout=20)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+
+class ItemActionStaticTests(unittest.TestCase):
+    """v0.1.29: swipe rows, action sheet, multi-select; automatic live display."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.js = (WEB / "app.js").read_text(encoding="utf-8")
+        cls.html = (WEB / "index.html").read_text(encoding="utf-8")
+        cls.css = (WEB / "style.css").read_text(encoding="utf-8")
+
+    def test_swipe_uses_pointer_events_with_an_axis_lock(self):
+        for token in ('"pointerdown"', '"pointermove"', '"pointerup"', '"pointercancel"',
+                      "setPointerCapture", "SWIPE_AXIS_PX = 10", "SWIPE_FULL = 0.6"):
+            self.assertIn(token, self.js)
+        self.assertRegex(self.css, r"touch-action:\s*pan-y")
+        self.assertIn('axis = "y"', self.js)
+        self.assertIn("prefers-reduced-motion", self.css)
+        self.assertIn("reducedMotion()", self.js)
+
+    def test_rows_have_the_menu_fallback_and_the_safe_default(self):
+        self.assertIn('"row-menu"', self.js)
+        self.assertIn("操作メニュー", self.js)
+        self.assertIn("aria-haspopup", self.js)
+        for label in ("削除", "開始", "停止", "ファイルも削除", "キャンセル", "元に戻せません"):
+            self.assertIn(label, self.js)
+        # The default (primary, focused) option keeps the files; the destructive one is separate.
+        self.assertRegex(self.js, r'一覧から削除（ファイルは残す）", primary: true')
+        self.assertIn("delete_files: false", self.js)
+        self.assertIn("delete_files: true, confirm_name: item.name", self.js)
+        self.assertIn("confirm(", self.js)
+        for ident in ("actionSheet", "selectBar", "selectStart", "selectStop", "selectDelete"):
+            self.assertIn('id="%s"' % ident, self.html)
+        self.assertIn('role="dialog"', self.html)
+
+    def test_long_press_selects_and_waiting_rows_swipe(self):
+        self.assertIn("LONG_PRESS_MS", self.js)
+        self.assertIn("enterSelect(", self.js)
+        self.assertIn('"/api/jd2/waiting/" + action', self.js)
+        self.assertIn('"/api/jd2/items/" + action', self.js)
+        self.assertIn("holdRender()", self.js)          # auto-refresh never rebuilds a held row
+
+    def test_no_innerhtml_in_the_new_code(self):
+        for token in ("innerHTML", "outerHTML", "insertAdjacentHTML"):
+            self.assertNotIn(token, self.js)
+
+    def test_auto_live_is_never_persisted_and_has_a_manual_way_back(self):
+        a = self.js.index("function challengeStep")
+        b = self.js.index("// The stage is the viewer")
+        region = self.js[a:b]
+        self.assertNotIn("rememberHostMode", region)
+        self.assertIn("returnToFast", region)
+        self.assertIn('id="autoLiveChip"', self.html)
+        self.assertIn("高速表示に戻す", self.html)
+        self.assertIn("wait=0", region)
+        self.assertIn("document.visibilityState", region)
+
+    @unittest.skipUnless(shutil.which("node"), "node not installed")
+    def test_challenge_step_logic(self):
+        a = self.js.index("const AUTO_POLL_MS")
+        b = self.js.index("function userPrefersLive")
+        script = self.js[a:b] + """
+const assert = require("assert");
+const mk = () => ({autoLive: false, autoSince: 0, autoClean: 0, autoChip: false});
+let rb = mk();
+assert.strictEqual(challengeStep(rb, false, false, 0, false), null);
+assert.strictEqual(challengeStep(rb, true, false, 1000, false), "enter");
+assert.ok(rb.autoLive);
+// one clean check is not enough; a challenge in between resets the count
+assert.strictEqual(challengeStep(rb, false, false, 2500, false), null);
+assert.strictEqual(challengeStep(rb, true, false, 4000, false), null);
+assert.strictEqual(challengeStep(rb, false, false, 5500, false), null);
+// clean but still loading does not count
+assert.strictEqual(challengeStep(rb, false, true, 7000, false), null);
+assert.strictEqual(rb.autoClean, 0);
+assert.strictEqual(challengeStep(rb, false, false, 8500, false), null);
+assert.strictEqual(challengeStep(rb, false, false, 10000, false), "return");
+assert.ok(!rb.autoLive && !rb.autoChip);
+// a manual live choice is never taken over
+rb = mk();
+assert.strictEqual(challengeStep(rb, true, false, 0, true), null);
+assert.ok(!rb.autoLive);
+// chip after the 90 s safety timeout, once; live stays; a later clean page still returns
+rb = mk();
+challengeStep(rb, true, false, 0, false);
+assert.strictEqual(challengeStep(rb, true, false, 89000, false), null);
+assert.strictEqual(challengeStep(rb, true, false, 90000, false), "chip");
+assert.strictEqual(challengeStep(rb, true, false, 95000, false), null);
+assert.ok(rb.autoLive && rb.autoChip);
+challengeStep(rb, false, false, 96000, false);
+assert.strictEqual(challengeStep(rb, false, false, 97500, false), "return");
+"""
         result = subprocess.run(["node", "-e", script], capture_output=True, text=True, timeout=20)
         self.assertEqual(result.returncode, 0, result.stderr)
 

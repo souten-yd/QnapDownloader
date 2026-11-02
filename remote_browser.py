@@ -139,6 +139,11 @@ SNAP_ID = re.compile(r"s[0-9]{1,9}\Z")
 SNAP_URL_MAX = 2048
 CHALLENGE_TITLES = ("just a moment", "しばらくお待ちください")
 CHALLENGE_URL = "/cdn-cgi/challenge"
+# Page-side check (v0.1.29): Cloudflare's interstitial keeps its normal title on some
+# sites, so the DOM is asked too. Re-evaluated after every load event, at most once per second.
+CHALLENGE_JS = ("!!(window._cf_chl_opt||document.querySelector('#challenge-form,#challenge-stage,"
+                ".cf-turnstile,iframe[src*=\"challenges.cloudflare.com\"]'))")
+CHALLENGE_CHECK_INTERVAL = 1.0
 SNAP_JS = (
     "(function(){try{if(!window.__qdlMut){var m=new MutationObserver(function(){window.__qdlDirty=true});"
     "m.observe(document.documentElement,{subtree:true,childList:true,attributes:true,"
@@ -536,6 +541,8 @@ class Tab:
         self.url = ""
         self.title = ""
         self.loading = set()
+        self.page_challenge = False   # last page-side challenge check (CHALLENGE_JS)
+        self.challenge_at = None      # clock of that check; None = stale (navigation/load)
         self.frame = None          # latest JPEG as a base64 string (RAM only)
         self.seq = 0
         self.size = DEFAULT_SIZE
@@ -1306,10 +1313,17 @@ class RemoteBrowser:
             if probe is not None:
                 self._probe_event(probe, method, params)
                 return
+            if method == "Page.loadEventFired":
+                with self._cv:
+                    stale = self._by_session.get(message.get("sessionId"))
+                    if stale is not None:
+                        stale.challenge_at = None
             if method not in ("Page.frameStartedLoading", "Page.frameStoppedLoading"):
                 return
             with self._cv:
                 tab = self._by_session.get(message.get("sessionId"))
+                if tab is not None:
+                    tab.challenge_at = None
                 frame_id = params.get("frameId")
                 if tab is not None and isinstance(frame_id, str):
                     before = bool(tab.loading)
@@ -1590,6 +1604,7 @@ class RemoteBrowser:
             before = (tab.url, tab.title, tab.blocked)
             tab.url = url[:2048] if not block else tab.url
             tab.title = title[:300]
+            tab.challenge_at = None
             if block:
                 tab.blocked = "https以外のアドレスはブロックしました"
             if before != (tab.url, tab.title, tab.blocked):
@@ -1664,8 +1679,8 @@ class RemoteBrowser:
                     "loading": bool(tab.loading), "blocked": tab.blocked,
                     "intercepts": tab.intercept_seq, "rev": tab.rev,
                     "popups": tab.popups_blocked, "editable": tab.editable,
-                    "challenge": looks_like_challenge(tab.url, tab.title),
                 }
+            result["challenge"] = self._challenge(tab)
             self._touch()
             return result
         finally:
@@ -1817,10 +1832,36 @@ class RemoteBrowser:
             out.append(box)
         return out
 
+    def _challenge(self, tab):
+        """Title/URL heuristic OR the page-side check (cached up to CHALLENGE_CHECK_INTERVAL)."""
+        if looks_like_challenge(tab.url, tab.title):
+            return True
+        if not tab.session:
+            return False
+        now = self._clock()
+        with self._lock:
+            fresh = (tab.challenge_at is not None and
+                     now - tab.challenge_at < CHALLENGE_CHECK_INTERVAL)
+            known = tab.page_challenge
+            if not fresh:
+                tab.challenge_at = now   # also throttles retries after an error
+        if fresh:
+            return known
+        try:
+            value = (self._call("Runtime.evaluate", {
+                "expression": CHALLENGE_JS, "returnByValue": True, "timeout": 1500},
+                session=tab.session, timeout=PROBE_CDP_TIMEOUT).get("result") or {}).get("value")
+            found = value is True
+        except BrowserError:
+            found = False
+        with self._lock:
+            tab.page_challenge = found
+        return found
+
     def _snap_public(self, tab, snap, reused):
         meta = dict(snap.meta)
         meta.update({"url": tab.url, "title": tab.title, "reused": reused,
-                     "challenge": looks_like_challenge(tab.url, tab.title)})
+                     "challenge": self._challenge(tab)})
         return meta
 
     def snapshot(self, ident, force=False, if_changed=False):
@@ -2025,8 +2066,8 @@ class RemoteBrowser:
                 "url": tab.url, "title": tab.title, "loading": bool(tab.loading),
                 "blocked": tab.blocked, "intercepts": tab.intercept_seq, "rev": tab.rev,
                 "popups": tab.popups_blocked, "editable": tab.editable, "snap": newest,
-                "challenge": looks_like_challenge(tab.url, tab.title),
             }
+        result["challenge"] = self._challenge(tab)
         self._touch()
         return result
 

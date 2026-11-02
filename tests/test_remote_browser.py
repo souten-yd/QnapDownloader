@@ -2504,6 +2504,26 @@ class SnapshotTests(BrowserBase):
         self.assertTrue(self.rb.snapshot("b1")["challenge"])
         self.assertTrue(self.rb.frame("b1", 0, wait=0)["challenge"])
 
+    def test_page_side_challenge_check_catches_a_normal_title(self):
+        # v0.1.29: a Cloudflare page that keeps its title is found through the DOM.
+        for token in ("_cf_chl_opt", "#challenge-form", "#challenge-stage", ".cf-turnstile",
+                      "challenges.cloudflare.com"):
+            self.assertIn(token, rb.CHALLENGE_JS)
+        self.assertFalse(self.rb.page_meta("b1", None)["challenge"])
+        self.ws.eval_map = [("_cf_chl_opt", True)]
+        self.ws.emit("Target.targetInfoChanged", {"targetInfo": {
+            "targetId": "TARGET00001", "type": "page", "url": "https://example.com/", "title": "Example"}})
+        self.barrier()
+        self.assertTrue(self.rb.page_meta("b1", None)["challenge"])
+        self.assertTrue(self.rb.frame("b1", 0, wait=0)["challenge"])
+        self.assertTrue(self.rb.snapshot("b1")["challenge"])
+        self.ws.eval_map = [("_cf_chl_opt", False)]
+        # Cached for one second, then re-checked; a navigation marks it stale at once.
+        self.assertTrue(self.rb.page_meta("b1", None)["challenge"])
+        self.ws.emit("Page.loadEventFired", {}, session="SESSION1")
+        self.barrier()
+        self.assertFalse(self.rb.page_meta("b1", None)["challenge"])
+
     def test_page_meta_long_poll_returns_on_a_new_revision_without_a_screencast(self):
         first = self.rb.page_meta("b1", None)
         self.assertIsNone(first["snap"])

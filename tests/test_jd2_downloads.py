@@ -18,6 +18,14 @@ class DownloadViewTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             view.query_options(view.LINK_FIELDS, True)
 
+    def test_links_carry_an_id_string_and_packages_too(self):
+        payload = view.snapshot([{"name": "P", "uuid": 9223372036854775807}],
+                                [{"name": "f", "uuid": 12, "packageUUID": 9223372036854775807}], 0)
+        self.assertEqual(payload["links"][0]["id"], "12")
+        self.assertEqual(payload["links"][0]["package_id"], "9223372036854775807")
+        self.assertEqual(payload["packages"][0]["id"], "9223372036854775807")
+        self.assertIn("uuid", view.LINK_FIELDS)
+
     def test_normalize_progress_and_ignore_extra_secrets(self):
         payload = view.snapshot([{
             "name": "Archive", "bytesLoaded": 500, "bytesTotal": 1000,

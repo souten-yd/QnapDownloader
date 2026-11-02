@@ -29,6 +29,15 @@ CLEANUP_ACTION = "DELETE_FINISHED"
 CLEANUP_MODE = "REMOVE_LINKS_ONLY"
 CLEANUP_SELECTION = "ALL"
 
+# v0.1.29: per-item removal. REMOVE_LINKS_ONLY never deletes files; the
+# DELETE_* triple is the only file-deleting call and is reachable only through
+# delete_with_files (the controller checks the typed name and the save path).
+DELETE_ACTION = "DELETE_ALL"
+DELETE_MODE = "REMOVE_LINKS_AND_DELETE_FILES"
+DELETE_SELECTION = "SELECTED"
+ITEM_IDS_MAX = 100
+ID_LIMIT = 2 ** 63   # JD2 ids are Java longs; they stay Python ints (exact in JSON)
+
 ALLOWED_CALLS = frozenset((
     ("jd", "getCoreRevision"),
     ("update", "isUpdateAvailable"),
@@ -47,6 +56,12 @@ ALLOWED_CALLS = frozenset((
     ("downloadcontroller", "stop"),
     ("linkgrabberv2", "queryLinks"),
     ("linkgrabberv2", "moveToDownloadlist"),
+    # v0.1.29: per-item start/stop/remove. removeLinks only edits the list;
+    # cleanup(DELETE_ALL, REMOVE_LINKS_AND_DELETE_FILES, SELECTED) deletes files.
+    ("downloadsV2", "setEnabled"),
+    ("downloadsV2", "removeLinks"),
+    ("downloadcontroller", "forceDownload"),
+    ("linkgrabberv2", "removeLinks"),
     # Premium accounts (v0.1.23). Secrets travel in the request line of these
     # calls, so the adapter routes the whole namespace through _call_private.
     ("accountsV2", "listAccounts"),
@@ -463,6 +478,84 @@ class LocalAdapter:
         """Remove finished downloads from JD2's list. The mode is a constant: files stay."""
         assert CLEANUP_MODE == "REMOVE_LINKS_ONLY"
         self._call("downloadsV2", "cleanup", [], [], CLEANUP_ACTION, CLEANUP_MODE, CLEANUP_SELECTION)
+
+    @staticmethod
+    def _id_list(values):
+        if (not isinstance(values, list) or len(values) > ITEM_IDS_MAX or
+                any(type(i) is not int or not 0 <= i < ID_LIMIT for i in values)):
+            raise LocalUnavailable("JD2のIDが不正です")
+        return list(values)
+
+    def _item_ids(self, link_ids, package_ids):
+        links, packages = self._id_list(link_ids), self._id_list(package_ids)
+        if not links and not packages:
+            raise LocalUnavailable("対象がありません")
+        return links, packages
+
+    def set_enabled(self, enabled, link_ids, package_ids):
+        if type(enabled) is not bool:
+            raise LocalUnavailable("有効／無効の指定が不正です")
+        links, packages = self._item_ids(link_ids, package_ids)
+        self._call("downloadsV2", "setEnabled", enabled, links, packages)
+
+    def force_download(self, link_ids, package_ids):
+        links, packages = self._item_ids(link_ids, package_ids)
+        self._call("downloadcontroller", "forceDownload", links, packages)
+
+    def remove_links(self, link_ids, package_ids):
+        """Remove from JD2's list only; saved files are never touched."""
+        links, packages = self._item_ids(link_ids, package_ids)
+        self._call("downloadsV2", "removeLinks", links, packages)
+
+    def delete_with_files(self, link_ids, package_ids):
+        """Remove from the list AND delete the saved files (caller must verify)."""
+        links, packages = self._item_ids(link_ids, package_ids)
+        self._require_empty_folder_cleanup_off()
+        self._call("downloadsV2", "cleanup", links, packages,
+                   DELETE_ACTION, DELETE_MODE, DELETE_SELECTION)
+
+    def _require_empty_folder_cleanup_off(self):
+        """JD2 may delete the emptied download folder itself; refuse unless that is OFF."""
+        refusal = ("JD2の『空フォルダ削除』がONのため、ファイル削除を中止しました"
+                   "（推奨設定を再適用してください）")
+        spec = KNOWN_KEYS["general.delete_empty_folders"]
+        handle = None
+        for entry in self._config_entries():
+            interface = entry.get("interfaceName") or entry.get("configInterface")
+            key = entry.get("key")
+            storage = entry.get("storage")
+            if (interface == spec["interface"] and isinstance(key, str) and
+                    key.lower() == spec["key"] and (storage is None or isinstance(storage, str))):
+                handle = (interface, storage, key)
+                break
+        if handle is None:
+            raise LocalUnavailable(refusal)
+        if self._call("config", "get", *handle) is False:
+            return
+        try:
+            self._call("config", "set", *handle, False)
+            confirmed = self._call("config", "get", *handle) is False
+        except LocalUnavailable:
+            confirmed = False
+        if not confirmed:
+            raise LocalUnavailable(refusal)
+
+    def remove_waiting(self, link_ids):
+        links, _ = self._item_ids(link_ids, [])
+        self._call("linkgrabberv2", "removeLinks", links, [])
+
+    def package_save_path(self, package_id):
+        """JD2-side save folder of one package (never sent to the browser)."""
+        package_id, = self._id_list([package_id])
+        raw = self._call("downloadsV2", "queryPackages", {
+            "uuid": True, "saveTo": True, "packageUUIDs": [package_id],
+            "maxResults": 1, "startAt": 0})
+        if isinstance(raw, list):
+            for entry in raw:
+                if (isinstance(entry, dict) and entry.get("uuid") == package_id and
+                        isinstance(entry.get("saveTo"), str)):
+                    return entry["saveTo"]
+        return None
 
     def list_linkgrabber(self):
         from jd2_downloads import linkgrabber_query_options, linkgrabber_snapshot

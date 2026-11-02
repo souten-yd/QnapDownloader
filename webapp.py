@@ -27,7 +27,7 @@ import engine_supervisor
 import remote_browser
 import updater
 
-VERSION = "0.1.28"
+VERSION = "0.1.29"
 PORT = 17864
 ROOT = Path(__file__).resolve().parent
 FILES = {"/": ("web/index.html", "text/html; charset=utf-8"),
@@ -479,6 +479,27 @@ class Handler(BaseHTTPRequestHandler):
                 if service is None:
                     service = self.server.accounts = jd2_accounts.AccountService()
         return service
+
+    @staticmethod
+    def body_ids(body):
+        """`ids` (list) or a single `id`; the controller validates every entry."""
+        if "ids" in body:
+            return body["ids"]
+        return [body.get("id")]
+
+    def item_action(self, action, body):
+        jd2, page = self.server.jd2, body.get("page", 0)
+        kind, ids = body.get("kind"), self.body_ids(body)
+        if action == "start":
+            return jd2.item_start(kind, ids, page=page)
+        if action == "stop":
+            return jd2.item_stop(kind, ids, page=page)
+        folder = None
+        if body.get("delete_files") is True:
+            folder = str(checked_directory(self.store.settings().get("download_dir")))
+        return jd2.item_remove(kind, ids, page=page,
+                               delete_files=body.get("delete_files", False),
+                               confirm_name=body.get("confirm_name"), download_dir=folder)
 
     def do_GET(self):
         if not self.check_host():
@@ -966,6 +987,13 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/jd2/linkgrabber/start":
                 return self.send_data(200, self.server.jd2.start_waiting(
                     confirmed=body.get("confirmed") is True))
+            if path in ("/api/jd2/items/start", "/api/jd2/items/stop", "/api/jd2/items/remove"):
+                return self.send_data(200, self.item_action(path.rsplit("/", 1)[1], body))
+            if path in ("/api/jd2/waiting/remove", "/api/jd2/waiting/start"):
+                ids = self.body_ids(body)
+                if path.endswith("/remove"):
+                    return self.send_data(200, self.server.jd2.waiting_remove(ids))
+                return self.send_data(200, self.server.jd2.waiting_start(ids))
             if path == "/api/jd2/downloads/start":
                 return self.send_data(200, self.server.jd2.start_downloads())
             if path == "/api/jd2/downloads/cleanup":

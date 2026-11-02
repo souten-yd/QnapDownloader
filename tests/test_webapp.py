@@ -486,7 +486,7 @@ class HttpTests(unittest.TestCase):
                                          headers={"Host": "192.168.68.57:17864"})
         with self.client.open(request, timeout=4) as response:
             self.assertEqual(response.status, 200)
-            self.assertEqual(json.load(response)["version"], "0.1.28")
+            self.assertEqual(json.load(response)["version"], "0.1.29")
         with self.client.open(self.url + "/icon.svg", timeout=4) as response:
             self.assertEqual(response.status, 200)
             self.assertEqual(response.headers.get_content_type(), "image/svg+xml")
@@ -1315,7 +1315,7 @@ class HttpTests(unittest.TestCase):
         self.assertFalse(info["supported"])
         code, _ = self.req("/api/update/apply", {"version": "v0.1.8"})
         self.assertEqual(code, 400)
-        self.assertEqual(self.req("/api/health")[1]["version"], "0.1.28")
+        self.assertEqual(self.req("/api/health")[1]["version"], "0.1.29")
         self.assertFalse(self.req("/api/jd2/status")[1]["connected"])
         self.assertEqual(self.req("/api/jd2/update/apply", {"confirmed": True})[0], 400)
         self.assertEqual(self.req("/api/jd2/preset/apply", {"confirmed": True})[0], 400)
@@ -1659,6 +1659,77 @@ class HttpTests(unittest.TestCase):
             self.assertEqual(self.req("/api/jd2/downloads/cleanup", {"confirmed": True}),
                              (200, {"cleared": True}))
             adapter.cleanup_finished.assert_called_once_with()
+
+    ITEM_POST = (("/api/jd2/items/start", {"kind": "package", "id": "1"}),
+                 ("/api/jd2/items/stop", {"kind": "package", "id": "1"}),
+                 ("/api/jd2/items/remove", {"kind": "package", "id": "1", "delete_files": False}),
+                 ("/api/jd2/waiting/remove", {"ids": ["1"]}),
+                 ("/api/jd2/waiting/start", {"ids": ["1"]}))
+
+    def test_item_endpoints_need_login_csrf_and_origin(self):
+        for path, body in self.ITEM_POST:
+            with self.subTest(path=path):
+                self.assertEqual(self.req(path, body)[0], 401)
+        self.login()
+        for path, body in self.ITEM_POST:
+            with self.subTest(path=path):
+                self.assertEqual(self.req(path, body, csrf=False)[0], 403)
+                self.assertEqual(self.req(path, body, origin=False)[0], 403)
+                self.assertEqual(self.req(path, body)[0], 400)   # engine not running: refused, no call
+
+    def item_adapter(self):
+        adapter = self.jd2_ready()
+        adapter.list_downloads.return_value = {
+            "packages": [{"id": "111", "name": "Pack"}],
+            "links": [{"id": "333", "package_id": "111", "name": "a.bin"}]}
+        adapter.list_linkgrabber.return_value = {"items": [{"id": "501", "package_id": None, "name": "w"}]}
+        adapter._options = {"nas_root": str(self.allowed), "jd2_root": "/downloads"}
+        adapter.package_save_path.return_value = "/downloads/sub"
+        return adapter
+
+    def test_item_endpoints_validate_ids_and_call_the_adapter(self):
+        self.login()
+        adapter = self.item_adapter()
+        with patch.object(self.server.jd2, "_require", return_value=adapter):
+            self.assertEqual(self.req("/api/jd2/items/start", {"kind": "package", "id": "111", "page": 1})[0], 200)
+            adapter.list_downloads.assert_called_with(1)
+            adapter.set_enabled.assert_called_with(True, [], [111])
+            adapter.force_download.assert_called_with([], [111])
+            self.assertEqual(self.req("/api/jd2/items/stop", {"kind": "link", "id": "333"})[0], 200)
+            adapter.set_enabled.assert_called_with(False, [333], [])
+            self.assertEqual(self.req("/api/jd2/items/remove", {"kind": "link", "ids": ["333"]})[0], 200)
+            adapter.remove_links.assert_called_with([333], [])
+            adapter.delete_with_files.assert_not_called()
+            adapter.reset_mock()
+            for body in ({"kind": "package", "id": 111}, {"kind": "package", "id": "999"},
+                         {"kind": "package", "id": "1.5"}, {"kind": "package", "ids": ["1"] * 101},
+                         {"kind": "nope", "id": "111"}, {"kind": "package"}):
+                with self.subTest(body=body):
+                    self.assertEqual(self.req("/api/jd2/items/start", body)[0], 400)
+            adapter.set_enabled.assert_not_called()
+            self.assertEqual(self.req("/api/jd2/waiting/remove", {"ids": ["501"]})[0], 200)
+            adapter.remove_waiting.assert_called_with([501])
+            self.assertEqual(self.req("/api/jd2/waiting/remove", {"ids": ["502"]})[0], 400)
+            self.assertEqual(self.req("/api/jd2/waiting/start", {"id": "501"})[0], 200)
+            adapter.move_to_downloadlist.assert_called_with([501], [])
+
+    def test_item_remove_with_files_needs_name_and_the_chosen_folder(self):
+        self.login()
+        (self.allowed / "sub").mkdir()
+        self.assertEqual(self.req("/api/settings/folder", {"path": str(self.allowed / "sub")})[0], 200)
+        adapter = self.item_adapter()
+        with patch.object(self.server.jd2, "_require", return_value=adapter):
+            body = {"kind": "package", "id": "111", "delete_files": True}
+            self.assertEqual(self.req("/api/jd2/items/remove", body)[0], 400)
+            self.assertEqual(self.req("/api/jd2/items/remove", dict(body, confirm_name="pack"))[0], 400)
+            self.assertEqual(self.req("/api/jd2/items/remove", dict(body, delete_files="yes", confirm_name="Pack"))[0], 400)
+            adapter.delete_with_files.assert_not_called()
+            adapter.package_save_path.return_value = "/downloads/elsewhere"
+            self.assertEqual(self.req("/api/jd2/items/remove", dict(body, confirm_name="Pack"))[0], 400)
+            adapter.delete_with_files.assert_not_called()
+            adapter.package_save_path.return_value = "/downloads/sub/x"
+            self.assertEqual(self.req("/api/jd2/items/remove", dict(body, confirm_name="Pack"))[0], 200)
+            adapter.delete_with_files.assert_called_once_with([], [111])
 
     def test_intercept_send_of_a_known_link_is_skipped_without_error(self):
         self.login()
