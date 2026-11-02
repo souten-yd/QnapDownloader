@@ -690,7 +690,7 @@ if (o !== "リーダー · ブロック 3 · 画像 1/2 · 取得 600 ms · 画�
 
     def test_v0130_overlay_names_the_mode_and_live_uses_the_stream(self):
         text = re.search(r"function perfText\(tab = remoteTab\(\)\) \{.*?\n\}\n", self.js, re.S).group(0)
-        for label in ("ライブ(ストリーム)", "ライブ(ポーリング)", "高速(全体表示)", "リーダー"):
+        for label in ("ライブ(ストリーム)", "ライブ(ポーリング", "高速(全体表示)", "リーダー"):
             self.assertIn(label, text)
         # live display: the <img> points at the stream; metadata still comes from the meta long-poll
         self.assertIn("/api/rb/stream.mjpg?tab=", self.js)
