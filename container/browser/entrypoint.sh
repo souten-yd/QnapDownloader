@@ -56,7 +56,8 @@ fail() {
   exit "$3"
 }
 
-Xvfb :99 -screen 0 1280x2000x24 -nolisten tcp >"$XVFB_LOG" 2>&1 &
+# 1600x2400 so every emulated viewer size (<= 1600x2400 CSS px) fits the window.
+Xvfb :99 -screen 0 1600x2400x24 -nolisten tcp >"$XVFB_LOG" 2>&1 &
 XVFB=$!
 i=0
 while [ ! -S /tmp/.X11-unix/X99 ]; do
@@ -79,8 +80,13 @@ chromium \
   --no-default-browser-check \
   --disable-sync \
   --disable-background-networking \
+  --disable-features=Translate,MediaRouter,OptimizationHints \
+  --renderer-process-limit=2 \
+  --disable-extensions \
+  --disable-component-update \
+  --mute-audio \
   --lang=ja \
-  --window-size=1280,2000 \
+  --window-size=1600,2400 \
   about:blank >"$CHROMIUM_LOG" 2>&1 &
 CHROMIUM=$!
 

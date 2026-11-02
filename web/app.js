@@ -49,15 +49,18 @@ const SANDBOX_COMPAT = "allow-scripts allow-forms allow-same-origin";
 const MODES = ["strict", "interactive", "compat"];
 // NAS remote browser (v0.1.16): a host preference and a per-tab flag, never a
 // sandbox value. The page is rendered by Chromium in a NAS container; this
-// page only shows JPEG frames from /api/rb/frame and posts validated input.
+// page only shows JPEG frames from /api/rb/frame.jpg (binary, shown through a
+// blob: object URL) and posts validated input.
 const REMOTE_MODE = "remote";
 const RB_MAX_POLL_FAILS = 3;
-const RB_SCROLL_MS = 80;
 const RB_TAP_MOVE_PX = 10;
 const RB_TAP_MAX_MS = 600;
 const RB_LINKS_DELAY_MS = 1200;
 const RB_STATUS_POLL_MS = 1500;
-const RB_JPEG_PREFIX = "data:image/jpeg;base64,";
+const RB_VIEWPORT_DEBOUNCE_MS = 250;
+const RB_INTERCEPT_QUEUE = 20;
+const RB_POPUP_TOAST_MS = 8000;
+const RB_STAGE_MIN_PX = 100;     // a hidden / not yet laid out stage reports ~0
 const RB_KEYS = ["Enter", "Backspace", "Tab", "Escape", "Delete",
   "ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown"];
 const MODE_LABELS = {strict: "強い制限", interactive: "限定操作", compat: "互換"};
@@ -96,6 +99,7 @@ const state = {
   engine: null, engineTimer: null, engineBusy: false,
   https: false, tailnet: false,
   rbPolling: "", rbGen: 0, rbStatus: null, rbTimer: null, rbBusy: false,
+  rbIntercepts: [],
 };
 
 // ------------------------------------------------------------------ helpers
@@ -1067,8 +1071,8 @@ async function openInTab(tab, value, commit, opts = {}) {
 
 // ---------------------------------------------------------- NAS remote browser
 // The Hub validates every URL (/api/browser/validate rules) and forwards a fixed
-// set of inputs. The only image source is a data:image/jpeg;base64 URL built from
-// the Hub's /api/rb/frame answer; it is never a remote URL.
+// set of inputs. The only image source is a blob: object URL made from
+// the Hub's /api/rb/frame.jpg bytes; it is never a remote URL.
 async function openRemote(tab, value, commit) {
   const token = ++tab.token;
   tab.error = "";
@@ -1093,7 +1097,8 @@ async function openRemote(tab, value, commit) {
         return;
       }
       tab.rb = {id: made.id, seq: 0, url: "", title: "", width: 0, height: 0,
-        loading: true, links: [], linksTimer: 0, blocked: null};
+        loading: true, links: [], linksTimer: 0, blocked: null,
+        rev: null, icptSeen: 0, present: 0, vp: ""};
     }
   } catch (e) {
     if (token === tab.token) { tab.loading = false; tab.error = e.message; updateChrome(); }
@@ -1107,6 +1112,7 @@ async function openRemote(tab, value, commit) {
   tab.loaded = true;
   tab.loading = false;
   tab.rb.seq = 0;
+  tab.rb.rev = null;
   saveTabs();
   swrDrop("rb-status");
   refreshAfterTabChange();
@@ -1120,6 +1126,10 @@ function releaseRemote(tab) {
   if (!rb) return;
   clearTimeout(rb.linksTimer);
   if (state.rbPolling === rb.id) { state.rbPolling = ""; state.rbGen++; }
+  dropRemoteImage(rb);
+  state.rbIntercepts = state.rbIntercepts.filter(item => item.tab !== rb.id);
+  if (rbPopup.item && rbPopup.item.tab === rb.id) hidePopupToast();
+  renderIntercept();
   api("/api/rb/tabs/close", {id: rb.id}).catch(() => {});
 }
 
@@ -1162,6 +1172,11 @@ async function rbInput(event) {
 }
 
 function remoteLost(tab) {
+  if (tab.rb) {
+    dropRemoteImage(tab.rb);
+    state.rbIntercepts = state.rbIntercepts.filter(item => item.tab !== tab.rb.id);
+    renderIntercept();
+  }
   tab.rb = null;
   tab.error = "NASブラウザのタブが閉じられました";
   state.rbPolling = "";
@@ -1169,24 +1184,68 @@ function remoteLost(tab) {
   updateChrome();
 }
 
-function validJpeg(text) {
-  return typeof text === "string" && text.length > 0 && text.length < 8 * 1024 * 1024 &&
-    /^[A-Za-z0-9+/]+={0,2}$/.test(text);
+// Free the object URL and clear the picture (nothing is kept once a tab is gone).
+// One <img> is shared by all remote tabs, so only its current owner clears it.
+const rbShown = {url: "", owner: null};
+
+function dropRemoteImage(rb) {
+  rb.present++;
+  if (rbShown.owner !== rb) return;
+  if (rbShown.url) URL.revokeObjectURL(rbShown.url);
+  rbShown.url = ""; rbShown.owner = null;
+  const img = $("remoteImg");
+  img.removeAttribute("src");
+  img.hidden = true;
 }
 
-function applyRemoteFrame(tab, f) {
+// Double buffer: the new JPEG is decoded off-screen first, then swapped in, and the
+// previous object URL is revoked. A frame that arrives while an older one is still
+// decoding wins; the older one is dropped.
+async function presentRemoteFrame(tab, rb, blob) {
+  const ticket = ++rb.present;
+  const next = URL.createObjectURL(blob);
+  const probe = new Image();
+  probe.src = next;
+  try {
+    await probe.decode();
+  } catch (e) {
+    URL.revokeObjectURL(next);
+    return;
+  }
+  if (ticket !== rb.present || tab.rb !== rb) { URL.revokeObjectURL(next); return; }
+  const img = $("remoteImg");
+  img.src = next;
+  img.hidden = false;
+  $("remoteIdle").hidden = true;
+  const previous = rbShown.url;
+  rbShown.url = next;
+  rbShown.owner = rb;
+  if (previous) URL.revokeObjectURL(previous);
+}
+
+function frameHeaders(res) {
+  const text = name => {
+    const raw = res.headers.get(name) || "";
+    try { return decodeURIComponent(raw); } catch (e) { return ""; }
+  };
+  const number = name => Number(res.headers.get(name));
+  return {
+    seq: number("X-Frame-Seq"), width: number("X-Frame-Width"), height: number("X-Frame-Height"),
+    url: text("X-Frame-Url"), title: text("X-Frame-Title"),
+    loading: res.headers.get("X-Frame-Loading") === "1",
+    intercepts: number("X-Frame-Intercepts"), rev: number("X-Frame-Rev"),
+    blocked: text("X-Frame-Blocked") || null,
+  };
+}
+
+function applyRemoteMeta(tab, f) {
   const rb = tab.rb;
-  if (!rb || typeof f.seq !== "number") return;
+  if (!rb || !Number.isFinite(f.seq)) return;
   rb.seq = Math.max(rb.seq, f.seq);
+  if (Number.isFinite(f.rev)) rb.rev = f.rev;
   let changed = false;
-  if (validJpeg(f.jpeg_base64)) {
-    const img = $("remoteImg");
-    img.src = RB_JPEG_PREFIX + f.jpeg_base64;
-    img.hidden = false;
-    $("remoteIdle").hidden = true;
-    if (Number.isFinite(f.width) && Number.isFinite(f.height) && f.width > 0 && f.height > 0) {
-      rb.width = f.width; rb.height = f.height;
-    }
+  if (Number.isFinite(f.width) && Number.isFinite(f.height) && f.width > 0 && f.height > 0) {
+    rb.width = f.width; rb.height = f.height;
   }
   const url = typeof f.url === "string" ? f.url : "";
   const title = typeof f.title === "string" ? f.title : "";
@@ -1209,20 +1268,75 @@ function applyRemoteFrame(tab, f) {
   if (f.blocked && f.blocked !== rb.blocked) toast(String(f.blocked), "error");
   rb.blocked = f.blocked || null;
   tab.loading = loading;
+  if (Number.isFinite(f.intercepts) && f.intercepts > rb.icptSeen) {
+    fetchIntercepts(tab).catch(() => {});
+  }
   if (changed) updateChrome();
 }
 
+// The stage is the viewer's CSS viewport for the remote page.
+function stageViewport() {
+  const stage = $("remoteStage");
+  const width = Math.round(stage.clientWidth), height = Math.round(stage.clientHeight);
+  if (width < RB_STAGE_MIN_PX || height < RB_STAGE_MIN_PX) return null;
+  const dpr = Math.min(3, Math.max(1, Number(window.devicePixelRatio) || 1));
+  return {width: Math.min(1600, Math.max(320, width)), height: Math.min(2400, Math.max(320, height)),
+    dpr: Math.round(dpr * 100) / 100};
+}
+
+async function sendViewport(tab) {
+  const rb = tab.rb;
+  const view = stageViewport();
+  if (!rb || !view) return;
+  const key = view.width + "x" + view.height + "@" + view.dpr;
+  if (key === rb.vp) return;
+  rb.vp = key;
+  try {
+    await api("/api/rb/viewport", Object.assign({tab: rb.id}, view));
+  } catch (e) {
+    rb.vp = "";
+    if (e.status === 404) remoteLost(tab);
+    else throw e;
+  }
+}
+
+const nextPaint = () => new Promise(resolve => requestAnimationFrame(() => resolve()));
+
 async function remoteLoop(tab, gen) {
   let fails = 0;
+  // Size the remote page to this device before the first frame is requested.
+  await nextPaint();
+  await nextPaint();
+  if (gen !== state.rbGen || !tab.rb) return;
+  await sendViewport(tab).catch(() => {});
   while (gen === state.rbGen && tab.rb) {
+    const rb = tab.rb;
     try {
-      const f = await api("/api/rb/frame?tab=" + encodeURIComponent(tab.rb.id) + "&since=" + tab.rb.seq);
-      if (gen !== state.rbGen || !tab.rb) return;
+      let target = "/api/rb/frame.jpg?tab=" + encodeURIComponent(rb.id) + "&since=" + rb.seq;
+      if (rb.rev !== null) target += "&rev=" + rb.rev;
+      const res = await fetch(target, {credentials: "same-origin", cache: "no-store"});
+      if (gen !== state.rbGen || tab.rb !== rb) return;
+      if (res.status === 401 && state.authed) {
+        state.authed = false;
+        setTimeout(go, 0);
+        return;
+      }
+      if (res.status === 404) { remoteLost(tab); return; }
+      if (res.status !== 200 && res.status !== 204) {
+        let message = "HTTP " + res.status;
+        try { message = (await res.json()).error || message; } catch (e) { /* not JSON */ }
+        throw new Error(message);
+      }
       fails = 0;
-      applyRemoteFrame(tab, f);
+      const meta = frameHeaders(res);
+      if (res.status === 200) {
+        const blob = await res.blob();
+        if (gen !== state.rbGen || tab.rb !== rb) return;
+        if (blob.size > 0 && blob.type === "image/jpeg") presentRemoteFrame(tab, rb, blob).catch(() => {});
+      }
+      applyRemoteMeta(tab, meta);
     } catch (e) {
       if (gen !== state.rbGen) return;
-      if (e.status === 404) { remoteLost(tab); return; }
       fails++;
       if (fails >= RB_MAX_POLL_FAILS) {
         state.rbPolling = "";
@@ -1251,7 +1365,7 @@ function updateRemoteView(tab) {
   const remote = Boolean(tab && tab.remote && tab.history.length);
   setShown("remoteView", remote);
   $("frames").hidden = remote;
-  if (!remote) { closeRemoteSheet(); return; }
+  if (!remote) { closeRemoteSheet(); setShown("interceptSheet", false); return; }
   const live = Boolean(tab.rb);
   $("remoteImg").hidden = !live || !$("remoteImg").getAttribute("src");
   $("remoteIdle").hidden = live && !$("remoteImg").hidden;
@@ -1262,6 +1376,7 @@ function updateRemoteView(tab) {
   const count = live ? tab.rb.links.length : 0;
   setShown("remoteLinks", count > 0);
   $("remoteLinks").textContent = "リンク " + count + "件";
+  renderIntercept();
 }
 
 function scheduleRemoteLinks(tab) {
@@ -1329,6 +1444,110 @@ async function remoteSend() {
   await sendLinks(staged);
 }
 
+// ---- detected links (hoster pages / downloads stopped on the NAS browser)
+async function fetchIntercepts(tab) {
+  const rb = tab.rb;
+  if (!rb || rb.icptFetching) return;
+  rb.icptFetching = true;
+  try {
+    const data = await api("/api/rb/intercepts?tab=" + encodeURIComponent(rb.id) + "&since=" + rb.icptSeen);
+    if (tab.rb !== rb) return;
+    for (const item of Array.isArray(data.items) ? data.items : []) {
+      if (!Number.isInteger(item.id) || item.id <= rb.icptSeen) continue;
+      rb.icptSeen = item.id;
+      if (typeof item.url !== "string" || !item.url.startsWith("https://")) continue;
+      if (item.kind === "popup") { showPopupToast({tab: rb.id, id: item.id, url: item.url}); continue; }
+      if (item.kind !== "hoster" && item.kind !== "download") continue;
+      state.rbIntercepts.push({tab: rb.id, id: item.id, kind: item.kind, url: item.url});
+    }
+    state.rbIntercepts = state.rbIntercepts.slice(-RB_INTERCEPT_QUEUE);
+    renderIntercept();
+    loadJd2Status().then(renderIntercept).catch(() => {});
+  } finally {
+    rb.icptFetching = false;
+  }
+}
+
+// Popups never move the tab by themselves: a small toast offers to open the URL.
+// One toast at a time (the latest popup wins); it disappears after 8 s.
+const rbPopup = {item: null, timer: 0};
+
+function hostLabel(url) {
+  try { return new URL(url).hostname; } catch (e) { return ""; }
+}
+
+function hidePopupToast() {
+  clearTimeout(rbPopup.timer);
+  rbPopup.item = null;
+  setShown("popupToast", false);
+}
+
+function showPopupToast(item) {
+  clearTimeout(rbPopup.timer);
+  rbPopup.item = item;
+  $("popupToastText").textContent = "ポップアップ: " + hostLabel(item.url) + " を開く";
+  $("popupToastText").title = item.url;
+  setShown("popupToast", true);
+  rbPopup.timer = setTimeout(hidePopupToast, RB_POPUP_TOAST_MS);
+}
+
+async function openPopupToast() {
+  const item = rbPopup.item;
+  if (!item) return;
+  hidePopupToast();
+  await api("/api/rb/intercepts/open", {tab: item.tab, id: item.id});
+}
+
+function currentIntercept() {
+  const tab = remoteTab();
+  if (!tab) return null;
+  const list = state.rbIntercepts.filter(item => item.tab === tab.rb.id);
+  return list.length ? {item: list[0], more: list.length - 1} : null;
+}
+
+function renderIntercept() {
+  const cur = currentIntercept();
+  setShown("interceptSheet", Boolean(cur) && !$("remoteView").hidden);
+  const tab = remoteTab();
+  if (rbPopup.item && (!tab || tab.rb.id !== rbPopup.item.tab || $("remoteView").hidden)) hidePopupToast();
+  if (!cur) return;
+  const canSend = jd2CanSend();
+  $("interceptKind").textContent = cur.item.kind === "download" ?
+    "ファイルのダウンロードを止めました" : "Rapidgatorのページを開かずに止めました";
+  $("interceptUrl").textContent = cur.item.url;
+  $("interceptUrl").title = cur.item.url;
+  $("interceptMore").textContent = cur.more > 0 ? "ほか" + cur.more + "件が待機中" : "";
+  setShown("interceptSend", canSend);
+  setShown("interceptOpen", cur.item.kind === "hoster");
+  $("interceptAdd").classList.toggle("primary", !canSend);
+}
+
+function dropIntercept(item) {
+  state.rbIntercepts = state.rbIntercepts.filter(other => other !== item);
+  renderIntercept();
+}
+
+async function interceptAction(action) {
+  const cur = currentIntercept();
+  if (!cur) return;
+  const item = cur.item;
+  const body = {tab: item.tab, id: item.id};
+  if (action === "send") {
+    if (!confirm("このリンクをJD2のLinkGrabberへ送ります。自動開始はOFFです。既存のPackagizerルールによりフォルダが変わる可能性があります。続けますか？")) return;
+    await api("/api/rb/intercepts/send", body);
+    swrDrop("links");
+    await loadQueue(true).catch(() => {});
+    flash("JD2のLinkGrabberへ送りました（ダウンロードは未開始）");
+  } else if (action === "add") {
+    await api("/api/rb/intercepts/add", body);
+    swrDrop("links");
+    flash("追加したリンクに入れました（JD2へは未送信）");
+  } else if (action === "open") {
+    await api("/api/rb/intercepts/open", body);
+  }
+  dropIntercept(item);
+}
+
 // Pointer to page coordinates: scaled to the frame size reported by the Hub.
 function remotePoint(event) {
   const tab = remoteTab();
@@ -1341,14 +1560,30 @@ function remotePoint(event) {
   return {x: Math.round(x), y: Math.round(y), scale: tab.rb.width / box.width};
 }
 
-const rbPointer = {id: null, startX: 0, startY: 0, lastY: 0, lastX: 0, t0: 0, moved: false, sentAt: 0, dx: 0, dy: 0};
+const rbPointer = {id: null, startX: 0, startY: 0, lastY: 0, lastX: 0, t0: 0, moved: false};
 
-function sendRemoteScroll(point) {
-  if (!point || (!rbPointer.dx && !rbPointer.dy)) return;
-  const dx = Math.max(-5000, Math.min(5000, Math.round(rbPointer.dx)));
-  const dy = Math.max(-5000, Math.min(5000, Math.round(rbPointer.dy)));
-  rbPointer.dx = 0; rbPointer.dy = 0;
-  rbInput({type: "scroll", x: point.x, y: point.y, dx, dy});
+// Scroll coalescing: deltas are summed and sent as ONE input per animation frame,
+// and never while the previous scroll request is still in flight.
+const rbScroll = {x: 0, y: 0, dx: 0, dy: 0, raf: 0, busy: false};
+
+function flushScroll() {
+  rbScroll.raf = 0;
+  if (rbScroll.busy || (!rbScroll.dx && !rbScroll.dy)) return;
+  const dx = Math.max(-5000, Math.min(5000, Math.round(rbScroll.dx)));
+  const dy = Math.max(-5000, Math.min(5000, Math.round(rbScroll.dy)));
+  const {x, y} = rbScroll;
+  rbScroll.dx = 0; rbScroll.dy = 0;
+  rbScroll.busy = true;
+  rbInput({type: "scroll", x, y, dx, dy}).finally(() => {
+    rbScroll.busy = false;
+    if (rbScroll.dx || rbScroll.dy) queueScroll(rbScroll.x, rbScroll.y, 0, 0);
+  });
+}
+
+function queueScroll(x, y, dx, dy) {
+  rbScroll.x = x; rbScroll.y = y;
+  rbScroll.dx += dx; rbScroll.dy += dy;
+  if (!rbScroll.raf) rbScroll.raf = requestAnimationFrame(flushScroll);
 }
 
 function wireRemote() {
@@ -1360,7 +1595,6 @@ function wireRemote() {
     rbPointer.startY = rbPointer.lastY = event.clientY;
     rbPointer.t0 = Date.now();
     rbPointer.moved = false;
-    rbPointer.dx = 0; rbPointer.dy = 0;
     try { stage.setPointerCapture(event.pointerId); } catch (e) { /* not supported */ }
   });
   stage.addEventListener("pointermove", event => {
@@ -1372,14 +1606,11 @@ function wireRemote() {
     const point = remotePoint(event);
     if (!point) return;
     // Dragging the finger up scrolls the page down (positive wheel delta).
-    rbPointer.dx += (rbPointer.lastX - event.clientX) * point.scale;
-    rbPointer.dy += (rbPointer.lastY - event.clientY) * point.scale;
+    const dx = (rbPointer.lastX - event.clientX) * point.scale;
+    const dy = (rbPointer.lastY - event.clientY) * point.scale;
     rbPointer.lastX = event.clientX;
     rbPointer.lastY = event.clientY;
-    if (Date.now() - rbPointer.sentAt >= RB_SCROLL_MS) {
-      rbPointer.sentAt = Date.now();
-      sendRemoteScroll(point);
-    }
+    queueScroll(point.x, point.y, dx, dy);
   });
   const finish = event => {
     if (event.pointerId !== rbPointer.id) return;
@@ -1388,8 +1619,6 @@ function wireRemote() {
     if (event.type === "pointercancel" || !point) return;
     if (!rbPointer.moved && Date.now() - rbPointer.t0 <= RB_TAP_MAX_MS) {
       rbInput({type: "tap", x: point.x, y: point.y});
-    } else {
-      sendRemoteScroll(point);
     }
   };
   stage.addEventListener("pointerup", finish);
@@ -1398,11 +1627,7 @@ function wireRemote() {
     const point = remotePoint(event);
     if (!point || !remoteTab()) return;
     event.preventDefault();
-    if (Date.now() - rbPointer.sentAt < RB_SCROLL_MS) return;
-    rbPointer.sentAt = Date.now();
-    rbInput({type: "scroll", x: point.x, y: point.y,
-      dx: Math.max(-5000, Math.min(5000, Math.round(event.deltaX))),
-      dy: Math.max(-5000, Math.min(5000, Math.round(event.deltaY)))});
+    queueScroll(point.x, point.y, event.deltaX, event.deltaY);
   }, {passive: false});
 
   // Hidden text input: iOS only shows its keyboard for a focused real input.
@@ -1433,6 +1658,25 @@ function wireRemote() {
   $("remoteKeyBack").addEventListener("click", () => rbInput({type: "key", key: "Backspace"}));
   $("remoteKeyTab").addEventListener("click", () => rbInput({type: "key", key: "Tab"}));
   $("remoteLinks").addEventListener("click", () => perform(openRemoteSheet));
+  $("popupToastOpen").addEventListener("click", () => perform(openPopupToast));
+  $("interceptSend").addEventListener("click", () => perform(() => interceptAction("send")));
+  $("interceptAdd").addEventListener("click", () => perform(() => interceptAction("add")));
+  $("interceptOpen").addEventListener("click", () => perform(() => interceptAction("open")));
+  $("interceptClose").addEventListener("click", () => {
+    const cur = currentIntercept();
+    if (cur) dropIntercept(cur.item);
+  });
+  // Re-size the remote page when the viewer's stage changes (rotation, keyboard, zoom).
+  let viewportTimer = 0;
+  const queueViewport = () => {
+    clearTimeout(viewportTimer);
+    viewportTimer = setTimeout(() => {
+      const tab = remoteTab();
+      if (tab && state.rbPolling === tab.rb.id) sendViewport(tab).catch(() => {});
+    }, RB_VIEWPORT_DEBOUNCE_MS);
+  };
+  if (typeof ResizeObserver === "function") new ResizeObserver(queueViewport).observe(stage);
+  window.addEventListener("resize", queueViewport);
   $("remoteSheetClose").addEventListener("click", closeRemoteSheet);
   $("remoteAdd").addEventListener("click", () => perform(remoteAdd));
   $("remoteSend").addEventListener("click", () => perform(remoteSend));

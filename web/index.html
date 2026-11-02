@@ -457,6 +457,26 @@
      <input id="remoteKbd" class="remote-kbd" type="text" inputmode="text" autocapitalize="off" autocomplete="off" autocorrect="off" spellcheck="false" aria-label="NASブラウザへ文字を入力">
     </div>
     <button type="button" id="remoteLinks" class="remote-badge" hidden>リンク 0件</button>
+    <div id="popupToast" class="popup-toast" role="status" hidden>
+     <span id="popupToastText" class="popup-toast-text"></span>
+     <button type="button" id="popupToastOpen" class="btn small primary">開く</button>
+    </div>
+    <div id="interceptSheet" class="remote-sheet intercept-sheet" role="dialog" aria-label="リンクを検出しました" hidden>
+     <div class="remote-sheet-head">
+      <strong id="interceptTitle">リンクを検出しました</strong>
+      <span id="interceptMore" class="muted"></span>
+     </div>
+     <div class="intercept-body">
+      <p id="interceptKind" class="muted"></p>
+      <p id="interceptUrl" class="intercept-url"></p>
+     </div>
+     <div class="remote-sheet-actions intercept-actions">
+      <button type="button" id="interceptSend" class="btn primary" hidden>JD2へ送る</button>
+      <button type="button" id="interceptAdd" class="btn">リンクに追加</button>
+      <button type="button" id="interceptOpen" class="btn" hidden>ページを開く</button>
+      <button type="button" id="interceptClose" class="btn">閉じる</button>
+     </div>
+    </div>
     <div id="remoteSheet" class="remote-sheet" role="dialog" aria-label="見つかったリンク" hidden>
      <div class="remote-sheet-head">
       <strong id="remoteSheetTitle">見つかったリンク</strong>

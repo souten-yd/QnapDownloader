@@ -68,6 +68,16 @@
 - リンク抽出: CDP `Runtime.evaluate` で表示中ページのリンク（Rapidgator等）を取得し「N件を追加 / JD2へ送る」。CAPTCHAの自動解答・自動クリックは行わない（利用者が画面越しに操作）。
 - ダウンロード: ブラウザ内のファイルダウンロードは無効（`Browser.setDownloadBehavior deny`）。ファイル取得はJD2経由のみ。
 
+> **v0.1.22 実機フィードバック対応（速度とリンク検出・実機未検証）**
+> - **画面サイズを閲覧端末に合わせる**: `POST /api/rb/viewport {tab,width,height,dpr}`（幅320〜1600・高さ320〜2400のCSSピクセル整数、dpr 1〜3）。Hubは `Emulation.setDeviceMetricsOverride {width,height,deviceScaleFactor:min(dpr,2),mobile:width<760}` を送り、モバイルのときだけ `Emulation.setTouchEmulationEnabled`。**ブラウザの識別文字列は変更しない（プロジェクト規則）**。スクリーンキャストの `maxWidth/maxHeight` は CSSサイズ×min(dpr,2)、JPEG品質はモバイル50・デスクトップ60。未送信のタブは従来の1280×2000/品質60。実行中に寸法が変わると `Page.stopScreencast`→`startScreencast` で再開する。Xvfbは1600x2400x24、Chromiumの `--window-size=1600,2400`（上限の寸法でも収まる）。
+> - **ackは到着の即時**: `Page.screencastFrame` をCDP読み取りスレッドで受けた瞬間に `Page.screencastFrameAck` を返し（応答は待たない）、タブごとに最新フレームだけを保持する。閲覧者の次のポーリングを待たないのでChromiumは止まらない（閲覧者が5秒いなくなれば従来どおり `stopScreencast`）。
+> - **バイナリフレーム**: `GET /api/rb/frame.jpg?tab=&since=&wait=[&rev=]` は `image/jpeg` を返し、ヘッダ `X-Frame-Seq`/`X-Frame-Width`/`X-Frame-Height`（CDPメタデータのCSSサイズ。タップ座標の換算に使う）/`X-Frame-Url`（パーセントエンコード）/`X-Frame-Title`（同、200文字まで）/`X-Frame-Loading`(0|1)/`X-Frame-Intercepts`（このタブの検出イベントの累計数）/`X-Frame-Rev`/`X-Frame-Blocked` を付ける。新しいフレームが `wait` 秒内に無ければ **204**（同じヘッダ付き）。`rev` を付けると、フレームが無くてもURL・タイトル・読み込み状態・検出の変化で即座に返る（検出イベントが画面更新を伴わないため）。JSON版 `/api/rb/frame` は互換のため残し、`intercepts`/`rev` が増えた。`Cache-Control: no-store` のまま。CSPは `img-src 'self' data: blob:`（`blob:` はこの表示のためだけ）。
+> - **ホスター検出（Fetch）**: タブごとに `Fetch.enable` を、resourceType `Document` かつ `*://rapidgator.net/file/*`・`*://*.rapidgator.net/file/*`・`*://rg.to/file/*` の3パターンだけで有効にする（他のリクエストは一切止めない。有効化に失敗してもタブは開く＝ログのみ）。`Fetch.requestPaused` で `rapidgator_extract.normalize` できるURLは `Fetch.failRequest (Aborted)` して `{kind:"hoster", url:正規化済み}` をRAMに記録（タブごと最大20件、直近2秒の同一イベントは1件にまとめる）。正規化できないURLやDocument以外は `Fetch.continueRequest` で素通し。
+> - **ポップアップ**: 自タブ由来（`openerId` が自タブ）の新規ターゲットは、最初のURL（`targetInfoChanged`、最長3秒）を待って閉じ、ホスターURLなら検出イベント `hoster`、`browser_safety` を通るhttpsなら検出イベント `popup`（**開いた元のタブは自動では動かさない**。広告ポップアップでタブを乗っ取られないため。閲覧者が「開く」を選んだときだけ `intercepts/open` で遷移）、それ以外は「ポップアップをブロックしました」を通知。自タブ以外由来は従来どおり即閉じ。
+> - **ダウンロード**: `Browser.setDownloadBehavior {behavior:"deny", eventsEnabled:true}`。保存は拒否のまま、`Browser.downloadWillBegin` のhttps URLを `{kind:"download"}` として記録（`frameId` がタブのターゲットIDと一致すればそのタブ、不明なら直近でポーリングされたタブ）。
+> - **検出API**（要ログイン、POSTはCSRF/Origin）: `GET /api/rb/intercepts?tab=&since=` → `{items:[{id,kind,url}]}`。`POST /api/rb/intercepts/open {tab,id}`（`hoster`/`popup` のみ。そのURLを `Page.navigate`。ホスターはそのURL1回だけ30秒間Fetchを素通しにし、ポップアップ（非ホスター）は素通し設定なし）、`/add`（`store.add_link`）、`/send`（`can_send` を確認→JD2ロック内で追加→既存の `/api/links/send` と同じ `prepare_transfer`→`begin_send`→`transfer` の経路。確認ダイアログはクライアント側）。
+> - 変更したChromium引数: `--disable-features=Translate,MediaRouter,OptimizationHints --renderer-process-limit=2 --disable-extensions --disable-component-update --mute-audio`（サンドボックスは有効のまま、識別文字列系の引数は無し）。イメージのタグはentrypointのハッシュなので、更新後は「初期設定を再実行」が必要。
+
 ## 5. 安全上の残余リスク
 - Hubは管理者権限でDocker CLIを使う。操作は固定関数のみ、引数はコード内定数とHubが検証した値だけ。
 - ブラウザコンテナはインターネットとLANへ出られる（ブラウザとして必要）。悪意あるページがLAN内機器へ要求を出す可能性はある（通常のブラウザと同等）。将来、LAN宛て通信の遮断を検討。

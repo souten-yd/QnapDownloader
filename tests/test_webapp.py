@@ -1,13 +1,17 @@
 """HTTP integration tests: zero network requests beyond local test server."""
+import base64
 import http.cookiejar
 from http.server import ThreadingHTTPServer
 import json
 import os
 from pathlib import Path
 import tempfile
+import time
 import threading
 import unittest
 import urllib.error
+import urllib.parse
+import unittest.mock
 import urllib.request
 from unittest.mock import patch
 
@@ -114,11 +118,16 @@ class HttpTests(unittest.TestCase):
         self.assertEqual(code, 200)
         self.csrf = body["csrf"]
 
-    RB_GET = ("/api/rb/status", "/api/rb/log", "/api/rb/frame?tab=b1&since=0", "/api/rb/links?tab=b1")
+    RB_GET = ("/api/rb/status", "/api/rb/log", "/api/rb/frame?tab=b1&since=0", "/api/rb/links?tab=b1",
+              "/api/rb/frame.jpg?tab=b1&since=0&wait=0", "/api/rb/intercepts?tab=b1&since=0")
     RB_POST = (("/api/rb/setup", {"confirmed": True}), ("/api/rb/stop", {"confirmed": True}),
                ("/api/rb/tabs", {"url": "https://example.com/"}), ("/api/rb/tabs/close", {"id": "b1"}),
                ("/api/rb/navigate", {"tab": "b1", "url": "https://example.com/"}),
                ("/api/rb/input", {"tab": "b1", "type": "reload"}),
+               ("/api/rb/viewport", {"tab": "b1", "width": 390, "height": 700, "dpr": 3}),
+               ("/api/rb/intercepts/open", {"tab": "b1", "id": 1}),
+               ("/api/rb/intercepts/add", {"tab": "b1", "id": 1}),
+               ("/api/rb/intercepts/send", {"tab": "b1", "id": 1}),
                ("/api/engine/native/remove", {"confirmed": True}))
 
     def test_rb_endpoints_require_login_csrf_and_origin(self):
@@ -162,7 +171,7 @@ class HttpTests(unittest.TestCase):
         code, frame = self.req("/api/rb/frame?tab=b1&since=0&wait=0")
         self.assertEqual(code, 200)
         self.assertEqual(set(frame), {"seq", "jpeg_base64", "width", "height", "url", "title",
-                                      "loading", "blocked"})
+                                      "loading", "blocked", "intercepts", "rev"})
         self.assertIsNone(frame["jpeg_base64"])
         self.rb_ws.emit("Page.screencastFrame", {"data": "QUJD", "sessionId": 1, "metadata": {
             "deviceWidth": 1280, "deviceHeight": 2000}}, "SESSION1")
@@ -191,6 +200,159 @@ class HttpTests(unittest.TestCase):
         code, body = self.req("/api/rb/stop", {"confirmed": True})
         self.assertEqual(code, 200)
         self.assertNotIn("qnapdl-browser", self.rb_fake.containers)
+
+    def get_raw(self, path):
+        request = urllib.request.Request(self.url + path, headers={"Host": self.host})
+        try:
+            with self.client.open(request, timeout=6) as response:
+                return response.status, response.headers, response.read()
+        except urllib.error.HTTPError as error:
+            return error.code, error.headers, error.read()
+
+    def feed_rb(self, data="QUJD", ack=1, width=390, height=700):
+        self.rb_ws.emit("Page.screencastFrame", {"data": data, "sessionId": ack, "metadata": {
+            "deviceWidth": width, "deviceHeight": height}}, "SESSION1")
+        for _ in range(200):
+            if self.server.rb._tabs["b1"].frame == data:
+                return
+            time.sleep(0.01)
+
+    def test_rb_viewport_validates_and_applies(self):
+        self.login()
+        self.assertEqual(self.req("/api/rb/tabs", {"url": "https://example.com/a"})[0], 201)
+        code, body = self.req("/api/rb/viewport", {"tab": "b1", "width": 390, "height": 700, "dpr": 3})
+        self.assertEqual((code, body), (200, {"ok": True, "changed": True}))
+        sent = [m for m in self.rb_ws.sent if m["method"] == "Emulation.setDeviceMetricsOverride"]
+        self.assertEqual(sent[0]["params"], {"width": 390, "height": 700, "deviceScaleFactor": 2.0, "mobile": True})
+        before = len(self.rb_ws.sent)
+        for bad in ({"width": 100, "height": 700, "dpr": 2}, {"width": 390, "height": 5000, "dpr": 2},
+                    {"width": 390, "height": 700, "dpr": 4}, {"width": "390", "height": 700, "dpr": 2},
+                    {"width": 390, "height": 700}, {"tab": "b9", "width": 390, "height": 700, "dpr": 2},
+                    {"tab": "../x", "width": 390, "height": 700, "dpr": 2}):
+            with self.subTest(bad=bad):
+                body = dict({"tab": "b1"}, **bad) if "tab" not in bad else bad
+                self.assertIn(self.req("/api/rb/viewport", body)[0], (400, 404))
+        self.assertEqual(len(self.rb_ws.sent), before)
+
+    def test_rb_frame_jpg_binary_headers_204_and_json_compat(self):
+        self.login()
+        self.req("/api/rb/tabs", {"url": "https://example.com/a"})
+        code, headers, data = self.get_raw("/api/rb/frame.jpg?tab=b1&since=0&wait=0")
+        self.assertEqual((code, data), (204, b""))
+        self.assertEqual(headers["X-Frame-Seq"], "0")
+        self.assertEqual(headers["Cache-Control"], "no-store")
+        self.assertIsNone(headers["Content-Length"])
+        self.rb_ws.emit("Target.targetInfoChanged", {"targetInfo": {
+            "targetId": "TARGET00001", "type": "page", "title": "日本語 タイトル " + "x" * 300,
+            "url": "https://example.com/a b?q=日本&x=1"}})
+        jpeg = b"\xff\xd8\xff\xe0JFIF-fake"
+        self.feed_rb(base64.b64encode(jpeg).decode())
+        code, headers, data = self.get_raw("/api/rb/frame.jpg?tab=b1&since=0&wait=0")
+        self.assertEqual((code, data), (200, jpeg))
+        self.assertEqual(headers["Content-Type"], "image/jpeg")
+        self.assertEqual(headers["Content-Length"], str(len(jpeg)))
+        self.assertEqual(headers["Cache-Control"], "no-store")
+        self.assertEqual(headers["X-Content-Type-Options"], "nosniff")
+        self.assertEqual((headers["X-Frame-Seq"], headers["X-Frame-Width"], headers["X-Frame-Height"],
+                          headers["X-Frame-Loading"], headers["X-Frame-Intercepts"]), ("1", "390", "700", "0", "0"))
+        self.assertTrue(headers["X-Frame-Url"].isascii())
+        self.assertEqual(urllib.parse.unquote(headers["X-Frame-Url"]), "https://example.com/a b?q=日本&x=1")
+        title = urllib.parse.unquote(headers["X-Frame-Title"])
+        self.assertTrue(title.startswith("日本語 タイトル ") and len(title) == 200)
+        self.assertEqual(self.get_raw("/api/rb/frame.jpg?tab=b1&since=1&wait=0")[0], 204)
+        self.assertEqual(self.get_raw("/api/rb/frame.jpg?tab=b1&since=x")[0], 400)
+        self.assertEqual(self.get_raw("/api/rb/frame.jpg?tab=b1&since=0&wait=11")[0], 400)
+        self.assertEqual(self.get_raw("/api/rb/frame.jpg?tab=b1&since=0&wait=0&rev=x")[0], 400)
+        self.assertEqual(self.get_raw("/api/rb/frame.jpg?tab=b9&since=0&wait=0")[0], 404)
+        self.assertEqual(self.req("/api/rb/frame?tab=b1&since=0&wait=0")[1]["jpeg_base64"],
+                         base64.b64encode(jpeg).decode())
+
+    def test_rb_intercepts_list_open_add_flow(self):
+        self.login()
+        self.req("/api/rb/tabs", {"url": "https://example.com/a"})
+        hoster = "https://rapidgator.net/file/0123456789abcdef0123456789abcdef"
+        self.rb_ws.emit("Fetch.requestPaused", {"requestId": "r1", "resourceType": "Document",
+                                                "request": {"url": hoster + "/x.rar"}}, "SESSION1")
+        for _ in range(200):
+            if self.req("/api/rb/intercepts?tab=b1&since=0")[1]["items"]:
+                break
+            time.sleep(0.01)
+        self.assertEqual(self.req("/api/rb/intercepts?tab=b1&since=0")[1],
+                         {"items": [{"id": 1, "kind": "hoster", "url": hoster}]})
+        self.assertEqual(self.req("/api/rb/intercepts?tab=b1&since=1")[1], {"items": []})
+        self.assertEqual(self.req("/api/rb/intercepts?tab=b1&since=z")[0], 400)
+        code, headers, _ = self.get_raw("/api/rb/frame.jpg?tab=b1&since=0&wait=0")
+        self.assertEqual(headers["X-Frame-Intercepts"], "1")
+        # validation
+        for bad in ({"tab": "b1", "id": 0}, {"tab": "b1", "id": "1"}, {"tab": "b1", "id": 99},
+                    {"tab": "b1"}, {"tab": "../x", "id": 1}):
+            for action in ("open", "add", "send"):
+                with self.subTest(bad=bad, action=action):
+                    self.assertEqual(self.req("/api/rb/intercepts/" + action, bad)[0], 400)
+        self.assertEqual(self.req("/api/rb/intercepts/add", {"tab": "b9", "id": 1})[0], 404)
+        # popup events can be opened too (plain navigation, opener was not moved before)
+        self.rb_ws.emit("Target.targetCreated", {"targetInfo": {
+            "targetId": "POPUP000001", "type": "page", "openerId": "TARGET00001",
+            "url": "https://shop.example/p"}})
+        for _ in range(200):
+            if len(self.req("/api/rb/intercepts?tab=b1&since=1")[1]["items"]) == 1:
+                break
+            time.sleep(0.01)
+        popup = self.req("/api/rb/intercepts?tab=b1&since=1")[1]["items"]
+        self.assertEqual(popup, [{"id": 2, "kind": "popup", "url": "https://shop.example/p"}])
+        navs = len([m for m in self.rb_ws.sent if m["method"] == "Page.navigate"])
+        self.assertEqual(self.req("/api/rb/intercepts/open", {"tab": "b1", "id": 2})[0], 200)
+        self.assertEqual([m for m in self.rb_ws.sent if m["method"] == "Page.navigate"][navs:][0]["params"],
+                         {"url": "https://shop.example/p"})
+        # add stages only (never sends)
+        code, staged = self.req("/api/rb/intercepts/add", {"tab": "b1", "id": 1})
+        self.assertEqual((code, staged["state"]), (201, "staged"))
+        self.assertEqual([l["url"] for l in self.req("/api/links")[1]["items"]], [hoster])
+        # open navigates the tab to exactly that URL and lets it through once
+        self.assertEqual(self.req("/api/rb/intercepts/open", {"tab": "b1", "id": 1})[0], 200)
+        self.assertEqual([m for m in self.rb_ws.sent if m["method"] == "Page.navigate"][-1]["params"],
+                         {"url": hoster})
+        self.rb_ws.emit("Fetch.requestPaused", {"requestId": "r2", "resourceType": "Document",
+                                                "request": {"url": hoster}}, "SESSION1")
+        for _ in range(200):
+            if any(m["method"] == "Fetch.continueRequest" for m in self.rb_ws.sent):
+                break
+            time.sleep(0.01)
+        self.assertTrue(any(m["method"] == "Fetch.continueRequest" for m in self.rb_ws.sent))
+
+    def test_rb_intercept_send_uses_the_existing_jd2_path(self):
+        self.login()
+        self.assertEqual(self.req("/api/settings/folder", {"path": str(self.allowed)})[0], 200)
+        self.req("/api/rb/tabs", {"url": "https://example.com/a"})
+        self.rb_ws.emit("Browser.downloadWillBegin", {"frameId": "TARGET00001",
+                                                      "url": "https://files.example/a.zip"})
+        for _ in range(200):
+            if self.req("/api/rb/intercepts?tab=b1&since=0")[1]["items"]:
+                break
+            time.sleep(0.01)
+        # engine not running: refused, nothing staged
+        self.assertEqual(self.req("/api/rb/intercepts/send", {"tab": "b1", "id": 1})[0], 400)
+        self.assertEqual(self.req("/api/links")[1]["items"], [])
+        adapter = unittest.mock.MagicMock()
+        adapter.can_send = False
+        with patch.object(self.server.jd2, "_require", return_value=adapter), \
+                patch("jd2_transfer.prepare_transfer") as prepare, \
+                patch("jd2_transfer.transfer", return_value={"state": "sent"}) as transfer:
+            code, body = self.req("/api/rb/intercepts/send", {"tab": "b1", "id": 1})
+            self.assertEqual(code, 400)
+            self.assertIn("JD2", body["error"])
+            transfer.assert_not_called()
+            self.assertEqual(self.req("/api/links")[1]["items"], [])
+            adapter.can_send = True
+            code, body = self.req("/api/rb/intercepts/send", {"tab": "b1", "id": 1})
+            self.assertEqual((code, body), (200, {"state": "sent"}))
+            transfer.assert_called_once_with(adapter, "https://files.example/a.zip", str(self.allowed.resolve()))
+            prepare.assert_called_with(adapter, str(self.allowed.resolve()))
+            # sending the same event again must not re-send
+            self.assertEqual(self.req("/api/rb/intercepts/send", {"tab": "b1", "id": 1})[0], 400)
+            self.assertEqual(transfer.call_count, 1)
+        links = self.req("/api/links")[1]["items"]
+        self.assertEqual([(l["url"], l["state"]) for l in links], [("https://files.example/a.zip", "sent")])
 
     def test_rb_tab_limit_and_memory_refusals_are_japanese_400s(self):
         self.login()
@@ -234,7 +396,7 @@ class HttpTests(unittest.TestCase):
                                          headers={"Host": "192.168.68.57:17864"})
         with self.client.open(request, timeout=4) as response:
             self.assertEqual(response.status, 200)
-            self.assertEqual(json.load(response)["version"], "0.1.21")
+            self.assertEqual(json.load(response)["version"], "0.1.22")
         with self.client.open(self.url + "/icon.svg", timeout=4) as response:
             self.assertEqual(response.status, 200)
             self.assertEqual(response.headers.get_content_type(), "image/svg+xml")
@@ -316,8 +478,9 @@ class HttpTests(unittest.TestCase):
         req = urllib.request.Request(self.url + "/icon.svg")
         with self.client.open(req, timeout=4) as response:
             csp = response.headers.get("Content-Security-Policy")
-            self.assertIn("img-src 'self' data:;", csp)
-            self.assertNotIn("blob:", csp)
+            # blob: is for the remote-browser screencast (object URL of /api/rb/frame.jpg)
+            self.assertIn("img-src 'self' data: blob:;", csp)
+            self.assertNotIn("blob:", csp.replace("img-src 'self' data: blob:;", ""))
             self.assertIn("default-src 'none'", csp)
             self.assertIn("frame-ancestors 'none'", csp)
             self.assertEqual(response.headers.get("X-Frame-Options"), "DENY")
@@ -864,7 +1027,7 @@ class HttpTests(unittest.TestCase):
         self.assertFalse(info["supported"])
         code, _ = self.req("/api/update/apply", {"version": "v0.1.8"})
         self.assertEqual(code, 400)
-        self.assertEqual(self.req("/api/health")[1]["version"], "0.1.21")
+        self.assertEqual(self.req("/api/health")[1]["version"], "0.1.22")
         self.assertFalse(self.req("/api/jd2/status")[1]["connected"])
         self.assertEqual(self.req("/api/jd2/update/apply", {"confirmed": True})[0], 400)
         self.assertEqual(self.req("/api/jd2/preset/apply", {"confirmed": True})[0], 400)

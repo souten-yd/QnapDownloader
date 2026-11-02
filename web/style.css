@@ -386,3 +386,12 @@ label{display:block;margin:12px 0;color:var(--muted);font-size:13px}
 .remote-sheet-list{flex:1;overflow:auto;padding:0 14px;font-size:12px;word-break:break-all}
 .remote-sheet-list .link-url{display:block;padding:4px 0;border-bottom:1px solid var(--border)}
 .remote-sheet-actions{display:flex;gap:8px;padding:10px 14px calc(10px + env(safe-area-inset-bottom))}
+.intercept-sheet{z-index:7}
+.intercept-body{padding:0 14px}
+.intercept-body p{margin:0 0 6px}
+.intercept-url{font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.intercept-actions{flex-wrap:wrap}
+.intercept-actions .btn[hidden]{display:none}
+.popup-toast{position:absolute;left:12px;right:12px;bottom:64px;z-index:8;display:flex;align-items:center;gap:10px;padding:8px 10px 8px 14px;background:var(--surface);border:1px solid var(--border);border-radius:12px;box-shadow:0 2px 10px rgba(0,0,0,.35)}
+.popup-toast[hidden]{display:none}
+.popup-toast-text{flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-size:13px}
