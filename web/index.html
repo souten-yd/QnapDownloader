@@ -525,12 +525,12 @@
      <div id="remoteRing" class="press-ring" aria-hidden="true" hidden></div>
      <div id="perfOverlay" class="perf-overlay" role="status" hidden></div>
     </div>
-    <div class="remote-tools">
+    <input id="remoteKbd" class="remote-kbd" type="text" inputmode="text" autocapitalize="off" autocomplete="off" autocorrect="off" spellcheck="false" aria-label="NASブラウザへ文字を入力">
+    <div id="remoteTools" class="remote-tools" hidden>
      <button type="button" id="remoteKbdBtn" class="btn small">キーボード</button>
      <button type="button" id="remoteKeyEnter" class="btn small">Enter</button>
      <button type="button" id="remoteKeyBack" class="btn small">⌫</button>
      <button type="button" id="remoteKeyTab" class="btn small">Tab</button>
-     <input id="remoteKbd" class="remote-kbd" type="text" inputmode="text" autocapitalize="off" autocomplete="off" autocorrect="off" spellcheck="false" aria-label="NASブラウザへ文字を入力">
     </div>
     <button type="button" id="remoteLinks" class="remote-badge" hidden>リンク 0件</button>
     <span id="remotePopups" class="remote-popups" role="status" hidden></span>
@@ -540,12 +540,13 @@
      <button type="button" id="popupToastAllow" class="btn small">常に許可</button>
      <button type="button" id="popupToastBlock" class="btn small">常にブロック</button>
     </div>
+    <button type="button" id="probeChip" class="probe-chip" aria-label="確認中のリンク" hidden>確認中 0件</button>
+    <div id="probeFlight" class="probe-flight" role="status" hidden></div>
     <div id="probeSheet" class="remote-sheet probe-sheet" role="dialog" aria-label="リンク先を確認しました" hidden>
      <div class="remote-sheet-head">
-      <strong id="probeTitle">リンク先を確認しています…</strong>
-      <button type="button" id="probeClose" class="btn small">閉じる</button>
+      <strong id="probeTitle">リンク先を確認しました</strong>
+      <button type="button" id="probeClose" class="btn small" aria-label="閉じる">×</button>
      </div>
-     <p id="probeStatus" class="muted probe-status"></p>
      <div id="probeList" class="remote-sheet-list"></div>
      <div class="remote-sheet-actions intercept-actions">
       <button type="button" id="probeSendAll" class="btn primary" hidden>すべてJD2へ送る</button>

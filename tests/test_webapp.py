@@ -174,7 +174,7 @@ class HttpTests(unittest.TestCase):
         code, frame = self.req("/api/rb/frame?tab=b1&since=0&wait=0")
         self.assertEqual(code, 200)
         self.assertEqual(set(frame), {"seq", "jpeg_base64", "width", "height", "url", "title",
-                                      "loading", "blocked", "intercepts", "rev", "popups"})
+                                      "loading", "blocked", "intercepts", "rev", "popups", "editable"})
         self.assertIsNone(frame["jpeg_base64"])
         self.rb_ws.emit("Page.screencastFrame", {"data": "QUJD", "sessionId": 1, "metadata": {
             "deviceWidth": 1280, "deviceHeight": 2000}}, "SESSION1")
@@ -400,7 +400,7 @@ class HttpTests(unittest.TestCase):
                                          headers={"Host": "192.168.68.57:17864"})
         with self.client.open(request, timeout=4) as response:
             self.assertEqual(response.status, 200)
-            self.assertEqual(json.load(response)["version"], "0.1.26")
+            self.assertEqual(json.load(response)["version"], "0.1.27")
         with self.client.open(self.url + "/icon.svg", timeout=4) as response:
             self.assertEqual(response.status, 200)
             self.assertEqual(response.headers.get_content_type(), "image/svg+xml")
@@ -1229,7 +1229,7 @@ class HttpTests(unittest.TestCase):
         self.assertFalse(info["supported"])
         code, _ = self.req("/api/update/apply", {"version": "v0.1.8"})
         self.assertEqual(code, 400)
-        self.assertEqual(self.req("/api/health")[1]["version"], "0.1.26")
+        self.assertEqual(self.req("/api/health")[1]["version"], "0.1.27")
         self.assertFalse(self.req("/api/jd2/status")[1]["connected"])
         self.assertEqual(self.req("/api/jd2/update/apply", {"confirmed": True})[0], 400)
         self.assertEqual(self.req("/api/jd2/preset/apply", {"confirmed": True})[0], 400)
@@ -1510,16 +1510,46 @@ class HttpTests(unittest.TestCase):
             self.assertEqual(transfer.call_args.args[1:], (self.HOSTER_A, str(self.allowed.resolve())))
             self.assertEqual(transfer.call_args.kwargs, {})
 
-    def test_probe_result_expires_is_capped_and_replaced(self):
+    def test_probe_results_are_stored_per_probe_id_expire_and_are_capped(self):
         self.login()
         now = time.time()
         pid = self.stored_probe([self.HOSTER_A], now - webapp.PROBE_TTL - 1)
         self.assertEqual(self.req("/api/rb/probe/send", {"tab": "b1", "probe_id": pid})[0], 400)
         many = ["https://rapidgator.net/file/%032x" % i for i in range(80)]
         pid = self.stored_probe(many)
-        self.assertEqual(len(self.server.probe_results["b1"]["links"]), webapp.PROBE_MAX_LINKS)
+        self.assertEqual(len(self.server.probe_results["b1"][pid]["links"]), webapp.PROBE_MAX_LINKS)
         self.assertIsNone(self.stored_probe([]))
+        # an empty result does not discard the earlier probe of the tab
+        self.assertIn(pid, self.server.probe_results["b1"])
+        ids = [self.stored_probe([self.HOSTER_A]) for _ in range(webapp.PROBE_KEEP_PER_TAB + 5)]
+        self.assertEqual(len(self.server.probe_results["b1"]), webapp.PROBE_KEEP_PER_TAB)
+        self.assertEqual(list(self.server.probe_results["b1"]), ids[-webapp.PROBE_KEEP_PER_TAB:])
         self.assertEqual(self.req("/api/rb/probe/send", {"tab": "b1", "probe_id": pid})[0], 400)
+
+    def test_probe_send_with_mixed_ids_sends_only_the_named_probe(self):
+        self.login()
+        self.req("/api/settings/folder", {"path": str(self.allowed)})
+        first = self.stored_probe([self.HOSTER_A])
+        second = self.stored_probe([self.HOSTER_B])
+        other_tab = webapp.remember_probe(self.server, "b2", [self.HOSTER_A])
+        with patch.object(self.server.jd2, "_require", return_value=self.jd2_ready()), \
+                patch("jd2_transfer.prepare_transfer"), \
+                patch("jd2_transfer.transfer", return_value={"state": "sent"}) as transfer:
+            code, body = self.req("/api/rb/probe/send", {"tab": "b1", "probe_id": second})
+            self.assertEqual((code, body["sent"], body["total"]), (200, 1, 1))
+            self.assertEqual([c.args[1] for c in transfer.call_args_list], [self.HOSTER_B])
+            self.assertEqual(self.req("/api/rb/probe/send", {"tab": "b1", "probe_id": other_tab})[0], 400)
+            self.assertEqual(self.req("/api/rb/probe/send", {"tab": "b3", "probe_id": first})[0], 400)
+            code, body = self.req("/api/rb/probe/send", {"tab": "b1", "probe_id": first})
+            self.assertEqual((code, body["sent"]), (200, 1))
+            self.assertEqual([c.args[1] for c in transfer.call_args_list], [self.HOSTER_B, self.HOSTER_A])
+
+    def test_probe_queue_overflow_is_http_429(self):
+        self.login()
+        with patch.object(self.server.rb, "probe",
+                          side_effect=remote_browser.ProbeQueueFull("確認待ちが多すぎます")):
+            code, body = self.req("/api/rb/probe", {"tab": "b1", "x": 1, "y": 1})
+        self.assertEqual((code, body["error"]), (429, "確認待ちが多すぎます"))
 
     def test_links_clear_endpoint_keeps_staged_by_default(self):
         self.login()

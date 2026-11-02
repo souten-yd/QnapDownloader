@@ -27,7 +27,7 @@ import engine_supervisor
 import remote_browser
 import updater
 
-VERSION = "0.1.26"
+VERSION = "0.1.27"
 PORT = 17864
 ROOT = Path(__file__).resolve().parent
 FILES = {"/": ("web/index.html", "text/html; charset=utf-8"),
@@ -282,11 +282,12 @@ def auto_send_link(server, url):
 PROBE_TTL = 300
 PROBE_MAX_LINKS = 50
 PROBE_MAX_TABS = 16
+PROBE_KEEP_PER_TAB = 20
 _PROBE_LOCK = threading.Lock()
 
 
 def remember_probe(server, tab, links, now=None):
-    """Keep the last probe result of one tab in RAM (<= 50 links, 5 minutes).
+    """Keep probe results per probe id in RAM (last 20 per tab, <= 50 links, 5 minutes).
 
     Returns the opaque probe id, or None when there are no links. The send
     endpoint only ever uses what is stored here, never client-supplied URLs.
@@ -294,27 +295,35 @@ def remember_probe(server, tab, links, now=None):
     now = time.time() if now is None else now
     with _PROBE_LOCK:
         store = server.__dict__.setdefault("probe_results", {})
-        for key in [k for k, v in store.items() if now - v["at"] > PROBE_TTL]:
-            del store[key]
+        for key in list(store):
+            for pid in [k for k, v in store[key].items() if now - v["at"] > PROBE_TTL]:
+                del store[key][pid]
+            if not store[key]:
+                del store[key]
         if not links:
-            store.pop(tab, None)
             return None
         if tab not in store and len(store) >= PROBE_MAX_TABS:
-            del store[min(store, key=lambda k: store[k]["at"])]
+            oldest = min(store, key=lambda k: max(v["at"] for v in store[k].values()))
+            del store[oldest]
+        results = store.setdefault(tab, {})
         probe_id = secrets.token_urlsafe(12)
-        store[tab] = {"id": probe_id, "links": list(links)[:PROBE_MAX_LINKS], "at": now}
+        results[probe_id] = {"links": list(links)[:PROBE_MAX_LINKS], "at": now}
+        while len(results) > PROBE_KEEP_PER_TAB:
+            del results[next(iter(results))]
         return probe_id
 
 
 def send_probe_links(server, tab, probe_id, now=None):
     """Send the stored links of one probe to JD2 (deduped); never takes URLs from the client."""
     now = time.time() if now is None else now
+    links = []
     with _PROBE_LOCK:
-        entry = server.__dict__.get("probe_results", {}).get(tab) if isinstance(tab, str) else None
-        if entry is not None and (now - entry["at"] > PROBE_TTL or not isinstance(probe_id, str)
-                                  or not hmac.compare_digest(entry["id"], probe_id)):
-            entry = None
-        links = list(entry["links"]) if entry else []
+        results = server.__dict__.get("probe_results", {}).get(tab) if isinstance(tab, str) else None
+        if results is not None and isinstance(probe_id, str):
+            for stored_id, entry in results.items():
+                if hmac.compare_digest(stored_id.encode(), probe_id.encode()) and now - entry["at"] <= PROBE_TTL:
+                    links = list(entry["links"])
+                    break
     if not links:
         raise ValueError("確認結果の有効期限が切れました。もう一度長押ししてください")
     sent = skipped = 0
@@ -613,6 +622,7 @@ class Handler(BaseHTTPRequestHandler):
                     "X-Frame-Rev": str(result["rev"]),
                     "X-Frame-Blocked": quote((result["blocked"] or "")[:200], safe=""),
                     "X-Frame-Popups": str(result["popups"]),
+                    "X-Frame-Editable": "1" if result.get("editable") else "0",
                 }
                 if result["jpeg"] is None:
                     return self.send_data(204, b"", extra=headers)
@@ -649,6 +659,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.reject(str(exc), exc.status)
         except remote_browser.TabGone as exc:
             return self.reject(str(exc), 404)
+        except remote_browser.ProbeQueueFull as exc:
+            return self.reject(str(exc), 429)
         except (OSError, ValueError, RuntimeError, KeyError, sqlite3.Error) as exc:
             return self.reject(str(exc))
         self.reject("APIが存在しません", 404)
@@ -945,6 +957,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.reject(str(exc), exc.status)
         except remote_browser.TabGone as exc:
             return self.reject(str(exc), 404)
+        except remote_browser.ProbeQueueFull as exc:
+            return self.reject(str(exc), 429)
         except (OSError, ValueError, KeyError, RuntimeError, json.JSONDecodeError, sqlite3.Error) as exc:
             return self.reject(str(exc))
         self.reject("APIが存在しません", 404)

@@ -5,6 +5,7 @@ import queue
 import struct
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 
@@ -660,6 +661,22 @@ class InputTests(BrowserBase):
 
     def mouse(self):
         return [m["params"] for m in self.ws.calls("Input.dispatchMouseEvent")]
+
+    def test_tap_reports_whether_the_focused_element_is_editable(self):
+        self.ws.eval_map = [("activeElement", True)]
+        self.assertEqual(self.rb.send_input("b1", {"type": "tap", "x": 1, "y": 1}),
+                         {"ok": True, "editable": True})
+        evaluate = [m for m in self.ws.calls("Runtime.evaluate")
+                    if "activeElement" in m["params"]["expression"]][-1]
+        self.assertTrue(evaluate["params"]["returnByValue"])
+        self.assertEqual(evaluate["sessionId"], "SESSION1")
+        self.assertIn("isContentEditable", evaluate["params"]["expression"])
+        self.assertIs(self.rb.frame("b1", 0, wait=0)["editable"], True)
+        self.ws.eval_map = [("activeElement", False)]
+        self.assertEqual(self.rb.send_input("b1", {"type": "tap", "x": 1, "y": 1})["editable"], False)
+        self.ws.eval_map = [("activeElement", "yes")]       # anything but True is not editable
+        self.assertEqual(self.rb.send_input("b1", {"type": "tap", "x": 1, "y": 1})["editable"], False)
+        self.assertIs(self.rb.frame("b1", 0, wait=0)["editable"], False)
 
     def test_tap_is_move_press_release(self):
         self.rb.send_input("b1", {"type": "tap", "x": 120, "y": 340.5})
@@ -1718,48 +1735,188 @@ class ProbeTests(BrowserBase):
         with self.assertRaises(rb.TabGone):
             self.rb.probe("b9", 1, 1)
 
-    def test_one_probe_per_tab_at_a_time_and_flag_is_released(self):
-        gate = threading.Event()
+    # ---- v0.1.27: parallel probes ------------------------------------------
+    def hold_navigations(self):
+        """Hold every probe at Page.navigate until released; returns (count_event_fn, release)."""
         release = threading.Event()
+        seen = []
+        lock = threading.Lock()
 
         def hook(message):
-            if message["method"] == "Page.navigate" and message.get("sessionId") == "SESSION2":
-                gate.set()
-                release.wait(5)
+            if message["method"] == "Page.navigate" and str(message.get("sessionId", "")) != "SESSION1":
+                with lock:
+                    seen.append(message["sessionId"])
+                release.wait(10)
         self.ws.hook = hook
+        return seen, release
+
+    def wait_for(self, predicate, timeout=5.0):
+        end = time.time() + timeout
+        while time.time() < end:
+            if predicate():
+                return True
+            time.sleep(0.01)
+        return predicate()
+
+    def run_probes(self, count, tab="b1"):
+        out, errors = [], []
+
+        def work(i):
+            try:
+                out.append(self.rb.probe(tab, 5 + i, 5))
+            except rb.BrowserError as error:
+                errors.append(error)
+        threads = [threading.Thread(target=work, args=(i,), daemon=True) for i in range(count)]
+        for t in threads:
+            t.start()
+        return threads, out, errors
+
+    def test_three_probes_run_in_parallel_with_distinct_targets_and_the_fourth_waits(self):
+        seen, release = self.hold_navigations()
         rb.PROBE_TIMEOUT = 1
         self.rb._clock = TickClock()
-        out = []
-        thread = threading.Thread(target=lambda: out.append(self.rb.probe("b1", 5, 5)))
-        thread.start()
-        self.assertTrue(gate.wait(5))
-        with self.assertRaises(rb.BrowserError) as error:
-            self.rb.probe("b1", 6, 6)
-        self.assertIn("確認中", str(error.exception))
+        threads, out, errors = self.run_probes(4)
+        self.assertTrue(self.wait_for(lambda: len(seen) == 3))
+        time.sleep(0.4)
+        self.assertEqual(len(seen), 3)                 # the 4th (same tab) is queued
+        self.assertEqual(len(set(seen)), 3)            # three distinct probe sessions
+        tab = self.rb._tabs["b1"]
+        self.assertEqual((tab.probing, tab.probe_waiting, self.rb._probes), (3, 1, 3))
+        self.assertEqual(len(self.rb._probe_targets), 3)
         release.set()
-        thread.join(10)
-        self.assertEqual(len(out), 1)
-        self.assertFalse(self.rb._tabs["b1"].probing)
-        self.ws.hook = None
-        self.assertEqual(self.rb.probe("b1", 7, 7)["start_url"], self.START)
+        for t in threads:
+            t.join(10)
+        self.assertEqual((len(out), errors), (4, []))
+        self.assertEqual(len(seen), 4)                 # the queued one ran afterwards
+        created = [m for m in self.ws.calls("Target.createTarget")][1:]
+        ids = ["TARGET%05d" % n for n in range(2, 6)]
+        self.assertEqual(len(created), 4)
+        self.assertEqual(sorted(i for i in self.closes() if i in ids), ids)
+        self.assertEqual((self.rb._probes, tab.probing, tab.probe_waiting), (0, 0, 0))
+        self.assertEqual((self.rb._probe_targets, self.rb._probe_sessions, self.rb._probe_queue),
+                         ({}, {}, []))
 
-    def test_global_probe_cap_counts_against_all_tabs(self):
-        self.open("https://example.com/b")
-        with self.rb._lock:
-            self.rb._probes = rb.MAX_PROBES
-        with self.assertRaises(rb.BrowserError):
-            self.rb.probe("b2", 5, 5)
-        self.assertFalse(self.rb._tabs["b2"].probing)
-        self.assertEqual(self.rb._probes, rb.MAX_PROBES)
+    def test_concurrent_probes_keep_their_own_redirect_capture_and_popups(self):
+        # each probe's hoster URL and popup is attributed by its own target/session
+        hosters = {}
 
-    def test_memory_guard_applies_before_a_target_is_created(self):
+        def hook(message):
+            if message["method"] != "Page.navigate" or message.get("sessionId") == "SESSION1":
+                return
+            session = message["sessionId"]
+            n = int(session[len("SESSION"):])
+            hoster = "https://rapidgator.net/file/%032x" % n
+            hosters[session] = hoster
+            self.ws.emit("Fetch.requestPaused", {"requestId": "rp%d" % n, "resourceType": "Document",
+                                                 "request": {"url": hoster}}, session)
+        self.ws.hook = hook
+        threads, out, errors = self.run_probes(3)
+        for t in threads:
+            t.join(10)
+        self.assertEqual(errors, [])
+        got = sorted(r["links"][0] for r in out)
+        self.assertEqual(got, sorted(hosters.values()))
+        self.assertEqual(len(set(got)), 3)
+        self.assertEqual(self.rb._probe_targets, {})
+
+    def test_overall_cap_is_four_across_tabs_and_waiters_run_later(self):
+        for n in range(2):
+            self.open("https://example.com/%d" % n)       # b2, b3
+        seen, release = self.hold_navigations()
+        rb.PROBE_TIMEOUT = 1
+        self.rb._clock = TickClock()
+        t1, o1, e1 = self.run_probes(3, "b1")
+        t2, o2, e2 = self.run_probes(2, "b2")
+        self.assertTrue(self.wait_for(lambda: len(seen) == 4))
+        time.sleep(0.4)
+        self.assertEqual((len(seen), self.rb._probes), (4, 4))
+        self.assertEqual(self.rb._tabs["b2"].probe_waiting, 1)
+        release.set()
+        for t in t1 + t2:
+            t.join(10)
+        self.assertEqual((len(o1), len(o2), e1, e2), (3, 2, [], []))
+        self.assertEqual(self.rb._probes, 0)
+
+    def test_fifo_order_of_the_waiting_probes(self):
+        seen, release = self.hold_navigations()
+        rb.PROBE_TIMEOUT = 1
+        self.rb._clock = TickClock()
+        order = []
+        threads = []
+
+        def work(i):
+            order.append(self.rb.probe("b1", i, i)["start_url"])
+        for i in range(3):
+            t = threading.Thread(target=work, args=(i,), daemon=True)
+            t.start()
+            threads.append(t)
+        self.assertTrue(self.wait_for(lambda: len(seen) == 3))
+        waiter_tickets = []
+        for i in (10, 11):
+            t = threading.Thread(target=work, args=(i,), daemon=True)
+            t.start()
+            threads.append(t)
+            self.assertTrue(self.wait_for(lambda: len(self.rb._probe_queue) == len(waiter_tickets) + 1))
+            waiter_tickets.append(list(self.rb._probe_queue)[-1])
+        self.assertEqual(self.rb._probe_queue, waiter_tickets)
+        release.set()
+        for t in threads:
+            t.join(10)
+        self.assertEqual(len(order), 5)
+        self.assertEqual(self.rb._probe_queue, [])
+
+    def test_queue_overflow_is_refused_with_the_429_error_class(self):
+        seen, release = self.hold_navigations()
+        rb.PROBE_TIMEOUT = 1
+        self.rb._clock = TickClock()
+        threads, out, errors = self.run_probes(3 + rb.PROBE_QUEUE_PER_TAB)
+        self.assertTrue(self.wait_for(lambda: self.rb._tabs["b1"].probe_waiting == rb.PROBE_QUEUE_PER_TAB))
+        with self.assertRaises(rb.ProbeQueueFull) as error:
+            self.rb.probe("b1", 9, 9)
+        self.assertIn("確認待ちが多すぎます", str(error.exception))
+        self.assertEqual(self.rb._tabs["b1"].probe_waiting, rb.PROBE_QUEUE_PER_TAB)
+        release.set()
+        for t in threads:
+            t.join(20)
+        self.assertEqual((len(out), errors), (3 + rb.PROBE_QUEUE_PER_TAB, []))
+        self.assertEqual((self.rb._probes, self.rb._tabs["b1"].probe_waiting), (0, 0))
+
+    def test_memory_guard_waits_then_runs_when_memory_returns(self):
         self.set_mem(100 * 1024)
+        rb.PROBE_TIMEOUT = 1
+        self.rb._clock = TickClock()
+        before = len(self.ws.calls("Target.createTarget"))
+        out = []
+        thread = threading.Thread(target=lambda: out.append(self.rb.probe("b1", 5, 5)), daemon=True)
+        thread.start()
+        time.sleep(0.4)
+        self.assertEqual(out, [])                      # still waiting, not failed
+        self.assertEqual(len(self.ws.calls("Target.createTarget")), before)
+        self.assertEqual(self.rb._probes, 1)
+        self.set_mem(8 * 1024 * 1024)
+        thread.join(10)
+        self.assertEqual(out[0]["start_url"], self.START)
+        self.assertEqual(self.rb._probes, 0)
+
+    def test_memory_guard_fails_with_the_message_after_the_wait(self):
+        self.set_mem(100 * 1024)                       # < 1 GiB
+        old_wait, rb.PROBE_QUEUE_WAIT = rb.PROBE_QUEUE_WAIT, 2.5
+        self.addCleanup(lambda: setattr(rb, "PROBE_QUEUE_WAIT", old_wait))
+        self.rb._clock = TickClock()
         before = len(self.ws.calls("Target.createTarget"))
         with self.assertRaises(rb.BrowserError) as error:
             self.rb.probe("b1", 5, 5)
         self.assertIn("メモリ", str(error.exception))
         self.assertEqual(len(self.ws.calls("Target.createTarget")), before)
-        self.assertEqual(self.rb._probes, 0)
+        self.assertEqual((self.rb._probes, self.rb._tabs["b1"].probing), (0, 0))
+
+    def test_probe_guard_thresholds_are_one_gib_and_eighty_five_percent(self):
+        self.assertEqual((rb.PROBE_MIN_AVAILABLE_KIB, rb.PROBE_MEM_LIMIT_PERCENT), (1024 * 1024, 85.0))
+        self.set_mem(1536 * 1024)                      # between 1 GiB and the 2 GiB tab rule
+        self.assertIsNone(self.rb.probe_memory_reason())
+        self.assertIsNotNone(self.rb.memory_reason())
+        self.set_mem(900 * 1024)
+        self.assertIsNotNone(self.rb.probe_memory_reason())
 
     def test_probe_popups_are_collected_and_closed(self):
         def navigate(emit):

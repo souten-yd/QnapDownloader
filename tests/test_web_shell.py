@@ -485,19 +485,49 @@ if (out !== want) { console.error(JSON.stringify(out)); process.exit(1); }
         self.assertNotIn("confirm(", send)
         self.assertIn("opts.confirmMany && links.length >= 5", self.js)
 
-    def test_v0126_probe_sheet_is_transient(self):
+    def test_v0127_parallel_probes_use_a_chip_and_never_a_blocking_sheet(self):
         self.assertNotIn("probeOpen", self.html + self.js)
         self.assertNotIn("このタブで開く", self.html + self.js)
+        self.assertNotIn("probeSeq", self.js)
+        self.assertIn('id="probeChip"', self.html)
+        self.assertIn('id="probeFlight"', self.html)
+        self.assertIn("確認中 ", self.js)
+        self.assertNotIn("リンク先を確認しています", self.html + self.js)
         start = self.js.index("async function startProbe")
         body = self.js[start:self.js.index("// Pointer to page coordinates")]
+        # startProbe never shows the sheet while probing; it starts its own request at once
+        self.assertNotIn('setShown("probeSheet", true)', body)
+        self.assertNotIn("probeSheet", body)
+        self.assertNotIn("rb.probing", body)
+        self.assertNotIn("cancel", body.lower())
+        self.assertIn('await api("/api/rb/probe"', body)
         self.assertIn("リンクは見つかりませんでした", body)
         self.assertIn("（最終: ", body)
-        self.assertRegex(body, r"if \(!result\.links\.length\) \{\s*//[^\n]*\n\s*setShown\(\"probeSheet\", false\)")
+        # results that cannot be auto-sent are appended to one sheet
+        self.assertIn("state.probeResults = (state.probeResults || []).concat(", body)
         auto = self.js[self.js.index("async function autoSendProbe"):start]
         self.assertIn("JD2へ送信しました（", auto)
-        self.assertEqual(auto.count('setShown("probeSheet", false)'), 2)
-        self.assertIn('"error"', auto)
+        self.assertNotIn("probeSheet", auto)
+        self.assertNotIn("state.probeSeq", auto)
         self.assertNotIn("stageLinks", auto)
+        # the only place the sheet is shown is the post-result renderer
+        self.assertEqual(self.js.count('setShown("probeSheet", groups.length > 0)'), 1)
+        self.assertNotIn('setShown("probeSheet", true)', self.js)
+        css = (WEB / "style.css").read_text(encoding="utf-8")
+        self.assertRegex(css, r"\.probe-chip\{[^}]*height:32px")
+        self.assertRegex(css, r"\.probe-chip\{[^}]*safe-area-inset-bottom")
+        self.assertRegex(css, r"\.probe-sheet\{[^}]*max-height:40%")
+
+    def test_v0127_key_bar_is_hidden_until_the_page_focuses_an_editable_element(self):
+        self.assertRegex(self.html, r'id="remoteTools"[^>]*\bhidden\b')
+        self.assertRegex(self.html.split('id="remoteKbd"')[0][-200:], r"<input $")
+        self.assertIn("X-Frame-Editable", self.js)
+        self.assertIn("setEditable(tab, r.editable, true)", self.js)
+        self.assertIn('setShown("remoteTools", !!(tab && tab.rb && tab.rb.editable))', self.js)
+        self.assertIn('$("remoteKbd").focus()', self.js)
+        css = (WEB / "style.css").read_text(encoding="utf-8")
+        self.assertIn(".remote-tools[hidden]{display:none}", css)
+        self.assertRegex(css, r"\.remote-tools\{[^}]*min-height:36px")
 
     def test_v0125_history_clear_and_duplicate_skips(self):
         for ident in ("clearHistory", "clearStaged", "downloadsClear"):

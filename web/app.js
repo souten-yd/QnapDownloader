@@ -110,7 +110,7 @@ const state = {
   rbPolling: "", rbGen: 0, rbStatus: null, rbTimer: null, rbBusy: false,
   rbIntercepts: [],
   rbQuality: loadRbQuality(), rbPerf: false, rbPerfSamples: [], rbPerfTimer: 0,
-  rbPerfSince: 0, probeSeq: 0, probeResult: null, siteRules: null, waiting: null,
+  rbPerfSince: 0, probeResult: null, probeResults: [], siteRules: null, waiting: null,
   accounts: null, accountsTruncated: false, accountHosts: [], accountBusy: false, accountEditId: "",
 };
 
@@ -489,6 +489,7 @@ function setOmniIcon(name) { $("omniIcon").setAttribute("href", "#i-" + name); }
 
 function updateChrome() {
   if (!state.authed) return;
+  syncKeyBar();
   const route = state.route, tab = activeWebTab(), shown = currentViewName();
   document.body.dataset.view = shown;
   let display = "", iconName = "globe";
@@ -1191,11 +1192,29 @@ function remoteTab() {
   return tab && tab.remote && tab.rb ? tab : null;
 }
 
+// The key bar (キーボード/Enter/⌫/Tab) is shown only while the remote page's focused element
+// is editable (reported by the Hub after each input); when it turns on, focus the hidden
+// text input so the iOS keyboard opens.
+function setEditable(tab, editable, focus) {
+  const rb = tab && tab.rb;
+  if (!rb) return;
+  const was = rb.editable === true;
+  rb.editable = editable === true;
+  syncKeyBar();
+  if (focus && rb.editable && !was && remoteTab() === tab) $("remoteKbd").focus();
+}
+
+function syncKeyBar() {
+  const tab = remoteTab();
+  setShown("remoteTools", !!(tab && tab.rb && tab.rb.editable));
+}
+
 async function rbInput(event) {
   const tab = remoteTab();
   if (!tab) return;
   try {
-    await api("/api/rb/input", Object.assign({tab: tab.rb.id}, event));
+    const r = await api("/api/rb/input", Object.assign({tab: tab.rb.id}, event));
+    if (r && typeof r.editable === "boolean") setEditable(tab, r.editable, true);
   } catch (e) {
     if (e.status === 404) remoteLost(tab);
     else toast(e.message, "error");
@@ -1267,6 +1286,7 @@ function frameHeaders(res) {
     intercepts: number("X-Frame-Intercepts"), rev: number("X-Frame-Rev"),
     blocked: text("X-Frame-Blocked") || null,
     popups: number("X-Frame-Popups"),
+    editable: res.headers.get("X-Frame-Editable") === "1",
   };
 }
 
@@ -1297,6 +1317,7 @@ function applyRemoteMeta(tab, f) {
     changed = true;
     if (!loading) scheduleRemoteLinks(tab);
   }
+  if (typeof f.editable === "boolean") setEditable(tab, f.editable, false);
   if (Number.isFinite(f.popups) && f.popups !== rb.popups) { rb.popups = f.popups; changed = true; }
   if (f.blocked && f.blocked !== rb.blocked) toast(String(f.blocked), "error");
   rb.blocked = f.blocked || null;
@@ -1747,70 +1768,91 @@ function longPress(clientX, clientY) {
   perform(() => startProbe(tab, point));
 }
 
+// ---- parallel long-press probes (v0.1.27) ----
+// Every long press starts its own request at once (the server queues beyond its limits).
+// While probing only the small chip is shown; the sheet appears solely when a finished
+// probe cannot be auto-sent, and then it collects the results of all such probes.
+let probeSerial = 0;
+const probeFlight = new Map();   // id -> {n, started}
+let probeFlightOpen = false;
+let probeTicker = 0;
+
 function closeProbeSheet() {
-  state.probeSeq++;
+  state.probeResults = [];
+  state.probeResult = null;
   setShown("probeSheet", false);
 }
 
-function renderProbe(view, tab) {
-  const busy = view.busy === true;
-  const result = view.result || null;
-  const links = result ? result.links : [];
-  $("probeTitle").textContent = busy ? "リンク先を確認しています…" : "リンク先を確認しました";
-  let status = "最大15秒かかります。確認用のページは自動で閉じます";
-  if (result) {
-    status = "リダイレクト " + result.redirects + "回 · 最終: " + (hostLabel(result.final_url) || "不明") +
-      (links.length ? "" : "（Rapidgatorのリンクは見つかりませんでした）");
-  }
-  if (view.error) status = "JD2へ送信できませんでした: " + view.error + "。下のボタンから再試行できます";
-  $("probeStatus").textContent = status;
-  $("probeStatus").title = result ? result.final_url : "";
-  const canSend = jd2CanSend();
-  const rows = links.map(url => {
-    const row = element("div", undefined, "probe-link");
-    row.appendChild(element("span", url, "link-url"));
-    const actions = element("span", undefined, "probe-link-actions");
-    if (canSend) {
-      const send = element("button", "送る", "btn small");
-      send.type = "button";
-      send.addEventListener("click", () => perform(() => sendUrls([url])));
-      actions.appendChild(send);
-    }
-    const add = element("button", "追加", "btn small");
-    add.type = "button";
-    add.addEventListener("click", () => perform(async () => {
-      await stageLinks([url]);
-      flash("追加したリンクに入れました（JD2へは未送信）");
-    }));
-    actions.appendChild(add);
-    row.appendChild(actions);
-    return row;
-  });
-  $("probeList").replaceChildren(...rows);
-  $("probeSendAll").textContent = "すべてJD2へ送る（" + links.length + "件）";
-  $("probeAddAll").textContent = "リンクに追加（" + links.length + "件）";
-  setShown("probeSendAll", !busy && canSend && links.length > 0);
-  setShown("probeAddAll", !busy && links.length > 0);
-  state.probeResult = result;
+function renderProbeChip() {
+  const count = probeFlight.size;
+  $("probeChip").textContent = "確認中 " + count + "件";
+  setShown("probeChip", count > 0);
+  if (!count) { probeFlightOpen = false; clearInterval(probeTicker); probeTicker = 0; }
+  else if (!probeTicker) probeTicker = setInterval(renderProbeFlight, 1000);
+  renderProbeFlight();
 }
 
-let probeError = "";
+function renderProbeFlight() {
+  const box = $("probeFlight");
+  box.hidden = !(probeFlightOpen && probeFlight.size);
+  if (box.hidden) return;
+  const now = Date.now();
+  box.replaceChildren(...Array.from(probeFlight.values()).map(p =>
+    element("div", "リンク" + p.n + " · " + Math.floor((now - p.started) / 1000) + "秒"
+      + (p.url ? " · " + p.url : ""))));
+}
+
+function renderProbe() {
+  const results = state.probeResults || [];
+  const canSend = jd2CanSend();
+  const all = [];
+  const groups = results.map(item => {
+    const group = element("div", undefined, "probe-group");
+    group.appendChild(element("div", "リンク" + item.n + " · リダイレクト " + item.result.redirects +
+      "回 · 最終: " + (hostLabel(item.result.final_url) || "不明") +
+      (item.error ? " · 送信失敗: " + item.error : ""), "probe-group-head"));
+    for (const url of item.result.links) {
+      all.push(url);
+      const row = element("div", undefined, "probe-link");
+      row.appendChild(element("span", url, "link-url"));
+      const actions = element("span", undefined, "probe-link-actions");
+      if (canSend) {
+        const send = element("button", "送る", "btn small");
+        send.type = "button";
+        send.addEventListener("click", () => perform(() => sendUrls([url])));
+        actions.appendChild(send);
+      }
+      const add = element("button", "追加", "btn small");
+      add.type = "button";
+      add.addEventListener("click", () => perform(async () => {
+        await stageLinks([url]);
+        flash("追加したリンクに入れました（JD2へは未送信）");
+      }));
+      actions.appendChild(add);
+      row.appendChild(actions);
+      group.appendChild(row);
+    }
+    return group;
+  });
+  $("probeList").replaceChildren(...groups);
+  state.probeResult = {links: all};
+  $("probeSendAll").textContent = "すべてJD2へ送る（" + all.length + "件）";
+  $("probeAddAll").textContent = "リンクに追加（" + all.length + "件）";
+  setShown("probeSendAll", canSend && all.length > 0);
+  setShown("probeAddAll", all.length > 0);
+  setShown("probeSheet", groups.length > 0);
+}
 
 // Long press found hoster links: hand them to JD2 without a dialog (setting probe_autosend).
-// Returns true when handled (toast shown, sheet closed); false keeps the sheet with its buttons
-// (the only case it stays: autosend off or the engine cannot send).
-async function autoSendProbe(result, rb, seq) {
-  probeError = "";
+// Returns true when handled (toast shown); false means the result goes to the sheet.
+async function autoSendProbe(result, rb, item) {
   if (!result.links.length || !result.probe_id) return false;
   await Promise.all([loadSettings().catch(() => {}), loadJd2Status().catch(() => {})]);
-  if (seq !== state.probeSeq) return true;
   if (!(state.settings && state.settings.probe_autosend !== false) || !jd2CanSend()) return false;
   try {
     const r = await api("/api/rb/probe/send", {tab: rb.id, probe_id: result.probe_id});
     swrDrop("links");
     loadQueue(true).catch(() => {});
-    if (seq !== state.probeSeq) return true;
-    setShown("probeSheet", false);
     if (r.error) {
       toast((r.sent ? r.sent + "件送信後に停止: " : "") + "JD2へ送信できませんでした: " + r.error, "error");
     } else if (r.sent === 0) {
@@ -1821,41 +1863,37 @@ async function autoSendProbe(result, rb, seq) {
     }
     return true;
   } catch (e) {
-    if (seq === state.probeSeq) {
-      setShown("probeSheet", false);
-      toast("JD2へ送信できませんでした: " + e.message, "error");
-    }
+    toast("JD2へ送信できませんでした: " + e.message, "error");
     return true;
   }
 }
 
 async function startProbe(tab, point) {
   const rb = tab.rb;
-  if (!rb || rb.probing) { toast("リンク先を確認中です", "error"); return; }
-  const seq = ++state.probeSeq;
-  rb.probing = true;
-  renderProbe({busy: true}, tab);
-  setShown("probeSheet", true);
-  loadJd2Status().then(() => { if (seq === state.probeSeq && state.probeResult) renderProbe({result: state.probeResult}, tab); }).catch(() => {});
+  if (!rb) return;
+  const item = {n: ++probeSerial, started: Date.now()};
+  const id = item.n;
+  probeFlight.set(id, item);
+  renderProbeChip();
   try {
     const result = await api("/api/rb/probe", {tab: rb.id, x: point.x, y: point.y});
-    if (seq !== state.probeSeq || tab.rb !== rb) return;
+    probeFlight.delete(id);
+    renderProbeChip();
+    if (tab.rb !== rb) return;
     if (!result.links.length) {
-      // Nothing found: the sheet was only a progress indicator, so say so and close it.
-      setShown("probeSheet", false);
       const host = hostLabel(result.final_url);
       flash("リンクは見つかりませんでした" + (host ? "（最終: " + host + "）" : ""));
       return;
     }
-    if (await autoSendProbe(result, rb, seq)) return;
-    if (seq !== state.probeSeq || tab.rb !== rb) return;
-    renderProbe({result, error: probeError}, tab);
+    if (await autoSendProbe(result, rb, item)) return;
+    if (tab.rb !== rb) return;
+    state.probeResults = (state.probeResults || []).concat([{n: item.n, result}]);
+    renderProbe();
   } catch (e) {
-    if (seq === state.probeSeq) setShown("probeSheet", false);
+    probeFlight.delete(id);
+    renderProbeChip();
     if (e.status === 404) remoteLost(tab);
     else throw e;
-  } finally {
-    rb.probing = false;
   }
 }
 
@@ -1985,6 +2023,7 @@ function wireRemote() {
   $("popupToastAllow").addEventListener("click", () => perform(() => popupRule("allow")));
   $("popupToastBlock").addEventListener("click", () => perform(() => popupRule("block")));
   $("probeClose").addEventListener("click", closeProbeSheet);
+  $("probeChip").addEventListener("click", () => { probeFlightOpen = !probeFlightOpen; renderProbeFlight(); });
   $("probeSendAll").addEventListener("click", () => perform(async () => {
     if (state.probeResult) await sendUrls(state.probeResult.links.slice());
   }));
