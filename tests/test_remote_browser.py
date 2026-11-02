@@ -2921,6 +2921,24 @@ class ReaderExtractorTests(ReaderBase):
                 with self.assertRaises(rb.BrowserError):
                     self.rb.reader("b1")
 
+    def test_evaluation_timeout_has_a_clear_japanese_message(self):
+        def slow(*args, **kwargs):
+            raise rb.BrowserTimeout("ブラウザの操作に失敗しました（Runtime.evaluate: timeout）")
+        self.rb._call = slow
+        with self.assertRaises(rb.BrowserError) as ctx:
+            self.rb.reader("b1")
+        self.assertIn("ページの本文取得がタイムアウトしました", str(ctx.exception))
+        self.assertNotIn("Runtime.evaluate", str(ctx.exception))
+
+    def test_cdp_timeout_becomes_browser_timeout(self):
+        class Conn:
+            closed = False
+            def call(self, *args):
+                raise rb.CDPError("timeout")
+        self.rb._conn = Conn()
+        with self.assertRaises(rb.BrowserTimeout):
+            self.rb._call("Runtime.evaluate")
+
     def test_unknown_tab(self):
         with self.assertRaises(rb.TabGone):
             self.rb.reader("b9")

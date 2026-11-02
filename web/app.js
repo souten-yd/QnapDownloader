@@ -1088,6 +1088,7 @@ async function openRemote(tab, value, commit) {
         snapAgain: null, snapTimer: 0, busy: 0, scrollTop: 0, owner: tab,
         vmap: null, vmapRev: -1, vmapTimer: 0, vmapBusy: false, vmapAt: 0, linksRev: -1,
         reader: null, readerBusy: false, readerPending: false, readerAgain: false,
+        readerEarly: "", readerFail: null, readerErr: false, tilesFor: "", snapEarly: "", loadUrl: "", loadSince: 0,
         stream: null, streamFailed: false, perf: {}};
     }
   } catch (e) {
@@ -2019,6 +2020,7 @@ function tabDisplay(tab) {
   const rb = tab && tab.rb;
   if (!rb) return "tiles";
   if (rb.autoLive) return "live";
+  if (rb.tilesFor && rb.tilesFor === rb.url) return "tiles";   // reader failed on this page (not persisted)
   return userDisplay(tab);
 }
 
@@ -2029,6 +2031,7 @@ function setUserDisplay(tab, mode) {
   if (host) rememberHostMode(host, MODE_OF_DISPLAY[mode]);
   stopAutoPoll(tab.rb);
   tab.rb.autoLive = false; tab.rb.autoChip = false;   // a manual choice is respected
+  tab.rb.tilesFor = ""; tab.rb.readerFail = null;
   renderRemoteHosts();
   applyDisplay(tab);
   flash("表示: " + RB_DISPLAY_LABELS[mode]);
@@ -2329,7 +2332,8 @@ async function tileLoop(tab, gen) {
   while (gen === state.rbGen && tab.rb) {
     const rb = tab.rb;
     try {
-      let target = "/api/rb/meta?tab=" + encodeURIComponent(rb.id) + "&wait=" + RB_META_WAIT_S;
+      const wait = rb.loading === true && rb.snapEarly !== rb.url ? RB_EARLY_POLL_S : RB_META_WAIT_S;
+      let target = "/api/rb/meta?tab=" + encodeURIComponent(rb.id) + "&wait=" + wait;
       if (rb.rev !== null) target += "&rev=" + rb.rev;
       const res = await fetch(target, {credentials: "same-origin", cache: "no-store"});
       if (gen !== state.rbGen || tab.rb !== rb) return;
@@ -2346,11 +2350,10 @@ async function tileLoop(tab, gen) {
       const unchanged = meta.rev === rb.rev;
       applyRemoteMeta(tab, Object.assign({}, meta, {seq: rb.seq}));
       if (gen !== state.rbGen || tab.rb !== rb || tabDisplay(tab) !== "tiles") return;
-      if (meta.loading !== true && rb.snap !== null && rb.snapKey !== (meta.url + "\n" + meta.title)) {
-        takeSnapshot(tab, {keepScroll: true, quiet: true}).catch(() => {});
-      } else if (meta.loading !== true && unchanged && rb.snap !== null) {
-        takeSnapshot(tab, {ifChanged: true, keepScroll: true, quiet: true}).catch(() => {});
-      }
+      const act = tilesAction(rb, meta, unchanged, Date.now());
+      if (act === "snap") takeSnapshot(tab, {keepScroll: true, quiet: true}).catch(() => {});
+      else if (act === "snap-force") takeSnapshot(tab, {force: true, keepScroll: true, quiet: true}).catch(() => {});
+      else if (act === "snap-changed") takeSnapshot(tab, {ifChanged: true, keepScroll: true, quiet: true}).catch(() => {});
     } catch (e) {
       if (gen !== state.rbGen) return;
       fails++;
@@ -2852,6 +2855,75 @@ function mountReader(tab) {
   scroller.scrollTop = rb.readerTop || 0;
 }
 
+// A page that is still "loading" after this long (ad-heavy pages never finish) is read anyway:
+// its DOM is usually ready. Used by the reader and the fast display.
+const RB_EARLY_LOAD_MS = 3000;
+const RB_EARLY_POLL_S = 1;             // meta wait while a loading page waits for the 3 s mark
+
+function noteLoadStart(rb, meta, now) {
+  if (rb.loadUrl !== meta.url || meta.loading !== true) {
+    rb.loadUrl = meta.url;
+    rb.loadSince = now;
+  }
+}
+
+function loadedLongEnough(rb, meta, now) {
+  noteLoadStart(rb, meta, now);
+  return meta.loading === true && now - rb.loadSince >= RB_EARLY_LOAD_MS;
+}
+
+// "run" when the reader should be fetched for this metadata, else "". When it ran while loading it
+// runs once more when loading turns false (same URL).
+function readerAction(rb, meta, now) {
+  if (meta.loading === true) {
+    rb.readerPending = true;
+    if (rb.readerEarly !== meta.url && loadedLongEnough(rb, meta, now)) {
+      rb.readerEarly = meta.url;
+      return "run";
+    }
+    return "";
+  }
+  noteLoadStart(rb, meta, now);
+  if (!rb.reader || rb.reader.url !== meta.url || rb.readerPending || rb.readerEarly === meta.url) {
+    rb.readerEarly = "";
+    return "run";
+  }
+  return "";
+}
+
+// "snap" / "snap-force" / "snap-changed" / "" for the fast display.
+function tilesAction(rb, meta, unchanged, now) {
+  if (meta.loading === true) {
+    if (rb.snapEarly !== meta.url && loadedLongEnough(rb, meta, now)) {
+      rb.snapEarly = meta.url;
+      return "snap";
+    }
+    return "";
+  }
+  noteLoadStart(rb, meta, now);
+  if (rb.snapEarly === meta.url) { rb.snapEarly = ""; return "snap-force"; }
+  if (rb.snap !== null && rb.snapKey !== (meta.url + "\n" + meta.title)) return "snap";
+  if (unchanged && rb.snap !== null) return "snap-changed";
+  return "";
+}
+
+// Records a failed reader run; true when this page should be shown in the fast display instead
+// (second failure in a row for the same URL, or an empty result).
+function readerFailed(rb, url, empty) {
+  const fail = rb.readerFail && rb.readerFail.url === url ? rb.readerFail : {url, n: 0};
+  fail.n++;
+  rb.readerFail = fail;
+  return empty === true || fail.n >= 2;
+}
+
+function readerFallback(tab, rb) {
+  rb.tilesFor = rb.url;
+  rb.readerFail = null;
+  tab.error = "";
+  toast("このページはリーダー表示に対応していないため高速表示にしました");
+  applyDisplay(tab);
+}
+
 async function runReader(tab, opts = {}) {
   const rb = tab && tab.rb;
   if (!rb || tabDisplay(tab) !== "reader") return;
@@ -2866,18 +2938,31 @@ async function runReader(tab, opts = {}) {
     const data = cleanReaderData(raw);
     if (tab.rb !== rb || tabDisplay(tab) !== "reader") return;
     if (!data) throw new Error("本文を取り出せませんでした");
+    if (data.blocks.length === 0) {
+      console.error("reader: 0 blocks", data.url);
+      readerFailed(rb, rb.url, true);
+      readerFallback(tab, rb);
+      return;
+    }
     const scroller = $("readerScroll");
     const mounted = readerHost.owner === rb;
     const sameUrl = Boolean(rb.reader && rb.reader.data) && rb.reader.data.url === data.url;
     const keepTop = mounted && sameUrl && opts.keepScroll !== false ? scroller.scrollTop : 0;
     rb.reader = {data, url: data.url};
     rb.readerPending = false;
+    rb.readerFail = null;
+    if (rb.readerErr) { tab.error = ""; rb.readerErr = false; }
     if (mounted) { renderReaderBody(rb); scroller.scrollTop = keepTop; }
     updateRemoteView(tab);
   } catch (e) {
     if (tab.rb !== rb) return;
-    if (e.status === 404) remoteLost(tab);
-    else if (!opts.quiet) toast(e.message, "error");
+    if (e.status === 404) { remoteLost(tab); return; }
+    console.error("reader failed:", e);
+    if (readerFailed(rb, rb.url, false)) { readerFallback(tab, rb); return; }
+    tab.error = "リーダー表示を作れませんでした: " + (e && e.message ? e.message : String(e));
+    rb.readerErr = true;
+    updateRemoteView(tab);
+    if (!opts.quiet) toast(tab.error, "error");
   } finally {
     rb.readerBusy = false;
     snapBusy(rb, -1);
@@ -2899,7 +2984,8 @@ async function readerLoop(tab, gen) {
   while (gen === state.rbGen && tab.rb) {
     const rb = tab.rb;
     try {
-      let target = "/api/rb/meta?tab=" + encodeURIComponent(rb.id) + "&wait=" + (first ? 0 : RB_META_WAIT_S);
+      const wait = first ? 0 : rb.loading === true && rb.readerEarly !== rb.url ? RB_EARLY_POLL_S : RB_META_WAIT_S;
+      let target = "/api/rb/meta?tab=" + encodeURIComponent(rb.id) + "&wait=" + wait;
       if (!first && rb.rev !== null) target += "&rev=" + rb.rev;
       first = false;
       const res = await fetch(target, {credentials: "same-origin", cache: "no-store"});
@@ -2916,11 +3002,7 @@ async function readerLoop(tab, gen) {
       fails = 0;
       applyRemoteMeta(tab, Object.assign({}, meta, {seq: rb.seq}));
       if (gen !== state.rbGen || tab.rb !== rb || tabDisplay(tab) !== "reader") return;
-      if (meta.loading === true) {
-        rb.readerPending = true;
-      } else if (!rb.reader || rb.reader.url !== meta.url || rb.readerPending) {
-        runReader(tab, {quiet: true}).catch(() => {});
-      }
+      if (readerAction(rb, meta, Date.now()) === "run") runReader(tab, {quiet: true}).catch(() => {});
     } catch (e) {
       if (gen !== state.rbGen) return;
       fails++;

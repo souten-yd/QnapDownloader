@@ -425,6 +425,10 @@ class SetupBusy(BrowserError):
     pass
 
 
+class BrowserTimeout(BrowserError):
+    """A browser call got no answer in time."""
+
+
 class TabGone(BrowserError):
     pass
 
@@ -1161,6 +1165,8 @@ class RemoteBrowser:
         try:
             return conn.call(method, params, session, timeout)
         except CDPError as error:
+            if str(error) == "timeout":
+                raise BrowserTimeout("ブラウザの操作に失敗しました（%s: %s）" % (method, error)) from None
             raise BrowserError("ブラウザの操作に失敗しました（%s: %s）" % (method, error)) from None
 
     # ------------------------------------------------------------ lifecycle
@@ -2685,9 +2691,16 @@ class RemoteBrowser:
         """Reader data of the page: validated blocks (see the section comment)."""
         tab = self._tab(ident)
         self._touch()
-        result = self._call("Runtime.evaluate", {
-            "expression": READER_JS, "returnByValue": True, "timeout": 15000},
-            session=tab.session, timeout=READER_TIMEOUT)
+        try:
+            result = self._call("Runtime.evaluate", {
+                "expression": READER_JS, "returnByValue": True, "timeout": 15000},
+                session=tab.session, timeout=READER_TIMEOUT)
+        except BrowserTimeout:
+            raise BrowserError("ページの本文取得がタイムアウトしました（広告の多いページなどで応答しない場合があります）") from None
+        except BrowserError as error:
+            if "terminated" in str(error).lower():
+                raise BrowserError("ページの本文取得がタイムアウトしました（広告の多いページなどで応答しない場合があります）") from None
+            raise
         value = (result.get("result") or {}).get("value")
         data, images = self._reader_clean(value)
         with self._lock:
