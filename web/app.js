@@ -1561,6 +1561,7 @@ function updateRemoteView(tab) {
   const reader = live && display === "reader";
   setShown("tileScroll", tiles);
   setShown("readerScroll", reader);
+  syncReaderProgress();
   setShown("tileRefresh", tiles || reader);
   if (tiles) mountTiles(tab);
   if (reader) mountReader(tab);
@@ -2599,7 +2600,7 @@ function cleanReaderData(data) {
     if (b.t === "pre") return typeof b.text === "string";
     if (b.t === "img") return Number.isInteger(b.i) && b.i >= 0;
     return true;
-  }).slice(0, 5000);
+  }).slice(0, 5000).map(b => (b.t === "p" && b.q !== undefined) ? Object.assign({}, b, {q: b.q === true}) : b);
   return {title: typeof data.title === "string" ? data.title : "", host: typeof data.host === "string" ? data.host : "",
     url: typeof data.url === "string" ? data.url : "", blocks, truncated: data.truncated === true};
 }
@@ -2622,14 +2623,16 @@ function readerObservers() {
 }
 
 function releaseReaderImage(e) {
-  if (!e.url) return;
-  if (!e.img.style.aspectRatio) e.img.style.height = e.img.offsetHeight + "px";   // keep the layout stable
+  if (!e.url || e.pinned) return;
+  if (!e.fig.style.aspectRatio) e.fig.style.height = e.fig.offsetHeight + "px";   // keep the layout stable
   URL.revokeObjectURL(e.url);
   e.url = "";
+  e.fig.classList.remove("is-loaded");
   e.img.removeAttribute("src");
 }
 
 function clearReaderBody() {
+  closeReaderViewer();
   for (const e of readerHost.entries) {
     e.dead = true;
     e.want = false;
@@ -2673,26 +2676,33 @@ function pumpReaderImages() {
   }
 }
 
+// Image bytes of a reader picture through the Hub (never the page's own URL). null on any failure.
+async function fetchReaderBlob(rb, index) {
+  const res = await fetch("/api/rb/reader/img?tab=" + encodeURIComponent(rb.id) + "&i=" + index,
+    {credentials: "same-origin", cache: "no-store"});
+  if (res.status === 401 && state.authed) { state.authed = false; setTimeout(go, 0); return null; }
+  if (res.status !== 200) return null;
+  const blob = await res.blob();
+  if (!blob.size || !/^image\/(jpeg|png|gif|webp|avif)$/.test(blob.type)) return null;
+  return blob;
+}
+
 async function fetchReaderImage(e) {
   const began = performance.now();
   try {
-    const res = await fetch("/api/rb/reader/img?tab=" + encodeURIComponent(e.rb.id) + "&i=" + e.index,
-      {credentials: "same-origin", cache: "no-store"});
+    const blob = await fetchReaderBlob(e.rb, e.index);
     if (e.dead) return;
-    if (res.status === 401 && state.authed) { state.authed = false; setTimeout(go, 0); return; }
-    if (res.status !== 200) { e.failedAt = Date.now(); e.img.classList.add("is-failed"); return; }
-    const blob = await res.blob();
-    if (e.dead || !e.want || e.url) return;
-    if (!blob.size || !/^image\/(jpeg|png|gif|webp|avif)$/.test(blob.type)) {
+    if (!blob) {
       e.failedAt = Date.now();
-      e.img.classList.add("is-failed");
+      e.fig.classList.add("is-failed");
       return;
     }
+    if (e.dead || !e.want || e.url) return;
     e.rb.perf.imgs = (e.rb.perf.imgs || 0) + 1;
     e.rb.perf.imgMs = (e.rb.perf.imgMs || 0) + (performance.now() - began);
     e.url = URL.createObjectURL(blob);
-    e.img.classList.remove("is-failed");
-    e.img.style.height = "";
+    e.fig.classList.remove("is-failed");
+    e.fig.style.height = "";
     e.img.src = e.url;
   } catch (err) {
     e.failedAt = Date.now();
@@ -2805,22 +2815,57 @@ function readerImage(rb, block) {
   img.alt = typeof block.alt === "string" ? block.alt : "";
   img.draggable = false;
   img.decoding = "async";
-  if (Number.isFinite(block.w) && Number.isFinite(block.h) && block.w > 0 && block.h > 0) {
-    img.style.aspectRatio = Math.min(block.w, 20000) + " / " + Math.min(block.h, 20000);
+  const sized = Number.isFinite(block.w) && Number.isFinite(block.h) && block.w > 0 && block.h > 0;
+  if (sized) {
+    const w = Math.min(block.w, 20000), h = Math.min(block.h, 20000);
+    figure.style.aspectRatio = w + " / " + h;           // the skeleton has the final shape: no layout shift
+    figure.style.setProperty("--w", w + "px");
+    if (w < 200) figure.classList.add("is-tiny");
+  } else {
+    figure.classList.add("is-unsized");
   }
-  const entry = {rb, img, index: block.i, url: "", want: false, dead: false, queued: false, failedAt: 0};
+  const entry = {rb, img, fig: figure, index: block.i, alt: img.alt, url: "", want: false, dead: false, queued: false,
+    failedAt: 0, pinned: false};
+  img.addEventListener("load", () => {
+    if (!entry.url) return;
+    figure.style.height = "";
+    if (img.naturalWidth > 0 && img.naturalHeight > 0) figure.style.aspectRatio = img.naturalWidth + " / " + img.naturalHeight;
+    figure.classList.add("is-loaded");
+  });
+  img.addEventListener("error", () => { if (entry.url) figure.classList.add("is-failed"); });
   readerHost.map.set(img, entry);
   readerHost.entries.add(entry);
   readerObservers();
   if (readerHost.near) { readerHost.near.observe(img); readerHost.far.observe(img); }
   else { entry.want = true; queueReaderImage(entry); }
-  if (typeof block.href === "string" && /^https?:\/\//i.test(block.href)) {
+  const linked = typeof block.href === "string" && /^https?:\/\//i.test(block.href);
+  if (linked) {
     const a = readerLink("", block.href);
     a.classList.add("reader-imglink");
     a.appendChild(img);
     figure.appendChild(a);
   } else {
     figure.appendChild(img);
+    figure.classList.add("can-zoom");
+    img.tabIndex = 0;
+    img.setAttribute("role", "button");
+  }
+  // "表示しない": a one-line placeholder that loads the picture when tapped.
+  const hold = element("button", undefined, "reader-hold");
+  hold.type = "button";
+  hold.appendChild(icon("image"));
+  const text = element("span", undefined, "reader-hold-text");
+  text.appendChild(document.createTextNode(img.alt ? "画像: " + img.alt : "画像"));
+  text.appendChild(element("small", "タップで読み込み"));
+  hold.appendChild(text);
+  figure.appendChild(hold);
+  if (linked) {
+    // a linked picture opens its link when tapped, so the viewer has its own button
+    const zoom = element("button", undefined, "reader-zoom");
+    zoom.type = "button";
+    zoom.setAttribute("aria-label", "画像を拡大表示");
+    zoom.appendChild(icon("search"));
+    figure.appendChild(zoom);
   }
   return figure;
 }
@@ -2855,28 +2900,521 @@ function readerChips(runs) {
   return row;
 }
 
-// Reader text size, per device (a convenience: falls back to the default when storage fails).
-const READER_SIZES = [["小", 14], ["標準", 16], ["大", 19], ["特大", 23]];
+// ---- v0.1.36: reader appearance (per device; every storage access is guarded) ----
+// One JSON object under qd.readerPrefs. Unknown / out-of-range values fall back to the default per key,
+// so a damaged or older value never breaks the reader. The v0.1.34 four-step size (qd.readerSize) migrates.
+const READER_PREFS_KEY = "qd.readerPrefs";
 const READER_SIZE_KEY = "qd.readerSize";
-function readerSizeIndex() {
+const READER_SIZE_STEPS = [13, 14, 16, 18, 20, 22, 24, 26];
+const READER_OLD_SIZES = [14, 16, 19, 23];
+const READER_LEADING = [1.6, 1.85, 2.1];
+const READER_WIDTHS = [30, 36, 44];
+const READER_CHOICES = {font: ["gothic", "mincho"], theme: ["auto", "light", "sepia", "dark", "black"],
+  images: ["full", "normal", "small", "none"]};
+const READER_FLAGS = ["justify", "group", "headings", "progress"];
+const READER_DEFAULTS = Object.freeze({size: 16, font: "gothic", theme: "auto", leading: 1, width: 1, justify: true,
+  images: "normal", group: true, headings: true, progress: true});
+
+function readerNearestStep(px) {
+  let best = 16;
+  for (const step of READER_SIZE_STEPS) if (Math.abs(step - px) < Math.abs(best - px)) best = step;
+  return best;
+}
+
+function readerPrefsClean(raw) {
+  const out = Object.assign({}, READER_DEFAULTS);
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return out;
+  if (READER_SIZE_STEPS.includes(raw.size)) out.size = raw.size;
+  for (const key of Object.keys(READER_CHOICES)) if (READER_CHOICES[key].includes(raw[key])) out[key] = raw[key];
+  if (Number.isInteger(raw.leading) && raw.leading >= 0 && raw.leading < READER_LEADING.length) out.leading = raw.leading;
+  if (Number.isInteger(raw.width) && raw.width >= 0 && raw.width < READER_WIDTHS.length) out.width = raw.width;
+  for (const key of READER_FLAGS) if (typeof raw[key] === "boolean") out[key] = raw[key];
+  return out;
+}
+
+function readerPrefsLoad() {
+  let raw = null;
   try {
-    const v = Number(localStorage.getItem(READER_SIZE_KEY));
-    if (Number.isInteger(v) && v >= 0 && v < READER_SIZES.length) return v;
-  } catch (e) { /* storage unavailable */ }
-  return 1;
+    const text = localStorage.getItem(READER_PREFS_KEY);
+    if (text) raw = JSON.parse(text);
+  } catch (e) { raw = null; }
+  if (raw === null) {
+    try {
+      const old = localStorage.getItem(READER_SIZE_KEY);
+      const index = old === null || old === "" ? NaN : Number(old);
+      if (Number.isInteger(index) && index >= 0 && index < READER_OLD_SIZES.length) {
+        raw = {size: readerNearestStep(READER_OLD_SIZES[index])};
+      }
+    } catch (e) { raw = null; }
+  }
+  return readerPrefsClean(raw);
 }
 
-function applyReaderSize(index) {
-  const [label, px] = READER_SIZES[index];
-  $("readerScroll").style.fontSize = px + "px";
-  $("readerSize").textContent = "文字 " + label;
-  $("readerSize").setAttribute("aria-label", "文字の大きさ: " + label + "（押すと切替）");
+function readerPrefsSave(prefs) {
+  try { localStorage.setItem(READER_PREFS_KEY, JSON.stringify(prefs)); } catch (e) { /* keep for this page only */ }
 }
 
-function cycleReaderSize() {
-  const next = (readerSizeIndex() + 1) % READER_SIZES.length;
-  try { localStorage.setItem(READER_SIZE_KEY, String(next)); } catch (e) { /* keep for this page only */ }
-  applyReaderSize(next);
+let readerPrefs = readerPrefsClean(null);
+
+function syncReaderProgress() {
+  const on = readerPrefs.progress && !$("readerScroll").hidden;
+  $("readerProgress").hidden = !on;
+  if (on) updateReaderProgress();
+}
+
+function updateReaderProgress() {
+  const s = $("readerScroll");
+  const max = s.scrollHeight - s.clientHeight;
+  const f = max > 0 ? Math.max(0, Math.min(1, s.scrollTop / max)) : 0;
+  $("readerProgressFill").style.transform = "scaleX(" + f.toFixed(4) + ")";
+  $("readerProgress").setAttribute("aria-valuenow", String(Math.round(f * 100)));
+}
+
+function applyReaderPrefs() {
+  const p = readerPrefs, el = $("readerScroll");
+  el.style.fontSize = p.size + "px";
+  el.style.setProperty("--rd-lh", String(READER_LEADING[p.leading]));
+  el.style.setProperty("--rd-w", READER_WIDTHS[p.width] + "em");
+  el.dataset.font = p.font;
+  el.dataset.theme = p.theme;
+  el.dataset.images = p.images;
+  el.classList.toggle("rd-justify", p.justify);
+  el.classList.toggle("rd-heads", p.headings);
+  syncReaderProgress();
+}
+
+// Layout-changing settings keep the reading place by position in the document.
+const READER_RELAYOUT = ["size", "font", "leading", "width", "headings", "images", "justify"];
+function setReaderPrefs(next) {
+  const s = $("readerScroll");
+  const before = readerPrefs;
+  const ratio = s.scrollHeight > 0 ? s.scrollTop / s.scrollHeight : 0;
+  readerPrefs = readerPrefsClean(next);
+  readerPrefsSave(readerPrefs);
+  applyReaderPrefs();
+  syncReaderSheet();
+  if (readerPrefs.group !== before.group) rerenderReader();
+  else if (READER_RELAYOUT.some(k => readerPrefs[k] !== before[k]) && s.scrollTop > 0) s.scrollTop = ratio * s.scrollHeight;
+}
+
+function setReaderPref(key, value) { setReaderPrefs(Object.assign({}, readerPrefs, {[key]: value})); }
+
+function stepReaderSize(delta) {
+  const i = READER_SIZE_STEPS.indexOf(readerPrefs.size) + delta;
+  if (i >= 0 && i < READER_SIZE_STEPS.length) setReaderPref("size", READER_SIZE_STEPS[i]);
+}
+
+function rerenderReader() {
+  const rb = readerHost.owner;
+  if (!rb) return;
+  const s = $("readerScroll"), top = s.scrollTop;
+  renderReaderBody(rb);
+  s.scrollTop = top;
+}
+
+// Remembered reading place per tab and URL (RAM only): survives a re-extract and returning to a page.
+const READER_POS_MAX = 40;
+function readerSavedTop(rb, url) {
+  return rb && rb.readerPos && url && Number.isFinite(rb.readerPos[url]) ? rb.readerPos[url] : 0;
+}
+
+function readerRememberTop(rb, top) {
+  const url = rb && rb.reader && rb.reader.data ? rb.reader.data.url : "";
+  if (!url) return;
+  const pos = rb.readerPos || (rb.readerPos = {});
+  delete pos[url];
+  pos[url] = Math.max(0, Math.round(top));       // insertion order = recency
+  const keys = Object.keys(pos);
+  for (let i = 0; i < keys.length - READER_POS_MAX; i++) delete pos[keys[i]];
+}
+
+// ---- appearance sheet (reuses the app's bottom-sheet look) ----
+const readerSheetRefs = {segs: {}, inputs: {}, value: null, minus: null, plus: null, opener: null};
+
+function readerSegRow(key, label, options) {
+  const row = element("div", undefined, "rs-row");
+  row.appendChild(element("div", label, "rs-label"));
+  const seg = element("div", undefined, "seg");
+  seg.setAttribute("role", "radiogroup");
+  seg.setAttribute("aria-label", label);
+  readerSheetRefs.segs[key] = [];
+  for (const [value, text, cls] of options) {
+    const b = element("button", undefined, cls || "");
+    b.type = "button";
+    b.setAttribute("role", "radio");
+    b.dataset.value = String(value);
+    b.appendChild(element("span", text));
+    b.addEventListener("click", () => setReaderPref(key, value));
+    seg.appendChild(b);
+    readerSheetRefs.segs[key].push(b);
+  }
+  row.appendChild(seg);
+  return row;
+}
+
+function readerSwitchRow(key, label) {
+  const row = element("label", undefined, "rs-row is-switch");
+  row.appendChild(element("span", label, "rs-label"));
+  const sw = element("span", undefined, "switch");
+  const input = document.createElement("input");
+  input.type = "checkbox";
+  input.addEventListener("change", () => setReaderPref(key, input.checked));
+  sw.append(input, element("span", undefined, "switch-track"));
+  row.appendChild(sw);
+  readerSheetRefs.inputs[key] = input;
+  return row;
+}
+
+function buildReaderSheet() {
+  const body = $("readerSheetBody");
+  if (body.childElementCount) return;
+  const size = element("div", undefined, "rs-row");
+  size.appendChild(element("div", "文字サイズ", "rs-label"));
+  const stepper = element("div", undefined, "rs-stepper");
+  const minus = element("button", "A−", "btn");
+  const plus = element("button", "A+", "btn");
+  for (const [b, label, delta] of [[minus, "文字を小さく", -1], [plus, "文字を大きく", 1]]) {
+    b.type = "button";
+    b.setAttribute("aria-label", label);
+    b.addEventListener("click", () => stepReaderSize(delta));
+  }
+  const value = element("span", "", "rs-value");
+  value.setAttribute("aria-live", "polite");
+  stepper.append(minus, value, plus);
+  size.appendChild(stepper);
+  Object.assign(readerSheetRefs, {value, minus, plus});
+  body.append(size,
+    readerSegRow("font", "書体", [["gothic", "ゴシック"], ["mincho", "明朝", "f-mincho"]]),
+    readerSegRow("theme", "テーマ", [["auto", "自動", "sw-auto"], ["light", "ライト", "sw-light"], ["sepia", "セピア", "sw-sepia"],
+      ["dark", "ダーク", "sw-dark"], ["black", "ブラック", "sw-black"]]),
+    readerSegRow("leading", "行間", [[0, "狭い"], [1, "標準"], [2, "広い"]]),
+    readerSegRow("width", "本文の幅", [[0, "狭い"], [1, "標準"], [2, "広い"]]),
+    readerSwitchRow("justify", "両端揃え"),
+    readerSegRow("images", "画像", [["full", "大きく"], ["normal", "標準"], ["small", "小さく"], ["none", "表示しない"]]),
+    readerSwitchRow("group", "連続画像をまとめる"),
+    readerSwitchRow("headings", "見出しを強調"),
+    readerSwitchRow("progress", "進行状況バー"));
+  const reset = element("button", "既定に戻す", "btn rs-reset");
+  reset.type = "button";
+  reset.addEventListener("click", () => setReaderPrefs(READER_DEFAULTS));
+  body.appendChild(reset);
+}
+
+function syncReaderSheet() {
+  const refs = readerSheetRefs;
+  if (!refs.value) return;
+  const p = readerPrefs;
+  refs.value.textContent = p.size + "px";
+  const at = READER_SIZE_STEPS.indexOf(p.size);
+  refs.minus.disabled = at <= 0;
+  refs.plus.disabled = at >= READER_SIZE_STEPS.length - 1;
+  for (const key of Object.keys(refs.segs)) {
+    for (const b of refs.segs[key]) b.setAttribute("aria-checked", String(b.dataset.value === String(p[key])));
+  }
+  for (const key of Object.keys(refs.inputs)) refs.inputs[key].checked = p[key] === true;
+}
+
+function openReaderSheet() {
+  buildReaderSheet();
+  syncReaderSheet();
+  readerSheetRefs.opener = document.activeElement;
+  setShown("readerSheet", true);
+  const first = $("readerSheetBody").querySelector("button:not(:disabled)");
+  if (first) first.focus({preventScroll: true});
+}
+
+function closeReaderSheet() {
+  if ($("readerSheet").hidden) return;
+  setShown("readerSheet", false);
+  const back = readerSheetRefs.opener;
+  readerSheetRefs.opener = null;
+  if (back && back.isConnected && typeof back.focus === "function") back.focus({preventScroll: true});
+}
+
+function wireReaderSheet() {
+  const sheet = $("readerSheet");
+  $("readerAppearance").addEventListener("click", openReaderSheet);
+  $("readerSheetClose").addEventListener("click", closeReaderSheet);
+  sheet.addEventListener("click", e => { if (e.target === sheet) closeReaderSheet(); });
+  sheet.addEventListener("keydown", e => {
+    if (e.key === "Escape") { e.preventDefault(); closeReaderSheet(); return; }
+    if (e.key !== "Tab") return;
+    const items = Array.from(sheet.querySelectorAll("button:not(:disabled), input"));
+    if (!items.length) return;
+    const first = items[0], last = items[items.length - 1];
+    if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }
+    else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
+  });
+}
+
+// ---- v0.1.36: full-screen image viewer (pinch / double-tap zoom, swipe between pictures, swipe down to close) ----
+// Pointer events + a CSS transform on one <img>; the pictures are the same Hub bytes as in the page.
+const rv = {open: false, list: [], i: 0, scale: 1, tx: 0, ty: 0, own: new Map(), ptrs: new Map(), g: null,
+  tap: {t: 0, x: 0, y: 0}, opener: null, token: 0, busy: false, from: 0};
+const RV_MAX_SCALE = 6;
+const RV_DOUBLE_SCALE = 2.6;
+
+function rvReduced() {
+  try { return window.matchMedia("(prefers-reduced-motion: reduce)").matches; } catch (e) { return false; }
+}
+
+function rvStage() {
+  const r = $("rvStage").getBoundingClientRect();
+  return {w: r.width, h: r.height, cx: r.left + r.width / 2, cy: r.top + r.height / 2};
+}
+
+// The picture as drawn at scale 1 (object-fit: contain), to limit panning to what is really there.
+function rvFit() {
+  const img = $("rvImg"), st = rvStage();
+  if (!img.naturalWidth || !img.naturalHeight) return {w: st.w, h: st.h};
+  const k = Math.min(st.w / img.naturalWidth, st.h / img.naturalHeight);
+  return {w: img.naturalWidth * k, h: img.naturalHeight * k};
+}
+
+function rvClamp() {
+  const st = rvStage(), f = rvFit();
+  const lx = Math.max(0, (f.w * rv.scale - st.w) / 2), ly = Math.max(0, (f.h * rv.scale - st.h) / 2);
+  rv.tx = Math.max(-lx, Math.min(lx, rv.tx));
+  rv.ty = Math.max(-ly, Math.min(ly, rv.ty));
+}
+
+function rvApply(ms) {
+  const img = $("rvImg");
+  const d = rvReduced() ? 0 : ms;
+  img.style.transition = d ? "transform " + d + "ms ease-out" : "none";
+  img.style.transform = "translate3d(" + rv.tx.toFixed(1) + "px," + rv.ty.toFixed(1) + "px,0) scale(" + rv.scale.toFixed(3) + ")";
+}
+
+function rvVeil(opacity) { $("readerViewer").style.background = "rgba(0,0,0," + opacity.toFixed(2) + ")"; }
+
+function rvReset(ms) {
+  rv.scale = 1; rv.tx = 0; rv.ty = 0;
+  rvVeil(1);
+  rvApply(ms);
+}
+
+// Zoom to `next` keeping the stage point (px, py) (relative to the stage centre) still.
+function rvZoomAt(next, px, py) {
+  next = Math.max(1, Math.min(RV_MAX_SCALE, next));
+  const k = next / rv.scale;
+  rv.tx = px - (px - rv.tx) * k;
+  rv.ty = py - (py - rv.ty) * k;
+  rv.scale = next;
+  if (next <= 1) { rv.tx = 0; rv.ty = 0; } else rvClamp();
+}
+
+async function rvSource(e) {
+  if (e.dead) return "";
+  if (e.url) { e.pinned = true; return e.url; }
+  const have = rv.own.get(e);
+  if (have) return have;
+  const blob = await fetchReaderBlob(e.rb, e.index).catch(() => null);
+  if (!blob || !rv.open) return "";
+  const url = URL.createObjectURL(blob);
+  rv.own.set(e, url);
+  return url;
+}
+
+function rvShow() {
+  const e = rv.list[rv.i], img = $("rvImg"), token = ++rv.token;
+  $("rvCount").textContent = (rv.i + 1) + " / " + rv.list.length;
+  $("rvCaption").textContent = e.alt || "";
+  $("rvPrev").hidden = rv.i === 0;
+  $("rvNext").hidden = rv.i === rv.list.length - 1;
+  $("rvMsg").textContent = "";
+  img.classList.add("is-loading");
+  rvSource(e).then(url => {
+    if (token !== rv.token || !rv.open) return;
+    if (!url) { $("rvMsg").textContent = "画像を読み込めません"; return; }
+    if (img.getAttribute("src") === url && img.complete && img.naturalWidth) img.classList.remove("is-loading");
+    else img.src = url;
+    for (const n of [rv.i + 1, rv.i - 1]) if (rv.list[n]) rvSource(rv.list[n]).catch(() => {});   // neighbours
+  }).catch(() => {});
+}
+
+function rvGo(dir) {
+  const j = rv.i + dir;
+  if (rv.busy || j < 0 || j >= rv.list.length) { rv.tx = 0; rvApply(150); return; }
+  rv.busy = true;
+  const w = rvStage().w, ms = rvReduced() ? 0 : 160;
+  rv.tx = -dir * w;
+  rvApply(ms);
+  setTimeout(() => {
+    rv.busy = false;
+    if (!rv.open) return;
+    rv.i = j;
+    rv.scale = 1; rv.ty = 0; rv.tx = dir * w;
+    rvApply(0);
+    rvShow();
+    void $("rvImg").offsetWidth;
+    rv.tx = 0;
+    rvApply(ms);
+  }, ms);
+}
+
+function openReaderViewer(fig) {
+  const list = [];
+  let at = 0;
+  for (const f of $("readerBody").querySelectorAll(".reader-fig")) {
+    const img = f.querySelector(".reader-img");
+    const e = img ? readerHost.map.get(img) : null;
+    if (!e || e.dead) continue;
+    if (f === fig) at = list.length;
+    list.push(e);
+  }
+  if (!list.length) return;
+  rv.list = list; rv.i = at; rv.from = at; rv.busy = false; rv.ptrs.clear(); rv.g = null;
+  rv.opener = fig.querySelector(".reader-img, .reader-zoom") || fig;
+  rv.open = true;
+  rvReset(0);
+  setShown("readerViewer", true);
+  rvShow();
+  $("rvClose").focus({preventScroll: true});
+}
+
+function closeReaderViewer() {
+  if (!rv.open) return;
+  rv.open = false;
+  rv.token++;
+  setShown("readerViewer", false);
+  const img = $("rvImg");
+  img.removeAttribute("src");
+  img.classList.add("is-loading");
+  for (const url of rv.own.values()) URL.revokeObjectURL(url);
+  rv.own.clear();
+  const last = rv.list[rv.i];
+  for (const e of rv.list) if (e.pinned) { e.pinned = false; if (!e.want) releaseReaderImage(e); }
+  rv.list = [];
+  rv.ptrs.clear(); rv.g = null;
+  if (last && !last.dead && rv.i !== rv.from) last.fig.scrollIntoView({block: "center"});   // leave the page where the viewer ended
+  const back = rv.opener;
+  rv.opener = null;
+  if (back && back.isConnected) back.focus({preventScroll: true});
+}
+
+function rvBegin() {
+  const pts = Array.from(rv.ptrs.values()), st = rvStage();
+  if (pts.length >= 2) {
+    const a = pts[0], b = pts[1];
+    rv.g = {type: "pinch", d0: Math.hypot(a.x - b.x, a.y - b.y) || 1, s0: rv.scale, tx0: rv.tx, ty0: rv.ty,
+      cx: (a.x + b.x) / 2 - st.cx, cy: (a.y + b.y) / 2 - st.cy};
+  } else if (pts.length === 1) {
+    rv.g = {type: "one", x0: pts[0].x, y0: pts[0].y, tx0: rv.tx, ty0: rv.ty, t0: performance.now(), axis: "",
+      moved: false, dx: 0, dy: 0};
+  } else rv.g = null;
+}
+
+function rvDown(e) {
+  if (e.pointerType === "mouse" && e.button !== 0) return;
+  try { $("rvStage").setPointerCapture(e.pointerId); } catch (err) { /* not capturable */ }
+  rv.ptrs.set(e.pointerId, {x: e.clientX, y: e.clientY});
+  if (rv.busy) return;
+  rvBegin();
+}
+
+function rvMove(e) {
+  const p = rv.ptrs.get(e.pointerId), g = rv.g;
+  if (!p) return;
+  p.x = e.clientX; p.y = e.clientY;
+  if (!g || rv.busy) return;
+  const st = rvStage();
+  if (g.type === "pinch") {
+    const pts = Array.from(rv.ptrs.values());
+    if (pts.length < 2) return;
+    const [a, b] = pts;
+    const s1 = Math.max(0.8, Math.min(RV_MAX_SCALE, g.s0 * Math.hypot(a.x - b.x, a.y - b.y) / g.d0));
+    const k = s1 / g.s0;
+    rv.scale = s1;
+    rv.tx = (a.x + b.x) / 2 - st.cx - (g.cx - g.tx0) * k;
+    rv.ty = (a.y + b.y) / 2 - st.cy - (g.cy - g.ty0) * k;
+    rvApply(0);
+    return;
+  }
+  const dx = e.clientX - g.x0, dy = e.clientY - g.y0;
+  g.dx = dx; g.dy = dy;
+  if (Math.hypot(dx, dy) > 8) g.moved = true;
+  if (rv.scale > 1.02) { rv.tx = g.tx0 + dx; rv.ty = g.ty0 + dy; rvClamp(); rvApply(0); return; }
+  if (!g.axis && g.moved) g.axis = Math.abs(dx) > Math.abs(dy) ? "x" : "y";
+  if (g.axis === "x") {
+    const has = rv.list[rv.i + (dx < 0 ? 1 : -1)] !== undefined;
+    rv.tx = has ? dx : dx * 0.3;
+    rvApply(0);
+  } else if (g.axis === "y") {
+    rv.ty = dy > 0 ? dy : dy * 0.2;
+    rvVeil(1 - Math.min(0.6, Math.abs(rv.ty) / 500));
+    rvApply(0);
+  }
+}
+
+function rvUp(e) {
+  if (!rv.ptrs.has(e.pointerId)) return;
+  const g = rv.g;
+  rv.ptrs.delete(e.pointerId);
+  try { $("rvStage").releasePointerCapture(e.pointerId); } catch (err) { /* already released */ }
+  if (!g || rv.busy) { rvBegin(); return; }
+  if (g.type === "pinch") {
+    if (rv.scale < 1.05) rvReset(150); else { rvClamp(); rvApply(150); }
+    rvBegin();
+    if (rv.g) rv.g.moved = true;           // the remaining finger pans; it is not a tap
+    return;
+  }
+  rvBegin();
+  const dt = Math.max(1, performance.now() - g.t0);
+  const cancelled = e.type === "pointercancel";
+  if (!g.moved && !cancelled && dt < 350) {
+    const now = performance.now(), t = rv.tap, st = rvStage();
+    if (now - t.t < 320 && Math.hypot(e.clientX - t.x, e.clientY - t.y) < 30) {
+      rv.tap.t = 0;
+      if (rv.scale > 1.05) rvReset(160);
+      else { rvZoomAt(RV_DOUBLE_SCALE, e.clientX - st.cx, e.clientY - st.cy); rvApply(160); }
+    } else rv.tap = {t: now, x: e.clientX, y: e.clientY};
+    return;
+  }
+  if (rv.scale > 1.02) return;
+  if (g.axis === "x") {
+    const dir = g.dx < 0 ? 1 : -1, w = rvStage().w;
+    const fast = Math.abs(g.dx) / dt > 0.5 && Math.abs(g.dx) > 30;
+    if (!cancelled && (Math.abs(g.dx) > w * 0.22 || fast) && rv.list[rv.i + dir]) rvGo(dir);
+    else { rv.tx = 0; rvApply(150); }
+  } else if (g.axis === "y") {
+    if (!cancelled && (g.dy > 110 || (g.dy > 40 && g.dy / dt > 0.6))) closeReaderViewer();
+    else { rv.ty = 0; rvVeil(1); rvApply(150); }
+  }
+}
+
+function wireReaderViewer() {
+  const stage = $("rvStage"), img = $("rvImg");
+  stage.addEventListener("pointerdown", rvDown);
+  stage.addEventListener("pointermove", rvMove);
+  stage.addEventListener("pointerup", rvUp);
+  stage.addEventListener("pointercancel", rvUp);
+  stage.addEventListener("wheel", e => {
+    if (!rv.open) return;
+    e.preventDefault();
+    const st = rvStage();
+    rvZoomAt(rv.scale * Math.exp(-e.deltaY * 0.002), e.clientX - st.cx, e.clientY - st.cy);
+    rvApply(0);
+  }, {passive: false});
+  img.addEventListener("load", () => { img.classList.remove("is-loading"); rvClamp(); rvApply(0); });
+  img.addEventListener("error", () => { if (rv.open && img.getAttribute("src")) $("rvMsg").textContent = "画像を読み込めません"; });
+  $("rvClose").addEventListener("click", closeReaderViewer);
+  $("rvPrev").addEventListener("click", () => rvGo(-1));
+  $("rvNext").addEventListener("click", () => rvGo(1));
+  $("readerViewer").addEventListener("keydown", e => {
+    if (!rv.open) return;
+    if (e.key === "Escape") { e.preventDefault(); closeReaderViewer(); }
+    else if (e.key === "ArrowLeft") { e.preventDefault(); rvGo(-1); }
+    else if (e.key === "ArrowRight") { e.preventDefault(); rvGo(1); }
+    else if (e.key === "+" || e.key === "=") { e.preventDefault(); rvZoomAt(rv.scale * 1.4, 0, 0); rvApply(120); }
+    else if (e.key === "-") { e.preventDefault(); rvZoomAt(rv.scale / 1.4, 0, 0); rvApply(120); }
+    else if (e.key === "Tab") {
+      const items = Array.from($("readerViewer").querySelectorAll("button:not([hidden])"));
+      if (!items.length) return;
+      const first = items[0], last = items[items.length - 1];
+      if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }
+      else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
+    }
+  });
 }
 
 function readerNode(rb, block) {
@@ -2887,13 +3425,13 @@ function readerNode(rb, block) {
   const cards = (block.t === "p" || block.t === "li") ? readerCardItems(block.runs) : null;
   if (cards) return readerCards(cards);
   if (block.t === "p") {
-    const p = element("p", undefined, "reader-p");
+    const p = element("p", undefined, block.q === true ? "reader-p reader-quote" : "reader-p");
     readerRuns(p, block.runs);
     return p;
   }
   if (block.t === "li") {
     const li = element("div", undefined, "reader-li");
-    li.style.marginLeft = (1.2 + 1.4 * Math.max(0, Math.min(8, Number(block.depth) || 0))) + "em";
+    li.style.marginLeft = (1.4 * Math.max(0, Math.min(8, Number(block.depth) || 0))) + "em";
     readerRuns(li, block.runs);
     return li;
   }
@@ -2921,6 +3459,18 @@ function renderReaderBody(rb) {
   const blocks = data.blocks;
   for (let k = 0; k < blocks.length; k++) {
     const block = blocks[k];
+    if (readerPrefs.group && block.t === "img") {          // a run of 3+ pictures becomes a 2-column grid
+      let j = k;
+      while (j < blocks.length && blocks[j].t === "img") j++;
+      if (j - k >= 3) {
+        const grid = element("div", undefined, "reader-grid");
+        for (let g = k; g < j; g++) grid.appendChild(readerImage(rb, blocks[g]));
+        frag.appendChild(grid);
+        k = j - 1;
+        prev = null;
+        continue;
+      }
+    }
     const runs = (block.t === "p" || block.t === "li") ? block.runs : null;
     const items = runs && !readerLinkRow(runs) ? readerCardItems(runs) : null;
     if (items) {
@@ -2951,12 +3501,19 @@ function renderReaderBody(rb) {
 // The reader container is shared by all remote tabs; only its owner's content is built.
 function mountReader(tab) {
   const rb = tab.rb;
-  if (!rb || readerHost.owner === rb) return;
+  if (!rb) return;
   const scroller = $("readerScroll");
-  if (readerHost.owner) readerHost.owner.readerTop = scroller.scrollTop;
+  const url = () => (rb.reader && rb.reader.data ? rb.reader.data.url : "");
+  if (readerHost.owner === rb) {
+    // a hidden scroller forgets its place: put it back
+    if (scroller.scrollTop === 0 && readerSavedTop(rb, url()) > 0) scroller.scrollTop = readerSavedTop(rb, url());
+    syncReaderProgress();
+    return;
+  }
   readerHost.owner = rb;
   renderReaderBody(rb);
-  scroller.scrollTop = rb.readerTop || 0;
+  scroller.scrollTop = readerSavedTop(rb, url());
+  syncReaderProgress();
 }
 
 // A page that is still "loading" after this long (ad-heavy pages never finish) is read anyway:
@@ -3052,12 +3609,15 @@ async function runReader(tab, opts = {}) {
     const scroller = $("readerScroll");
     const mounted = readerHost.owner === rb;
     const sameUrl = Boolean(rb.reader && rb.reader.data) && rb.reader.data.url === data.url;
-    const keepTop = mounted && sameUrl && opts.keepScroll !== false ? scroller.scrollTop : 0;
+    const prevUrl = rb.reader && rb.reader.data ? rb.reader.data.url : "";
+    let keepTop = 0;
+    if (mounted && sameUrl && opts.keepScroll !== false) keepTop = scroller.scrollTop;
+    else if (!prevUrl || prevUrl === data.url) keepTop = readerSavedTop(rb, data.url);   // same page again: back to the reading place
     rb.reader = {data, url: data.url};
     rb.readerPending = false;
     rb.readerFail = null;
     if (rb.readerErr) { tab.error = ""; rb.readerErr = false; }
-    if (mounted) { renderReaderBody(rb); scroller.scrollTop = keepTop; }
+    if (mounted) { renderReaderBody(rb); scroller.scrollTop = keepTop; syncReaderProgress(); }
     updateRemoteView(tab);
   } catch (e) {
     if (tab.rb !== rb) return;
@@ -3138,8 +3698,32 @@ async function readerNavigate(tab, href) {
 
 function wireReader() {
   const body = $("readerBody");
-  applyReaderSize(readerSizeIndex());
-  $("readerSize").addEventListener("click", cycleReaderSize);
+  readerPrefs = readerPrefsLoad();
+  applyReaderPrefs();
+  wireReaderSheet();
+  wireReaderViewer();
+  const scroller = $("readerScroll");
+  let scrollTick = 0;
+  scroller.addEventListener("scroll", () => {
+    if (scrollTick) return;
+    scrollTick = requestAnimationFrame(() => {
+      scrollTick = 0;
+      updateReaderProgress();
+      if (readerHost.owner && body.childElementCount) readerRememberTop(readerHost.owner, scroller.scrollTop);
+    });
+  }, {passive: true});
+  const figureOf = event => (event.target && event.target.closest) ? event.target.closest(".reader-fig") : null;
+  body.addEventListener("click", event => {
+    const fig = figureOf(event);
+    if (!fig || event.target.closest("a[data-href]")) return;
+    if (event.target.closest(".reader-hold")) { fig.classList.add("is-open"); return; }
+    if (scroller.dataset.images === "none" && !fig.classList.contains("is-open")) return;
+    if (event.target.closest(".reader-zoom") || fig.classList.contains("can-zoom")) openReaderViewer(fig);
+  });
+  body.addEventListener("keydown", event => {
+    if ((event.key === "Enter" || event.key === " ") && event.target.classList && event.target.classList.contains("reader-img") &&
+        event.target.closest(".reader-fig.can-zoom")) { event.preventDefault(); openReaderViewer(event.target.closest(".reader-fig")); }
+  });
   const press = {timer: 0, a: null, x: 0, y: 0, id: null, fired: false};
   const stop = () => { clearTimeout(press.timer); press.timer = 0; };
   const anchor = event => (event.target && event.target.closest) ? event.target.closest("a[data-href]") : null;

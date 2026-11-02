@@ -3292,3 +3292,102 @@ class StreamTests(BrowserBase):
         self.rb.close_tab("b1")
         thread.join(3)
         self.assertEqual(self.rb.page_meta.__name__, "page_meta")
+
+
+# ------------------------------------------------------------ v0.1.37: reader look (srcset, quotes, fallbacks)
+class ReaderLookTests(ReaderBase):
+    def pick_script(self, body):
+        script = rb.READER_JS
+        piece = script[script.index("/*PICK*/"):script.index("/*ENDPICK*/")]
+        return piece + body
+
+    def run_node(self, body):
+        import shutil
+        import subprocess
+        if shutil.which("node") is None:
+            self.skipTest("node missing")
+        result = subprocess.run(["node", "-e", self.pick_script(body)], capture_output=True, text=True, timeout=20)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_srcset_chooser_picks_the_smallest_candidate_of_1280_or_more(self):
+        self.run_node("""
+const eq = (a, b, m) => { if (JSON.stringify(a) !== JSON.stringify(b)) { console.error(m + ": " + JSON.stringify(a)); process.exit(1); } };
+const pick = (s, base) => { const r = pickBest(parseSrcset(s, base), 1280); return r && r.u; };
+eq(pick("a 640w, b 1280w, c 2560w", 600), "b", "exact 1280w");
+eq(pick("a 640w, b 1600w, c 2560w", 600), "b", "smallest at or above target");
+eq(pick("c 2560w, a 640w, b 1600w", 600), "b", "order does not matter");
+eq(pick("a 400w, b 800w", 600), "b", "largest when none reaches the target");
+eq(pick("a 1x, b 2x, c 3x", 500), "c", "x descriptors scale by the rendered width");
+eq(pick("a 1x, b 2x, c 3x", 700), "b", "2x of 700 is 1400");
+eq(pick("a, b 2x", 700), "b", "no descriptor counts as 1x");
+eq(pick("https://h/w=100,h=50/a.jpg 100w, https://h/w=2000,h=900/b.jpg 2000w", 0), "https://h/w=2000,h=900/b.jpg", "commas inside URLs");
+eq(pick("a 1x, b 2x", 0), "b", "x without a base width: the last one");
+eq(pick("", 100), null, "empty");
+eq(pickBest([{u: "", w: 5}], 1280), null, "empty URL ignored");
+eq(parseSrcset("a 640w , b 1280w", 0).map(c => c.w), [640, 1280], "spaces around commas");
+eq(pickBest([{u: "s", w: 0}, {u: "t", w: 900}], 1280).u, "t", "unknown widths lose to known ones");
+""")
+
+    def test_extractor_uses_the_chooser_and_keeps_lazy_fallbacks(self):
+        script = rb.READER_JS
+        for needle in ("pickBest(cands,1280)", "data-srcset", "'PICTURE'", "'SOURCE'", "data-lazy-src", "data-original",
+                       "BLOCKQUOTE", "pb.q=true", "out.fallbacks", "matchMedia"):
+            self.assertIn(needle, script)
+        self.assertNotIn("__TARGET__", script)
+        self.assertEqual(rb.READER_IMAGE_TARGET, 1280)
+        self.assertEqual(rb.IMAGE_MAX_BYTES, 4 * 1024 * 1024)
+
+    def test_quote_flag_is_a_boolean_only(self):
+        data = self.extract(blocks=[
+            {"t": "p", "runs": [{"text": "a"}], "q": True},
+            {"t": "p", "runs": [{"text": "b"}], "q": "yes"},
+            {"t": "p", "runs": [{"text": "c"}], "q": 1},
+            {"t": "li", "runs": [{"text": "d"}], "depth": 0, "q": True},
+            {"t": "p", "runs": [{"text": "e"}], "q": False},
+        ])
+        self.assertEqual(data["blocks"], [
+            {"t": "p", "runs": [{"text": "a"}], "q": True},
+            {"t": "p", "runs": [{"text": "b"}]},
+            {"t": "p", "runs": [{"text": "c"}]},
+            {"t": "li", "runs": [{"text": "d"}], "depth": 0},
+            {"t": "p", "runs": [{"text": "e"}]},
+        ])
+
+    def test_fallback_urls_stay_on_the_hub_and_are_validated(self):
+        big, small = "https://cdn.example.org/big.jpg", "https://cdn.example.org/small.jpg"
+        data = self.extract(images=[big, big + "2"], fallbacks=[small, "javascript:1"],
+                            blocks=[{"t": "img", "i": 0, "alt": "", "w": 1, "h": 1}])
+        self.assertNotIn(small, json.dumps(data))
+        self.assertEqual(self.rb._tabs["b1"].reader_fallbacks, [small, None])
+        self.extract(images=[big], blocks=[], fallbacks="x")
+        self.assertEqual(self.rb._tabs["b1"].reader_fallbacks, [None])
+
+    def test_smaller_candidate_is_used_when_the_large_one_fails_or_is_too_big(self):
+        big, small = "https://cdn.example.org/big.jpg", "https://cdn.example.org/small.jpg"
+        self.extract(images=[big], fallbacks=[small], blocks=[{"t": "img", "i": 0, "alt": "", "w": 1, "h": 1}])
+        asked = []
+
+        def fake(tab, url):
+            asked.append(url)
+            if url == big:
+                raise rb.ImageRefused("画像が大きすぎます")
+            return JPEG, "image/jpeg"
+        self.rb._fetch_reader_image = fake
+        self.assertEqual(self.rb.reader_image("b1", 0), (JPEG, "image/jpeg"))
+        self.assertEqual(asked, [big, small])
+        # both fail: the last error is reported, nothing else is tried
+        asked.clear()
+
+        def failing(tab, url):
+            asked.append(url)
+            raise rb.ImageUnavailable("画像を取得できません")
+        self.rb._fetch_reader_image = failing
+        with self.assertRaises(rb.ImageUnavailable):
+            self.rb.reader_image("b1", 0)
+        self.assertEqual(asked, [big, small])
+        # no fallback: only the one URL
+        self.extract(images=[big], blocks=[{"t": "img", "i": 0, "alt": "", "w": 1, "h": 1}])
+        asked.clear()
+        with self.assertRaises(rb.ImageUnavailable):
+            self.rb.reader_image("b1", 0)
+        self.assertEqual(asked, [big])

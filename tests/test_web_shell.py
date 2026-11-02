@@ -131,13 +131,13 @@ if (bad.length) { console.error("mismatch: " + bad.join(",")); process.exit(1); 
 
     def test_image_src_assignments_are_bounded(self):
         self.assertIn("/api/browser/validate", self.js)
-        # Exactly seven assignments (v0.1.35: the iframe one is gone): the remote-browser
+        # Exactly eight assignments (v0.1.35: the iframe one is gone; v0.1.37: + the image viewer's <img>): the remote-browser
         # screencast (blob: object URLs made from /api/rb/frame.jpg bytes: an
         # off-screen probe image for decoding, then the visible image), since v0.1.28
         # one tile <img> (blob: object URL of /api/rb/tile.jpg bytes) and, since v0.1.30,
         # one reader <img> (blob: object URL of /api/rb/reader/img bytes) and the two places
         # that point the live <img> at the same-origin MJPEG stream URL.
-        self.assertEqual(len(re.findall(r"\.src\s*=", self.js)), 7)
+        self.assertEqual(len(re.findall(r"\.src\s*=", self.js)), 8)
         self.assertNotIn("frame.src", self.js)
         self.assertIn("img.src = next;", self.js)
 
@@ -435,10 +435,10 @@ if (out !== want) { console.error(JSON.stringify(out)); process.exit(1); }
 
     def test_v0122_image_source_is_only_a_blob_url_from_the_binary_api(self):
         assignments = re.findall(r"(\w+)\.src\s*=\s*(.+?);", self.js)
-        self.assertEqual(sorted(a[0] for a in assignments), ["img", "img", "img", "img", "img", "probe"])
+        self.assertEqual(sorted(a[0] for a in assignments), ["img", "img", "img", "img", "img", "img", "probe"])
         # the only other <img> sources are the same-origin MJPEG stream URLs (v0.1.30)
         self.assertEqual(sorted(v for k, v in assignments if k == "img"),
-                         ["e.url", "next", "streamUrl(rb)", "streamUrl(rb)", "t.url"])
+                         ["e.url", "next", "streamUrl(rb)", "streamUrl(rb)", "t.url", "url"])
         self.assertIn("t.url = URL.createObjectURL(blob);", self.js)
         self.assertIn("e.url = URL.createObjectURL(blob);", self.js)       # reader image (v0.1.30)
         self.assertIn("/api/rb/tile.jpg?tab=", self.js)
@@ -881,6 +881,8 @@ const snapBusy = () => {};
 const $ = () => ({scrollTop: 0});
 const readerHost = {owner: null};
 const renderReaderBody = () => {};
+const readerSavedTop = () => 0;
+const syncReaderProgress = () => {};
 const cleanReaderData = raw => raw && Array.isArray(raw.blocks) ? raw : null;
 const api = async () => { if (apiError) throw apiError; return apiResult; };
 const performance = {now: () => 0};
@@ -1141,11 +1143,11 @@ class ReaderTapTargetsTest(unittest.TestCase):
         app = (root / "app.js").read_text(encoding="utf-8")
         html = (root / "index.html").read_text(encoding="utf-8")
         css = (root / "style.css").read_text(encoding="utf-8")
-        self.assertIn('id="readerSize"', html)
-        for name in ("function readerLinkRow", "function readerChips", "function cycleReaderSize"):
+        self.assertIn('id="readerAppearance"', html)       # v0.1.37: the cycle button became the Aa sheet
+        for name in ("function readerLinkRow", "function readerChips", "function stepReaderSize"):
             self.assertIn(name, app)
         # storage is optional: every access is guarded
-        self.assertIn("try { localStorage.setItem(READER_SIZE_KEY", app)
+        self.assertIn("try { localStorage.setItem(READER_PREFS_KEY", app)
         self.assertIn("min-height:44px", css.split(".reader-chip{", 1)[1].split("}", 1)[0])
 
 
@@ -1174,3 +1176,132 @@ class ReaderLinkCardsFoldTest(unittest.TestCase):
         self.assertIn("prev.node.remove()", app)
         # long = URL or an ASCII file-name run, never plain length (Japanese has no spaces)
         self.assertIn("READER_LONG_RUN.test(t)", app)
+
+
+def css_theme(css, name):
+    block = re.search(r'\.reader-scroll\[data-theme="%s"\]\{([^}]*)\}' % name, css).group(1)
+    return dict(re.findall(r"--rd-([a-z-]+):(#[0-9a-fA-F]{6})", block))
+
+
+def luminance(color):
+    channels = [int(color[i:i + 2], 16) / 255 for i in (1, 3, 5)]
+    r, g, b = [c / 12.92 if c <= 0.03928 else ((c + 0.055) / 1.055) ** 2.4 for c in channels]
+    return 0.2126 * r + 0.7152 * g + 0.0722 * b
+
+
+def contrast(a, b):
+    high, low = sorted((luminance(a), luminance(b)), reverse=True)
+    return (high + 0.05) / (low + 0.05)
+
+
+class ReaderLookTests(unittest.TestCase):
+    """v0.1.37: reader appearance settings, themes, image viewer, progress, placeholders."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.js = (WEB / "app.js").read_text(encoding="utf-8")
+        cls.html = (WEB / "index.html").read_text(encoding="utf-8")
+        cls.css = (WEB / "style.css").read_text(encoding="utf-8")
+
+    def test_themes_keep_text_and_links_readable(self):
+        for name in ("light", "sepia", "dark", "black"):
+            tokens = css_theme(self.css, name)
+            for fg in ("fg", "muted", "link"):
+                for bg in ("bg", "surface"):
+                    with self.subTest(theme=name, fg=fg, bg=bg):
+                        self.assertGreaterEqual(contrast(tokens[fg], tokens[bg]), 4.5)
+        self.assertEqual(css_theme(self.css, "black")["bg"].lower(), "#000000")
+
+    def test_sheet_and_viewer_markup_and_controls(self):
+        for ident in ("readerAppearance", "readerSheet", "readerSheetBody", "readerViewer", "rvStage", "rvImg",
+                      "rvClose", "rvPrev", "rvNext", "readerProgress", "readerProgressFill"):
+            self.assertIn('id="%s"' % ident, self.html)
+        self.assertNotIn('id="readerSize"', self.html)
+        for text in ("文字サイズ", "書体", "ゴシック", "明朝", "テーマ", "セピア", "ブラック", "行間", "本文の幅", "両端揃え",
+                     "大きく", "小さく", "表示しない", "連続画像をまとめる", "見出しを強調", "進行状況バー", "既定に戻す", "自動"):
+            self.assertIn(text, self.js)
+        self.assertIn("Hiragino Mincho ProN", self.css)
+        self.assertIn("Hiragino Kaku Gothic ProN", self.css)
+        self.assertNotRegex(self.css, r"@font-face|@import|url\(")      # system fonts only, no downloads
+        self.assertRegex(self.css, r"\.reader-viewer\{[^}]*touch-action:none")
+        self.assertIn("prefers-reduced-motion", self.css)
+        self.assertRegex(self.css, r"hanging-punctuation")
+        self.assertRegex(self.css, r"text-spacing-trim")
+
+    def test_viewer_and_sheet_build_dom_without_remote_html(self):
+        start = self.js.index("// ---- v0.1.36: reader appearance")
+        end = self.js.index("function readerNode(rb, block) {")
+        text = self.js[start:end]
+        for token in ("innerHTML", "outerHTML", "insertAdjacentHTML", "document.write", "eval(", "new Function", "window.open", "srcdoc"):
+            self.assertNotIn(token, text)
+        self.assertNotRegex(text, r"(?<!dataset)\.href\s*=(?!=)")
+
+    def test_prefs_clean_migrate_and_survive_broken_storage(self):
+        if shutil.which("node") is None:
+            self.skipTest("node missing")
+        start = self.js.index("const READER_PREFS_KEY")
+        end = self.js.index("function syncReaderProgress()")
+        script = """
+let store = {}, broken = false;
+const localStorage = {getItem: k => { if (broken) throw new Error("x"); return k in store ? store[k] : null; },
+  setItem: (k, v) => { if (broken) throw new Error("x"); store[k] = v; }};
+%s
+const eq = (a, b, m) => { if (JSON.stringify(a) !== JSON.stringify(b)) { console.error(m + ": " + JSON.stringify(a)); process.exit(1); } };
+const D = {size: 16, font: "gothic", theme: "auto", leading: 1, width: 1, justify: true, images: "normal", group: true, headings: true, progress: true};
+eq(readerPrefsLoad(), D, "defaults");
+store["qd.readerSize"] = "3";
+eq(readerPrefsLoad().size, 22, "old size index migrates to the nearest step (ties go down)");
+store["qd.readerSize"] = "0";
+eq(readerPrefsLoad().size, 14, "old small");
+store["qd.readerSize"] = "9";
+eq(readerPrefsLoad().size, 16, "bad old index");
+readerPrefsSave(Object.assign({}, D, {theme: "sepia", size: 20}));
+eq(readerPrefsLoad().theme, "sepia", "saved");
+eq(readerPrefsLoad().size, 20, "saved prefs win over the old key");
+store["qd.readerPrefs"] = JSON.stringify({size: 99, font: "comic", theme: "pink", leading: 7, width: -1, justify: "yes", images: "x", group: 0, headings: false, progress: false, extra: 1});
+eq(readerPrefsLoad(), Object.assign({}, D, {headings: false, progress: false}), "invalid values fall back per key");
+store["qd.readerPrefs"] = "not json";
+eq(readerPrefsLoad(), D, "garbage");
+store["qd.readerPrefs"] = "[1,2]";
+eq(readerPrefsLoad(), D, "array");
+broken = true;
+eq(readerPrefsLoad(), D, "unreadable storage");
+readerPrefsSave(D);
+eq(READER_SIZE_STEPS.length >= 7 && READER_SIZE_STEPS.length <= 8, true, "steps");
+eq([READER_SIZE_STEPS[0], READER_SIZE_STEPS[READER_SIZE_STEPS.length - 1]], [13, 26], "range");
+""" % self.js[start:end]
+        result = subprocess.run(["node", "-e", script], capture_output=True, text=True, timeout=20)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_reading_position_is_remembered_per_url(self):
+        if shutil.which("node") is None:
+            self.skipTest("node missing")
+        start = self.js.index("const READER_POS_MAX")
+        end = self.js.index("// ---- appearance sheet")
+        script = """
+%s
+const eq = (a, b, m) => { if (JSON.stringify(a) !== JSON.stringify(b)) { console.error(m + ": " + JSON.stringify(a)); process.exit(1); } };
+const rb = {reader: {data: {url: "https://a/1"}}};
+readerRememberTop(rb, 120.4);
+eq(readerSavedTop(rb, "https://a/1"), 120, "stored");
+eq(readerSavedTop(rb, "https://a/2"), 0, "unknown url");
+rb.reader = null;
+eq(readerSavedTop(rb, "https://a/1"), 120, "survives dropReader");
+readerRememberTop(rb, 5);
+eq(readerSavedTop(rb, "https://a/1"), 120, "no data: nothing recorded");
+rb.reader = {data: {url: "x"}};
+for (let i = 0; i < 100; i++) { rb.reader.data.url = "u" + i; readerRememberTop(rb, i); }
+eq(Object.keys(rb.readerPos).length, READER_POS_MAX, "bounded");
+eq(readerSavedTop(rb, "u99"), 99, "newest kept");
+""" % self.js[start:end]
+        result = subprocess.run(["node", "-e", script], capture_output=True, text=True, timeout=20)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_images_have_placeholders_modes_and_a_zoom_button_for_linked_ones(self):
+        for needle in ("reader-hold", "reader-zoom", "reader-grid", "is-loaded", "is-failed", "figure.style.aspectRatio",
+                       "readerPrefs.group", "block.q === true", "openReaderViewer(fig)"):
+            self.assertIn(needle, self.js)
+        for needle in ('[data-images="full"]', '[data-images="small"]', '[data-images="none"]', ".rd-justify", ".rd-heads",
+                       ".reader-quote", "rdShimmer"):
+            self.assertIn(needle, self.css)
+        self.assertNotRegex(self.css, r"\.rd-justify[^{]*\.reader-(h|card)")         # never justify headings or cards
