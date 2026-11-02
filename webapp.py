@@ -13,7 +13,7 @@ import signal
 import sqlite3
 import threading
 import time
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, quote, urlsplit
 
 import self_update
 import storage
@@ -26,7 +26,7 @@ import engine_supervisor
 import remote_browser
 import updater
 
-VERSION = "0.1.21"
+VERSION = "0.1.22"
 PORT = 17864
 ROOT = Path(__file__).resolve().parent
 FILES = {"/": ("web/index.html", "text/html; charset=utf-8"),
@@ -224,11 +224,14 @@ class Handler(BaseHTTPRequestHandler):
             return
         super().log_message(format, *args)
 
-    def send_data(self, status, data, content_type="application/json; charset=utf-8"):
+    def send_data(self, status, data, content_type="application/json; charset=utf-8", extra=None):
         raw = json.dumps(data, ensure_ascii=False).encode("utf-8") if not isinstance(data, bytes) else data
         self.send_response(status)
-        self.send_header("Content-Type", content_type)
-        self.send_header("Content-Length", str(len(raw)))
+        if status != 204:       # a 204 has neither a body nor a Content-Length
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(raw)))
+        for name, value in (extra or {}).items():
+            self.send_header(name, value)
         self.send_header("Cache-Control", "no-store")
         # No Strict-Transport-Security on purpose: the same host name is also
         # reached over plain HTTP on the LAN/tailnet, and HSTS would make
@@ -237,11 +240,12 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("X-Frame-Options", "DENY")
         self.send_header("Referrer-Policy", "no-referrer")
         self.send_header("Permissions-Policy", "geolocation=(),camera=(),microphone=(),payment=()")
-        # img-src data: is needed ONLY for the remote-browser screencast: the UI
-        # sets one <img> to data:image/jpeg;base64,... built from /api/rb/frame
-        # (Hub-controlled bytes). 'self' alone cannot display it; blob: is not
-        # allowed. No other directive changes (default-src 'none', no inline).
-        self.send_header("Content-Security-Policy", "default-src 'none'; img-src 'self' data:; script-src 'self'; style-src 'self'; connect-src 'self'; frame-src https:; base-uri 'none'; frame-ancestors 'none'; form-action 'self'")
+        # img-src blob: is needed ONLY for the remote-browser screencast: the UI
+        # fetches /api/rb/frame.jpg (Hub-controlled JPEG bytes), wraps them in a
+        # Blob and sets one <img> to URL.createObjectURL(blob). 'self' alone
+        # cannot display a blob: URL. data: stays for the JSON fallback endpoint
+        # (/api/rb/frame). No other directive changes (default-src 'none', no inline).
+        self.send_header("Content-Security-Policy", "default-src 'none'; img-src 'self' data: blob:; script-src 'self'; style-src 'self'; connect-src 'self'; frame-src https:; base-uri 'none'; frame-ancestors 'none'; form-action 'self'")
         if getattr(self, "_cookie", None):
             self.send_header("Set-Cookie", self._cookie)
         self.end_headers()
@@ -424,7 +428,7 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/rb/log":
                 # RAM ring only (early-exit reasons from the browser container).
                 return self.send_data(200, {"lines": self.server.rb.log_lines()})
-            if path == "/api/rb/frame":
+            if path in ("/api/rb/frame", "/api/rb/frame.jpg"):
                 query = parse_qs(urlsplit(self.path).query)
                 since_text = query.get("since", ["0"])[0]
                 if not since_text.isdecimal() or len(since_text) > 12:
@@ -432,8 +436,36 @@ class Handler(BaseHTTPRequestHandler):
                 wait_text = query.get("wait", [str(int(remote_browser.FRAME_WAIT_MAX))])[0]
                 if not wait_text.isdecimal() or len(wait_text) > 2 or int(wait_text) > 10:
                     raise ValueError("waitが不正です")
-                return self.send_data(200, self.server.rb.frame(
-                    query.get("tab", [""])[0], int(since_text), wait=int(wait_text)))
+                rev_text = query.get("rev", [None])[0]
+                if rev_text is not None and (not rev_text.isdecimal() or len(rev_text) > 12):
+                    raise ValueError("revが不正です")
+                rev = None if rev_text is None else int(rev_text)
+                tab_id = query.get("tab", [""])[0]
+                if path == "/api/rb/frame":
+                    return self.send_data(200, self.server.rb.frame(
+                        tab_id, int(since_text), wait=int(wait_text), rev=rev))
+                result = self.server.rb.frame_image(tab_id, int(since_text), wait=int(wait_text), rev=rev)
+                headers = {
+                    "X-Frame-Seq": str(result["seq"]),
+                    "X-Frame-Width": str(result["width"]),
+                    "X-Frame-Height": str(result["height"]),
+                    "X-Frame-Url": quote(result["url"], safe=""),
+                    "X-Frame-Title": quote(result["title"][:200], safe=""),
+                    "X-Frame-Loading": "1" if result["loading"] else "0",
+                    "X-Frame-Intercepts": str(result["intercepts"]),
+                    "X-Frame-Rev": str(result["rev"]),
+                    "X-Frame-Blocked": quote((result["blocked"] or "")[:200], safe=""),
+                }
+                if result["jpeg"] is None:
+                    return self.send_data(204, b"", extra=headers)
+                return self.send_data(200, result["jpeg"], "image/jpeg", extra=headers)
+            if path == "/api/rb/intercepts":
+                query = parse_qs(urlsplit(self.path).query)
+                since_text = query.get("since", ["0"])[0]
+                if not since_text.isdecimal() or len(since_text) > 12:
+                    raise ValueError("sinceが不正です")
+                return self.send_data(200, {"items": self.server.rb.intercepts(
+                    query.get("tab", [""])[0], int(since_text))})
             if path == "/api/rb/links":
                 query = parse_qs(urlsplit(self.path).query)
                 return self.send_data(200, self.server.rb.links(query.get("tab", [""])[0]))
@@ -456,6 +488,31 @@ class Handler(BaseHTTPRequestHandler):
         except (OSError, ValueError, RuntimeError, KeyError, sqlite3.Error) as exc:
             return self.reject(str(exc))
         self.reject("APIが存在しません", 404)
+
+    def send_staged_link(self, ident=None, url=None):
+        """Send one staged link to JD2 (the only send path).
+
+        With `url` (remote-browser intercepts) the link is staged first and the
+        engine must be able to send. Serialized with JD2 independent update and
+        preset reapply. The read-only preflight runs before the intent is marked
+        sending; there is no automatic retry after uncertain sends.
+        """
+        chosen = checked_directory(self.store.settings().get("download_dir"))
+        with self.server.jd2.lock:
+            adapter = self.server.jd2._require()
+            if url is not None and getattr(adapter, "can_send", False) is not True:
+                raise ValueError("JD2へ送信できる状態ではありません（エンジンの状態を確認してください）")
+            jd2_transfer.prepare_transfer(adapter, str(chosen))
+            if url is not None:
+                ident = self.store.add_link(url)["id"]
+            url = self.store.begin_send(ident)
+            try:
+                outcome = jd2_transfer.transfer(adapter, url, str(chosen))
+            except Exception:
+                self.store.finish_send(ident, "uncertain")
+                raise ValueError("JD2への送信結果が不明です。JD2で確認してください") from None
+            self.store.finish_send(ident, "sent")
+        return outcome
 
     def share_attempt_failed(self, address):
         with SESSION_LOCK:
@@ -612,22 +669,7 @@ class Handler(BaseHTTPRequestHandler):
                     "items": found, "count": len(found), "digest": evidence,
                     "saved": False, "limit": limit})
             if path == "/api/links/send":
-                chosen = checked_directory(self.store.settings().get("download_dir"))
-                ident = body.get("id")
-                # Serialize with JD2 independent update and preset reapply.
-                # The read-only preflight runs before the intent is marked
-                # sending; there is no automatic retry after uncertain sends.
-                with self.server.jd2.lock:
-                    adapter = self.server.jd2._require()
-                    jd2_transfer.prepare_transfer(adapter, str(chosen))
-                    url = self.store.begin_send(ident)
-                    try:
-                        outcome = jd2_transfer.transfer(adapter, url, str(chosen))
-                    except Exception:
-                        self.store.finish_send(ident, "uncertain")
-                        raise ValueError("JD2への送信結果が不明です。JD2で確認してください") from None
-                    self.store.finish_send(ident, "sent")
-                return self.send_data(200, outcome)
+                return self.send_data(200, self.send_staged_link(ident=body.get("id")))
             if path == "/api/update/apply":
                 return self.send_data(202, self.server.updates.apply(body.get("version"), channel=body.get("channel", "rc")))
             if path == "/api/engine/setup":
@@ -671,6 +713,18 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_data(200, self.server.rb.navigate(body.get("tab"), checked))
             if path == "/api/rb/input":
                 return self.send_data(200, self.server.rb.send_input(body.get("tab"), body))
+            if path == "/api/rb/viewport":
+                return self.send_data(200, self.server.rb.set_viewport(
+                    body.get("tab"), body.get("width"), body.get("height"), body.get("dpr")))
+            if path == "/api/rb/intercepts/open":
+                return self.send_data(200, self.server.rb.open_intercept(body.get("tab"), body.get("id")))
+            if path == "/api/rb/intercepts/add":
+                item = self.server.rb.intercept(body.get("tab"), body.get("id"))
+                return self.send_data(201, self.store.add_link(item["url"]))
+            if path == "/api/rb/intercepts/send":
+                item = self.server.rb.intercept(body.get("tab"), body.get("id"))
+                # Same path as /api/links/send; the link is staged inside the JD2 lock.
+                return self.send_data(200, self.send_staged_link(url=item["url"]))
             if path == "/api/engine/start":
                 self.server.engine.start()
                 return self.send_data(202, {"started": True})

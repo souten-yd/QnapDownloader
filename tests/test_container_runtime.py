@@ -633,10 +633,12 @@ class BrowserDockerfileStaticTests(unittest.TestCase):
         for flag in ("--remote-debugging-port=9222", "--user-data-dir=/profile", "--disk-cache-size=1",
                      "--media-cache-size=1", "--disable-breakpad", "--disable-crash-reporter",
                      "--no-first-run", "--no-default-browser-check", "--disable-sync",
-                     "--disable-background-networking", "--lang=ja", "--window-size=1280,2000",
-                     "about:blank"):
+                     "--disable-background-networking", "--lang=ja", "--window-size=1600,2400",
+                     "--disable-features=Translate,MediaRouter,OptimizationHints",
+                     "--renderer-process-limit=2", "--disable-extensions",
+                     "--disable-component-update", "--mute-audio", "about:blank"):
             self.assertIn(flag, self.entry)
-        self.assertIn("Xvfb :99 -screen 0 1280x2000x24", self.entry)
+        self.assertIn("Xvfb :99 -screen 0 1600x2400x24", self.entry)
         self.assertIn("socat TCP-LISTEN:9223,fork,reuseaddr,bind=0.0.0.0 TCP:127.0.0.1:9222", self.entry)
         self.assertIn("exit 78", self.entry)
 

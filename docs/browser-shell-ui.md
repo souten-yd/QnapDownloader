@@ -173,11 +173,17 @@ QnapDownloaderの画面を「普段使っているWebブラウザ」と同じ感
 Cloudflare等で手元のブラウザ（iframe）では開けないサイトを、NAS上のコンテナ内Chromiumで開く第3のモード。設計・安全性は [container-runtime.md](container-runtime.md) §4。端末には外部サイトの通信もスクリプトも届かず、HubのJPEGフレームと入力だけがやり取りされる。
 
 - モード: `"remote"` はホスト別の記憶値（`external` と同じ `qnapdl.hostmodes.v1`）とタブのフラグ `tab.remote` で、`MODES`/sandbox値ではない（sandbox定数は3つのまま）。Cloudflareヒントのバーとメニューの「NASブラウザで開く」を選ぶと、そのホストが「NASブラウザで開くサイト」（設定 › NASブラウザ）に記憶される（解除可）。メニューの「NASブラウザをやめる（通常表示へ）」で戻せる。
-- 表示: `#remoteView` の `<img>` に、`GET /api/rb/frame?tab=&since=` のロングポーリング結果から `data:image/jpeg;base64,…` を設定する（`.src =` は iframe の `validatedUrl` とこの1箇所だけ。base64は形式検査してから使う）。ポーリングは「リモートタブが表示中かつページが可視」のときだけ1本。外れるとHubが5秒でスクリーンキャストを止める。
-- 入力: タップ→`tap`、ドラッグ→`scroll`（約80msに1回）、PCのホイール→`scroll`。座標はHubが返すフレームの幅・高さ（CSSピクセル）に換算。「キーボード」ボタンで非表示の入力欄にフォーカス（iOSのキーボード用）、IMEは `compositionend` で確定文字だけ送る。Enter/Backspace/Tab/矢印/Esc/Delete は `key`。戻る/進む/再読み込みは `back`/`forward`/`reload`。
+- 表示（v0.1.22で変更）: `#remoteView` の `<img>` に、`GET /api/rb/frame.jpg` のロングポーリング（`since`/`rev`）で受けたJPEGバイトを `Blob` → `URL.createObjectURL` で設定する（旧：data URL）。新しい画像はまず画面外の `Image` で `decode()` してから切り替え（ダブルバッファ）、直前のオブジェクトURLは `URL.revokeObjectURL` で解放する。`.src =` は iframe の `validatedUrl` と、この `probe`/`img` の2箇所。ポーリングは「リモートタブが表示中かつページが可視」のときだけ1本。外れるとHubが5秒でスクリーンキャストを止める。
+- 入力: タップ→`tap`、ドラッグ／PCのホイール→`scroll`（v0.1.22：差分を合算して**アニメーションフレームごとに1回**、前の送信が完了するまで次は送らず合算を続ける）。座標はHubが返すフレームの幅・高さ（CSSピクセル）に換算。「キーボード」ボタンで非表示の入力欄にフォーカス（iOSのキーボード用）、IMEは `compositionend` で確定文字だけ送る。Enter/Backspace/Tab/矢印/Esc/Delete は `key`。戻る/進む/再読み込みは `back`/`forward`/`reload`。
 - 「リンク N件」バッジ: ページ読み込み完了の1.2秒後に `GET /api/rb/links` で更新。タップで下からのシート（URL一覧）、「N件を追加」は既存の `/api/rapidgator/extract`（プレビュー→digest付きcommit）で追加したリンクへ、「JD2へ送る」（エンジンの `can_send` のときだけ）は追加後に既存の `sendLinks`（確認ダイアログあり）。
 - 復元: 再読み込み後、リモートタブのURL履歴は復元するが、NAS側のタブは自動では開かない（「NASブラウザで開く」ボタン）。Webタブを閉じる／ログアウトすると対応するNASタブを閉じる。コンテナが自動停止していたら404で検知して案内する。
 - 設定 › NASブラウザ（エンジンの次）: 状態（停止中/起動中/稼働中）、メモリ使用量とNAS空きメモリ、「初期設定（イメージ作成）」（確認ダイアログ→段階表示、エンジンの初期設定と同じ表示）、「停止」、メモリ保護と自動停止の説明、Container Station未導入の案内。
 - 設定 › エンジン › 詳細: 従来方式のJava削除（`native_leftovers.present` のときだけ表示）。
-- CSP: `img-src 'self' data:`（スクリーンキャスト表示にだけ必要。`blob:` は許可しない。他のディレクティブは不変）。
-- 既知の制約（実機未検証）: ページは1280×2000のデスクトップ表示のままiPhoneの幅に縮小して見せる。ピンチ拡大は未対応（操作はタップ/ドラッグ/キーボード）。
+- CSP: v0.1.22で `img-src 'self' data: blob:`（`blob:` はスクリーンキャストのオブジェクトURLにだけ必要。他のディレクティブは不変）。
+- 既知の制約（実機未検証）: ピンチ拡大は未対応（操作はタップ/ドラッグ/キーボード）。（v0.1.22でページは端末の表示領域に合わせたサイズになった。）
+
+### v0.1.22 速度・リンク検出
+- **ビューポート**: 画面（`#remoteStage`）のCSSサイズとdevicePixelRatioを `POST /api/rb/viewport` で送る。送るタイミングは、最初のフレームを要求する前（タブを開いた／切り替えて戻った直後）と、`ResizeObserver`／`resize` の250msデバウンス後（回転・キーボードなど）。幅760未満はHub側でモバイルとして描画される。ブラウザの識別文字列は変えない。
+- **タップ**: 座標は、最新フレームのヘッダ（`X-Frame-Width/Height`＝CSSサイズ）と表示中の`<img>`の大きさの比で換算する。
+- **検出ボトムシート**（`#interceptSheet`）: `X-Frame-Intercepts` が増えたら `GET /api/rb/intercepts?tab=&since=` で取得し、キューに積む（最大20件、表示中のタブ分だけ先頭から1件ずつ）。見出し「リンクを検出しました」、URL（1行・末尾省略）、ボタン「JD2へ送る」（主ボタン。`can_send` のときだけ表示。確認ダイアログあり）「リンクに追加」（`can_send` でないときは主ボタン）「ページを開く」（ホスターのみ。Fetch検出を1回だけ素通しにして開く）「閉じる」。他に待機中があれば「ほかN件が待機中」。**ポップアップ（`kind:"popup"`）はシートを出さず**、画面下の小さなトースト「ポップアップ: <ホスト名> を開く」＋「開く」（`POST /api/rb/intercepts/open` でタブを遷移）を表示する。同時に1つだけ（最新が優先）、8秒で自動的に消え、タブ切り替え・閉鎖でも消える。ホスターのポップアップは従来どおりシート。従来の「リンク N件」バッジ（ページ内リンクの一覧）はそのまま。
+- DOMは `textContent` のみ（`innerHTML` 不使用）。

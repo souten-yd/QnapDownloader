@@ -47,6 +47,23 @@ LINK_RESULT_CAP = rapidgator_extract.HARD_LIMIT
 SCREENCAST = {"format": "jpeg", "quality": 60, "maxWidth": 1280, "maxHeight": 2000,
               "everyNthFrame": 1}
 DEFAULT_SIZE = (1280, 2000)
+WINDOW_SIZE = (1600, 2400)     # matches the Xvfb screen: emulated viewports always fit
+VIEWPORT_W = (320, 1600)       # CSS pixels accepted from the viewer
+VIEWPORT_H = (320, 2400)
+VIEWPORT_DPR = (1.0, 3.0)
+MAX_SCALE = 2.0                # device scale factor / screencast scale is capped here
+MOBILE_WIDTH = 760             # narrower viewports are emulated as a touch device
+QUALITY_MOBILE = 50
+QUALITY_DESKTOP = 60
+# Hoster pages that are intercepted (aborted) instead of rendered. Only these
+# Document requests are ever paused; every other request is untouched.
+FETCH_PATTERNS = tuple({"urlPattern": pattern, "resourceType": "Document"} for pattern in (
+    "*://rapidgator.net/file/*", "*://*.rapidgator.net/file/*", "*://rg.to/file/*"))
+INTERCEPT_CAP = 20             # events kept per tab (RAM only)
+INTERCEPT_DEDUP = 2.0          # an identical event within this many seconds is one event
+BYPASS_TTL = 30.0              # a "page open" bypass is valid for one navigation, this long
+POPUP_WAIT = 3.0               # popups: wait this long for the first URL
+POPUP_BLOCKED = "ポップアップをブロックしました"
 SETUP_CACHE_TTL = 30.0
 CS_CACHE_TTL = 60.0
 WS_PATH = re.compile(r"/devtools/browser/[A-Za-z0-9-]{1,100}\Z")
@@ -437,11 +454,15 @@ class Tab:
         self.seq = 0
         self.size = DEFAULT_SIZE
         self.screencast = False
-        self.pending_ack = None
-        self.last_ack = 0.0
+        self.viewport = None       # (css width, css height, capped scale) once the viewer reported it
+        self.touch = False
         self.last_poll = now
         self.pollers = 0
         self.blocked = None
+        self.rev = 0               # bumped on every change of url/title/loading/blocked/intercepts
+        self.intercepts = deque(maxlen=INTERCEPT_CAP)
+        self.intercept_seq = 0     # id of the newest intercept event (monotonic per tab)
+        self.bypass = {}           # exact URL -> expiry; lets one navigation through the Fetch pattern
 
 
 def _scheme_ok(url):
@@ -469,6 +490,7 @@ class RemoteBrowser:
         self._conn = None
         self._tabs = {}
         self._by_session = {}
+        self._popups = {}          # popup target id -> owning Tab, until its first URL is known
         self._anchor = None
         self._next_id = 1
         self._last_activity = clock()
@@ -783,7 +805,8 @@ class RemoteBrowser:
             self._conn = conn
             self._call("Target.setDiscoverTargets", {"discover": True})
             # Downloads are never allowed; failing to set this aborts the start.
-            self._call("Browser.setDownloadBehavior", {"behavior": "deny"})
+            # (eventsEnabled: Browser.downloadWillBegin is reported as an intercept.)
+            self._call("Browser.setDownloadBehavior", {"behavior": "deny", "eventsEnabled": True})
             pages = [t for t in self._call("Target.getTargets").get("targetInfos", [])
                      if isinstance(t, dict) and t.get("type") == "page"]
             anchor = pages[0].get("targetId") if pages else None
@@ -820,6 +843,7 @@ class RemoteBrowser:
         with self._cv:
             self._tabs.clear()
             self._by_session.clear()
+            self._popups.clear()
             self._anchor = None
             self._state = "stopped"
             self._stats_cache = None
@@ -927,7 +951,7 @@ class RemoteBrowser:
     def _create_tab(self, checked):
         created = self._call("Target.createTarget", {
             "url": "about:blank", "newWindow": True,
-            "width": DEFAULT_SIZE[0], "height": DEFAULT_SIZE[1]})
+            "width": WINDOW_SIZE[0], "height": WINDOW_SIZE[1]})
         target = created.get("targetId")
         if not isinstance(target, str) or not TARGET_ID.match(target):
             raise BrowserError("タブを作成できません")
@@ -947,6 +971,12 @@ class RemoteBrowser:
                 self._by_session[session] = tab
             self._call("Page.enable", session=session)
             self._call("Emulation.setFocusEmulationEnabled", {"enabled": True}, session=session)
+            try:
+                self._call("Fetch.enable", {"patterns": [dict(p) for p in FETCH_PATTERNS]},
+                           session=session)
+            except BrowserError as error:
+                # Not a safety control: without it hoster pages simply load.
+                self.log("Fetch.enable failed: %s" % error)
             self._call("Page.navigate", {"url": checked}, session=session)
         except BrowserError:
             self._drop_tab(tab, close=True)
@@ -983,6 +1013,54 @@ class RemoteBrowser:
         self._call("Page.navigate", {"url": checked}, session=tab.session)
         return {"id": tab.id, "url": checked}
 
+    # ------------------------------------------------------------ viewport
+    @staticmethod
+    def _dimension(value, bounds, name):
+        if (isinstance(value, bool) or not isinstance(value, int) or
+                not bounds[0] <= value <= bounds[1]):
+            raise BrowserError("%sは%d〜%dの整数で指定してください" % (name, bounds[0], bounds[1]))
+        return value
+
+    def _screencast_params(self, tab):
+        view = tab.viewport
+        if view is None:
+            return dict(SCREENCAST)
+        width, height, scale = view
+        return {"format": "jpeg",
+                "quality": QUALITY_MOBILE if width < MOBILE_WIDTH else QUALITY_DESKTOP,
+                "maxWidth": int(round(width * scale)), "maxHeight": int(round(height * scale)),
+                "everyNthFrame": 1}
+
+    def set_viewport(self, ident, width, height, dpr):
+        """Size the page to the viewer (CSS pixels) so no pixels are wasted."""
+        width = self._dimension(width, VIEWPORT_W, "width")
+        height = self._dimension(height, VIEWPORT_H, "height")
+        if (isinstance(dpr, bool) or not isinstance(dpr, (int, float)) or dpr != dpr or
+                not VIEWPORT_DPR[0] <= dpr <= VIEWPORT_DPR[1]):
+            raise BrowserError("dprは1〜3で指定してください")
+        tab = self._tab(ident)
+        self._touch()
+        scale = min(float(dpr), MAX_SCALE)
+        mobile = width < MOBILE_WIDTH
+        view = (width, height, scale)
+        with self._lock:
+            if tab.viewport == view:
+                return {"ok": True, "changed": False}
+            touch = tab.touch
+        session = tab.session
+        self._call("Emulation.setDeviceMetricsOverride", {
+            "width": width, "height": height, "deviceScaleFactor": scale, "mobile": mobile}, session)
+        if mobile != touch:
+            self._call("Emulation.setTouchEmulationEnabled", {"enabled": mobile}, session)
+        with self._lock:
+            tab.viewport, tab.touch = view, mobile
+            running = tab.screencast
+        if running:
+            # New frame size / quality: restart the already running screencast.
+            self._call("Page.stopScreencast", session=session, timeout=5.0)
+            self._call("Page.startScreencast", self._screencast_params(tab), session=session)
+        return {"ok": True, "changed": True}
+
     # ------------------------------------------------------------ events
     def _find_by_target(self, target):
         for tab in self._tabs.values():
@@ -1009,11 +1087,18 @@ class RemoteBrowser:
                 tab = self._by_session.get(message.get("sessionId"))
                 frame_id = params.get("frameId")
                 if tab is not None and isinstance(frame_id, str):
+                    before = bool(tab.loading)
                     if method.endswith("StartedLoading"):
                         tab.loading.add(frame_id)
                     else:
                         tab.loading.discard(frame_id)
+                    if before != bool(tab.loading):
+                        tab.rev += 1
                     self._cv.notify_all()
+        elif method == "Fetch.requestPaused":
+            self._on_request_paused(message.get("sessionId"), params, conn)
+        elif method == "Browser.downloadWillBegin":
+            self._on_download(params)
         elif method == "Page.javascriptDialogOpening":
             tab = self._by_session.get(message.get("sessionId"))
             if tab is not None and conn is not None:
@@ -1025,22 +1110,126 @@ class RemoteBrowser:
         ack = params.get("sessionId")
         with self._cv:
             tab = self._by_session.get(session)
-            if tab is None:
-                tab = None
-            else:
-                if (isinstance(data, str) and 0 < len(data) <= FRAME_MAX_CHARS and
-                        BASE64.match(data)):
-                    tab.frame = data
-                    tab.seq += 1
-                    meta = params.get("metadata") if isinstance(params.get("metadata"), dict) else {}
-                    width, height = meta.get("deviceWidth"), meta.get("deviceHeight")
-                    if (isinstance(width, (int, float)) and isinstance(height, (int, float)) and
-                            0 < width <= 20000 and 0 < height <= 20000):
-                        tab.size = (int(width), int(height))
-                if isinstance(ack, int):
-                    # Acked lazily by the next viewer poll (flow control).
-                    tab.pending_ack = ack
+            if tab is not None and (isinstance(data, str) and 0 < len(data) <= FRAME_MAX_CHARS and
+                                    BASE64.match(data)):
+                # Only the newest frame is kept; older ones are simply replaced.
+                tab.frame = data
+                tab.seq += 1
+                meta = params.get("metadata") if isinstance(params.get("metadata"), dict) else {}
+                width, height = meta.get("deviceWidth"), meta.get("deviceHeight")
+                if (isinstance(width, (int, float)) and isinstance(height, (int, float)) and
+                        0 < width <= 20000 and 0 < height <= 20000):
+                    tab.size = (int(width), int(height))
+            if tab is not None:
                 self._cv.notify_all()
+        # Ack at once (still on the reader thread, no waiting for a response), so
+        # Chromium keeps producing frames without waiting for the viewer's next poll.
+        if tab is not None and isinstance(ack, int) and not isinstance(ack, bool) and conn is not None:
+            try:
+                conn.send_nowait("Page.screencastFrameAck", {"sessionId": ack}, session=session)
+            except CDPError:
+                pass
+
+    # ------------------------------------------------- intercepts (RAM only)
+    def _add_intercept(self, tab, kind, url):
+        now = self._clock()
+        with self._cv:
+            last = tab.intercepts[-1] if tab.intercepts else None
+            if (last is not None and last["kind"] == kind and last["url"] == url and
+                    now - last["t"] < INTERCEPT_DEDUP):
+                return
+            tab.intercept_seq += 1
+            tab.intercepts.append({"id": tab.intercept_seq, "kind": kind, "url": url, "t": now})
+            tab.rev += 1
+            self._cv.notify_all()
+
+    def _on_request_paused(self, session, params, conn):
+        request_id = params.get("requestId")
+        request = params.get("request") if isinstance(params.get("request"), dict) else {}
+        url = request.get("url") if isinstance(request.get("url"), str) else ""
+        if conn is None or not isinstance(request_id, str):
+            return
+        now = self._clock()
+        with self._cv:
+            tab = self._by_session.get(session)
+            bypassed = False
+            if tab is not None:
+                tab.bypass = {u: t for u, t in tab.bypass.items() if t > now}
+                bypassed = tab.bypass.pop(url, None) is not None
+        normalized = rapidgator_extract.normalize(url) if len(url) <= 4096 else None
+        try:
+            if tab is None or bypassed or params.get("resourceType") != "Document" or normalized is None:
+                # Never block what is not a recognisable hoster file page.
+                conn.send_nowait("Fetch.continueRequest", {"requestId": request_id}, session=session)
+                return
+            conn.send_nowait("Fetch.failRequest", {"requestId": request_id, "errorReason": "Aborted"},
+                             session=session)
+        except CDPError:
+            return
+        self._add_intercept(tab, "hoster", normalized)
+
+    def _on_download(self, params):
+        url = params.get("url")
+        if not isinstance(url, str) or not url.startswith("https://") or len(url) > 2048:
+            return
+        frame_id = params.get("frameId")
+        with self._cv:
+            tab = self._find_by_target(frame_id) if isinstance(frame_id, str) else None
+            if tab is None and self._tabs:
+                tab = max(self._tabs.values(), key=lambda t: t.last_poll)
+        if tab is not None:
+            self._add_intercept(tab, "download", rapidgator_extract.normalize(url) or url)
+
+    # ----------------------------------------------------------------- popups
+    @staticmethod
+    def _real_url(url):
+        return isinstance(url, str) and url not in ("", "about:blank")
+
+    def _popup_opened(self, target, owner, url, conn):
+        with self._cv:
+            self._popups[target] = owner
+        if self._real_url(url):
+            self._popup_resolve(target, url)
+            return
+        timer = threading.Timer(POPUP_WAIT, self._popup_resolve, (target, None))
+        timer.daemon = True
+        timer.start()
+
+    def _popup_resolve(self, target, url):
+        """Close the popup, then record what its first URL is (the opener is not moved)."""
+        with self._cv:
+            owner = self._popups.pop(target, None)
+            alive = owner is not None and self._tabs.get(owner.id) is owner
+        conn = self._conn
+        if owner is None or conn is None:
+            return
+        try:
+            conn.send_nowait("Target.closeTarget", {"targetId": target})
+        except CDPError:
+            return
+        if not alive:
+            return
+        if not self._real_url(url):
+            self._popup_note(owner)
+            return
+        normalized = rapidgator_extract.normalize(url)
+        if normalized is not None:
+            self._add_intercept(owner, "hoster", normalized)
+            return
+        try:
+            checked = browser_safety.validate(url)
+        except ValueError:
+            self._popup_note(owner)
+            return
+        # Never navigate the opener on its own (ad popups would hijack the tab):
+        # the viewer decides through "intercepts/open".
+        self._add_intercept(owner, "popup", checked)
+
+    def _popup_note(self, tab):
+        with self._cv:
+            tab.blocked = POPUP_BLOCKED
+            tab.rev += 1
+            self._cv.notify_all()
 
     def _on_target_info(self, method, info, conn):
         target = info.get("targetId")
@@ -1050,21 +1239,38 @@ class RemoteBrowser:
             tab = self._find_by_target(target)
             known = tab is not None or target == self._anchor
         if tab is None:
-            # A popup opened by a page (window.open / target=_blank): never keep it.
-            if not known and info.get("openerId") and conn is not None:
-                try:
-                    conn.send_nowait("Target.closeTarget", {"targetId": target})
-                except CDPError:
-                    pass
+            if known or conn is None:
+                return
+            url = info.get("url") if isinstance(info.get("url"), str) else ""
+            with self._cv:
+                waiting = target in self._popups
+                owner = self._find_by_target(info.get("openerId")) if info.get("openerId") else None
+            if waiting:
+                if self._real_url(url):
+                    self._popup_resolve(target, url)
+            elif method == "Target.targetCreated" and info.get("openerId"):
+                if owner is None:
+                    # Opened by something that is not one of our tabs: never keep it.
+                    try:
+                        conn.send_nowait("Target.closeTarget", {"targetId": target})
+                    except CDPError:
+                        pass
+                else:
+                    # A popup (window.open / target=_blank): wait for its first URL, close
+                    # it, and either report a hoster link or follow it in the opener tab.
+                    self._popup_opened(target, owner, url, conn)
             return
         url = info.get("url") if isinstance(info.get("url"), str) else ""
         title = info.get("title") if isinstance(info.get("title"), str) else ""
         block = not _scheme_ok(url)
         with self._cv:
+            before = (tab.url, tab.title, tab.blocked)
             tab.url = url[:2048] if not block else tab.url
             tab.title = title[:300]
             if block:
                 tab.blocked = "https以外のアドレスはブロックしました"
+            if before != (tab.url, tab.title, tab.blocked):
+                tab.rev += 1
             self._cv.notify_all()
         if block and conn is not None and tab.session:
             try:
@@ -1075,36 +1281,24 @@ class RemoteBrowser:
     # ----------------------------------------------------------- screencast
     def _start_screencast(self, tab):
         self._call("Target.activateTarget", {"targetId": tab.target_id})
-        self._call("Page.startScreencast", dict(SCREENCAST), session=tab.session)
+        self._call("Page.startScreencast", self._screencast_params(tab), session=tab.session)
 
     def _stop_screencast(self, tab):
         with self._lock:
             if not tab.screencast:
                 return
             tab.screencast = False
-            tab.pending_ack = None
         try:
             self._call("Page.stopScreencast", session=tab.session, timeout=5.0)
         except BrowserError:
             pass
 
-    def _flush_ack(self, tab):
-        with self._lock:
-            ack, tab.pending_ack = tab.pending_ack, None
-            last = tab.last_ack
-        if ack is None or self._conn is None:
-            return
-        wait = self._frame_interval - (self._clock() - last)
-        if wait > 0:
-            self._sleep(wait)
-        try:
-            self._conn.send_nowait("Page.screencastFrameAck", {"sessionId": ack}, session=tab.session)
-        except CDPError:
-            pass
-        tab.last_ack = self._clock()
+    def frame(self, ident, since, wait=FRAME_WAIT_MAX, rev=None):
+        """Long-poll: newest frame with seq > since, else meta only after `wait`.
 
-    def frame(self, ident, since, wait=FRAME_WAIT_MAX):
-        """Long-poll: newest frame with seq > since, else meta only after `wait`."""
+        With `rev` the poll also returns as soon as the tab's metadata (url, title,
+        loading, blocked note, intercepts) differs from that revision.
+        """
         tab = self._tab(ident)
         wait = max(0.0, min(float(wait), FRAME_WAIT_MAX))
         with self._lock:
@@ -1121,11 +1315,10 @@ class RemoteBrowser:
                     with self._lock:
                         tab.screencast = False
                     raise
-            self._flush_ack(tab)
             deadline = self._clock() + wait
             with self._cv:
-                while (tab.seq <= since and self._tabs.get(tab.id) is tab and
-                       self._state == "running"):
+                while (tab.seq <= since and (rev is None or tab.rev == rev) and
+                       self._tabs.get(tab.id) is tab and self._state == "running"):
                     remaining = deadline - self._clock()
                     if remaining <= 0:
                         break
@@ -1140,6 +1333,7 @@ class RemoteBrowser:
                     "width": tab.size[0], "height": tab.size[1],
                     "url": tab.url, "title": tab.title,
                     "loading": bool(tab.loading), "blocked": tab.blocked,
+                    "intercepts": tab.intercept_seq, "rev": tab.rev,
                 }
             self._touch()
             return result
@@ -1147,6 +1341,13 @@ class RemoteBrowser:
             with self._lock:
                 tab.pollers -= 1
                 tab.last_poll = self._clock()
+
+    def frame_image(self, ident, since, wait=FRAME_WAIT_MAX, rev=None):
+        """Like frame() but the JPEG is returned as bytes (None when nothing newer)."""
+        result = self.frame(ident, since, wait=wait, rev=rev)
+        text = result.pop("jpeg_base64")
+        result["jpeg"] = base64.b64decode(text) if text else None
+        return result
 
     # ---------------------------------------------------------------- input
     @staticmethod
@@ -1245,3 +1446,41 @@ class RemoteBrowser:
         hrefs = value if isinstance(value, list) else []
         items = self.extract_links(hrefs[:LINK_CAP])
         return {"items": items, "count": len(items), "scanned": min(len(hrefs), LINK_CAP)}
+
+    # ------------------------------------------------------------ intercepts
+    def intercepts(self, ident, since=0):
+        tab = self._tab(ident)
+        self._touch()
+        with self._lock:
+            return [{"id": e["id"], "kind": e["kind"], "url": e["url"]}
+                    for e in tab.intercepts if e["id"] > since]
+
+    def intercept(self, ident, event_id):
+        tab = self._tab(ident)
+        if isinstance(event_id, bool) or not isinstance(event_id, int) or event_id <= 0:
+            raise BrowserError("検出リンクの指定が不正です")
+        self._touch()
+        with self._lock:
+            for e in tab.intercepts:
+                if e["id"] == event_id:
+                    return {"id": e["id"], "kind": e["kind"], "url": e["url"]}
+        raise BrowserError("検出リンクは見つかりません（古いため消えました）")
+
+    def open_intercept(self, ident, event_id):
+        """Show an intercepted hoster page: that exact URL passes the Fetch pattern once."""
+        item = self.intercept(ident, event_id)
+        if item["kind"] not in ("hoster", "popup"):
+            raise BrowserError("ページとして開けるのはホスターとポップアップのリンクだけです")
+        checked = browser_safety.validate(item["url"])
+        tab = self._tab(ident)
+        with self._lock:
+            if item["kind"] == "hoster":      # only hoster pages are paused by Fetch
+                tab.bypass[checked] = self._clock() + BYPASS_TTL
+            tab.blocked = None
+        try:
+            self._call("Page.navigate", {"url": checked}, session=tab.session)
+        except BrowserError:
+            with self._lock:
+                tab.bypass.pop(checked, None)
+            raise
+        return {"id": tab.id, "url": checked}

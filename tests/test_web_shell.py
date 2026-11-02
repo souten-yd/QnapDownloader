@@ -109,11 +109,12 @@ if (bad.length) { console.error("mismatch: " + bad.join(",")); process.exit(1); 
 
     def test_iframe_src_comes_from_validation(self):
         self.assertIn("/api/browser/validate", self.js)
-        # Exactly two assignments: the validated iframe URL and the remote-browser
-        # screencast image (data:image/jpeg;base64 built from /api/rb/frame).
-        self.assertEqual(len(re.findall(r"\.src\s*=", self.js)), 2)
+        # Exactly three assignments: the validated iframe URL and the remote-browser
+        # screencast (blob: object URLs made from /api/rb/frame.jpg bytes: an
+        # off-screen probe image for decoding, then the visible image).
+        self.assertEqual(len(re.findall(r"\.src\s*=", self.js)), 3)
         self.assertIn("frame.src = validatedUrl", self.js)
-        self.assertIn("img.src = RB_JPEG_PREFIX + f.jpeg_base64", self.js)
+        self.assertIn("img.src = next;", self.js)
 
     def test_routes_and_limits(self):
         for route in ("#/downloads", "#/links", "#/settings/"):
@@ -288,19 +289,61 @@ if (out !== want) { console.error(JSON.stringify(out)); process.exit(1); }
             self.assertIn(route, self.js)
         self.assertIn('"/api/rapidgator/extract"', self.js)
 
-    def test_v0116_image_source_is_only_a_jpeg_data_url_from_the_api(self):
-        self.assertIn('RB_JPEG_PREFIX = "data:image/jpeg;base64,"', self.js)
+    def test_v0122_image_source_is_only_a_blob_url_from_the_binary_api(self):
         assignments = re.findall(r"(\w+)\.src\s*=\s*(.+?);", self.js)
-        self.assertEqual(sorted(a[0] for a in assignments), ["frame", "img"])
-        self.assertEqual(dict(assignments)["img"], "RB_JPEG_PREFIX + f.jpeg_base64")
-        self.assertIn("function validJpeg", self.js)
-        self.assertIn("/^[A-Za-z0-9+/]+={0,2}$/", self.js)
+        self.assertEqual(sorted(a[0] for a in assignments), ["frame", "img", "probe"])
+        self.assertEqual(dict(assignments)["img"], "next")
+        self.assertEqual(dict(assignments)["probe"], "next")
+        self.assertIn("const next = URL.createObjectURL(blob);", self.js)
+        self.assertIn("/api/rb/frame.jpg?tab=", self.js)
+        self.assertNotIn("data:image", self.js)
+        self.assertNotIn("jpeg_base64", self.js)
         self.assertNotRegex(self.js, r"setAttribute\(\"src\"")
+        # double buffering and no object URL leak
+        self.assertIn("await probe.decode()", self.js)
+        self.assertGreaterEqual(self.js.count("URL.revokeObjectURL("), 4)
+        self.assertIn('blob.type === "image/jpeg"', self.js)
         # still no remote-controlled markup and no forbidden sandbox tokens
         for token in ("innerHTML", "outerHTML", "insertAdjacentHTML"):
             self.assertNotIn(token, self.js)
         for token in FORBIDDEN_SANDBOX:
             self.assertNotIn(token, self.js + self.html)
+
+    def test_v0122_viewport_scroll_coalescing_and_intercept_sheet(self):
+        # viewport is reported from the stage, validated ranges mirror the server
+        self.assertIn("/api/rb/viewport", self.js)
+        self.assertIn("devicePixelRatio", self.js)
+        self.assertIn("ResizeObserver", self.js)
+        # one scroll input per animation frame, deltas summed
+        self.assertIn("requestAnimationFrame(flushScroll)", self.js)
+        self.assertIn("rbScroll.dx += dx", self.js)
+        self.assertNotIn("RB_SCROLL_MS", self.js)
+        # intercept bottom sheet
+        for ident in ("interceptSheet", "interceptUrl", "interceptSend", "interceptAdd",
+                      "interceptOpen", "interceptClose"):
+            self.assertIn('id="%s"' % ident, self.html)
+        for text in ("リンクを検出しました", "JD2へ送る", "リンクに追加", "ページを開く", "閉じる"):
+            self.assertIn(text, self.html)
+        self.assertRegex(self.html, r'<button[^>]*id="interceptSend"[^>]*class="btn primary"[^>]*hidden')
+        for route in ("/api/rb/intercepts?tab=", "/api/rb/intercepts/send", "/api/rb/intercepts/add",
+                      "/api/rb/intercepts/open"):
+            self.assertIn(route, self.js)
+        self.assertIn('setShown("interceptSend", canSend)', self.js)
+        self.assertIn('setShown("interceptOpen", cur.item.kind === "hoster")', self.js)
+        self.assertIn("confirm(", self.js[self.js.index("async function interceptAction"):])
+        self.assertIn('"リンク " + count + "件"', self.js)       # the badge stays
+        # popups: a non-blocking toast (latest wins, 8 s), never the sheet
+        for ident in ("popupToast", "popupToastText", "popupToastOpen"):
+            self.assertIn('id="%s"' % ident, self.html)
+        self.assertIn("RB_POPUP_TOAST_MS = 8000", self.js)
+        self.assertIn('item.kind === "popup"', self.js)
+        self.assertIn('"ポップアップ: " + hostLabel(item.url) + " を開く"', self.js)
+        self.assertIn("clearTimeout(rbPopup.timer);\n  rbPopup.item = item;", self.js)
+        self.assertIn('api("/api/rb/intercepts/open", {tab: item.tab, id: item.id})', self.js)
+        self.assertRegex(self.html, r'<div id="popupToast"[^>]*hidden')
+        css = (WEB / "style.css").read_text(encoding="utf-8")
+        self.assertIn(".intercept-url", css)
+        self.assertIn("text-overflow:ellipsis", css)
 
     def test_v0116_remote_tab_lifecycle_and_input_wiring(self):
         # closing the web tab frees the NAS tab; polling only for the visible tab
