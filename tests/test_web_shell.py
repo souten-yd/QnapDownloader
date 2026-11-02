@@ -1072,3 +1072,18 @@ class ReaderTapTargetsTest(unittest.TestCase):
         # storage is optional: every access is guarded
         self.assertIn("try { localStorage.setItem(READER_SIZE_KEY", app)
         self.assertIn("min-height:44px", css.split(".reader-chip{", 1)[1].split("}", 1)[0])
+
+
+class ReaderLinkCardsTest(unittest.TestCase):
+    """v0.1.35: long link texts become cards (block) or are shortened in the middle (inline)."""
+
+    def test_link_cards(self):
+        root = Path(__file__).resolve().parents[1] / "web"
+        app = (root / "app.js").read_text(encoding="utf-8")
+        css = (root / "style.css").read_text(encoding="utf-8")
+        for name in ("function readerCardItems", "function readerCards", "function middleEllipsis",
+                     "function readerLongText"):
+            self.assertIn(name, app)
+        # cards stay data-href anchors: taps and long presses keep going through the NAS browser
+        self.assertIn('readerLink("", it.href)', app)
+        self.assertIn(".reader-card{", css)
