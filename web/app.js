@@ -2789,9 +2789,81 @@ function readerLink(text, href) {
   return a;
 }
 
+// Long link texts (file names, raw URLs, ad-redirect addresses) break the reader's lines.
+// v0.1.35: inline they are shortened in the middle (start and extension stay readable);
+// a block that is only such links with short labels becomes a list of link cards.
+const READER_LONG_TOKEN = 28;
+const READER_SIZE_RE = /^\s*[(（［\[]?\s*(\d[\d.,]*\s*[KMGT]i?B)\s*[)）］\]]?/i;
+
+function readerLongText(text) {
+  const t = text.trim();
+  return /^https?:\/\//i.test(t) || (t.length >= READER_LONG_TOKEN && !/\s/.test(t));
+}
+
+function middleEllipsis(text, max) {
+  const t = text.trim();
+  if (t.length <= max) return t;
+  const tail = Math.min(18, Math.floor(max / 3));
+  return t.slice(0, max - tail - 1) + "…" + t.slice(-tail);
+}
+
+function readerHostOf(href) {
+  try { return new URL(href).hostname.replace(/^www\./, ""); } catch (e) { return ""; }
+}
+
+function readerLabel(text) {
+  return text.replace(/[|｜:：・\-–—]+/g, " ").replace(/\s+/g, " ").trim();
+}
+
+// Splits a block into [{label, text, href, size}] when it is a set of long links with short
+// labels ("RapidGator | name.rar (66.76 MB)"), else null (ordinary prose keeps inline links).
+function readerCardItems(runs) {
+  const links = runs.filter(r => r.href);
+  if (!links.length || links.length > 30 || !links.every(r => readerLongText(r.text))) return null;
+  const items = [];
+  let pending = "";
+  for (const r of runs) {
+    if (r.href) {
+      items.push({label: readerLabel(pending), text: r.text.trim(), href: r.href, size: ""});
+      pending = "";
+      continue;
+    }
+    let text = r.text;
+    const last = items[items.length - 1];
+    const m = last && !last.size && !pending ? READER_SIZE_RE.exec(text) : null;
+    if (m) { last.size = m[1].replace(/\s+/g, " "); text = text.slice(m[0].length); }
+    pending += text;
+  }
+  if (readerLabel(pending).length > 40) return null;          // trailing prose: not a link list
+  if (items.some(it => it.label.length > 40)) return null;
+  return items;
+}
+
+function readerCards(items) {
+  const list = element("div", undefined, "reader-cards");
+  for (const it of items) {
+    const a = readerLink("", it.href);
+    a.className = "reader-link reader-card";
+    a.setAttribute("aria-label", (it.label ? it.label + ": " : "") + it.text);
+    const top = element("span", undefined, "reader-card-top");
+    const host = readerHostOf(it.href);
+    top.appendChild(element("span", it.label || host, "reader-card-label"));
+    if (it.size) top.appendChild(element("span", it.size, "reader-card-size"));
+    a.appendChild(top);
+    a.appendChild(element("span", middleEllipsis(it.text, 56), "reader-card-title"));
+    if (it.label && host) a.appendChild(element("span", host, "reader-card-host"));
+    list.appendChild(a);
+  }
+  return list;
+}
+
 function readerRuns(parent, runs) {
   for (const run of runs) {
-    if (run.href) parent.appendChild(readerLink(run.text, run.href));
+    if (run.href && readerLongText(run.text)) {
+      const a = readerLink(middleEllipsis(run.text, 40), run.href);
+      a.title = run.text.trim();
+      parent.appendChild(a);
+    } else if (run.href) parent.appendChild(readerLink(run.text, run.href));
     else parent.appendChild(document.createTextNode(run.text));
   }
 }
@@ -2882,6 +2954,8 @@ function readerNode(rb, block) {
     return element("h" + Math.min(6, Math.max(2, block.level + 1)), block.text, "reader-h");
   }
   if ((block.t === "p" || block.t === "li") && readerLinkRow(block.runs)) return readerChips(block.runs);
+  const cards = (block.t === "p" || block.t === "li") ? readerCardItems(block.runs) : null;
+  if (cards) return readerCards(cards);
   if (block.t === "p") {
     const p = element("p", undefined, "reader-p");
     readerRuns(p, block.runs);

@@ -530,3 +530,12 @@ h5.reader-h,h6.reader-h{font-size:1em}
 .reader-chip{display:inline-flex;align-items:center;justify-content:center;min-width:44px;min-height:44px;padding:0 12px;
   border:1px solid var(--border);border-radius:var(--radius);background:var(--surface);text-decoration:none;line-height:1.2}
 .reader-chip.is-plain{color:var(--text);font-weight:700;border-color:transparent;background:none}
+/* v0.1.35: link cards for long link texts */
+.reader-cards{display:flex;flex-direction:column;gap:8px;margin:0 0 1em}
+.reader-card{display:flex;flex-direction:column;gap:2px;min-height:44px;padding:8px 12px;border:1px solid var(--border);
+  border-radius:var(--radius);background:var(--surface);text-decoration:none;line-height:1.35}
+.reader-card-top{display:flex;align-items:baseline;gap:8px;color:var(--text);font-weight:700;font-size:.9em}
+.reader-card-label{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.reader-card-size{flex:none;color:var(--muted);font-weight:400}
+.reader-card-title{color:var(--accent);overflow-wrap:anywhere;word-break:break-all}
+.reader-card-host{color:var(--muted);font-size:.8em}
