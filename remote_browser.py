@@ -26,8 +26,10 @@ from urllib.parse import urlsplit
 import browser_safety
 import container_runtime as cr
 import debuglog
+import diskio
 import rapidgator_extract
 import rb_blocklist
+import rb_resident
 
 MAX_TABS = 3
 MIN_AVAILABLE_KIB = cr.BROWSER_MIN_AVAILABLE_KIB     # MemAvailable >= 2 GiB
@@ -37,6 +39,8 @@ VIEWER_STOP_AFTER = 5.0        # stop the screencast after this long without a p
 NO_TAB_IDLE = 300.0            # no tabs for 5 minutes -> stop the container
 NO_VIEWER_IDLE = 600.0         # no viewer activity for 10 minutes -> stop
 MONITOR_INTERVAL = 5.0
+HEALTH_INTERVAL = 30.0         # while running: ask docker whether the container still runs
+TRIM_TIMEOUT = 5.0             # resident: memory trim commands are best-effort
 FRAME_WAIT_MAX = 10.0
 MIN_FRAME_INTERVAL = 0.1       # at most 10 frames per second
 START_TIMEOUT = 45.0
@@ -992,7 +996,9 @@ class RemoteBrowser:
     def __init__(self, runtime, context_dir, *, meminfo_path="/proc/meminfo", connect=None,
                  clock=time.monotonic, sleep=time.sleep, monitor=True,
                  frame_interval=MIN_FRAME_INTERVAL, start_timeout=START_TIMEOUT,
-                 rules=None, auto_send=None, spawn=None):
+                 rules=None, auto_send=None, spawn=None, wall=time.time,
+                 cgroup_root=diskio.DEFAULT_CGROUP_ROOT, proc_root="/proc",
+                 hub_status_path="/proc/self/status"):
         self.runtime = runtime
         self.context_dir = str(context_dir)
         self._meminfo = meminfo_path
@@ -1038,6 +1044,22 @@ class RemoteBrowser:
         self._probe_targets = {}   # probe target id -> Probe
         self._probe_sessions = {}  # CDP session id -> Probe
         self._probe_popups = {}    # popup target id -> Probe
+        # v0.1.38: resident mode, watchdog and memory figures (RAM only)
+        self._wall = wall
+        self._cgroup_root = cgroup_root
+        self._proc_root = proc_root
+        self._hub_status = hub_status_path
+        self._resident = False
+        self._user_stopped = False   # stopped on purpose: nothing restarts it
+        self.wd = rb_resident.Watchdog(clock, wall)
+        self.idle = rb_resident.IdleBaseline(wall)
+        self._tick_lock = threading.Lock()
+        self._monitor_thread = None
+        self._monitor_evt = threading.Event()
+        self._health_at = clock()
+        self._trim_at = None         # when the last memory trim ran (resident, no tabs)
+        self._idle_sample_at = None
+        self._mem_cache = None
 
     @staticmethod
     def _spawn_thread(fn):
@@ -1180,6 +1202,9 @@ class RemoteBrowser:
                 reason = "NASブラウザのタブは最大%d枚です" % MAX_TABS
         if bool(station) and not ready and stale and not setup:
             reason = UPDATE_NEEDED
+        resident = self.resident_status()
+        if resident["watchdog"]["state"] == rb_resident.STATE_GAVE_UP and state == "stopped":
+            reason = resident["watchdog"]["message"]
         return {
             "container_station": {"available": bool(station), "version": station},
             "image_ready": ready,
@@ -1194,6 +1219,7 @@ class RemoteBrowser:
             "available_mib": None if available is None else available // 1024,
             "can_open": bool(ready and reason is None),
             "reason": reason,
+            "resident": resident,
         }
 
     # -------------------------------------------------------------- setup
@@ -1229,6 +1255,8 @@ class RemoteBrowser:
         finally:
             with self._lock:
                 self._setup_active = False
+                self._user_stopped = False     # a rebuild stop is over: resident may start again
+            self.wd.unblock()
 
     def _execute_setup(self):
         current = "precheck"
@@ -1362,8 +1390,11 @@ class RemoteBrowser:
                 self._anchor = anchor    # keeps the browser alive when the last tab closes
                 self._state = "running"
                 self._last_activity = self._no_tabs_since = self._clock()
-            if self._monitor_on:
-                threading.Thread(target=self._monitor, args=(self._stop_evt,), daemon=True).start()
+                self._health_at = self._clock()
+                self._trim_at = None
+                self._idle_sample_at = None
+                self._user_stopped = False
+            self._ensure_monitor()
         except Exception as error:
             self._teardown()
             if isinstance(error, (BrowserError,)):
@@ -1402,6 +1433,8 @@ class RemoteBrowser:
                 return False
             was = self._state
             self._state = "stopping"
+            self._user_stopped = True      # on purpose: the watchdog / resident start must not undo it
+            self.wd.cancel()
             targets = [t.target_id for t in self._tabs.values() if t.target_id]
             self._cv.notify_all()
         if was == "running":
@@ -1414,6 +1447,7 @@ class RemoteBrowser:
         return True
 
     def shutdown(self):
+        self._monitor_evt.set()
         try:
             self.stop()
         except Exception:
@@ -1436,6 +1470,19 @@ class RemoteBrowser:
         with self._cv:
             self._cv.notify_all()
 
+    def _ensure_monitor(self):
+        """One housekeeping thread for the life of the Hub (started with the first container)."""
+        if not self._monitor_on:
+            return
+        with self._lock:
+            thread = self._monitor_thread
+            if thread is not None and thread.is_alive():
+                return
+            self._monitor_evt.clear()
+            thread = self._monitor_thread = threading.Thread(
+                target=self._monitor, args=(self._monitor_evt,), daemon=True)
+        thread.start()
+
     def _monitor(self, stop_evt):
         while not stop_evt.wait(MONITOR_INTERVAL):
             try:
@@ -1444,22 +1491,308 @@ class RemoteBrowser:
                 pass
 
     def tick(self):
-        """Housekeeping (called every few seconds while running)."""
+        """Housekeeping (every few seconds): idle stop, health check, watchdog, resident start."""
+        if not self._tick_lock.acquire(blocking=False):
+            return
+        try:
+            self._tick()
+        finally:
+            self._tick_lock.release()
+
+    def _tick(self):
         now = self._clock()
         with self._lock:
-            if self._state != "running":
-                return
+            state = self._state
+            setup = self._setup_active
+        if setup or state in ("starting", "stopping"):
+            return
+        if state != "running":
+            self._tick_stopped()
+            return
+        with self._lock:
             conn = self._conn
-            idle_tabs = not self._tabs and now - self._no_tabs_since >= NO_TAB_IDLE
+            resident = self._resident
+            idle_tabs = (not self._tabs and now - self._no_tabs_since >= NO_TAB_IDLE
+                         and not resident)
             idle_view = now - self._last_activity >= NO_VIEWER_IDLE
             lost = conn is None or conn.closed
             expired = [t for t in self._tabs.values()
                        if t.screencast and t.pollers == 0 and now - t.last_poll > VIEWER_STOP_AFTER]
-        if lost or idle_tabs or idle_view:
+            health_due = now - self._health_at >= HEALTH_INTERVAL
+        if lost:
+            self._unexpected_exit({"lost": True})
+            return
+        if health_due:
+            with self._lock:
+                self._health_at = now
+            try:
+                info = self.runtime.container_state(cr.BROWSER_NAME)
+            except cr.ContainerError:
+                info = None
+            if info is not None and not info.get("running"):
+                self._unexpected_exit(info)
+                return
+        if idle_tabs:
             self.stop()
             return
+        if idle_view:
+            if not resident:
+                self.stop()
+                return
+            # Resident: the container stays; open tabs are closed to give the memory back.
+            self._release_tabs()
+            with self._lock:
+                self._last_activity = now
         for tab in expired:
             self._stop_screencast(tab)
+        if resident:
+            self._tick_idle_sample(now)
+
+    # -------------------------------------------- resident mode / watchdog (v0.1.38)
+    def resident(self):
+        with self._lock:
+            return self._resident
+
+    def set_resident(self, on):
+        """Setting rb_resident changed (or the Hub booted with it on)."""
+        on = bool(on)
+        with self._lock:
+            changed = on != self._resident
+            self._resident = on
+            if on:
+                self._user_stopped = False
+            else:
+                self._no_tabs_since = self._last_activity = self._clock()
+                self._trim_at = self._idle_sample_at = None
+        if changed or on:
+            self.wd.event("resident", "常駐をオンにしました" if on else "常駐をオフにしました")
+            debuglog.log("rb", "info", "resident", {"on": on})
+        if on:
+            self.wd.unblock()
+            self.wd.schedule_initial()
+            self._ensure_monitor()
+            self._after_start_trim()
+            self._spawn(self.tick)
+        else:
+            if self.wd.state in (rb_resident.STATE_BLOCKED, rb_resident.STATE_GAVE_UP):
+                self.wd.reset()
+            else:
+                self.wd.cancel()
+
+    def retry(self):
+        """The 再試行 button after the watchdog gave up."""
+        with self._lock:
+            self._user_stopped = False
+            running = self._state in ("running", "starting")
+        if running:
+            self.wd.reset()
+            return False
+        self.wd.retry()
+        debuglog.log("rb", "info", "watchdog retry")
+        self._ensure_monitor()
+        self._spawn(self.tick)
+        return True
+
+    def _tick_stopped(self):
+        """Stopped: restart after an unexpected stop, or start the resident browser."""
+        with self._lock:
+            resident = self._resident
+            hold = self._user_stopped
+        wd = self.wd
+        if wd.state == rb_resident.STATE_IDLE and resident and not hold:
+            wd.schedule_initial()
+        if not wd.due():
+            return
+        if hold and wd.state != rb_resident.STATE_STARTING:
+            wd.cancel()
+            return
+        with self._open_lock:
+            with self._lock:
+                if self._state != "stopped" or self._setup_active or self._user_stopped:
+                    return
+            if not self.image_ready():
+                wd.disarm("NASブラウザのイメージがないため自動起動しません")
+                debuglog.log("rb", "warn", "watchdog blocked: image missing")
+                return
+            reason = self.memory_reason()
+            if reason:
+                first = wd.state != rb_resident.STATE_MEMORY
+                wd.memory_blocked()
+                if first:
+                    self.log("自動起動を待機: " + reason)
+                    debuglog.log("rb", "warn", "watchdog memory wait")
+                return
+            wd.begin_attempt()
+            try:
+                self._start()
+            except BrowserError as error:
+                self.log("自動起動に失敗: %s" % error)
+                debuglog.log("rb", "warn", "watchdog start failed", {"state": wd.state})
+                wd.failed(str(error))
+                return
+            toast = wd.succeeded()
+            debuglog.log("rb", "info", "watchdog started", {"restarted": toast})
+        self._after_start_trim()
+
+    def _exit_info(self, hint):
+        """docker's State of the container that disappeared (before it is removed)."""
+        info = dict(hint or {})
+        try:
+            state = self.runtime.container_state(cr.BROWSER_NAME)
+        except cr.ContainerError:
+            state = {}
+        if state.get("exists") and state.get("running") is False:
+            for key in ("exit_code", "oom", "error", "finished_at"):
+                if key in state and key not in info:
+                    info[key] = state[key]
+        return info
+
+    def _unexpected_exit(self, hint):
+        """The container stopped (or the DevTools connection died) without the Hub asking for it."""
+        info = self._exit_info(hint)
+        with self._lock:
+            if self._state != "running":
+                return
+            tabs_were = len(self._tabs)
+            resident = self._resident
+        self._teardown()
+        text = rb_resident.reason_text(info)
+        self.log("NASブラウザが予期せず停止: " + text)
+        debuglog.log("rb", "warn", "unexpected stop", {"tabs": tabs_were, "resident": resident,
+                                                       "exit_code": info.get("exit_code"),
+                                                       "oom": info.get("oom") is True})
+        if resident or tabs_were:
+            self.wd.exited(info, tabs_lost=tabs_were > 0)
+        else:
+            self.wd.event("exit", "停止を検出（%s）。タブも常駐もないため再起動しません" % text)
+
+    def _release_tabs(self):
+        """Close every tab (resident, no viewer activity): the container stays up."""
+        with self._lock:
+            tabs = list(self._tabs.values())
+        for tab in tabs:
+            self._drop_tab(tab, close=True)
+
+    # ---- memory trimming and figures
+    def _after_start_trim(self):
+        with self._lock:
+            resident = self._resident and not self._tabs and self._state == "running"
+        if resident:
+            self._schedule_trim()
+
+    def _schedule_trim(self):
+        self._spawn(self._trim)
+
+    def _trim(self):
+        """Ask Chromium to give memory back; best effort, every error is ignored."""
+        with self._lock:
+            if self._state != "running" or not self._resident or self._tabs:
+                return
+            anchor = self._anchor
+            self._trim_at = self._clock()
+            self._idle_sample_at = None
+        try:
+            self._call("Memory.simulatePressureNotification", {"level": "critical"},
+                       timeout=TRIM_TIMEOUT)
+        except BrowserError:
+            pass
+        if isinstance(anchor, str):
+            session = None
+            try:
+                session = self._call("Target.attachToTarget", {"targetId": anchor, "flatten": True},
+                                     timeout=TRIM_TIMEOUT).get("sessionId")
+                if isinstance(session, str) and session:
+                    self._call("HeapProfiler.collectGarbage", session=session, timeout=TRIM_TIMEOUT)
+            except BrowserError:
+                pass
+            if isinstance(session, str) and session:
+                try:
+                    self._call("Target.detachFromTarget", {"sessionId": session}, timeout=TRIM_TIMEOUT)
+                except BrowserError:
+                    pass
+        debuglog.log("rb", "info", "memory trim")
+
+    def container_memory(self, fresh=False):
+        """Current memory of the browser container (cgroup, else docker stats), cached 5 s."""
+        now = self._clock()
+        with self._lock:
+            cached = self._mem_cache
+            running = self._state == "running"
+        if not running:
+            return None
+        if cached is not None and not fresh and now - cached[0] < rb_resident.MEM_TTL:
+            return cached[1]
+        value = None
+        paths = diskio.container_cgroup_paths(self.runtime, cr.BROWSER_NAME,
+                                              self._cgroup_root, self._proc_root)
+        found = rb_resident.read_cgroup_memory(paths) if paths else None
+        if found is not None:
+            value = found
+        else:
+            try:
+                stats = self._stats()
+                value = {"used_bytes": stats["used_bytes"], "anon_bytes": None, "file_bytes": None,
+                         "source": "docker stats"}
+            except BrowserError:
+                value = None
+        with self._lock:
+            self._mem_cache = (now, value)
+        return value
+
+    def _tick_idle_sample(self, now):
+        """Resident and no tabs for 60 s after the trim: record the idle memory."""
+        with self._lock:
+            if self._tabs or self._trim_at is None:
+                return
+            if now - self._trim_at < rb_resident.IDLE_SETTLE:
+                return
+            last = self._idle_sample_at
+            if last is not None and now - last < rb_resident.IDLE_RESAMPLE:
+                return
+            self._idle_sample_at = now
+        memory = self.container_memory(fresh=True)
+        if memory is None:
+            return
+        if self.idle.record(memory["used_bytes"], memory.get("anon_bytes")):
+            self.wd.event("idle_sample", "待機時メモリ %d MiB" % round(memory["used_bytes"] / 1048576))
+            debuglog.log("rb", "info", "idle memory", {"mib": round(memory["used_bytes"] / 1048576)})
+
+    def resident_status(self):
+        """Compact resident / watchdog / memory block for /api/rb/status."""
+        with self._lock:
+            resident = self._resident
+            state = self._state
+            hold = self._user_stopped
+            tabs = len(self._tabs)
+        wd = self.wd.snapshot()
+        total = rb_resident.mem_total_kib(self._meminfo)
+        memory = self.container_memory()
+        rss = rb_resident.hub_rss_bytes(self._hub_status)
+        mib = 1024 * 1024
+        if wd["state"] == rb_resident.STATE_GAVE_UP:
+            key = "gave_up"
+        elif wd["state"] == rb_resident.STATE_MEMORY:
+            key = "memory_wait"
+        elif wd["state"] in (rb_resident.STATE_SCHEDULED, rb_resident.STATE_STARTING) and wd["restart_n"]:
+            key = "restarting"
+        elif state == "running":
+            key = "resident" if resident else "running"
+        elif state == "starting":
+            key = "starting"
+        else:
+            key = "stopped"
+        return {
+            "on": resident, "state": key, "user_stopped": hold, "tabs": tabs,
+            "memory": None if memory is None else {
+                "used_mib": round(memory["used_bytes"] / mib),
+                "anon_mib": None if memory.get("anon_bytes") is None else round(memory["anon_bytes"] / mib),
+                "file_mib": None if memory.get("file_bytes") is None else round(memory["file_bytes"] / mib),
+                "source": memory["source"]},
+            "idle": self.idle.snapshot(total),
+            "total_mib": None if total is None else total // 1024,
+            "hub_rss_mib": None if rss is None else round(rss / mib),
+            "watchdog": wd,
+        }
 
     # ----------------------------------------------------------------- tabs
     def _tab(self, ident):
@@ -1487,11 +1820,14 @@ class RemoteBrowser:
                         stale = self._stale
                     raise BrowserError(UPDATE_NEEDED if stale else
                                        "NASブラウザの初期設定（イメージ作成）が必要です")
+            if not running and self.wd.state == rb_resident.STATE_GAVE_UP:
+                raise BrowserError(self.wd.message())
             reason = self.memory_reason()
             if reason:
                 raise BrowserError(reason)
             if not running:
                 self._start()
+                self.wd.succeeded()       # a pending automatic restart is done by this open
             created = self._create_tab(checked)
             debuglog.log("rb", "info", "tab open", {"tab": created.get("id"), "host": self._host_of(checked)})
             return created
@@ -1585,7 +1921,8 @@ class RemoteBrowser:
             self._tabs.pop(tab.id, None)
             if tab.session:
                 self._by_session.pop(tab.session, None)
-            if not self._tabs:
+            empty = not self._tabs
+            if empty:
                 self._no_tabs_since = self._clock()
             tab.frame = None
             self._snap_clear(tab)
@@ -1595,6 +1932,12 @@ class RemoteBrowser:
                 self._call("Target.closeTarget", {"targetId": tab.target_id}, timeout=5.0)
             except BrowserError:
                 pass
+        if empty:
+            # Resident: hand the memory of the closed tab back (best effort, off this thread).
+            with self._lock:
+                resident = self._resident and self._state == "running"
+            if resident:
+                self._schedule_trim()
 
     def close_tab(self, ident):
         tab = self._tab(ident)

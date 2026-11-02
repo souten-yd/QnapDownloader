@@ -490,7 +490,7 @@ class HttpTests(unittest.TestCase):
                                          headers={"Host": "192.168.68.57:17864"})
         with self.client.open(request, timeout=4) as response:
             self.assertEqual(response.status, 200)
-            self.assertEqual(json.load(response)["version"], "0.1.37")
+            self.assertEqual(json.load(response)["version"], "0.1.38")
         with self.client.open(self.url + "/icon.svg", timeout=4) as response:
             self.assertEqual(response.status, 200)
             self.assertEqual(response.headers.get_content_type(), "image/svg+xml")
@@ -1399,7 +1399,7 @@ class HttpTests(unittest.TestCase):
         self.assertFalse(info["supported"])
         code, _ = self.req("/api/update/apply", {"version": "v0.1.8"})
         self.assertEqual(code, 400)
-        self.assertEqual(self.req("/api/health")[1]["version"], "0.1.37")
+        self.assertEqual(self.req("/api/health")[1]["version"], "0.1.38")
         self.assertFalse(self.req("/api/jd2/status")[1]["connected"])
         self.assertEqual(self.req("/api/jd2/update/apply", {"confirmed": True})[0], 400)
         self.assertEqual(self.req("/api/jd2/preset/apply", {"confirmed": True})[0], 400)
@@ -2061,6 +2061,49 @@ class HttpTests(unittest.TestCase):
             self.assertEqual(self.server.rb._streams, 0)
         finally:
             conn.close()
+
+
+    # ---- v0.1.38: resident NAS browser ------------------------------------------------
+    def test_v0138_resident_setting_default_persist_validate_and_apply(self):
+        self.login()
+        self.assertIs(self.req("/api/settings")[1]["rb_resident"], False)
+        code, body = self.req("/api/settings/options", {"rb_resident": True})
+        self.assertEqual((code, body["rb_resident"]), (200, True))
+        self.assertTrue(self.server.rb.resident())
+        self.assertIs(self.store.settings()["rb_resident"], True)
+        for bad in ({"rb_resident": "yes"}, {"rb_resident": 1}, {"rb_resident": None},
+                    {"rb_resident": True, "x": 1}):
+            with self.subTest(bad=bad):
+                self.assertEqual(self.req("/api/settings/options", bad)[0], 400)
+        self.assertIs(self.req("/api/settings/options", {"rb_resident": False})[1]["rb_resident"], False)
+        self.assertFalse(self.server.rb.resident())
+        before = self.store.revision()
+        self.req("/api/settings/options", {"rb_resident": False})
+        self.assertEqual(self.store.revision(), before)
+
+    def test_v0138_boot_starts_resident_only_when_enabled(self):
+        self.login()
+        webapp.boot_remote_browser(self.server)
+        self.assertFalse(self.server.rb.resident())
+        self.store.set_option("rb_resident", True)
+        webapp.boot_remote_browser(self.server)
+        self.assertTrue(self.server.rb.resident())
+
+    def test_v0138_status_state_and_retry_endpoint(self):
+        self.assertEqual(self.req("/api/rb/retry")[0], 401)
+        self.assertIn(self.req("/api/rb/retry", {})[0], (401, 403))
+        self.login()
+        self.assertEqual(self.req("/api/rb/retry", {}, csrf=False)[0], 403)
+        self.assertEqual(self.req("/api/rb/retry", {}, origin=False)[0], 403)
+        self.assertEqual(self.req("/api/rb/retry", {"x": 1})[0], 202)
+        status = self.req("/api/rb/status")[1]
+        for key in ("on", "state", "memory", "idle", "hub_rss_mib", "total_mib", "watchdog"):
+            self.assertIn(key, status["resident"])
+        for key in ("state", "restart_n", "reason", "message", "events", "restarts", "lost_seq"):
+            self.assertIn(key, status["resident"]["watchdog"])
+        rbstate = self.req("/api/state")[1]["rb"]
+        for key in ("res", "rs", "idle_mib", "cur_mib", "restarts", "lost"):
+            self.assertIn(key, rbstate)
 
 
 if __name__ == "__main__":

@@ -88,9 +88,21 @@ class StateHub:
         except Exception:
             return {"state": "unknown", "tabs": 0, "mem": None, "ready": None, "sig": ""}
         memory = status.get("memory") or {}
+        res = status.get("resident") or {}
+        wd = res.get("watchdog") or {}
+        idle = res.get("idle") or {}
+        used = (res.get("memory") or {}).get("used_mib")
+        # Volatile figures (current memory, Hub RSS, countdown) do not make a new revision by
+        # themselves: the settings view reads them when it fetches /api/rb/status.
+        stable = dict(status)
+        stable["resident"] = dict(res, memory=None, hub_rss_mib=None, watchdog=dict(wd, next_in_s=None))
         return {"state": status.get("phase"), "tabs": len(status.get("tabs") or []),
                 "mem": memory.get("percent"), "ready": status.get("image_ready") is True,
-                "sig": _digest(status)}
+                "res": res.get("on") is True, "rs": res.get("state"),
+                "idle_mib": idle.get("latest_mib"),
+                "cur_mib": None if used is None else int(used // 50 * 50),
+                "restarts": wd.get("restarts", 0), "lost": wd.get("lost_seq", 0),
+                "sig": _digest(stable)}
 
     def _build(self):
         engine, running = self._engine()

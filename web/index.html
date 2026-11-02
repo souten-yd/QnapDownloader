@@ -372,13 +372,27 @@
         <p id="rbState" class="engine-state" role="status" aria-live="polite">確認しています…</p>
         <div class="engine-actions">
          <button type="button" id="rbSetup" class="btn primary" hidden>初期設定（イメージ作成）</button>
+         <button type="button" id="rbResidentQuick" class="btn quiet" aria-pressed="false">常駐: オフ</button>
+         <button type="button" id="rbRetry" class="btn primary" hidden>再試行</button>
          <button type="button" id="rbStop" class="btn quiet" hidden>停止</button>
         </div>
        </div>
+       <p id="rbResidentLine" class="set-text muted"></p>
        <p id="rbMemory" class="set-text muted"></p>
+       <p id="rbWatchdog" class="engine-error" hidden></p>
        <p id="rbNoContainer" class="engine-error" hidden>QTSのApp CenterでContainer Stationをインストールしてください（NASブラウザはコンテナ内でのみ動かします）</p>
        <p id="rbReason" class="set-text muted" hidden></p>
        <p id="rbError" class="engine-error" hidden></p>
+       <div class="set-row">
+        <div class="set-main"><span class="set-label">NASブラウザを常駐</span>
+         <span class="set-desc"><span class="set-text">タブがなくても起動したままにして、開くのを速くします</span>
+          <details class="hint"><summary aria-label="詳しい説明">ⓘ</summary><p>オンにすると、Hubの起動時（と切り替えた直後）に、イメージがあり空きメモリが足りていればNASブラウザを起動し、タブが0枚でも止めません。タブを閉じるとChromiumにメモリの解放を依頼し、60秒後に待機時のメモリを測ります。予期せず停止したときは、5秒→15秒→60秒の間隔で自動的に再起動します（15分に5回まで。超えたら止めて「再試行」を出します）。再起動の前には毎回空きメモリを確認します。オフにすると、これまでどおりタブが0枚で5分後に停止します。</p></details></span></div>
+        <label class="switch" for="rbResident"><input type="checkbox" id="rbResident" role="switch" aria-label="NASブラウザを常駐"><span class="switch-track" aria-hidden="true"></span></label>
+       </div>
+       <details id="rbWdBox" class="fold">
+        <summary>自動再起動の履歴</summary>
+        <pre id="rbWdLog" class="update-log">まだありません</pre>
+       </details>
        <details id="rbLogBox" class="fold">
         <summary>ログ</summary>
         <pre id="rbLog" class="update-log">開くと表示します</pre>
