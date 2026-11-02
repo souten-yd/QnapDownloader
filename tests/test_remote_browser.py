@@ -1776,6 +1776,69 @@ class ProbeTests(BrowserBase):
         # nothing was recorded on the origin tab
         self.assertEqual(self.rb.intercepts("b1"), [])
 
+    def test_probe_popups_never_become_events_or_tabs_even_with_popup_allow(self):
+        class Rules:
+            def site_rule_for(self, host):
+                return {"popup": "allow", "auto_send": True}
+        self.rb.rules = Rules()
+        def navigate(emit):
+            self.ws.emit("Target.targetCreated", {"targetInfo": {
+                "targetId": "POPUPPROBE04", "type": "page", "openerId": "TARGET00002", "url": ""}})
+            self.ws.emit("Target.targetInfoChanged", {"targetInfo": {
+                "targetId": "POPUPPROBE04", "type": "page", "openerId": "TARGET00002",
+                "url": "https://ads.example/pop"}})
+            # a popup of the popup (transitive)
+            self.ws.emit("Target.targetCreated", {"targetInfo": {
+                "targetId": "POPUPPROBE05", "type": "page", "openerId": "POPUPPROBE04",
+                "url": self.HOSTER + "/z.html"}})
+        self.ws.eval_map += [("location.href", self.START), ("querySelectorAll", [])]
+        self.script(navigate)
+        tabs_before = set(self.rb._tabs)
+        result = self.rb.probe("b1", 5, 5)
+        self.assertEqual(result["links"], [self.HOSTER])
+        closes = self.closes()
+        for target in ("POPUPPROBE04", "POPUPPROBE05", "TARGET00002"):
+            self.assertIn(target, closes)
+        self.assertEqual(set(self.rb._tabs), tabs_before)
+        self.assertEqual(self.rb.intercepts("b1"), [])
+        self.assertEqual(len(self.ws.calls("Page.navigate")), 2)
+        self.assertEqual(self.rb._probe_popups, {})
+
+    def test_leftover_probe_targets_are_closed_after_the_probe(self):
+        base = self.ws.send_text
+        def listing(text):
+            message = json.loads(text)
+            if message["method"] == "Target.getTargets" and self.ws.calls("Target.closeTarget"):
+                self.ws.sent.append(message)
+                self.ws.q.put(json.dumps({"id": message["id"], "result": {"targetInfos": [
+                    {"targetId": "ANCHOR00001", "type": "page"},
+                    {"targetId": "TARGET00002", "type": "page"},
+                    {"targetId": "STRAY0000001", "type": "page", "openerId": "TARGET00002"},
+                    {"targetId": "STRAY0000002", "type": "page", "openerId": "STRAY0000001"}]}}))
+                return
+            base(text)
+        self.ws.send_text = listing
+        self.script(lambda emit: emit("Fetch.requestPaused", {
+            "requestId": "rp1", "resourceType": "Document", "request": {"url": self.HOSTER}}))
+        self.rb.probe("b1", 5, 5)
+        closes = self.closes()
+        for target in ("TARGET00002", "STRAY0000001", "STRAY0000002"):
+            self.assertIn(target, closes)
+        self.assertNotIn("ANCHOR00001", closes)
+        self.assertGreaterEqual(closes.count("TARGET00002"), 2)
+
+    def test_hoster_anchors_of_a_popup_are_collected(self):
+        self.script(lambda emit: self.ws.emit("Target.targetCreated", {"targetInfo": {
+            "targetId": "POPUPPROBE06", "type": "page", "openerId": "TARGET00002",
+            "url": "https://ads.example/p"}}))
+        rb.PROBE_TIMEOUT = 2
+        self.rb._clock = TickClock()
+        self.ws.eval_map += [("querySelectorAll", [self.HOSTER + "/a.rar.html"]),
+                             ("location.href", self.START)]
+        result = self.rb.probe("b1", 5, 5)
+        self.assertEqual(result["links"], [self.HOSTER])
+        self.assertIn("POPUPPROBE06", self.closes())
+
     def test_unrelated_popups_of_the_probe_are_closed_never_followed(self):
         def navigate(emit):
             self.ws.emit("Target.targetCreated", {"targetInfo": {

@@ -458,10 +458,10 @@ if (out !== want) { console.error(JSON.stringify(out)); process.exit(1); }
     def test_v0124_long_press_probe_ui(self):
         self.assertRegex(self.js, r"RB_LONGPRESS_MS\s*=\s*550\b")
         self.assertRegex(self.js, r"RB_LONGPRESS_MOVE_PX\s*=\s*10\b")
-        for ident in ("probeSheet", "probeList", "probeSendAll", "probeAddAll", "probeOpen", "probeClose",
+        for ident in ("probeSheet", "probeList", "probeSendAll", "probeAddAll", "probeClose",
                       "remoteRing"):
             self.assertIn('id="%s"' % ident, self.html)
-        for text in ("リンク先を確認しました", "すべてJD2へ送る", "リンクに追加", "このタブで開く"):
+        for text in ("リンク先を確認しました", "すべてJD2へ送る", "リンクに追加"):
             self.assertIn(text, self.html + self.js)
         self.assertIn("/api/rb/probe", self.js)
         # a long press suppresses the tap, moving cancels it, the OS context menu is off
@@ -484,6 +484,20 @@ if (out !== want) { console.error(JSON.stringify(out)); process.exit(1); }
         send = self.js[self.js.index('if (action === "send")'):self.js.index('} else if (action === "add")')]
         self.assertNotIn("confirm(", send)
         self.assertIn("opts.confirmMany && links.length >= 5", self.js)
+
+    def test_v0126_probe_sheet_is_transient(self):
+        self.assertNotIn("probeOpen", self.html + self.js)
+        self.assertNotIn("このタブで開く", self.html + self.js)
+        start = self.js.index("async function startProbe")
+        body = self.js[start:self.js.index("// Pointer to page coordinates")]
+        self.assertIn("リンクは見つかりませんでした", body)
+        self.assertIn("（最終: ", body)
+        self.assertRegex(body, r"if \(!result\.links\.length\) \{\s*//[^\n]*\n\s*setShown\(\"probeSheet\", false\)")
+        auto = self.js[self.js.index("async function autoSendProbe"):start]
+        self.assertIn("JD2へ送信しました（", auto)
+        self.assertEqual(auto.count('setShown("probeSheet", false)'), 2)
+        self.assertIn('"error"', auto)
+        self.assertNotIn("stageLinks", auto)
 
     def test_v0125_history_clear_and_duplicate_skips(self):
         for ident in ("clearHistory", "clearStaged", "downloadsClear"):

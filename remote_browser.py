@@ -1333,7 +1333,8 @@ class RemoteBrowser:
         if not isinstance(url, str) or not url.startswith("https://") or len(url) > 2048:
             return
         frame_id = params.get("frameId")
-        if isinstance(frame_id, str) and frame_id in self._probe_targets:
+        if isinstance(frame_id, str) and (frame_id in self._probe_targets or
+                                          frame_id in self._probe_popups):
             return      # a probe never reports downloads to a tab
         with self._cv:
             tab = self._find_by_target(frame_id) if isinstance(frame_id, str) else None
@@ -1772,17 +1773,12 @@ class RemoteBrowser:
         if probe is None:
             return False
         url = info.get("url") if isinstance(info.get("url"), str) else ""
-        if self._real_url(url) and conn is not None:
+        if self._real_url(url):
             normalized = rapidgator_extract.normalize(url) if len(url) <= 4096 else None
             if normalized is not None:
                 self._probe_add(probe, normalized)
-            try:
-                conn.send_nowait("Target.closeTarget", {"targetId": target})
-            except CDPError:
-                pass
-            with self._cv:
-                self._probe_popups.pop(target, None)
-                probe.popups.discard(target)
+        # Never closed here: the mapping must survive so popups of popups stay
+        # attributed to the probe; _probe_close closes every one of them.
         return True
 
     def _wait_probe(self, probe, deadline):
@@ -1800,21 +1796,72 @@ class RemoteBrowser:
                     return "timeout"
                 self._cv.wait(min(remaining, 0.25))
 
-    def _probe_close(self, probe):
-        with self._cv:
-            self._probe_targets.pop(probe.target, None)
-            self._probe_sessions.pop(probe.session, None)
+    def _probe_read_popups(self, probe):
+        """Collect hoster anchors of still-open probe popups (best effort, read only)."""
+        with self._lock:
             targets = list(probe.popups)
-            for target in targets:
-                self._probe_popups.pop(target, None)
-            probe.popups.clear()
-            if probe.target:
-                targets.append(probe.target)
         for target in targets:
+            if len(probe.links) >= PROBE_LINK_CAP:
+                return
+            try:
+                session = self._call("Target.attachToTarget", {"targetId": target, "flatten": True},
+                                     timeout=PROBE_CDP_TIMEOUT).get("sessionId")
+                if not isinstance(session, str) or not session:
+                    continue
+                hrefs = (self._call("Runtime.evaluate", {
+                    "expression": LINKS_JS, "returnByValue": True, "timeout": 3000},
+                    session=session, timeout=PROBE_CDP_TIMEOUT).get("result") or {}).get("value")
+                for url in self.extract_links(hrefs[:LINK_CAP] if isinstance(hrefs, list) else []):
+                    self._probe_add(probe, url)
+            except BrowserError as error:
+                self.log("probe popup read failed: %s" % error)
+
+    def _probe_close(self, probe):
+        """Close the probe target and every popup it spawned; verify nothing is left."""
+        with self._cv:
+            ids = set(probe.popups)
+            if probe.target:
+                ids.add(probe.target)
+        for target in sorted(ids):
             try:
                 self._call("Target.closeTarget", {"targetId": target}, timeout=5.0)
             except BrowserError as error:
                 self.log("probe target close failed: %s" % error)
+        # Explicit check: anything of ours (or opened by it, transitively) that is still listed.
+        try:
+            infos = self._call("Target.getTargets", timeout=5.0).get("targetInfos", [])
+        except BrowserError as error:
+            self.log("probe leftover check failed: %s" % error)
+            infos = []
+        with self._cv:
+            known = set(ids) | set(self._probe_popups_of(probe))
+        leftovers = []
+        changed = True
+        while changed:
+            changed = False
+            for info in infos:
+                if not isinstance(info, dict):
+                    continue
+                tid = info.get("targetId")
+                if (isinstance(tid, str) and tid not in leftovers and
+                        (tid in known or info.get("openerId") in known)):
+                    known.add(tid)
+                    leftovers.append(tid)
+                    changed = True
+        for target in leftovers:
+            try:
+                self._call("Target.closeTarget", {"targetId": target}, timeout=5.0)
+            except BrowserError as error:
+                self.log("probe leftover close failed: %s" % error)
+        with self._cv:
+            self._probe_targets.pop(probe.target, None)
+            self._probe_sessions.pop(probe.session, None)
+            for target in list(self._probe_popups_of(probe)):
+                self._probe_popups.pop(target, None)
+            probe.popups.clear()
+
+    def _probe_popups_of(self, probe):
+        return [t for t, p in self._probe_popups.items() if p is probe]
 
     def probe(self, ident, x, y, url_check=None):
         """Follow the link under (x, y) in a hidden target; see the section comment.
@@ -1886,6 +1933,8 @@ class RemoteBrowser:
                     self.log("probe ad blocking failed: %s" % error)
             self._call("Page.navigate", {"url": start}, session=session)
             self._wait_probe(probe, self._clock() + PROBE_TIMEOUT)
+            if not probe.links:
+                self._probe_read_popups(probe)
             final = None
             if not probe.links:
                 # No hoster URL on the way: read the anchors of the page we ended on.
