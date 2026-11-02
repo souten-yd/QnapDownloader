@@ -1,6 +1,6 @@
 "use strict";
 /*
- * QnapDownloader browser-style shell (v0.1.13).
+ * QnapDownloader browser-style shell (v0.1.14).
  * Spec: docs/browser-shell-ui.md. Single file, no build step.
  *
  * Security notes (see "Security invariants" in the spec):
@@ -30,6 +30,8 @@ const MAX_HISTORY = 50;
 const AUTO_REFRESH_MS = 5000;     // downloads view: local data, refreshed while visible
 const BADGE_REFRESH_MS = 30000;   // header badge: only while the engine is running
 const FRAME_LOAD_TIMEOUT_MS = 12000;
+const HINT_DELAY_MS = 6000;         // offer the "not showing?" bar after this long
+const EXTERNAL_TOAST_MS = 8000;
 const PAGE_SIZE = 30;
 // Remote pages never get popups, downloads, modals or top navigation.
 const SANDBOX_STRICT = "";
@@ -46,6 +48,9 @@ const SANDBOX_INTERACTIVE = "allow-scripts allow-forms";
 const SANDBOX_COMPAT = "allow-scripts allow-forms allow-same-origin";
 const MODES = ["strict", "interactive", "compat"];
 const MODE_LABELS = {strict: "強い制限", interactive: "限定操作", compat: "互換"};
+// Per-host "always open in Safari". Stored in the same hostname->mode map as the
+// isolation modes, but it is NOT a tab mode (never in MODES / tab.mode / sandbox).
+const EXTERNAL_MODE = "external";
 const SHELL_KEY = "qnapdl.shell.v1";
 const HOST_MODE_KEY = "qnapdl.hostmodes.v1";
 const TAB_STORAGE_KEY = "qnapdl.webtabs.v1";
@@ -167,7 +172,7 @@ function readHostModes() {
     const data = JSON.parse(readLocal(HOST_MODE_KEY) || "[]");
     if (!Array.isArray(data)) return [];
     return data.filter(e => Array.isArray(e) && typeof e[0] === "string" && e[0].length <= 253 &&
-      MODES.includes(e[1]) && e[1] !== "strict").slice(-MAX_HOST_MODES);
+      ((MODES.includes(e[1]) && e[1] !== "strict") || e[1] === EXTERNAL_MODE)).slice(-MAX_HOST_MODES);
   } catch (e) { return []; }
 }
 
@@ -181,6 +186,16 @@ function rememberHostMode(host, mode) {
 function rememberedMode(host) {
   const hit = readHostModes().find(e => e[0] === host);
   return hit ? hit[1] : null;
+}
+
+function isExternalHost(host) { return Boolean(host) && rememberedMode(host) === EXTERNAL_MODE; }
+
+function externalHosts() {
+  return readHostModes().filter(e => e[1] === EXTERNAL_MODE).map(e => e[0]);
+}
+
+function clearExternalHost(host) {
+  if (isExternalHost(host)) rememberHostMode(host, "strict");   // strict = store nothing
 }
 
 // ------------------------------------------------- stale-while-revalidate
@@ -509,25 +524,51 @@ function renderWebTabs() {
   updateMobileBar();
 }
 
+// One compact row per web tab (single line, ellipsis): [mode chip] host ... [Safari] [...]
 function updateWebStatus(tab) {
   const box = $("webStatus");
   box.replaceChildren();
   if (!tab || !tab.history.length) return;
-  box.appendChild(element("span", MODE_LABELS[tab.mode] || MODE_LABELS.strict, "mode-badge " + tab.mode));
-  let text;
-  if (tab.error) text = "読み込めませんでした: " + tab.error;
-  else if (!tab.current) text = "検証して読み込み中です…";
-  else text = "隔離表示中: " + tab.current +
-    " — サイトが埋め込みを禁止している場合は空白になります。⋮ メニューからSafariで開けます。" +
-    "枠内の遷移先URLは読み取れません。" +
-    (tab.mode === "compat" ? "互換モード: このサイト自身のCookie・ストレージを枠内で使えます。" : "");
-  box.appendChild(element("span", text, "web-status-text"));
+  const external = Boolean(tab.external);
+  const chip = element("button", external ? "Safari固定" : (MODE_LABELS[tab.mode] || MODE_LABELS.strict),
+    "mode-badge " + (external ? "external" : tab.mode));
+  chip.type = "button";
+  chip.title = "表示されない場合のヒントを表示";
+  chip.addEventListener("click", () => {
+    tab.showHint = true;
+    tab.hintDismissed = false;
+    updateChrome();
+  });
+  box.appendChild(chip);
+  const host = hostOf(tab.history[tab.index]);
+  let text = host;
+  if (tab.error) text = host + " — 読み込めませんでした: " + tab.error;
+  else if (!tab.current) text = host + " — 読み込み中…";
+  const label = element("span", text, "web-status-text");
+  label.title = tab.current || text;
+  box.appendChild(label);
+  const safari = element("button", "Safari", "btn small");
+  safari.type = "button";
+  safari.title = "Safariで開く（今回のみ）";
+  safari.setAttribute("aria-label", "Safariで開く（今回のみ）");
+  safari.disabled = !tab.current;
+  safari.addEventListener("click", () => openExternal(tab));
+  box.appendChild(safari);
+  const more = element("button", undefined, "icon-btn small");
+  more.type = "button";
+  more.title = "メニュー";
+  more.setAttribute("aria-label", "メニューを開く");
+  more.appendChild(icon("more"));
+  more.addEventListener("click", event => { event.stopPropagation(); openMenu(); });
+  box.appendChild(more);
 }
 
-// Slim, non-blocking hint under the toolbar while the tab is not in compat mode.
+// Slim one-line bar: shown 6 s after a load starts (or when the chip is tapped).
+// Cross-origin load failure cannot be detected, so this is a timing heuristic.
 function updateCfHint(tab) {
-  $("cfHint").hidden = !(tab && tab.current && tab.mode !== "compat" && !tab.hintDismissed);
-  $("cfHttps").hidden = isHttpsNow();
+  const show = Boolean(tab && tab.current && !tab.external && tab.showHint && !tab.hintDismissed);
+  $("cfHint").hidden = !show;
+  $("cfCompat").hidden = !tab || tab.mode === "compat";
 }
 
 // ------------------------------------------------------------- status/home
@@ -697,7 +738,7 @@ async function addBookmark(title, url) {
 function newTabRecord(id) {
   return {id, history: [], index: -1, mode: "strict", current: "",
     loaded: false, loading: false, token: 0, frame: null, error: "",
-    lastUsed: 0, hintDismissed: false};
+    lastUsed: 0, hintDismissed: false, showHint: false, hintTimer: 0, external: false};
 }
 
 function saveTabs() {
@@ -756,6 +797,7 @@ function closeTab(id) {
     while (state.closed.length > MAX_CLOSED_TABS) state.closed.shift();
   }
   tab.token++;
+  clearTimeout(tab.hintTimer);
   if (tab.frame) tab.frame.remove();
   state.tabs.splice(idx, 1);
   saveTabs();
@@ -844,6 +886,13 @@ function mountFrame(tab, validatedUrl) {
   };
   frame.addEventListener("load", done);
   setTimeout(done, FRAME_LOAD_TIMEOUT_MS);
+  // Heuristic only: whether or not 'load' fired, offer the bar after HINT_DELAY_MS.
+  clearTimeout(tab.hintTimer);
+  tab.showHint = false;
+  tab.hintDismissed = false;
+  tab.hintTimer = setTimeout(() => {
+    if (tab.frame === frame && state.tabs.includes(tab)) { tab.showHint = true; updateChrome(); }
+  }, HINT_DELAY_MS);
   $("frames").appendChild(frame);
   tab.frame = frame;
   tab.loading = true;
@@ -865,12 +914,75 @@ function syncFrameVisibility() {
 // that host; compat never carries over to a host the user did not choose it for.
 function applyHostMode(tab, url) {
   const remembered = rememberedMode(hostOf(url));
-  if (remembered) tab.mode = remembered;
+  if (remembered && MODES.includes(remembered)) tab.mode = remembered;
   else if (tab.mode === "compat") tab.mode = "strict";
 }
 
+// ---- always-open-in-Safari (external mode) ----
+// iOS only allows window.open() inside the user-gesture call stack, and
+// /api/browser/validate is async, so we cannot validate first and open after
+// (nor open a blank window first: that leaves an opener-linked popup). A host
+// is only in external mode because the user chose it for a page that already
+// passed server validation, so for such a host we run a cheap client-side
+// sanity check (https, no credentials/port, public-looking hostname equal to
+// the stored host) and call window.open synchronously with noopener. The
+// server stays authoritative: /api/browser/validate is still called right
+// afterwards and a rejection is surfaced (and the host's external mode cleared).
+function externalSanityUrl(value) {
+  let parsed;
+  try { parsed = new URL(value); } catch (e) { return ""; }
+  const host = parsed.hostname.toLowerCase();
+  const hub = location.hostname.toLowerCase().replace(/^\[|\]$/g, "");
+  const ok = parsed.protocol === "https:" && !parsed.username && !parsed.password && !parsed.port &&
+    host.length <= 253 && host.includes(".") && host !== hub &&
+    !/^[\d.]+$/.test(host) && !host.includes(":") && !host.startsWith("[") &&
+    !/(^|\.)(localhost|local|internal|lan|home|ts\.net)$/.test(host) &&
+    parsed.href.length <= 2048 && isExternalHost(hostOf(parsed.href));
+  return ok ? parsed.href : "";
+}
+
+function showExternalToast(host, href) {
+  stickyToast("external", "Safariで開きました（このサイトは常に外部で開きます）", "success", [{
+    label: "タブで開く",
+    run: () => {
+      clearExternalHost(host);
+      dropExternalToast();
+      renderExternalHosts();
+      perform(() => openWebUrl(href));
+    },
+  }]);
+  setTimeout(dropExternalToast, EXTERNAL_TOAST_MS);
+}
+
+function dropExternalToast() {
+  for (const old of Array.from($("notice").children)) {
+    if (old.dataset.sticky === "external") old.remove();
+  }
+}
+
+// Returns true when the navigation was handed to Safari (no iframe is created).
+function tryExternalOpen(value, tab) {
+  const href = externalSanityUrl(value);
+  if (!href) return false;
+  const host = hostOf(href);
+  window.open(href, "_blank", "noopener,noreferrer");
+  validateUrl(href).catch(e => {
+    clearExternalHost(host);
+    renderExternalHosts();
+    toast("このサイトは開けません: " + e.message, "error");
+  });
+  showExternalToast(host, href);
+  // A blank/new tab would only show an empty page: close it. A tab showing
+  // another page is left as it is.
+  if (tab && state.tabs.includes(tab) && !tab.history.length) closeTab(tab.id);
+  return true;
+}
+
 // Validate `value`, let `commit` update the history, then (re)load the iframe.
-async function openInTab(tab, value, commit) {
+// opts.restore: not a user gesture (lazy load of a restored tab), so an
+// external host is shown without a frame instead of calling window.open.
+async function openInTab(tab, value, commit, opts = {}) {
+  if (!opts.restore && isExternalHost(hostOf(value)) && tryExternalOpen(value, tab)) return;
   const token = ++tab.token;
   tab.error = "";
   tab.loading = true;
@@ -888,7 +1000,16 @@ async function openInTab(tab, value, commit) {
   if (!previous || hostOf(previous) !== hostOf(url)) applyHostMode(tab, url);
   tab.current = url;
   tab.loaded = true;
-  mountFrame(tab, url);
+  if (isExternalHost(hostOf(url))) {
+    // No iframe for an external host; the compact row offers the Safari button.
+    if (tab.frame) tab.frame.remove();
+    tab.frame = null;
+    tab.loading = false;
+    tab.external = true;
+  } else {
+    tab.external = false;
+    mountFrame(tab, url);
+  }
   saveTabs();
   refreshAfterTabChange();
 }
@@ -916,7 +1037,7 @@ const reloadTab = tab => openInTab(tab, tab.history[tab.index],
 
 function ensureLoaded(tab) {
   if (!tab || !tab.history.length || tab.loaded || tab.loading) return Promise.resolve();
-  return reloadTab(tab);
+  return openInTab(tab, tab.history[tab.index], url => { tab.history[tab.index] = url; }, {restore: true});
 }
 
 async function stepHistory(tab, delta) {
@@ -932,6 +1053,7 @@ async function stepHistory(tab, delta) {
 async function openWebUrl(value) {
   const tab = activeWebTab();
   if (tab) { await navigateTab(tab, value); return; }
+  if (isExternalHost(hostOf(value)) && tryExternalOpen(value, null)) return;
   if (tabLimitReached()) return;
   const url = await validateUrl(value);
   const fresh = createTab();
@@ -939,7 +1061,8 @@ async function openWebUrl(value) {
   applyHostMode(fresh, url);
   fresh.current = url;
   fresh.loaded = true;
-  mountFrame(fresh, url);
+  if (isExternalHost(hostOf(url))) fresh.external = true;
+  else mountFrame(fresh, url);
   saveTabs();
   navigate("#/tab/" + fresh.id);
 }
@@ -1064,6 +1187,38 @@ async function menuAction(action) {
 function openExternal(tab) {
   if (!tab.current) return;   // only a URL that passed /api/browser/validate
   window.open(tab.current, "_blank", "noopener,noreferrer");
+}
+
+// "Safariで開く（次回から自動）": open now (inside the click gesture) and remember the host.
+function alwaysExternal(tab) {
+  if (!tab.current) return;
+  const host = hostOf(tab.current);
+  rememberHostMode(host, EXTERNAL_MODE);
+  window.open(tab.current, "_blank", "noopener,noreferrer");
+  showExternalToast(host, tab.current);
+  renderExternalHosts();
+}
+
+// Settings: hosts set to "always open in Safari", each with a release button.
+function renderExternalHosts() {
+  const box = $("externalHosts");
+  if (!box) return;
+  const hosts = externalHosts();
+  if (!hosts.length) {
+    box.replaceChildren(element("p", "設定されたサイトはありません。", "empty-state"));
+    return;
+  }
+  const nodes = [];
+  for (const host of hosts) {
+    const row = element("div", undefined, "item");
+    row.appendChild(element("span", host));
+    const off = element("button", "解除", "btn small");
+    off.type = "button";
+    off.addEventListener("click", () => { clearExternalHost(host); renderExternalHosts(); });
+    row.appendChild(off);
+    nodes.push(row);
+  }
+  box.replaceChildren(...nodes);
 }
 
 async function stageTabUrl(tab) {
@@ -1618,6 +1773,7 @@ async function enterSettings(section, force = false) {
     renderShareStatic();
     await swr("share-tokens", "/api/share/tokens", renderShareDevices, {force});
   } else if (section === "bookmarks") {
+    renderExternalHosts();
     await loadBookmarks(force);
   } else if (section === "updates") {
     await Promise.all([loadStatus(force), updateStatus(force)]);
@@ -2021,7 +2177,7 @@ function wireShell() {
   });
   $("cfSafari").addEventListener("click", () => {
     const tab = activeWebTab();
-    if (tab) openExternal(tab);
+    if (tab) alwaysExternal(tab);
   });
   $("cfDismiss").addEventListener("click", () => {
     const tab = activeWebTab();

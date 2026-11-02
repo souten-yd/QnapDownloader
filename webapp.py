@@ -25,7 +25,7 @@ import runtime_diagnostics
 import engine_supervisor
 import updater
 
-VERSION = "0.1.13"
+VERSION = "0.1.14"
 PORT = 17864
 ROOT = Path(__file__).resolve().parent
 FILES = {"/": ("web/index.html", "text/html; charset=utf-8"),
