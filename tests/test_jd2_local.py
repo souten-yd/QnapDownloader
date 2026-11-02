@@ -3,6 +3,7 @@ import os
 import tempfile
 import threading
 import unittest
+import unittest.mock
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
@@ -284,6 +285,129 @@ class AdapterTests(unittest.TestCase):
         self.assertTrue(self.adapter._options["allow_link_submit"])
         self.engine.preset_applied = False
         self.assertFalse(self.adapter._options["allow_link_submit"])
+
+
+SECRET = "Pw:s3cr3t&=?/ \u00e9\u65e5\u672c"
+
+
+class AccountAdapterTests(unittest.TestCase):
+    """v0.1.23 accountsV2 calls: allowlist, GET encoding and secret redaction."""
+
+    def setUp(self):
+        self.server = HTTPServer(("127.0.0.1", 0), StubHandler)
+        self.server.paths = []
+        self.server.responses = {}
+        self.server.status = 200
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.addCleanup(lambda: (self.server.shutdown(), self.server.server_close()))
+        self.engine = Engine(self.server.server_port)
+        self.adapter = jl.LocalAdapter(self.engine)
+
+    def decoded_args(self):
+        path = self.server.paths[-1]
+        prefix, _, query = path.partition("?")
+        return prefix, [json.loads(urllib.parse.unquote(a)) for a in query.split("&")] if query else []
+
+    def test_account_calls_are_allowlisted_and_nothing_else_in_the_namespace(self):
+        names = sorted(m for ns, m in jl.ALLOWED_CALLS if ns == "accountsV2")
+        self.assertEqual(names, sorted([
+            "listAccounts", "listPremiumHoster", "addAccount", "refreshAccounts",
+            "enableAccounts", "disableAccounts", "setUserNameAndPassword", "removeAccounts"]))
+        with self.assertRaises(jl.LocalUnavailable):
+            jl.encode_call("accountsV2", "getAccountCookies", ())
+        with self.assertRaises(jl.LocalUnavailable):
+            jl.encode_call("accounts", "listAccounts", ())
+
+    def test_list_accounts_uses_the_documented_query_and_get_encoding(self):
+        self.server.responses["/accountsV2/listAccounts"] = {"data": [{"UUID": 1}, "junk"]}
+        self.assertEqual(self.adapter.list_accounts(), [{"UUID": 1}])
+        prefix, args = self.decoded_args()
+        self.assertEqual(prefix, "/accountsV2/listAccounts")
+        self.assertEqual(args, [{"userName": True, "validUntil": True, "trafficLeft": True,
+                                 "trafficMax": True, "enabled": True, "valid": True,
+                                 "error": True, "maxResults": -1, "startAt": 0}])
+        self.server.responses["/accountsV2/listPremiumHoster"] = {"data": ["rapidgator.net"]}
+        self.assertEqual(self.adapter.list_premium_hosters(), ["rapidgator.net"])
+        self.assertEqual(self.decoded_args(), ("/accountsV2/listPremiumHoster", []))
+
+    def test_write_calls_encode_one_json_argument_each(self):
+        self.adapter.add_account("rapidgator.net", "user@example.com", SECRET)
+        prefix, args = self.decoded_args()
+        self.assertEqual((prefix, args), ("/accountsV2/addAccount",
+                                          ["rapidgator.net", "user@example.com", SECRET]))
+        self.assertNotIn(" ", self.server.paths[-1])
+        self.assertEqual(self.server.paths[-1].count("&"), 2)
+        self.adapter.set_credentials(123, "u", SECRET)
+        self.assertEqual(self.decoded_args(), ("/accountsV2/setUserNameAndPassword", [123, "u", SECRET]))
+        for method, name in ((self.adapter.refresh_accounts, "refreshAccounts"),
+                             (self.adapter.enable_accounts, "enableAccounts"),
+                             (self.adapter.disable_accounts, "disableAccounts"),
+                             (self.adapter.remove_accounts, "removeAccounts")):
+            method([5, 6])
+            self.assertEqual(self.decoded_args(), ("/accountsV2/" + name, [[5, 6]]))
+        for bad in ([], ["1"], [True], [-1], [1] * 51, "1", None):
+            with self.subTest(bad=bad):
+                with self.assertRaises(jl.LocalUnavailable):
+                    self.adapter.remove_accounts(bad)
+
+    def test_false_results_are_refusals(self):
+        self.server.responses["/accountsV2/addAccount"] = {"data": False}
+        with self.assertRaises(jl.LocalUnavailable) as ctx:
+            self.adapter.add_account("rapidgator.net", "u", SECRET)
+        self.assertNotIn(SECRET, str(ctx.exception))
+
+    def assert_redacted(self, error):
+        text = repr(error) + str(error) + repr(error.args)
+        for needle in (SECRET, urllib.parse.quote(SECRET, safe=""), "s3cr3t", "user%40", "user@example.com",
+                       "/accountsV2/addAccount?", "?%22"):
+            self.assertNotIn(needle, text)
+        self.assertIn("addAccount", str(error))
+        self.assertIsNone(error.__cause__)
+        self.assertIsNone(error.__context__)
+
+    def test_http_error_does_not_echo_request(self):
+        self.server.status = 500
+        with self.assertRaises(jl.LocalUnavailable) as ctx:
+            self.adapter.add_account("rapidgator.net", "user@example.com", SECRET)
+        self.assert_redacted(ctx.exception)
+        self.assertIn("HTTP 500", str(ctx.exception))
+
+    def test_transport_exception_that_carries_the_path_is_redacted(self):
+        def leaky(self_, method, url, **kwargs):
+            raise OSError("cannot send " + url)
+        import http.client
+        with unittest.mock.patch.object(http.client.HTTPConnection, "request", leaky):
+            with self.assertRaises(jl.LocalUnavailable) as ctx:
+                self.adapter.add_account("rapidgator.net", "user@example.com", SECRET)
+        self.assert_redacted(ctx.exception)
+        with unittest.mock.patch.object(http.client.HTTPConnection, "request", leaky):
+            with self.assertRaises(jl.LocalUnavailable) as ctx:
+                self.adapter.set_credentials(9, "user@example.com", SECRET)
+        self.assertNotIn(SECRET, repr(ctx.exception) + str(ctx.exception.__context__))
+
+    def test_unparsable_and_oversize_responses_are_redacted(self):
+        with unittest.mock.patch.object(jl.json, "loads", side_effect=ValueError("bad " + SECRET)):
+            self.server.responses["/accountsV2/addAccount"] = {"data": True}
+            with self.assertRaises(jl.LocalUnavailable) as ctx:
+                self.adapter.add_account("rapidgator.net", "user@example.com", SECRET)
+        self.assert_redacted(ctx.exception)
+
+    def test_closed_port_failure_is_redacted_and_private_calls_never_log(self):
+        self.server.shutdown()
+        self.server.server_close()
+        with self.assertLogs(level="DEBUG") as logs, self.assertRaises(jl.LocalUnavailable) as ctx:
+            import logging
+            logging.getLogger().debug("probe")
+            self.adapter.add_account("rapidgator.net", "user@example.com", SECRET)
+        self.assert_redacted(ctx.exception)
+        self.assertNotIn(SECRET, "\n".join(logs.output))
+
+    def test_engine_not_running_fails_before_any_request(self):
+        self.engine.running = False
+        with self.assertRaises(jl.LocalUnavailable):
+            self.adapter.add_account("rapidgator.net", "u", SECRET)
+        self.assertEqual(self.server.paths, [])
+        self.assertFalse(self.adapter.engine_running)
 
 
 if __name__ == "__main__":

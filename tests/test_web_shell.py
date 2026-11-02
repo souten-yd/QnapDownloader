@@ -178,7 +178,7 @@ if (bad.length) { console.error("mismatch: " + bad.join(",")); process.exit(1); 
 
     def test_settings_order_and_auto_refresh_interval(self):
         order = re.findall(r'<a href="#/settings/(\w+)" data-section', self.html)
-        self.assertEqual(order, ["engine", "browser", "storage", "https", "share", "bookmarks", "updates", "diagnostics", "about"])
+        self.assertEqual(order, ["engine", "accounts", "browser", "storage", "https", "share", "bookmarks", "updates", "diagnostics", "about"])
         self.assertRegex(self.js, r"AUTO_REFRESH_MS\s*=\s*5000\b")
         self.assertRegex(self.js, r"BADGE_REFRESH_MS\s*=\s*30000\b")
         self.assertRegex(self.js, r"PASTE_DEBOUNCE_MS\s*=\s*400\b")
@@ -366,7 +366,7 @@ if (out !== want) { console.error(JSON.stringify(out)); process.exit(1); }
             self.assertIn('id="%s"' % ident, section)
         for text in ("初期設定（イメージ作成）", "停止", "2GiB", "80%", "5分", "10分", "Container Station"):
             self.assertIn(text, section)
-        self.assertIn('SETTINGS_SECTIONS = ["engine", "browser"', self.js)
+        self.assertIn('SETTINGS_SECTIONS = ["engine", "accounts", "browser"', self.js)
 
     def test_v0116_native_leftover_row(self):
         self.assertRegex(self.html, r'<div id="engineNativeRow"[^>]*hidden')
@@ -381,6 +381,45 @@ if (out !== want) { console.error(JSON.stringify(out)); process.exit(1); }
         self.assertIn("<symbol", self.html)
         self.assertIn('id="notice"', self.html)
         self.assertIn('role="status"', self.html)
+
+    def test_v0123_accounts_section_ui_and_secret_handling(self):
+        section = re.search(r'<section class="settings-section" data-section="accounts".*?</section>',
+                            self.html, re.S).group(0)
+        for ident in ("accountsList", "accountForm", "accountHost", "accountHostList", "accountUser",
+                      "accountPass", "accountAdd", "accountsSecure", "accountEditPass", "accountResult"):
+            self.assertIn('id="%s"' % ident, section)
+        self.assertIn('href="#/settings/https"', section)
+        # Password inputs: masked, never autofilled/saved by the browser.
+        for ident in ("accountPass", "accountEditPass"):
+            tag = re.search(r'<input id="%s"[^>]*>' % ident, section).group(0)
+            self.assertIn('type="password"', tag)
+            self.assertIn('autocomplete="new-password"', tag)
+        self.assertIn('list="accountHostList"', section)
+        # Settings order: アカウント directly after エンジン.
+        self.assertRegex(self.html, r'data-section="engine">エンジン</a>\s*<a href="#/settings/accounts" data-section="accounts">アカウント</a>')
+        # Onboarding: optional third item, hidden by default.
+        self.assertRegex(self.html, r'<li id="obAccounts"[^>]*hidden')
+        self.assertIn("プレミアムアカウントを登録（任意）", self.html)
+        # The two password inputs are read only to build a request body and are
+        # emptied; they never reach storage, URLs, the DOM text or the console.
+        for ident in ("accountPass", "accountEditPass"):
+            for call in re.finditer(r'\$\("%s"\)\.value' % ident, self.js):
+                line = self.js[self.js.rfind("\n", 0, call.start()) + 1:self.js.find("\n", call.end())]
+                self.assertNotRegex(line, r"(?i)storage|textContent|location|console|setAttribute|toast|flash")
+        self.assertNotRegex(self.js, r"(?i)(session|local)Storage\.setItem\([^)]*(pass|account)")
+        self.assertNotRegex(self.js, r"(?i)write(Session|Local)\([^)]*(pass|account)")
+        self.assertNotRegex(self.js, r"console\.\w+\([^)]*(?i:pass)")
+        # Writes go to the dedicated endpoints; delete needs the typed host name.
+        for path in ("/api/accounts/add", "/api/accounts/update", "/api/accounts/enable",
+                     "/api/accounts/refresh", "/api/accounts/delete", "/api/accounts/hosts"):
+            self.assertIn(path, self.js)
+        self.assertIn("confirm_host", self.js)
+        self.assertIn("/api/accounts/schema", self.js)
+        self.assertIn("アカウント情報の項目を調べる", self.html)
+        self.assertIn("一覧に出ないアカウントがある場合は、この結果を開発者に送ってください", self.html)
+        self.assertIn("state.https === true || state.tailnet === true", self.js)
+        self.assertIn("パスワードはHTTPSまたはTailscale経由でのみ送信できます", self.js)
+        self.assertNotIn("innerHTML", self.js)
 
 
 if __name__ == "__main__":
