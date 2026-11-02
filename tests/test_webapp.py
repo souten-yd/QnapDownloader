@@ -174,7 +174,7 @@ class HttpTests(unittest.TestCase):
         code, frame = self.req("/api/rb/frame?tab=b1&since=0&wait=0")
         self.assertEqual(code, 200)
         self.assertEqual(set(frame), {"seq", "jpeg_base64", "width", "height", "url", "title",
-                                      "loading", "blocked", "intercepts", "rev", "popups", "editable"})
+                                      "loading", "blocked", "intercepts", "rev", "popups", "editable", "challenge"})
         self.assertIsNone(frame["jpeg_base64"])
         self.rb_ws.emit("Page.screencastFrame", {"data": "QUJD", "sessionId": 1, "metadata": {
             "deviceWidth": 1280, "deviceHeight": 2000}}, "SESSION1")
@@ -219,6 +219,92 @@ class HttpTests(unittest.TestCase):
             if self.server.rb._tabs["b1"].frame == data:
                 return
             time.sleep(0.01)
+
+    V28_GET = ("/api/rb/tile.jpg?tab=b1&snap=s1&i=0", "/api/rb/meta?tab=b1&wait=0")
+    V28_POST = (("/api/rb/snapshot", {"tab": "b1"}),
+                ("/api/rb/snapshot/release", {"tab": "b1"}),
+                ("/api/rb/tap-page", {"tab": "b1", "snap": "s1", "x": 1, "y": 1}),
+                ("/api/rb/probe", {"tab": "b1", "href": "https://example.org/x"}))
+
+    def test_v0128_snapshot_endpoints_require_login_csrf_and_origin(self):
+        for path in self.V28_GET:
+            with self.subTest(path=path):
+                self.assertEqual(self.req(path)[0], 401)
+        for path, body in self.V28_POST:
+            with self.subTest(path=path):
+                self.assertIn(self.req(path, body)[0], (401, 403))
+        self.login()
+        for path, body in self.V28_POST:
+            with self.subTest(path=path, case="no csrf"):
+                self.assertEqual(self.req(path, body, csrf=False)[0], 403)
+            with self.subTest(path=path, case="no origin"):
+                self.assertEqual(self.req(path, body, origin=False)[0], 403)
+        self.assertEqual(self.rb_ws.calls("Page.captureScreenshot"), [])
+
+    def test_v0128_snapshot_tile_tap_and_meta_flow(self):
+        self.login()
+        self.assertEqual(self.req("/api/rb/tabs", {"url": "https://example.com/a"})[0], 201)
+        self.assertEqual(self.req("/api/rb/viewport", {"tab": "b1", "width": 390, "height": 700, "dpr": 2})[0], 200)
+        self.rb_ws.eval_map = [("__qdlMut", {"links": [
+            {"x": 5, "y": 6, "w": 50, "h": 20, "href": "https://example.org/a"},
+            {"x": 5, "y": 6, "w": 50, "h": 20, "href": "javascript:1"}], "inputs": []}),
+            ("scrollTo", [0, 0, 390, 700])]
+        code, meta = self.req("/api/rb/snapshot", {"tab": "b1"})
+        self.assertEqual(code, 200)
+        self.assertEqual((meta["width"], meta["height"], meta["tiles"], meta["tile_height"]),
+                         (390, 4001, 3, 1600))
+        self.assertEqual([l["href"] for l in meta["links"]], ["https://example.org/a"])
+        self.assertEqual(self.rb_ws.calls("Page.captureScreenshot"), [])
+        code, headers, data = self.get_raw("/api/rb/tile.jpg?tab=b1&snap=%s&i=2" % meta["snap_id"])
+        self.assertEqual((code, headers["Content-Type"]), (200, "image/jpeg"))
+        self.assertEqual(len(data), 100)
+        self.assertEqual(headers["Cache-Control"], "no-store")
+        self.assertEqual(len(self.rb_ws.calls("Page.captureScreenshot")), 1)
+        for bad in ("i=x", "i=-1", "i=123456", "i="):
+            with self.subTest(bad=bad):
+                self.assertEqual(self.get_raw("/api/rb/tile.jpg?tab=b1&snap=%s&%s" % (meta["snap_id"], bad))[0], 400)
+        self.assertEqual(self.get_raw("/api/rb/tile.jpg?tab=b1&snap=%s&i=3" % meta["snap_id"])[0], 400)
+        self.assertEqual(self.get_raw("/api/rb/tile.jpg?tab=b1&snap=s99&i=0")[0], 404)      # re-snapshot
+        self.assertEqual(self.get_raw("/api/rb/tile.jpg?tab=b1&snap=../x&i=0")[0], 400)
+        self.assertEqual(self.get_raw("/api/rb/tile.jpg?tab=b9&snap=s1&i=0")[0], 404)
+        code, tapped = self.req("/api/rb/tap-page", {"tab": "b1", "snap": meta["snap_id"], "x": 10, "y": 20})
+        self.assertEqual((code, tapped["snap_needed"], tapped["navigated"]), (200, True, False))
+        for body in ({"tab": "b1", "snap": meta["snap_id"], "x": -1, "y": 1},
+                     {"tab": "b1", "snap": meta["snap_id"], "x": 1},
+                     {"tab": "b1", "snap": meta["snap_id"], "x": "1", "y": 1},
+                     {"tab": "b1", "snap": "zz", "x": 1, "y": 1},
+                     {"tab": "b1", "snap": meta["snap_id"], "x": 1e6, "y": 1}):
+            with self.subTest(body=body):
+                self.assertEqual(self.req("/api/rb/tap-page", body)[0], 400)
+        self.assertEqual(self.req("/api/rb/tap-page", {"tab": "b1", "snap": "s99", "x": 1, "y": 1})[0], 404)
+        code, state = self.req("/api/rb/meta?tab=b1&wait=0")
+        self.assertEqual((code, state["snap"], state["challenge"]), (200, meta["snap_id"], False))
+        for bad in ("wait=11", "wait=x", "rev=x"):
+            self.assertEqual(self.req("/api/rb/meta?tab=b1&" + bad)[0], 400)
+        self.assertEqual(self.req("/api/rb/meta?tab=b9&wait=0")[0], 404)
+        self.assertEqual(self.req("/api/rb/snapshot/release", {"tab": "b1"}), (200, {"ok": True}))
+        self.assertEqual(self.get_raw("/api/rb/tile.jpg?tab=b1&snap=%s&i=0" % meta["snap_id"])[0], 404)
+        self.assertEqual(self.req("/api/rb/snapshot", {"tab": "b9"})[0], 404)
+        self.assertEqual(self.req("/api/rb/snapshot", {})[0], 400)
+
+    def test_v0128_frame_header_reports_the_challenge(self):
+        self.login()
+        self.req("/api/rb/tabs", {"url": "https://example.com/a"})
+        self.feed_rb()
+        code, headers, _ = self.get_raw("/api/rb/frame.jpg?tab=b1&since=0&wait=0")
+        self.assertEqual(headers["X-Frame-Challenge"], "0")
+
+    def test_v0128_probe_href_is_validated_by_the_server(self):
+        self.login()
+        self.req("/api/rb/tabs", {"url": "https://example.com/a"})
+        for href in ("http://example.org/x", "https://127.0.0.1/x", "https://localhost/", "javascript:1",
+                     "https://" + self.host.split(":")[0] + "/x", "https://nas.tail1234.ts.net/x", 5):
+            with self.subTest(href=href):
+                self.assertEqual(self.req("/api/rb/probe", {"tab": "b1", "href": href})[0], 400)
+        hoster = "https://rapidgator.net/file/0123456789abcdef0123456789abcdef"
+        code, body = self.req("/api/rb/probe", {"tab": "b1", "href": hoster})
+        self.assertEqual((code, body["links"]), (200, [hoster]))
+        self.assertTrue(body["probe_id"])
 
     def test_rb_viewport_validates_and_applies(self):
         self.login()
@@ -400,7 +486,7 @@ class HttpTests(unittest.TestCase):
                                          headers={"Host": "192.168.68.57:17864"})
         with self.client.open(request, timeout=4) as response:
             self.assertEqual(response.status, 200)
-            self.assertEqual(json.load(response)["version"], "0.1.27")
+            self.assertEqual(json.load(response)["version"], "0.1.28")
         with self.client.open(self.url + "/icon.svg", timeout=4) as response:
             self.assertEqual(response.status, 200)
             self.assertEqual(response.headers.get_content_type(), "image/svg+xml")
@@ -1229,7 +1315,7 @@ class HttpTests(unittest.TestCase):
         self.assertFalse(info["supported"])
         code, _ = self.req("/api/update/apply", {"version": "v0.1.8"})
         self.assertEqual(code, 400)
-        self.assertEqual(self.req("/api/health")[1]["version"], "0.1.27")
+        self.assertEqual(self.req("/api/health")[1]["version"], "0.1.28")
         self.assertFalse(self.req("/api/jd2/status")[1]["connected"])
         self.assertEqual(self.req("/api/jd2/update/apply", {"confirmed": True})[0], 400)
         self.assertEqual(self.req("/api/jd2/preset/apply", {"confirmed": True})[0], 400)

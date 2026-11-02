@@ -93,6 +93,8 @@
      <button type="button" role="menuitem" data-action="toggleMode" data-scope="web" id="menuMode">限定操作モードに切り替え</button>
      <button type="button" role="menuitem" data-action="compatMode" data-scope="web" id="menuCompat">互換モードに切り替え</button>
      <button type="button" role="menuitem" data-action="remoteOpen" data-scope="web" id="menuRemote">NASブラウザで開く</button>
+     <button type="button" role="menuitem" data-action="display:tiles" data-display="tiles" data-scope="remote">表示: 高速（全体表示）</button>
+     <button type="button" role="menuitem" data-action="display:live" data-display="live" data-scope="remote">表示: ライブ</button>
      <button type="button" role="menuitem" data-action="quality:speed" data-quality="speed" data-scope="remote">画質: 速度優先</button>
      <button type="button" role="menuitem" data-action="quality:standard" data-quality="standard" data-scope="remote">画質: 標準</button>
      <button type="button" role="menuitem" data-action="quality:high" data-quality="high" data-scope="remote">画質: 高画質</button>
@@ -517,11 +519,14 @@
    <div id="remoteView" class="remote-view" hidden>
     <div id="remoteStage" class="remote-stage">
      <img id="remoteImg" class="remote-img" alt="NASブラウザの画面" draggable="false" hidden>
+     <div id="tileScroll" class="tile-scroll" aria-label="NASブラウザのページ（全体表示）" hidden></div>
      <div id="remoteIdle" class="remote-idle">
       <p id="remoteIdleText" class="muted">NASブラウザのタブは開かれていません。</p>
       <button type="button" id="remoteReopen" class="btn primary">NASブラウザで開く</button>
      </div>
      <div id="remoteLoading" class="loading-bar" hidden></div>
+     <div id="snapProgress" class="loading-bar snap-progress" role="progressbar" aria-label="ページを取得中" hidden></div>
+     <button type="button" id="tileRefresh" class="tile-refresh" aria-label="再取得" title="再取得" hidden>⟳</button>
      <div id="remoteRing" class="press-ring" aria-hidden="true" hidden></div>
      <div id="perfOverlay" class="perf-overlay" role="status" hidden></div>
     </div>

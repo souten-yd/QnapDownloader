@@ -118,6 +118,62 @@ MAX_COORD = 20000.0
 MAX_SCROLL = 5000.0
 MAX_TEXT = 500
 
+# Fast full-page display (v0.1.28): the page is measured, then rendered lazily as JPEG
+# tiles that the phone scrolls natively. Tiles live in RAM only (never on disk).
+SNAP_TILE = 1600               # CSS pixels per tile (the last one may be shorter)
+SNAP_MAX_HEIGHT = 30000        # CSS pixels captured at most; the rest of the page is cut off
+SNAP_CLIP_SCALE = 1.0          # clip.scale. The device scale factor already comes from the
+                               # emulated viewport; scale=dsf here would multiply it twice.
+SNAP_MAX_TILES = 40            # cached tiles per tab (LRU)
+SNAP_MAX_BYTES = 24 * 1024 * 1024
+SNAP_MAX_TILE_BYTES = 12 * 1024 * 1024
+SNAP_KEEP = 2                  # snapshots kept per tab (the previous one until the new one has a tile)
+SNAP_REUSE = 2.0               # an unchanged snapshot younger than this is returned as is
+SNAP_LINK_CAP = 3000
+SNAP_INPUT_CAP = 300
+SNAP_CDP_TIMEOUT = 20.0
+TAP_NAV_WAIT = 0.6             # after a click: wait this long for a navigation to start
+TAP_SETTLE_MAX = 10.0          # ... and at most this long for it to finish
+META_WAIT_MAX = 10.0
+SNAP_ID = re.compile(r"s[0-9]{1,9}\Z")
+SNAP_URL_MAX = 2048
+CHALLENGE_TITLES = ("just a moment", "しばらくお待ちください")
+CHALLENGE_URL = "/cdn-cgi/challenge"
+SNAP_JS = (
+    "(function(){try{if(!window.__qdlMut){var m=new MutationObserver(function(){window.__qdlDirty=true});"
+    "m.observe(document.documentElement,{subtree:true,childList:true,attributes:true,"
+    "characterData:true});window.__qdlMut=m;}window.__qdlDirty=false;}catch(e){}"
+    "var sx=window.scrollX,sy=window.scrollY,W=%d,H=%d,L=[],I=[];"
+    "var a=document.querySelectorAll('a[href]');"
+    "for(var i=0;i<a.length&&L.length<%d;i++){var h=a[i].href;"
+    "if(typeof h!=='string'||!/^https?:/i.test(h)||h.length>%d)continue;"
+    "var r=a[i].getBoundingClientRect();if(r.width<2||r.height<2)continue;"
+    "var x=r.left+sx,y=r.top+sy;if(x+r.width<=0||x>=W||y+r.height<=0||y>=H)continue;"
+    "var c=getComputedStyle(a[i]);if(c.visibility==='hidden'||c.display==='none')continue;"
+    "L.push({x:Math.round(x),y:Math.round(y),w:Math.round(r.width),h:Math.round(r.height),href:h});}"
+    "var e=document.querySelectorAll(\"input:not([type=hidden]):not([type=checkbox]):not([type=radio])"
+    ":not([type=button]):not([type=submit]):not([type=reset]):not([type=image]):not([type=file])"
+    ":not([type=range]):not([type=color]),textarea,[contenteditable=''],[contenteditable=true]\");"
+    "for(var j=0;j<e.length&&I.length<%d;j++){var q=e[j].getBoundingClientRect();"
+    "if(q.width<2||q.height<2)continue;var u=q.left+sx,v=q.top+sy;"
+    "if(u+q.width<=0||u>=W||v+q.height<=0||v>=H)continue;"
+    "I.push({x:Math.round(u),y:Math.round(v),w:Math.round(q.width),h:Math.round(q.height)});}"
+    "return {links:L,inputs:I};})()")
+DIRTY_JS = "window.__qdlDirty===true"
+SCROLL_JS = (
+    "(function(y){var ih=window.innerHeight;"
+    "var m=Math.max(0,Math.max(document.documentElement.scrollHeight,document.body?"
+    "document.body.scrollHeight:0)-ih);var t=Math.max(0,Math.min(y-ih/2,m));"
+    "window.scrollTo({top:t,left:0,behavior:'instant'});"
+    "return [window.scrollX,window.scrollY,window.innerWidth,ih];})(%.1f)")
+
+
+def looks_like_challenge(url, title):
+    """True while the page is a Cloudflare check (it needs the live screencast to complete)."""
+    title = (title or "").lower()
+    return (any(t in title for t in CHALLENGE_TITLES) or
+            CHALLENGE_URL in (url or "").lower())
+
 LINKS_JS = (
     "(function(){var o=[],s=new Set(),l=document.querySelectorAll('a[href]');"
     "for(var i=0;i<l.length&&o.length<%d;i++){var h=l[i].href;"
@@ -139,6 +195,10 @@ class TabGone(BrowserError):
 
 class ProbeQueueFull(BrowserError):
     pass
+
+
+class SnapshotGone(TabGone):
+    """The requested snapshot was replaced or released: take a new one."""
 
 
 class WebSocketError(Exception):
@@ -496,6 +556,35 @@ class Tab:
         self.probing = 0           # probes running now (<= MAX_PROBES_PER_TAB)
         self.probe_waiting = 0     # probes queued behind the limits
         self.editable = False      # the page's focused element accepts text (after the last input)
+        self.snaps = {}            # snapshot id -> Snapshot (newest last, <= SNAP_KEEP)
+        self.snap_seq = 0
+        self.snap_gen = 0          # bumped by anything that may change the page (input, navigation)
+        self.snap_lock = threading.Lock()    # one capture at a time per tab
+        self.tiles = {}            # (snapshot id, index) -> JPEG bytes, in LRU order (oldest first)
+        self.tile_bytes = 0
+
+
+class Snapshot:
+    """Measured page: tiles are rendered lazily and cached on the Tab (RAM only)."""
+
+    def __init__(self, ident, width, height, scale, quality, rev, gen, now):
+        self.id = ident
+        self.width = width
+        self.height = height
+        self.scale = scale
+        self.quality = quality
+        self.rev = rev
+        self.gen = gen
+        self.created = now
+        self.tiles = (height + SNAP_TILE - 1) // SNAP_TILE
+        self.meta = None
+
+
+def tile_clip(width, height, index, scale=SNAP_CLIP_SCALE):
+    """CDP clip of tile `index`: full width, SNAP_TILE high (the last tile is the remainder)."""
+    top = index * SNAP_TILE
+    return {"x": 0, "y": top, "width": width, "height": min(SNAP_TILE, height - top),
+            "scale": scale}
 
 
 class Probe:
@@ -1115,6 +1204,7 @@ class RemoteBrowser:
             if not self._tabs:
                 self._no_tabs_since = self._clock()
             tab.frame = None
+            self._snap_clear(tab)
             self._cv.notify_all()
         if close and tab.target_id:
             try:
@@ -1133,6 +1223,7 @@ class RemoteBrowser:
         tab = self._tab(ident)
         self._touch()
         tab.blocked = None
+        tab.snap_gen += 1
         self._call("Page.navigate", {"url": checked}, session=tab.session)
         return {"id": tab.id, "url": checked}
 
@@ -1180,6 +1271,8 @@ class RemoteBrowser:
         with self._lock:
             tab.viewport, tab.touch, tab.quality = view, mobile, mode
             running = tab.screencast
+            self._snap_clear(tab)    # other width / scale / quality: tiles would be wrong
+            tab.snap_gen += 1
         if running:
             # New frame size / quality: restart the already running screencast.
             self._call("Page.stopScreencast", session=session, timeout=5.0)
@@ -1571,6 +1664,7 @@ class RemoteBrowser:
                     "loading": bool(tab.loading), "blocked": tab.blocked,
                     "intercepts": tab.intercept_seq, "rev": tab.rev,
                     "popups": tab.popups_blocked, "editable": tab.editable,
+                    "challenge": looks_like_challenge(tab.url, tab.title),
                 }
             self._touch()
             return result
@@ -1600,6 +1694,8 @@ class RemoteBrowser:
         tab = self._tab(ident)
         self._touch()
         kind, session = event["type"], tab.session
+        if kind != "scroll":
+            tab.snap_gen += 1
         if kind == "tap":
             x = self._number(event.get("x"), 0, MAX_COORD, "x")
             y = self._number(event.get("y"), 0, MAX_COORD, "y")
@@ -1658,6 +1754,281 @@ class RemoteBrowser:
         except BrowserError:
             value = False
         tab.editable = value is True
+
+    # ------------------------------------------------- fast full-page display
+    # The page is measured once (snapshot) and rendered lazily as JPEG tiles that the
+    # phone scrolls natively. Tiles and link boxes are data only: nothing from the
+    # remote page is ever executed on the phone, and every href is validated again
+    # before the Hub acts on it.
+    def _snap_clear(self, tab):
+        tab.snaps.clear()
+        tab.tiles.clear()
+        tab.tile_bytes = 0
+
+    def snapshot_release(self, ident):
+        tab = self._tab(ident)
+        with self._lock:
+            self._snap_clear(tab)
+        return {"ok": True}
+
+    def _snap_drop(self, tab, snap_id):
+        tab.snaps.pop(snap_id, None)
+        for key in [k for k in tab.tiles if k[0] == snap_id]:
+            tab.tile_bytes -= len(tab.tiles.pop(key))
+
+    def _tile_put(self, tab, key, data):
+        if len(data) > SNAP_MAX_BYTES:
+            return      # never cached; still served once
+        tab.tiles.pop(key, None)
+        tab.tiles[key] = data
+        tab.tile_bytes = sum(len(v) for v in tab.tiles.values())
+        while len(tab.tiles) > 1 and (len(tab.tiles) > SNAP_MAX_TILES or
+                                       tab.tile_bytes > SNAP_MAX_BYTES):
+            oldest = next(iter(tab.tiles))
+            tab.tile_bytes -= len(tab.tiles.pop(oldest))
+
+    @staticmethod
+    def _boxes(raw, cap, width, height, with_href):
+        """Sanitised link / input boxes: finite ints, http(s) hrefs only, bounded."""
+        out = []
+        if not isinstance(raw, list):
+            return out
+        for item in raw:
+            if len(out) >= cap:
+                break
+            if not isinstance(item, dict):
+                continue
+            box = {}
+            for name in ("x", "y", "w", "h"):
+                value = item.get(name)
+                if (isinstance(value, bool) or not isinstance(value, (int, float)) or
+                        value != value or not -MAX_COORD <= value <= MAX_COORD):
+                    box = None
+                    break
+                box[name] = int(round(value))
+            if box is None or box["w"] < 1 or box["h"] < 1 or box["y"] >= height or box["x"] >= width:
+                continue
+            if with_href:
+                href = item.get("href")
+                if (not isinstance(href, str) or len(href) > SNAP_URL_MAX or
+                        not (href.startswith("https://") or href.startswith("http://"))):
+                    continue
+                box["href"] = href
+            out.append(box)
+        return out
+
+    def _snap_public(self, tab, snap, reused):
+        meta = dict(snap.meta)
+        meta.update({"url": tab.url, "title": tab.title, "reused": reused,
+                     "challenge": looks_like_challenge(tab.url, tab.title)})
+        return meta
+
+    def snapshot(self, ident, force=False, if_changed=False):
+        """Measure the page and return the snapshot description (no tile is rendered yet).
+
+        An unchanged snapshot younger than SNAP_REUSE is returned as is. With `if_changed`
+        the newest snapshot is also returned while the page reports no DOM change.
+        """
+        tab = self._tab(ident)
+        self._touch()
+        with tab.snap_lock:
+            now = self._clock()
+            with self._lock:
+                newest = next(reversed(tab.snaps.values()), None) if tab.snaps else None
+                same = (newest is not None and newest.gen == tab.snap_gen and
+                        newest.rev == tab.rev)
+            if same and not force:
+                if now - newest.created < SNAP_REUSE:
+                    return self._snap_public(tab, newest, True)
+                if if_changed and self._dom_quiet(tab):
+                    return self._snap_public(tab, newest, True)
+            reason = self.probe_memory_reason()
+            if reason:
+                raise BrowserError(reason)
+            session = tab.session
+            try:
+                self._call("Target.activateTarget", {"targetId": tab.target_id}, timeout=5.0)
+            except BrowserError:
+                pass
+            with self._lock:
+                gen, rev = tab.snap_gen, tab.rev
+                viewport = tab.viewport
+                quality = tab.quality
+            layout = self._call("Page.getLayoutMetrics", session=session,
+                                timeout=PROBE_CDP_TIMEOUT)
+            content = layout.get("cssContentSize") or layout.get("contentSize") or {}
+            page_height = content.get("height") if isinstance(content, dict) else None
+            if (isinstance(page_height, bool) or not isinstance(page_height, (int, float)) or
+                    page_height != page_height or page_height < 0):
+                raise BrowserError("ページの高さを取得できません")
+            height = min(max(int(-(-page_height // 1)), 1), SNAP_MAX_HEIGHT)
+            if viewport is not None:
+                width, scale = viewport[0], viewport[2]
+            else:
+                visual = layout.get("cssLayoutViewport") or {}
+                width = visual.get("clientWidth") if isinstance(visual, dict) else None
+                width = int(width) if (isinstance(width, (int, float)) and
+                                       not isinstance(width, bool) and 1 <= width <= 20000) else 1280
+                scale = 1.0
+            result = self._call("Runtime.evaluate", {
+                "expression": SNAP_JS % (width, SNAP_MAX_HEIGHT, SNAP_LINK_CAP, SNAP_URL_MAX,
+                                         SNAP_INPUT_CAP),
+                "returnByValue": True, "timeout": 5000},
+                session=session, timeout=PROBE_CDP_TIMEOUT)
+            value = (result.get("result") or {}).get("value")
+            value = value if isinstance(value, dict) else {}
+            with self._lock:
+                tab.snap_seq += 1
+                snap = Snapshot("s%d" % tab.snap_seq, width, height, scale, quality, rev, gen, now)
+                snap.meta = {
+                    "snap_id": snap.id, "width": width, "height": height,
+                    "tile_height": SNAP_TILE, "tiles": snap.tiles, "scale": scale,
+                    "quality": quality,
+                    "links": self._boxes(value.get("links"), SNAP_LINK_CAP, width, height, True),
+                    "inputs": self._boxes(value.get("inputs"), SNAP_INPUT_CAP, width, height, False),
+                }
+                tab.snaps[snap.id] = snap
+                # The previous snapshot stays (until the new one renders a tile); older ones go.
+                while len(tab.snaps) > SNAP_KEEP:
+                    self._snap_drop(tab, next(iter(tab.snaps)))
+            return self._snap_public(tab, snap, False)
+
+    def _dom_quiet(self, tab):
+        try:
+            value = (self._call("Runtime.evaluate", {
+                "expression": DIRTY_JS, "returnByValue": True, "timeout": 2000},
+                session=tab.session, timeout=PROBE_CDP_TIMEOUT).get("result") or {}).get("value")
+        except BrowserError:
+            return False
+        return value is False
+
+    def tile(self, ident, snap_id, index):
+        """JPEG bytes of one tile; rendered on first request, then served from the LRU."""
+        tab = self._tab(ident)
+        if (not isinstance(snap_id, str) or not SNAP_ID.match(snap_id) or
+                isinstance(index, bool) or not isinstance(index, int) or index < 0):
+            raise BrowserError("タイルの指定が不正です")
+        self._touch()
+        with self._lock:
+            snap = tab.snaps.get(snap_id)
+            if snap is None:
+                raise SnapshotGone("この表示は古くなりました。再取得します")
+            if index >= snap.tiles:
+                raise BrowserError("タイルの番号が範囲外です")
+            data = tab.tiles.get((snap_id, index))
+            if data is not None:
+                tab.tiles[(snap_id, index)] = tab.tiles.pop((snap_id, index))    # LRU: most recent last
+                return data
+        with tab.snap_lock:
+            with self._lock:
+                data = tab.tiles.get((snap_id, index))
+                if data is not None:
+                    return data
+                if tab.snaps.get(snap_id) is not snap:
+                    raise SnapshotGone("この表示は古くなりました。再取得します")
+            result = self._call("Page.captureScreenshot", {
+                "format": "jpeg", "quality": QUALITY_MODES[snap.quality][1],
+                "clip": tile_clip(snap.width, snap.height, index),
+                "captureBeyondViewport": True, "fromSurface": True},
+                session=tab.session, timeout=SNAP_CDP_TIMEOUT)
+            text = result.get("data")
+            if (not isinstance(text, str) or not text or len(text) > SNAP_MAX_TILE_BYTES * 4 // 3 + 8
+                    or not BASE64.match(text)):
+                raise BrowserError("画面を取得できませんでした")
+            data = base64.b64decode(text)
+            with self._lock:
+                if tab.snaps.get(snap_id) is snap:
+                    self._tile_put(tab, (snap_id, index), data)
+                    if snap_id == next(reversed(tab.snaps)):
+                        for old in [k for k in tab.snaps if k != snap_id]:
+                            self._snap_drop(tab, old)       # the new snapshot has its first tile
+            return data
+
+    def tap_page(self, ident, snap_id, x, y):
+        """Click at page coordinates (x, y) of a snapshot: scroll there, click, wait to settle."""
+        tab = self._tab(ident)
+        if not isinstance(snap_id, str) or not SNAP_ID.match(snap_id):
+            raise BrowserError("スナップショットの指定が不正です")
+        x = self._number(x, 0, MAX_COORD, "x")
+        y = self._number(y, 0, MAX_COORD, "y")
+        with self._lock:
+            snap = tab.snaps.get(snap_id)
+        if snap is None:
+            raise SnapshotGone("この表示は古くなりました。再取得します")
+        if x > snap.width or y > snap.height:
+            raise BrowserError("タップ位置がページの外です")
+        self._touch()
+        session = tab.session
+        state = (self._call("Runtime.evaluate", {
+            "expression": SCROLL_JS % y, "returnByValue": True, "timeout": 3000},
+            session=session, timeout=PROBE_CDP_TIMEOUT).get("result") or {}).get("value")
+        if (not isinstance(state, list) or len(state) != 4 or
+                any(isinstance(v, bool) or not isinstance(v, (int, float)) or v != v
+                    for v in state)):
+            raise BrowserError("ページをスクロールできません")
+        scroll_x, scroll_y, inner_w, inner_h = state
+        vx, vy = x - scroll_x, y - scroll_y
+        if not (0 <= vx <= inner_w and 0 <= vy <= inner_h):
+            raise BrowserError("タップ位置を表示できません。画面を更新してください")
+        with self._lock:
+            before_url, before_rev = tab.url, tab.rev
+            tab.snap_gen += 1
+        base = {"x": vx, "y": vy, "button": "left", "clickCount": 1}
+        self._call("Input.dispatchMouseEvent", {"type": "mouseMoved", "x": vx, "y": vy}, session)
+        self._call("Input.dispatchMouseEvent", dict(base, type="mousePressed", buttons=1), session)
+        self._call("Input.dispatchMouseEvent", dict(base, type="mouseReleased", buttons=0), session)
+        self._refresh_editable(tab)
+        started = self._settle(tab, before_rev)
+        with self._lock:
+            navigated = started or tab.url != before_url
+        return {"ok": True, "navigated": navigated, "editable": tab.editable,
+                "snap_needed": True}
+
+    def _settle(self, tab, before_rev):
+        """Wait for a navigation caused by a click: True when one started."""
+        deadline = self._clock() + TAP_NAV_WAIT
+        started = False
+        with self._cv:
+            while True:
+                if tab.loading or tab.rev != before_rev:
+                    started = True
+                    break
+                remaining = deadline - self._clock()
+                if remaining <= 0 or self._state != "running":
+                    return False
+                self._cv.wait(min(remaining, 0.1))
+            deadline = self._clock() + TAP_SETTLE_MAX
+            while tab.loading and self._state == "running" and self._tabs.get(tab.id) is tab:
+                remaining = deadline - self._clock()
+                if remaining <= 0:
+                    break
+                self._cv.wait(min(remaining, 0.25))
+        return started
+
+    def page_meta(self, ident, rev=None, wait=META_WAIT_MAX):
+        """Long-poll of tab metadata (no screencast): returns when `rev` is out of date."""
+        tab = self._tab(ident)
+        wait = max(0.0, min(float(wait), META_WAIT_MAX))
+        self._touch()
+        deadline = self._clock() + wait
+        with self._cv:
+            while (rev is not None and tab.rev == rev and self._tabs.get(tab.id) is tab and
+                   self._state == "running"):
+                remaining = deadline - self._clock()
+                if remaining <= 0:
+                    break
+                self._cv.wait(min(remaining, 1.0))
+            if self._tabs.get(tab.id) is not tab:
+                raise TabGone("このタブはすでに閉じられています")
+            newest = next(reversed(tab.snaps)) if tab.snaps else None
+            result = {
+                "url": tab.url, "title": tab.title, "loading": bool(tab.loading),
+                "blocked": tab.blocked, "intercepts": tab.intercept_seq, "rev": tab.rev,
+                "popups": tab.popups_blocked, "editable": tab.editable, "snap": newest,
+                "challenge": looks_like_challenge(tab.url, tab.title),
+            }
+        self._touch()
+        return result
 
     # ---------------------------------------------------------------- links
     @staticmethod
@@ -1725,6 +2096,7 @@ class RemoteBrowser:
             raise BrowserError("ページとして開けるのはホスターとポップアップのリンクだけです")
         checked = browser_safety.validate(item["url"])
         tab = self._tab(ident)
+        tab.snap_gen += 1
         with self._lock:
             if item["kind"] == "hoster":      # only hoster pages are paused by Fetch
                 tab.bypass[checked] = self._clock() + BYPASS_TTL
@@ -1950,7 +2322,7 @@ class RemoteBrowser:
             self._probes -= 1
             self._cv.notify_all()
 
-    def probe(self, ident, x, y, url_check=None):
+    def probe(self, ident, x, y, url_check=None, href=None):
         """Follow the link under (x, y) in a hidden target; see the section comment.
 
         `url_check(url)` may raise ValueError to refuse a start URL (the Hub's own
@@ -1958,17 +2330,24 @@ class RemoteBrowser:
         in a FIFO queue); each has its own hidden target. Returns
         {start_url, final_url, links, redirects}.
         """
-        x = self._number(x, 0, MAX_COORD, "x")
-        y = self._number(y, 0, MAX_COORD, "y")
         tab = self._tab(ident)
         self._touch()
-        # The link under the finger is resolved right away, before any queueing.
-        result = self._call("Runtime.evaluate", {
-            "expression": PROBE_JS % (x, y), "returnByValue": True, "timeout": 5000},
-            session=tab.session, timeout=PROBE_CDP_TIMEOUT)
-        href = (result.get("result") or {}).get("value")
-        if not isinstance(href, str) or not href:
-            raise BrowserError("この位置にリンクが見つかりません")
+        if href is not None:
+            # Fast display: the phone already knows the link under the finger (from the
+            # snapshot's link map). It is text from a remote page, so it gets exactly the
+            # same validation as any address before the hidden page opens it.
+            if not isinstance(href, str) or not href or len(href) > SNAP_URL_MAX:
+                raise BrowserError("リンク先の指定が不正です")
+        else:
+            x = self._number(x, 0, MAX_COORD, "x")
+            y = self._number(y, 0, MAX_COORD, "y")
+            # The link under the finger is resolved right away, before any queueing.
+            result = self._call("Runtime.evaluate", {
+                "expression": PROBE_JS % (x, y), "returnByValue": True, "timeout": 5000},
+                session=tab.session, timeout=PROBE_CDP_TIMEOUT)
+            href = (result.get("result") or {}).get("value")
+            if not isinstance(href, str) or not href:
+                raise BrowserError("この位置にリンクが見つかりません")
         try:
             start = browser_safety.validate(href)
             if url_check is not None:

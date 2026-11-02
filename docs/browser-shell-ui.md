@@ -217,3 +217,22 @@ Cloudflare等で手元のブラウザ（iframe）では開けないサイトを�
 - 重複リンクは常に確認なしでスキップし、件数だけ表示します。
 - リンク画面「履歴を削除」: `POST /api/links/clear {include_staged}` が送信済み・要確認の記録（任意で未送信も）を削除します。JD2・ファイルには触れません。
 - ダウンロード画面「完了したものを一覧から消す」: `downloadsV2/cleanup`（`DELETE_FINISHED` / `REMOVE_LINKS_ONLY` / `ALL`、固定値）。保存ファイルは削除されません。
+
+## v0.1.28 NASブラウザの高速表示（全体表示）（実機未検証）
+
+スクロールのたびに「スマホ → NASで描画 → JPEG → スマホ」を往復していた遅さをなくすための新しい既定表示。従来のスクリーンキャストは「ライブ」として残る。
+
+- **表示の選択**: ⋯メニュー（NASブラウザのタブのみ）に「表示: 高速（全体表示）」「表示: ライブ」。サイトごとに端末の `localStorage` の既存ホスト別マップ（`qnapdl.hostmodes.v1`）へ保存する。値は `remote`（高速、**既定**。エントリが無いときも高速）と `remote-live`（ライブ）。どちらも「このサイトはNASブラウザ」を意味し、設定 › NASブラウザのサイト一覧・解除も共通。
+- **画面（高速）**: ネイティブスクロールのコンテナ（`#tileScroll`）に、絶対配置の `<img>` タイルを並べる（高さ＝タイルの高さ×コンテナ幅/ページ幅）。`IntersectionObserver` で画面の上下1画面以内のタイルだけ `/api/rb/tile.jpg` から取得して `blob:` のオブジェクトURLを `<img>` に設定し、3画面より離れたタイルは `URL.revokeObjectURL` で解放する。同時取得は3枚。画面には何も重ねない（タップ位置はリンク位置表で当たり判定するだけ）。
+- **撮り直し**: 上部に細い進捗バーを表示。ナビゲーション完了時（タイトル/URLの変化）、キー・文字入力の800ms後、タップ後、10秒ごとにページが「DOM変更あり」と報告したとき、上端から下へ引っ張る／右上の「⟳」で撮り直す。新しい表示の最初のタイルが届くまで古い表示を残し、URLが同じなら位置を保ち、違えば先頭へ。
+- **操作**: タップ → `POST /api/rb/tap-page`（ページ座標）。長押し → クライアントが持つリンク位置表からリンク先を特定し、`POST /api/rb/probe {tab, href}` を即送信（Hubが `browser_safety.validate` と Hub自身のオリジン拒否で検証し、確認用ページを開くのは従来どおりHub）。リンクが無い位置の長押しは何もしない。キーボード・Enter・⌫・Tab は従来の `/api/rb/input`。
+- **Cloudflare**: Hubが「タイトルに `Just a moment`／`しばらくお待ちください`、またはURLに `/cdn-cgi/challenge`」を検出し（`challenge` フラグ。`/api/rb/meta`・`/api/rb/snapshot`・`frame.jpg` のヘッダ `X-Frame-Challenge`）、そのタブをライブに自動で切り替える。確認画面が終わって読み込みが済むと元の表示へ戻る。
+- **安全**: タイルは画像だけ。リモートのHTML/JSは端末に届かない。リンクの `href` は当たり判定と長押しの入力にだけ使うテキストで、Hubが再検証してから動く。CSPは `img-src 'self' data: blob:` のまま変更なし。
+
+## 高速表示のAPI（v0.1.28）
+- `POST /api/rb/snapshot {tab, force?, if_changed?}` → `{snap_id, width, height, tile_height:1600, tiles, scale, quality, url, title, links:[{x,y,w,h,href}], inputs:[{x,y,w,h}], challenge, reused}`。直前の変更なしのスナップショットが2秒以内なら再利用（`reused:true`）。`if_changed` は10秒ごとの確認用で、ページが「DOM変更なし」と答えれば再利用する。
+- `GET /api/rb/tile.jpg?tab=&snap=&i=` → `image/jpeg`（初回要求時に描画）。スナップショットが破棄済みなら404（クライアントが撮り直す）。
+- `POST /api/rb/tap-page {tab, snap, x, y}`（ページ座標）→ `{ok, navigated, editable, snap_needed:true}`。
+- `POST /api/rb/snapshot/release {tab}`（ライブへ切り替えたときにタイルをRAMから解放）。
+- `GET /api/rb/meta?tab=&rev=&wait=`: スクリーンキャストを始めないタブのメタデータ（URL・タイトル・読み込み・検出数・`challenge`・最新の`snap`）のロングポーリング。
+- `POST /api/rb/probe` は `href` を受け付ける（`x`,`y` の代わり）。いずれも管理者ログイン必須、POSTはCSRF＋Origin。
