@@ -4,6 +4,29 @@
 
 設計日: 2026-11-01 / 開発前提: JD2がダウンロード処理とホスト別アカウントの唯一の正本
 
+## 実装状況（v0.1.23）
+
+Phase A（読取）とPhase B（ユーザー名/パスワード型アカウントの変更）を実装した。**実機（TS-253BeのJD2・Rapidgator）では未検証**で、JD2の`accountsV2`戻り値のフィールド名は公開APIの記述（`UUID`/`hostname`/`username`/`validUntil`/`trafficLeft`/`trafficMax`/`enabled`/`valid`/`errorType`/`errorString`）に基づく。Cookie/APIキー型・MFA・ホスト利用優先度（Phase C）は未実装。
+
+- コード: `jd2_accounts.py`（正規化・マスク・検証・キャッシュ・レート制限・readback）、`jd2_local.py`（許可リスト8メソッドと秘密保護呼び出し）、`webapp.py`（`/api/accounts*`）、`web/`（設定 › アカウント、ホームの任意項目）。
+- Hub API（管理者ログイン必須。POSTはCSRF+Origin、本文4 KiB以内、`no-store`）: `GET /api/accounts`（30秒RAMキャッシュ、`?refresh=1`で回避）、`GET /api/accounts/hosts`（10分RAMキャッシュ、rapidgator.netが先頭）、`POST /api/accounts/add|update|enable|refresh|delete`。エンジン停止中は503。§4の予定パス`/api/jd2/accounts*`とは別名に変更し、`check`は`refresh`にした。
+- 公開モデルは§4のうち`revision`と`last_checked_at`を省き、`traffic_max_bytes`と`traffic_unlimited`（trafficLeftが-1）を加えた。未知フィールドは構築時に捨てる。`display_username`は先頭2文字（短い名前は半分まで）+`••••`+メールならドメイン。`account_type`は型フィールドか「将来の有効期限」からのみ導出し、判断できなければ`unknown`。`error_summary`は120文字以内で、ユーザー名・メール・URL・長いトークン様文字列を伏せる。一覧は200件まで。
+- 操作対象のIDは直前にJD2から取得した一覧と突合してから使う（`revision`の代わり）。enable/delete/updateは操作後に一覧を読み直して結果を確認し、失敗時の自動再試行はしない。追加は直前後の一覧差分で新IDを特定して`refreshAccounts`し、特定できないときはその旨を返す。削除は`confirm_host`が対象のホストと一致しなければ拒否（UIはホスト名の入力を求める）。
+- 追加・更新は10分に10回まで（全体、RAM）。本文のusername 1〜200文字、password 1〜500文字、制御文字不可。パスワードはレスポンス・キャッシュ・ログ・例外に含めず、処理後に参照を捨てる（Pythonの文字列は上書きできないためベストエフォート）。
+
+### 送信経路のルール（サーバー側強制）
+
+資格情報を含む`add`/`update`は、`request_is_https(peer, headers)`（ループバックのTLS終端＝Tailscale Serve等、`X-Forwarded-Proto`は非ループバックでは信用しない）**または**`tailnet_peer(peer)`（WireGuardで暗号化されたTailscaleピア）のときだけ受け付け、それ以外（LANのHTTP等）は403「パスワードはHTTPSまたはTailscale経由でのみ送信できます」。一覧・ホスト取得・再確認・有効/無効・削除は認証済みなら経路を問わない。UIは`/api/session`の`https`/`tailnet`（同じ判定）でフォームを無効にし、「HTTPS接続」へ案内する。
+
+### 残余リスク: JD2へのGETエンコーディング
+
+JD2のRemoteAPIはNAS上で検証済みの形式がGETのみ（引数をURLエンコードしたJSONとしてリクエストラインに載せる）で、`addAccount`/`setUserNameAndPassword`のパスワードもリクエストラインに入る。対策と限界:
+
+- 宛先はloopback（ネイティブ）またはHub専用コンテナの非公開ブリッジIP（コンテナ）のみ。LANへは出ない。
+- Hubは`accountsV2`のURL・引数をログ・RAMログ・例外・レスポンスに入れない（失敗時の文言はメソッド名とHTTPステータスだけ。例外の連鎖も切る）。
+- 限界: ①JD2自身やJavaのログが受信したリクエストを記録する可能性は制御できない（エンジンのRAMログには既存の`scrub`が通るが、パターンに合わない形式は漏れ得る。実機でJD2ログに残らないか確認が必要）。②同一ホスト上でloopback/ブリッジを観測できる特権プロセスには見える（rootが前提のため境界外）。③JD2が資格情報を保存する形式はJD2側の仕様（Hubは複製しない）。
+
+
 ## 1. UIゴール
 
 QnapDownloaderの単一Web管理画面に「**アカウント**」タブを追加する。Rapidgatorをはじめ、JD2プラグインがサポートするホストごとに複数アカウントを管理できる。MyJDownloaderの別画面へ飛ばさず、iPhone Safari・QNAP App Centerの画面を共通入口とする。

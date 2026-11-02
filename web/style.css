@@ -395,3 +395,15 @@ label{display:block;margin:12px 0;color:var(--muted);font-size:13px}
 .popup-toast{position:absolute;left:12px;right:12px;bottom:64px;z-index:8;display:flex;align-items:center;gap:10px;padding:8px 10px 8px 14px;background:var(--surface);border:1px solid var(--border);border-radius:12px;box-shadow:0 2px 10px rgba(0,0,0,.35)}
 .popup-toast[hidden]{display:none}
 .popup-toast-text{flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-size:13px}
+
+/* premium accounts (v0.1.23) */
+.account-form{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin:8px 0}
+.account-form input{margin:0;flex:1 1 180px;width:auto}
+.account-edit{margin:10px 0}
+.account-head{display:flex;flex-wrap:wrap;align-items:center;gap:6px 8px}
+.account-badge{display:inline-block;padding:1px 9px;border-radius:10px;border:1px solid var(--border-strong);font-size:12px;font-weight:600}
+.account-badge.is-ok{background:var(--ok-soft);border-color:var(--ok);color:var(--ok)}
+.account-badge.is-bad{background:var(--danger-soft);border-color:var(--danger);color:var(--danger)}
+.account-meta{display:grid;gap:2px;margin:6px 0}
+.account-actions{display:flex;flex-wrap:wrap;gap:6px}
+.account-actions .btn{margin-top:0}

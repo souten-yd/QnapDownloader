@@ -22,9 +22,11 @@ import jd2_control
 import jd2_local
 import container_runtime
 import remote_browser
+import jd2_accounts
 import webapp
 from fake_docker import FakeDocker
 from test_remote_browser import FakeWS
+from test_jd2_accounts import FakeAdapter
 
 
 class HttpTests(unittest.TestCase):
@@ -79,8 +81,9 @@ class HttpTests(unittest.TestCase):
         self.server.server_close()
         self.thread.join(timeout=2)
 
-    def req(self, path, body=None, origin=True, csrf=True):
+    def req(self, path, body=None, origin=True, csrf=True, extra=None):
         headers = {"Host": self.host}
+        headers.update(extra or {})
         if body is not None:
             headers["Content-Type"] = "application/json"
             if origin:
@@ -396,7 +399,7 @@ class HttpTests(unittest.TestCase):
                                          headers={"Host": "192.168.68.57:17864"})
         with self.client.open(request, timeout=4) as response:
             self.assertEqual(response.status, 200)
-            self.assertEqual(json.load(response)["version"], "0.1.22")
+            self.assertEqual(json.load(response)["version"], "0.1.23")
         with self.client.open(self.url + "/icon.svg", timeout=4) as response:
             self.assertEqual(response.status, 200)
             self.assertEqual(response.headers.get_content_type(), "image/svg+xml")
@@ -972,6 +975,204 @@ class HttpTests(unittest.TestCase):
         self.assertIn('id="downloadsRefresh"',html)
         self.assertIn('id="downloadList"',html)
 
+    # ---- v0.1.23: premium accounts -------------------------------------
+    HTTPS = {"X-Forwarded-Proto": "https"}
+    PW = "TopSecret-Pw-123"
+
+    def accounts_setup(self):
+        self.login()
+        self.fake = FakeAdapter()
+        self.server.jd2 = jd2_control.JD2Controller(self.fake)
+        self.server.accounts = jd2_accounts.AccountService(sleep=lambda s: None)
+
+    def add_account(self, user="alice@example.com", password=None):
+        return self.req("/api/accounts/add", {"host": "rapidgator.net", "username": user,
+                                             "password": password or self.PW}, extra=self.HTTPS)
+
+    def test_accounts_apis_require_login_csrf_and_origin(self):
+        posts = [("add", {"host": "rapidgator.net", "username": "u", "password": "p"}),
+                 ("update", {"id": "1", "username": "u", "password": "p"}),
+                 ("enable", {"id": "1", "enabled": True}), ("refresh", {"id": "1"}),
+                 ("delete", {"id": "1", "confirm_host": "rapidgator.net"})]
+        for path in ("/api/accounts", "/api/accounts/hosts"):
+            self.assertEqual(self.req(path)[0], 401)
+        for action, body in posts:
+            self.assertEqual(self.req("/api/accounts/" + action, body, extra=self.HTTPS)[0], 401)
+        self.accounts_setup()
+        for action, body in posts:
+            with self.subTest(action=action):
+                self.assertEqual(self.req("/api/accounts/" + action, body, csrf=False, extra=self.HTTPS)[0], 403)
+                self.assertEqual(self.req("/api/accounts/" + action, body, origin=False, extra=self.HTTPS)[0], 403)
+        self.assertEqual(self.req("/api/accounts/nope", {}, extra=self.HTTPS)[0], 404)
+        self.assertEqual([c for c in self.fake.calls if c[0] not in ("list", "hosters")], [])
+
+    def test_accounts_need_a_running_engine(self):
+        self.login()   # real (stopped) engine
+        self.assertEqual(self.req("/api/accounts")[0], 503)
+        self.assertEqual(self.req("/api/accounts/hosts")[0], 503)
+        code, body = self.add_account()
+        self.assertEqual(code, 503)
+        self.assertNotIn(self.PW, json.dumps(body))
+        self.assertIn("エンジン", body["error"])
+
+    def test_list_and_hosts_are_masked_cached_and_leak_nothing(self):
+        self.accounts_setup()
+        self.fake.accounts[7] = {"UUID": 7, "hostname": "rapidgator.net", "username": "alice@example.com",
+                                 "enabled": True, "valid": True, "validUntil": 4_000_000_000_000,
+                                 "trafficLeft": 5 * 1024 ** 3, "trafficMax": 10 * 1024 ** 3,
+                                 "password": "RAWPW", "cookies": "RAWCOOKIE", "token": "RAWTOKEN"}
+        code, data = self.req("/api/accounts")   # reads work over plain HTTP too
+        self.assertEqual(code, 200)
+        text = json.dumps(data, ensure_ascii=False)
+        for needle in ("RAWPW", "RAWCOOKIE", "RAWTOKEN", "alice@example.com"):
+            self.assertNotIn(needle, text)
+        self.assertEqual(data["items"][0]["display_username"], "al••••@example.com")
+        self.assertEqual(data["items"][0]["id"], "7")
+        self.fake.accounts[8] = dict(self.fake.accounts[7], UUID=8)
+        self.assertEqual(len(self.req("/api/accounts")[1]["items"]), 1)            # 30 s cache
+        self.assertEqual(len(self.req("/api/accounts?refresh=1")[1]["items"]), 2)  # bypass
+        self.assertEqual(self.req("/api/accounts/hosts")[1]["items"][0], "rapidgator.net")
+        self.req("/api/accounts/hosts")
+        self.assertEqual(len([c for c in self.fake.calls if c[0] == "hosters"]), 1)  # 10 min cache
+
+    def test_credential_writes_need_https_or_tailnet(self):
+        self.accounts_setup()
+        code, body = self.req("/api/accounts/add", {"host": "rapidgator.net", "username": "u",
+                                                    "password": self.PW})       # plain-HTTP LAN peer
+        self.assertEqual(code, 403)
+        self.assertEqual(body["error"], "パスワードはHTTPSまたはTailscale経由でのみ送信できます")
+        self.assertNotIn(self.PW, json.dumps(body))
+        self.assertEqual(self.req("/api/accounts/update", {"id": "1", "username": "u", "password": self.PW})[0], 403)
+        self.assertEqual([c for c in self.fake.calls if c[0] in ("add", "set")], [])
+        with patch.object(webapp, "tailnet_peer", return_value=True):         # WireGuard peer
+            self.assertEqual(self.add_account_plain()[0], 200)
+        self.assertEqual(self.add_account()[0], 200)                           # HTTPS terminator
+        # Non-credential changes are allowed on plain HTTP once logged in.
+        ident = str(self.fake.next_id)
+        self.assertEqual(self.req("/api/accounts/refresh", {"id": ident})[0], 200)
+        self.assertEqual(self.req("/api/accounts/enable", {"id": ident, "enabled": False})[0], 200)
+
+    def add_account_plain(self):
+        return self.req("/api/accounts/add", {"host": "rapidgator.net", "username": "bob@example.com",
+                                             "password": self.PW})
+
+    def test_transport_rule_helper(self):
+        https = {"X-Forwarded-Proto": "https", "Host": "192.168.1.5:17864"}
+        self.assertTrue(webapp.credentials_transport_ok("127.0.0.1", https))
+        self.assertTrue(webapp.credentials_transport_ok("127.0.0.1", {"Host": "nas.tail1.ts.net"}))
+        self.assertTrue(webapp.credentials_transport_ok("100.100.1.2", {"Host": "nas:17864"}))
+        self.assertTrue(webapp.credentials_transport_ok("fd7a:115c:a1e0::7", {}))
+        for peer in ("192.168.1.5", "10.0.0.5", "8.8.8.8", "garbage", None):
+            self.assertFalse(webapp.credentials_transport_ok(peer, https), peer)   # forged header
+        self.assertFalse(webapp.credentials_transport_ok("127.0.0.1", {"Host": "192.168.1.5"}))
+        self.assertFalse(webapp.credentials_transport_ok("192.168.1.5", {}))
+
+    def test_add_flow_masks_validates_host_and_never_echoes_the_password(self):
+        self.accounts_setup()
+        code, data = self.add_account()
+        self.assertEqual(code, 200)
+        text = json.dumps(data, ensure_ascii=False)
+        self.assertNotIn(self.PW, text)
+        self.assertNotIn("alice@example.com", text)
+        self.assertEqual(data["item"]["display_username"], "al••••@example.com")
+        self.assertEqual(data["item"]["status"], "valid")
+        # host must come from the hoster list
+        for host in ("evil.example", "", None, 5, "rapidgator.net/../x"):
+            with self.subTest(host=host):
+                code, body = self.req("/api/accounts/add", {"host": host, "username": "u", "password": self.PW},
+                                      extra=self.HTTPS)
+                self.assertEqual(code, 400)
+                self.assertNotIn(self.PW, json.dumps(body))
+        for body in ({"host": "rapidgator.net", "username": "", "password": "p"},
+                     {"host": "rapidgator.net", "username": "u" * 201, "password": "p"},
+                     {"host": "rapidgator.net", "username": "u", "password": "p" * 501},
+                     {"host": "rapidgator.net", "username": "u", "password": "a\nb"},
+                     {"host": "rapidgator.net", "username": "u\x00", "password": "p"}):
+            self.assertEqual(self.req("/api/accounts/add", body, extra=self.HTTPS)[0], 400)
+        self.assertEqual(len([c for c in self.fake.calls if c[0] == "add"]), 1)
+
+    def test_account_bodies_are_limited_to_4_kib(self):
+        self.accounts_setup()
+        big = {"host": "rapidgator.net", "username": "u", "password": "p", "pad": "x" * 4200}
+        code, body = self.req("/api/accounts/add", big, extra=self.HTTPS)
+        self.assertEqual(code, 400)
+        self.assertEqual(body["error"], "リクエストが大きすぎます")
+        self.assertEqual([c for c in self.fake.calls if c[0] == "add"], [])
+
+    def test_add_and_update_rate_limit_is_ten_per_ten_minutes(self):
+        self.accounts_setup()
+        for _ in range(10):
+            self.assertEqual(self.add_account()[0], 200)
+        code, body = self.add_account()
+        self.assertEqual(code, 429)
+        ident = str(self.fake.next_id)
+        code, _ = self.req("/api/accounts/update", {"id": ident, "username": "u", "password": self.PW},
+                           extra=self.HTTPS)
+        self.assertEqual(code, 429)
+        self.assertEqual(self.req("/api/accounts")[0], 200)     # reads are not limited
+        self.assertEqual(len([c for c in self.fake.calls if c[0] == "add"]), 10)
+
+    def test_update_enable_refresh_delete_flow_and_confirm_host(self):
+        self.accounts_setup()
+        self.add_account()
+        ident = str(self.fake.next_id)
+        code, data = self.req("/api/accounts/update", {"id": ident, "username": "carol", "password": self.PW},
+                              extra=self.HTTPS)
+        self.assertEqual(code, 200)
+        self.assertNotIn(self.PW, json.dumps(data))
+        self.assertEqual(data["item"]["status"], "invalid")
+        self.assertEqual(self.req("/api/accounts/enable", {"id": ident, "enabled": False})[1]["item"]["enabled"], False)
+        self.assertEqual(self.req("/api/accounts/enable", {"id": ident, "enabled": "no"})[0], 400)
+        self.assertEqual(self.req("/api/accounts/refresh", {"id": ident})[0], 200)
+        self.assertEqual(self.req("/api/accounts/refresh", {"id": "424242"})[0], 404)
+        self.assertEqual(self.req("/api/accounts/delete", {"id": ident, "confirm_host": "other.example"})[0], 400)
+        self.assertEqual(self.req("/api/accounts/delete", {"id": ident})[0], 400)
+        self.assertIn(self.fake.next_id, self.fake.accounts)
+        code, data = self.req("/api/accounts/delete", {"id": ident, "confirm_host": "rapidgator.net"})
+        self.assertEqual((code, data), (200, {"deleted": True, "id": ident}))
+        self.assertEqual(self.req("/api/accounts?refresh=1")[1]["items"], [])
+
+    def test_failed_account_call_leaves_no_secret_in_response_or_ram_logs(self):
+        self.accounts_setup()
+        self.fake.fail["add"] = True
+        code, body = self.add_account()
+        self.assertEqual(code, 503)
+        self.assertNotIn(self.PW, json.dumps(body, ensure_ascii=False))
+        self.assertNotIn("alice@example.com", json.dumps(body, ensure_ascii=False))
+        self.assertNotIn(self.PW, "\n".join(self.server.engine.log_lines()))
+
+    def test_schema_diagnostic_lists_keys_and_types_never_values(self):
+        self.assertEqual(self.req("/api/accounts/schema")[0], 401)
+        self.login()
+        self.assertEqual(self.req("/api/accounts/schema")[0], 503)   # engine stopped
+        self.fake = FakeAdapter()
+        self.server.jd2 = jd2_control.JD2Controller(self.fake)
+        self.server.accounts = jd2_accounts.AccountService(sleep=lambda s: None)
+        self.fake.accounts[1] = {"UUID": 1, "hostname": "rapidgator.net", "username": "alice",
+                                 "password": "LEAK-PW-1", "cookies": ["LEAK-C"], "valid": True}
+        self.fake.accounts[2] = {"UUID": 2, "hostname": "bad host", "token": "LEAK-T"}   # dropped
+        self.fake.accounts[3] = {"nothing": None}                                         # dropped
+        self.fake.hosts = ["rapidgator.net", "x.example", "y y", "z.example", "w.example"]
+        code, data = self.req("/api/accounts/schema")
+        self.assertEqual(code, 200)
+        text = json.dumps(data, ensure_ascii=False)
+        for needle in ("LEAK", "alice"):
+            self.assertNotIn(needle, text)
+        self.assertEqual((data["count"], data["normalized"], data["dropped"]), (3, 1, 2))
+        first = data["samples"][0]
+        self.assertEqual(first, sorted(first, key=lambda e: e["key"]))
+        self.assertIn({"key": "password", "type": "string"}, first)
+        self.assertIn({"key": "cookies", "type": "array"}, first)
+        self.assertEqual(data["hoster_item_type"], "string")
+        self.assertEqual(data["hoster_first"], ["rapidgator.net", "x.example"])
+        self.assertEqual(len(data["samples"]), 3)
+
+    def test_accounts_in_version_and_static_files(self):
+        with self.client.open(self.url + "/", timeout=4) as response:
+            html = response.read().decode()
+        self.assertIn('data-section="accounts"', html)
+        self.assertEqual(webapp.ACCOUNT_BODY_MAX, 4096)
+
     def test_delete_apis_require_auth_csrf_and_only_staged_links(self):
         link = {"id": 1}
         self.assertEqual(self.req("/api/links/delete", link)[0], 401)
@@ -1027,7 +1228,7 @@ class HttpTests(unittest.TestCase):
         self.assertFalse(info["supported"])
         code, _ = self.req("/api/update/apply", {"version": "v0.1.8"})
         self.assertEqual(code, 400)
-        self.assertEqual(self.req("/api/health")[1]["version"], "0.1.22")
+        self.assertEqual(self.req("/api/health")[1]["version"], "0.1.23")
         self.assertFalse(self.req("/api/jd2/status")[1]["connected"])
         self.assertEqual(self.req("/api/jd2/update/apply", {"confirmed": True})[0], 400)
         self.assertEqual(self.req("/api/jd2/preset/apply", {"confirmed": True})[0], 400)

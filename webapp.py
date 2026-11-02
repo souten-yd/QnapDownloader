@@ -17,6 +17,7 @@ from urllib.parse import parse_qs, quote, urlsplit
 
 import self_update
 import storage
+import jd2_accounts
 import jd2_control
 import jd2_transfer
 import rapidgator_extract
@@ -26,7 +27,7 @@ import engine_supervisor
 import remote_browser
 import updater
 
-VERSION = "0.1.22"
+VERSION = "0.1.23"
 PORT = 17864
 ROOT = Path(__file__).resolve().parent
 FILES = {"/": ("web/index.html", "text/html; charset=utf-8"),
@@ -43,6 +44,8 @@ SHARE_FAIL_LIMIT, SHARE_FAIL_WINDOW = 20, 300
 SHARE_RATE_LIMIT, SHARE_RATE_WINDOW = 30, 600
 SHARE_LINK_LIMIT = 50
 SESSION_LOCK = threading.RLock()
+CREDENTIALS_TRANSPORT_ERROR = "パスワードはHTTPSまたはTailscale経由でのみ送信できます"
+ACCOUNT_BODY_MAX = 4096
 
 
 def allowed_roots():
@@ -210,6 +213,15 @@ def tailnet_peer(value):
         return False
 
 
+def credentials_transport_ok(peer, headers):
+    """Premium-account credentials may only arrive over an encrypted hop.
+
+    HTTPS through a trusted local TLS terminator (request_is_https) or a
+    Tailscale peer (WireGuard). Plain-HTTP LAN peers are refused.
+    """
+    return request_is_https(peer, headers) or tailnet_peer(peer)
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "QnapDownloader"
     sys_version = ""
@@ -321,13 +333,26 @@ class Handler(BaseHTTPRequestHandler):
         if self.headers.get("Content-Type", "").split(";")[0] != "application/json":
             raise ValueError("JSON形式で送信してください")
         size = int(self.headers.get("Content-Length", "-1"))
-        maximum = 72000 if urlsplit(self.path).path in ("/api/rapidgator/extract", "/api/share") else 16384
+        path = urlsplit(self.path).path
+        maximum = 72000 if path in ("/api/rapidgator/extract", "/api/share") else 16384
+        if path.startswith("/api/accounts/"):
+            maximum = ACCOUNT_BODY_MAX
         if not 0 <= size <= maximum:
             raise ValueError("リクエストが大きすぎます")
         value = json.loads(self.rfile.read(size))
         if not isinstance(value, dict):
             raise ValueError("JSONオブジェクトが必要です")
         return value
+
+    @property
+    def accounts(self):
+        service = getattr(self.server, "accounts", None)
+        if service is None:
+            with SESSION_LOCK:
+                service = getattr(self.server, "accounts", None)
+                if service is None:
+                    service = self.server.accounts = jd2_accounts.AccountService()
+        return service
 
     def do_GET(self):
         if not self.check_host():
@@ -377,6 +402,18 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_data(200, {"lines": self.server.engine.log_lines()})
             if path == "/api/jd2/status":
                 return self.send_data(200, self.server.jd2.status())
+            if path == "/api/accounts/schema":
+                # Key names and JSON type names only (no values), for confirming
+                # the real accountsV2 field names on the NAS.
+                return self.send_data(200, self.accounts.schema(self.server.jd2))
+            if path in ("/api/accounts", "/api/accounts/hosts"):
+                # Masked, normalized accounts only (reads work on any authenticated
+                # session). RAM caches: 30 s accounts, 10 min hosters; ?refresh=1 skips them.
+                query = parse_qs(urlsplit(self.path).query)
+                refresh = query.get("refresh", ["0"])[0] == "1"
+                if path == "/api/accounts":
+                    return self.send_data(200, self.accounts.list(self.server.jd2, refresh))
+                return self.send_data(200, self.accounts.hosts(self.server.jd2, refresh))
             if path == "/api/jd2/downloads":
                 # Explicit manual refresh only. No scheduled poll of remote JD2
                 # and no raw JD2 response or secret fields go to the browser.
@@ -483,6 +520,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_data(200, {"available": release is not None,
                   "release": {"version": release["version"], "size": release["size"]}
                             if release else None, "current": VERSION, "channel": channel})
+        except jd2_accounts.ServiceError as exc:
+            return self.reject(str(exc), exc.status)
         except remote_browser.TabGone as exc:
             return self.reject(str(exc), 404)
         except (OSError, ValueError, RuntimeError, KeyError, sqlite3.Error) as exc:
@@ -735,6 +774,20 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/engine/autostart":
                 return self.send_data(200, {"autostart": self.server.engine.set_autostart(
                     body.get("enabled"))})
+            if path.startswith("/api/accounts/"):
+                action = path[len("/api/accounts/"):]
+                if action not in ("add", "update", "enable", "refresh", "delete"):
+                    return self.reject("APIが存在しません", 404)
+                if action in ("add", "update") and not credentials_transport_ok(
+                        self.client_address[0], self.headers):
+                    body.clear()
+                    return self.reject(CREDENTIALS_TRANSPORT_ERROR, 403)
+                service = self.accounts
+                handler = {"add": service.add, "update": service.update,
+                           "enable": service.set_enabled, "refresh": service.refresh,
+                           "delete": service.delete}[action]
+                # The password is never echoed; the service clears the body dict.
+                return self.send_data(200, handler(self.server.jd2, body))
             if path == "/api/jd2/connect/test":
                 return self.send_data(200, self.server.jd2.connection_test())
             if path == "/api/jd2/update/check":
@@ -745,6 +798,8 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/jd2/preset/apply":
                 return self.send_data(200, self.server.jd2.preset_reapply(
                     confirmed=body.get("confirmed") is True))
+        except jd2_accounts.ServiceError as exc:
+            return self.reject(str(exc), exc.status)
         except remote_browser.TabGone as exc:
             return self.reject(str(exc), 404)
         except (OSError, ValueError, KeyError, RuntimeError, json.JSONDecodeError, sqlite3.Error) as exc:
@@ -783,6 +838,7 @@ def main():
     server.updates = self_update.UpdateManager(data, ROOT, VERSION, "x86_64", args.port)
     server.engine = engine_supervisor.EngineManager(data, store)
     server.jd2 = jd2_control.JD2Controller(server.engine.adapter)
+    server.accounts = jd2_accounts.AccountService()
     server.rb = remote_browser.RemoteBrowser(
         server.engine.runtime, ROOT / "container" / "browser")
     # A labelled browser container surviving a Hub crash would hold memory.

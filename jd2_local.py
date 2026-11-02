@@ -17,6 +17,7 @@ import os
 import re
 import urllib.parse
 
+from jd2_accounts import LIST_QUERY
 from jd2_policy import KNOWN_KEYS, REQUIRED, valid_value
 
 API_PORT = 3128
@@ -34,7 +35,19 @@ ALLOWED_CALLS = frozenset((
     ("downloadsV2", "queryPackages"),
     ("downloadsV2", "queryLinks"),
     ("linkgrabberv2", "addLinks"),
+    # Premium accounts (v0.1.23). Secrets travel in the request line of these
+    # calls, so the adapter routes the whole namespace through _call_private.
+    ("accountsV2", "listAccounts"),
+    ("accountsV2", "listPremiumHoster"),
+    ("accountsV2", "addAccount"),
+    ("accountsV2", "refreshAccounts"),
+    ("accountsV2", "enableAccounts"),
+    ("accountsV2", "disableAccounts"),
+    ("accountsV2", "setUserNameAndPassword"),
+    ("accountsV2", "removeAccounts"),
 ))
+PRIVATE_NAMESPACE = "accountsV2"
+RAW_ACCOUNT_LIMIT = 5000
 
 
 class LocalUnavailable(RuntimeError):
@@ -201,6 +214,10 @@ class LocalAdapter:
     def can_send(self):
         return bool(self._engine.is_ours_running() and self._engine.preset_applied)
 
+    @property
+    def engine_running(self):
+        return bool(self._engine.is_ours_running())
+
     def note_preset_applied(self):
         self._engine.note_preset_applied()
 
@@ -224,7 +241,55 @@ class LocalAdapter:
         return {"allow_link_submit": self.can_send,
                 "allow_unverified_packagizer": True, "same_host": True}
 
+    def _call_private(self, method, args):
+        """accountsV2 calls: credentials are in the GET request line.
+
+        Residual risk (documented in docs/premium-accounts-design.md): the
+        request goes only to loopback (native) or the private unpublished
+        bridge IP of the Hub's own container, never over a LAN. The path and
+        arguments are never logged, stored, or put into an exception: every
+        failure says only the method name (and an HTTP status). The new
+        exception is raised outside any `except` block so no chained context
+        carries the request either.
+        """
+        target = self._engine.connection_target()   # fixed texts, no arguments
+        host, port = (self._host, target) if isinstance(target, int) else target
+        status = body = None
+        try:
+            path = encode_call(PRIVATE_NAMESPACE, method, args)
+            connection = http.client.HTTPConnection(host, port, timeout=self._timeout)
+            try:
+                connection.request("GET", path, headers={"Accept": "application/json"})
+                response = connection.getresponse()
+                body = response.read(MAX_RESPONSE + 1)
+                status = response.status
+            finally:
+                connection.close()
+                path = None
+        except Exception:
+            body = None
+        label = "JD2アカウントAPI（%s）" % method
+        if body is None:
+            raise LocalUnavailable(label + "の呼び出しに失敗しました")
+        if status != 200:
+            raise LocalUnavailable(label + "がエラーを返しました（HTTP %d）" % status)
+        if len(body) > MAX_RESPONSE:
+            raise LocalUnavailable(label + "の応答が大きすぎます")
+        if not body.strip():
+            return None
+        try:
+            value = json.loads(body.decode("utf-8"))
+        except (UnicodeError, ValueError):
+            value = body = None
+        if body is None:
+            raise LocalUnavailable(label + "の応答を解析できません")
+        if isinstance(value, dict) and "data" in value:
+            return value["data"]
+        return value
+
     def _call(self, namespace, method, *args):
+        if namespace == PRIVATE_NAMESPACE:
+            return self._call_private(method, args)
         path = encode_call(namespace, method, args)
         target = self._engine.connection_target()
         # Native: a port on 127.0.0.1. Container: (verified container IP, port).
@@ -372,3 +437,49 @@ class LocalAdapter:
             "overwritePackagizerRules": True,
             "priority": "DEFAULT",
         })
+
+    # ---------------------------------------------------- premium accounts
+    # list_* return JD2's raw objects for jd2_accounts to project onto the
+    # public model; they never leave the Hub process as they are.
+    def list_accounts(self):
+        raw = self._call("accountsV2", "listAccounts", dict(LIST_QUERY))
+        if not isinstance(raw, list) or len(raw) > RAW_ACCOUNT_LIMIT:
+            raise LocalUnavailable("JD2アカウントAPI（listAccounts）の応答形式が不正です")
+        return [entry for entry in raw if isinstance(entry, dict)]
+
+    def list_premium_hosters(self):
+        raw = self._call("accountsV2", "listPremiumHoster")
+        if not isinstance(raw, list) or len(raw) > RAW_ACCOUNT_LIMIT:
+            raise LocalUnavailable("JD2アカウントAPI（listPremiumHoster）の応答形式が不正です")
+        return raw
+
+    @staticmethod
+    def _ids(ids):
+        if (not isinstance(ids, list) or not 1 <= len(ids) <= 50 or
+                any(type(i) is not int or not 0 <= i < 2 ** 63 for i in ids)):
+            raise LocalUnavailable("アカウントIDが不正です")
+        return list(ids)
+
+    def add_account(self, host, username, password):
+        if not all(isinstance(v, str) and v for v in (host, username, password)):
+            raise LocalUnavailable("アカウント情報が不正です")
+        if self._call("accountsV2", "addAccount", host, username, password) is False:
+            raise LocalUnavailable("JD2がアカウントの追加を拒否しました")
+
+    def refresh_accounts(self, ids):
+        self._call("accountsV2", "refreshAccounts", self._ids(ids))
+
+    def enable_accounts(self, ids):
+        self._call("accountsV2", "enableAccounts", self._ids(ids))
+
+    def disable_accounts(self, ids):
+        self._call("accountsV2", "disableAccounts", self._ids(ids))
+
+    def set_credentials(self, ident, username, password):
+        if type(ident) is not int or not all(isinstance(v, str) and v for v in (username, password)):
+            raise LocalUnavailable("アカウント情報が不正です")
+        if self._call("accountsV2", "setUserNameAndPassword", ident, username, password) is False:
+            raise LocalUnavailable("JD2が認証情報の更新を拒否しました")
+
+    def remove_accounts(self, ids):
+        self._call("accountsV2", "removeAccounts", self._ids(ids))

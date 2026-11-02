@@ -125,6 +125,11 @@
        <span class="check-body"><b>JD2エンジンを準備</b><span id="obEngineText" class="muted"></span></span>
        <button type="button" class="btn small primary" id="homeEngineSetup">初期設定を開始</button>
       </li>
+      <li id="obAccounts" class="check-row" hidden>
+       <span class="check-mark" aria-hidden="true"></span>
+       <span class="check-body"><b>プレミアムアカウントを登録（任意）</b><span class="muted">Rapidgatorなどのプレミアムを使う場合に、JD2へ登録します</span></span>
+       <a class="btn small primary" href="#/settings/accounts">登録</a>
+      </li>
      </ol>
     </section>
     <div id="homeStatus" class="home-status" aria-live="polite" hidden>
@@ -200,6 +205,7 @@
    <div class="settings-layout">
     <nav class="settings-nav" aria-label="設定の項目">
      <a href="#/settings/engine" data-section="engine">エンジン</a>
+     <a href="#/settings/accounts" data-section="accounts">アカウント</a>
      <a href="#/settings/browser" data-section="browser">NASブラウザ</a>
      <a href="#/settings/storage" data-section="storage">保存先</a>
      <a href="#/settings/https" data-section="https">HTTPS接続</a>
@@ -262,6 +268,48 @@
        <summary>ログ</summary>
        <pre id="engineLog" class="update-log">開くと表示します</pre>
       </details>
+     </section>
+
+     <section class="settings-section" data-section="accounts" hidden>
+      <h1>アカウント</h1>
+      <p class="muted">Rapidgatorなどのプレミアムアカウントを、Hub管理のJD2エンジンに登録して管理します。パスワードはHubには保存せず、JD2のアカウント管理にだけ渡します。ユーザー名は一部を伏せて表示します。</p>
+      <p id="accountsState" class="muted" role="status" aria-live="polite"></p>
+      <div class="engine-row">
+       <button type="button" id="accountsReload" class="btn small">再読み込み</button>
+      </div>
+      <div id="accountsList" class="items"></div>
+      <div id="accountEdit" class="card account-edit" hidden>
+       <h2 id="accountEditTitle">認証情報を更新</h2>
+       <form id="accountEditForm" class="account-form" autocomplete="off">
+        <input id="accountEditUser" maxlength="200" placeholder="ユーザー名またはメールアドレス" aria-label="新しいユーザー名" autocomplete="off" autocapitalize="off" spellcheck="false">
+        <input id="accountEditPass" type="password" maxlength="500" placeholder="パスワード" aria-label="新しいパスワード" autocomplete="new-password">
+        <div class="engine-row">
+         <button type="submit" id="accountEditSave" class="btn primary">更新して再確認</button>
+         <button type="button" id="accountEditCancel" class="btn">キャンセル</button>
+        </div>
+       </form>
+      </div>
+      <h2>アカウントを追加</h2>
+      <div id="accountsSecure" class="notice lan-warning" role="note" hidden>
+       <span id="accountsSecureText">パスワードはHTTPSまたはTailscale経由でのみ送信できます。</span>
+       <a href="#/settings/https">HTTPS接続の設定へ</a>
+      </div>
+      <form id="accountForm" class="account-form" autocomplete="off">
+       <input id="accountHost" list="accountHostList" maxlength="100" placeholder="ホスト（例: rapidgator.net）" aria-label="ホスト" autocomplete="off" autocapitalize="off" spellcheck="false">
+       <datalist id="accountHostList"></datalist>
+       <input id="accountUser" maxlength="200" placeholder="ユーザー名またはメールアドレス" aria-label="ユーザー名" autocomplete="off" autocapitalize="off" spellcheck="false">
+       <input id="accountPass" type="password" maxlength="500" placeholder="パスワード" aria-label="パスワード" autocomplete="new-password">
+       <button type="submit" id="accountAdd" class="btn primary">追加</button>
+      </form>
+      <p id="accountResult" class="muted" role="status" aria-live="polite"></p>
+      <details id="accountSchemaBox" class="fold">
+       <summary>詳細</summary>
+       <p class="muted">一覧に出ないアカウントがある場合は、この結果を開発者に送ってください</p>
+       <button type="button" id="accountSchema" class="btn small quiet">アカウント情報の項目を調べる</button>
+       <button type="button" id="accountSchemaCopy" class="btn small" hidden>コピー</button>
+       <pre id="accountSchemaOut" class="update-log" hidden></pre>
+      </details>
+      <p class="muted">追加すると、JD2が各サイトへログインして状態（有効期限・残り容量）を確認します。頻繁な再確認はサイト側の制限につながることがあります。削除してもダウンロード済みのファイルやキューには触れません。</p>
      </section>
 
      <section class="settings-section" data-section="browser" hidden>

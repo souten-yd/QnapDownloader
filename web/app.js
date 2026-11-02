@@ -71,7 +71,7 @@ const SHELL_KEY = "qnapdl.shell.v1";
 const HOST_MODE_KEY = "qnapdl.hostmodes.v1";
 const TAB_STORAGE_KEY = "qnapdl.webtabs.v1";
 const LEGACY_AUTO_KEY = "qnapdl.downloads.auto";   // v0.1.11 switch; removed silently
-const SETTINGS_SECTIONS = ["engine", "browser", "storage", "https", "share", "bookmarks", "updates", "diagnostics", "about"];
+const SETTINGS_SECTIONS = ["engine", "accounts", "browser", "storage", "https", "share", "bookmarks", "updates", "diagnostics", "about"];
 const SECTION_ALIASES = {jd2: "engine"};   // old #/settings/jd2 links
 const ENGINE_POLL_MS = 1500;
 const SVG_NS = "http://www.w3.org/2000/svg";
@@ -100,6 +100,7 @@ const state = {
   https: false, tailnet: false,
   rbPolling: "", rbGen: 0, rbStatus: null, rbTimer: null, rbBusy: false,
   rbIntercepts: [],
+  accounts: null, accountsTruncated: false, accountHosts: [], accountBusy: false, accountEditId: "",
 };
 
 // ------------------------------------------------------------------ helpers
@@ -638,6 +639,8 @@ async function loadSettings(force = false) {
 async function loadHome(force = false) {
   await Promise.all([loadStatus(force), loadSettings(force)]);
   refreshBadge();
+  // Quiet: only decides whether the optional "register an account" item shows.
+  if (engineRunning() && state.accounts === null) loadAccounts().catch(() => {});
 }
 
 // The Hub may have been updated (from this or another device) since this page
@@ -667,8 +670,20 @@ function renderHome() {
   const folderDone = Boolean(cfg.download_dir);
   const engineDone = e.installed === true;
   const onboarding = !folderDone || !engineDone;
-  setShown("onboarding", onboarding);
+  // Optional third item: the engine runs and JD2 has no premium account yet.
+  const wantAccounts = !onboarding && e.phase === "running" &&
+    Array.isArray(state.accounts) && state.accounts.length === 0;
+  setShown("onboarding", onboarding || wantAccounts);
   setShown("homeStatus", !onboarding);
+  setShown("obAccounts", wantAccounts);
+  if (wantAccounts) {
+    setCheck("obStorage", true);
+    setCheck("obEngine", true);
+    $("obStorageText").textContent = cfg.download_dir;
+    setShown("obStorageBtn", false);
+    setShown("homeEngineSetup", false);
+    $("obEngineText").textContent = "準備できました";
+  }
   if (onboarding) {
     setCheck("obStorage", folderDone);
     setCheck("obEngine", engineDone);
@@ -2449,6 +2464,7 @@ function setPicker(open) {
 async function enterSettings(section, force = false) {
   showSettingsSection(section);
   if (section !== "share") hideShareToken();
+  if (section !== "accounts") clearAccountForms();
   if (section === "storage") {
     await loadSettings(force);
     // Nothing chosen yet: go straight to the picker.
@@ -2465,6 +2481,10 @@ async function enterSettings(section, force = false) {
       await loadJd2Status(force);
       checkConnection();
     }
+  } else if (section === "accounts") {
+    await loadEngine(force);
+    renderAccountsAvailability();
+    if (engineRunning()) await Promise.all([loadAccounts(force), loadAccountHosts(force)]);
   } else if (section === "browser") {
     renderRemoteHosts();
     await loadBrowserStatus(force);
@@ -2745,10 +2765,14 @@ function teardownSession() {
   state.folderPath = "";
   state.bookmarks = [];
   state.status = null;
+  state.accounts = null;
+  state.accountHosts = [];
+  state.accountEditId = "";
+  clearAccountForms();
   swrReset();
   writeSession(SHELL_KEY, null);
   for (const id of ["downloadList", "downloadOrphans", "queueItems", "pasteList",
-      "folderPicker", "bookmarkItems", "shareDevices", "speedDial", "bookmarkBar", "webTabs"]) {
+      "folderPicker", "bookmarkItems", "shareDevices", "accountsList", "speedDial", "bookmarkBar", "webTabs"]) {
     $(id).replaceChildren();
   }
   $("downloadsSummary").textContent = "";
@@ -3256,6 +3280,250 @@ async function startEngine() {
   applyEngine(await api("/api/engine/status"));
 }
 
+// ---- Settings › アカウント (v0.1.23)
+// Credentials only ever live in the two password inputs below. They are
+// never put into storage, a URL, a log or a DOM text node, and the inputs are
+// emptied right after the request is built (and whenever the section closes).
+const ACCOUNT_STATUS = {valid: "正常", invalid: "認証エラー", expired: "期限切れ",
+  temporarily_unavailable: "一時的に利用不可", disabled: "無効", unknown: "不明"};
+const ACCOUNT_SECURE_MESSAGE = "パスワードはHTTPSまたはTailscale経由でのみ送信できます。";
+
+// The server decides (TCP peer + trusted TLS terminator); this only mirrors it.
+function accountsSecureNow() { return state.https === true || state.tailnet === true; }
+
+function clearAccountForms() {
+  for (const id of ["accountPass", "accountEditPass"]) $(id).value = "";
+  $("accountEditUser").value = "";
+  setShown("accountEdit", false);
+  state.accountEditId = "";
+}
+
+function accountDateText(iso) {
+  if (typeof iso !== "string") return "不明";
+  const moment = new Date(iso);
+  return Number.isNaN(moment.getTime()) ? "不明" : moment.toLocaleDateString("ja-JP");
+}
+
+function accountTrafficText(item) {
+  if (item.traffic_unlimited === true) return "無制限";
+  if (typeof item.traffic_left_bytes !== "number") return "不明";
+  const left = readableSize(item.traffic_left_bytes);
+  return typeof item.traffic_max_bytes === "number" && item.traffic_max_bytes > 0 ?
+    left + " / " + readableSize(item.traffic_max_bytes) : left;
+}
+
+function accountSummary(item) {
+  const type = item.account_type === "premium" ? "Premium" :
+    item.account_type === "free" ? "Free" : "種別不明";
+  if (item.status === "valid") {
+    return type + (item.valid_until ? "・有効期限 " + accountDateText(item.valid_until) : "") +
+      (item.enabled === false ? "・無効" : "・有効");
+  }
+  return type + "・" + (ACCOUNT_STATUS[item.status] || "不明") +
+    (item.error_summary ? "（" + item.error_summary + "）" : "");
+}
+
+function renderAccountsAvailability() {
+  const secure = accountsSecureNow();
+  const running = engineRunning();
+  setShown("accountsSecure", !secure);
+  $("accountsSecureText").textContent = ACCOUNT_SECURE_MESSAGE;
+  for (const id of ["accountHost", "accountUser", "accountPass", "accountAdd",
+      "accountEditUser", "accountEditPass", "accountEditSave"]) {
+    $(id).disabled = !(secure && running);
+  }
+  $("accountsReload").disabled = !running;
+  if (!running) {
+    $("accountsState").textContent = "JD2エンジンが起動していません。設定 › エンジン で起動すると、アカウントを管理できます。";
+    $("accountsList").replaceChildren();
+  }
+}
+
+function accountButton(label, handler, item) {
+  const button = element("button", label, "btn small");
+  button.type = "button";
+  button.disabled = state.accountBusy;
+  button.addEventListener("click", () => perform(() => handler(item)));
+  return button;
+}
+
+function accountCard(item) {
+  const card = element("div", undefined, "item");
+  const head = element("div", undefined, "account-head");
+  head.appendChild(element("b", item.host));
+  head.appendChild(element("span", item.display_username || "（名前不明）"));
+  const type = element("span", item.account_type === "premium" ? "Premium" :
+    item.account_type === "free" ? "Free" : "種別不明",
+    "account-badge" + (item.account_type === "premium" ? " is-ok" : ""));
+  head.appendChild(type);
+  head.appendChild(element("span", item.enabled === true ? "有効" : item.enabled === false ? "無効" : "有効/無効 不明",
+    "account-badge" + (item.enabled === false ? " is-bad" : "")));
+  card.appendChild(head);
+  const meta = element("div", undefined, "account-meta");
+  const bad = ["invalid", "expired", "temporarily_unavailable"].includes(item.status);
+  meta.appendChild(element("span", "状態: " + (ACCOUNT_STATUS[item.status] || "不明") +
+    (item.error_summary ? "（" + item.error_summary + "）" : ""), bad ? "engine-error" : undefined));
+  meta.appendChild(element("span", "有効期限: " + accountDateText(item.valid_until)));
+  meta.appendChild(element("span", "残り容量: " + accountTrafficText(item)));
+  card.appendChild(meta);
+  const actions = element("div", undefined, "account-actions");
+  actions.appendChild(accountButton("再確認", refreshAccount, item));
+  actions.appendChild(accountButton(item.enabled === false ? "有効にする" : "無効にする", toggleAccount, item));
+  const edit = accountButton("認証情報を更新", openAccountEdit, item);
+  edit.disabled = state.accountBusy || !accountsSecureNow();
+  actions.appendChild(edit);
+  actions.appendChild(accountButton("削除", deleteAccount, item));
+  card.appendChild(actions);
+  return card;
+}
+
+function renderAccounts(data) {
+  state.accounts = Array.isArray(data.items) ? data.items : [];
+  state.accountsTruncated = data.truncated === true;
+  renderAccountsAvailability();
+  if (engineRunning()) {
+    $("accountsState").textContent = state.accounts.length ?
+      state.accounts.length + "件のアカウント" + (data.truncated ? "（上限200件まで表示）" : "") :
+      "登録されているアカウントはありません。下のフォームから追加できます。";
+    $("accountsList").replaceChildren(...state.accounts.map(accountCard));
+  }
+  renderHome();
+}
+
+async function loadAccounts(force = false) {
+  await swr("accounts", force ? "/api/accounts?refresh=1" : "/api/accounts", renderAccounts, {force});
+}
+
+function renderAccountHosts(data) {
+  state.accountHosts = Array.isArray(data.items) ? data.items : [];
+  $("accountHostList").replaceChildren(...state.accountHosts.map(host => {
+    const option = document.createElement("option");
+    option.value = host;
+    return option;
+  }));
+  if (!$("accountHost").value && state.accountHosts.includes("rapidgator.net")) {
+    $("accountHost").value = "rapidgator.net";
+  }
+}
+
+async function loadAccountHosts(force = false) {
+  await swr("account-hosts", "/api/accounts/hosts", renderAccountHosts, {force});
+}
+
+// Every change goes through here: buttons are locked, the list is re-read after.
+async function accountChange(path, body) {
+  state.accountBusy = true;
+  renderAccounts({items: state.accounts || [], truncated: state.accountsTruncated});
+  try {
+    return await api(path, body);
+  } finally {
+    state.accountBusy = false;
+    swrDrop("accounts");
+    await loadAccounts(true).catch(() => {});
+    // The list may be unchanged (so swr would skip painting): unlock the buttons.
+    renderAccounts({items: state.accounts || [], truncated: state.accountsTruncated});
+  }
+}
+
+function showAccountResult(item, fallback) {
+  const text = item ? item.host + " " + (item.display_username || "") + ": " + accountSummary(item) : fallback;
+  $("accountResult").textContent = text;
+  const bad = item && ["invalid", "expired", "temporarily_unavailable"].includes(item.status);
+  toast(text, bad ? "error" : "success");
+}
+
+async function addAccount() {
+  if (!accountsSecureNow()) throw new Error(ACCOUNT_SECURE_MESSAGE);
+  const host = $("accountHost").value.trim().toLowerCase();
+  if (!state.accountHosts.includes(host)) throw new Error("一覧にあるホストを選んでください");
+  const body = {host, username: $("accountUser").value, password: $("accountPass").value};
+  $("accountPass").value = "";
+  $("accountResult").textContent = "追加して、JD2でログイン確認しています…";
+  try {
+    const result = await accountChange("/api/accounts/add", body);
+    $("accountUser").value = "";
+    showAccountResult(result.item, result.message || "追加しました");
+  } catch (e) {
+    $("accountResult").textContent = "";
+    throw e;
+  } finally {
+    body.password = "";
+  }
+}
+
+function openAccountEdit(item) {
+  if (!accountsSecureNow()) throw new Error(ACCOUNT_SECURE_MESSAGE);
+  state.accountEditId = item.id;
+  $("accountEditTitle").textContent = item.host + " " + (item.display_username || "") + " の認証情報を更新";
+  $("accountEditUser").value = "";
+  $("accountEditPass").value = "";
+  setShown("accountEdit", true);
+  $("accountEditUser").focus();
+}
+
+async function saveAccountEdit() {
+  if (!accountsSecureNow()) throw new Error(ACCOUNT_SECURE_MESSAGE);
+  const body = {id: state.accountEditId, username: $("accountEditUser").value,
+    password: $("accountEditPass").value};
+  $("accountEditPass").value = "";
+  try {
+    const result = await accountChange("/api/accounts/update", body);
+    setShown("accountEdit", false);
+    $("accountEditUser").value = "";
+    state.accountEditId = "";
+    showAccountResult(result.item, "更新しました");
+  } finally {
+    body.password = "";
+  }
+}
+
+async function refreshAccount(item) {
+  const result = await accountChange("/api/accounts/refresh", {id: item.id});
+  showAccountResult(result.item, "再確認しました");
+}
+
+async function toggleAccount(item) {
+  const wanted = item.enabled === false;
+  const result = await accountChange("/api/accounts/enable", {id: item.id, enabled: wanted});
+  showAccountResult(result.item, wanted ? "有効にしました" : "無効にしました");
+}
+
+async function deleteAccount(item) {
+  const typed = prompt("JD2からこのアカウントを削除します（ダウンロード済みのファイルやキューには触れません）。\n\n" +
+    item.host + "  " + (item.display_username || "") + "\n\n続けるには、ホスト名「" + item.host + "」を入力してください。");
+  if (typed === null) return;
+  if (typed.trim().toLowerCase() !== item.host) throw new Error("ホスト名が一致しないため削除しませんでした");
+  await accountChange("/api/accounts/delete", {id: item.id, confirm_host: typed.trim()});
+  flash(item.host + " のアカウントを削除しました");
+}
+
+async function loadAccountSchema() {
+  const data = await api("/api/accounts/schema");
+  $("accountSchemaOut").textContent = JSON.stringify(data, null, 1);
+  setShown("accountSchemaOut", true);
+  setShown("accountSchemaCopy", true);
+}
+
+function wireAccounts() {
+  $("accountSchema").addEventListener("click", () => perform(loadAccountSchema));
+  $("accountSchemaCopy").addEventListener("click", () => copyText($("accountSchemaOut").textContent));
+  $("accountForm").addEventListener("submit", event => {
+    event.preventDefault();
+    perform(addAccount);
+  });
+  $("accountEditForm").addEventListener("submit", event => {
+    event.preventDefault();
+    perform(saveAccountEdit);
+  });
+  $("accountEditCancel").addEventListener("click", () => {
+    $("accountEditPass").value = "";
+    $("accountEditUser").value = "";
+    setShown("accountEdit", false);
+    state.accountEditId = "";
+  });
+  $("accountsReload").addEventListener("click", () => perform(() => loadAccounts(true)));
+}
+
 // ---- Settings › NASブラウザ (v0.1.16)
 const RB_PHASE_LABELS = {stopped: "停止中", starting: "起動中…", running: "稼働中",
   stopping: "停止処理中…", setup: "初期設定中"};
@@ -3478,6 +3746,7 @@ function wireSettings() {
       "接続できてもJD2の認証や外部からの隔離は確認できません。";
   }));
   wireEngine();
+  wireAccounts();
   $("httpsCmdCopy").addEventListener("click", () => copyText(HTTPS_SERVE_COMMAND));
   $("shareForm").addEventListener("submit", event => {
     event.preventDefault();

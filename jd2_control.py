@@ -20,6 +20,10 @@ class JD2Controller:
             raise PresetUnavailable("エンジン未起動/未導入")
         return self.adapter
 
+    def require_adapter(self):
+        """The engine adapter, or PresetUnavailable. Callers hold self.lock."""
+        return self._require()
+
     def status(self):
         if self.adapter is None:
             return {"connected": False, "reason": "エンジン未起動/未導入",
