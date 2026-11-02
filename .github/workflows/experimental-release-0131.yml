@@ -1,0 +1,43 @@
+name: Publish QnapDownloader v0.1.31-rc1 reader start fix
+on:
+  push:
+    branches: [release/experimental-0.1.31-rc1]
+permissions:
+  contents: write
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Full unit, web, shell and safety verification
+        run: bash scripts/verify.sh
+      - name: Install QDK 2.5.3 and build-only dependencies
+        run: |
+          curl -fLSs --retry 2 https://github.com/qnap-dev/QDK/releases/download/v2.5.3/qdk_2.5.3_amd64.deb -o /tmp/qdk.deb
+          sudo apt-get update -qq
+          sudo apt-get install -y /tmp/qdk.deb rsync
+          python3 -m pip install --disable-pip-version-check 'cairosvg==2.8.2' 'pillow>=10,<13'
+      - name: Build and checksum x86_64 QPKG
+        run: |
+          bash scripts/build-qpkg.sh x86_64 dist
+          (cd dist && sha256sum QnapDownloader_0.1.31_x86_64.qpkg > SHA256SUMS && sha256sum -c SHA256SUMS)
+      - name: Publish as prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view v0.1.31-rc1 >/dev/null 2>&1; then
+            echo 'Existing tag; refusing to overwrite'
+            exit 1
+          fi
+          gh release create v0.1.31-rc1 dist/QnapDownloader_0.1.31_x86_64.qpkg dist/SHA256SUMS \
+            --repo "${{ github.repository }}" --target "2abf1d07bbc8c14c7f2d5f0749a42b25a246f89a" \
+            --title "QnapDownloader v0.1.31-rc1: Reader display start fix" \
+            --prerelease \
+            --notes "Experimental QNAP x86_64 build. Reader and fast displays now start after 3 s even when a page never finishes loading (ads), and refresh once loading ends. Reader errors are shown in the tab; pages the reader cannot handle fall back to fast display for that page only."
