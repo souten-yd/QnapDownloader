@@ -25,9 +25,11 @@ import browser_safety
 import runtime_diagnostics
 import engine_supervisor
 import remote_browser
+import state_hub
+import ttlcache
 import updater
 
-VERSION = "0.1.32"
+VERSION = "0.1.33"
 PORT = 17864
 ROOT = Path(__file__).resolve().parent
 FILES = {"/": ("web/index.html", "text/html; charset=utf-8"),
@@ -348,6 +350,32 @@ def wire_remote_browser(server):
     server.rb.auto_send = lambda url: auto_send_link(server, url)
 
 
+def server_cache(server):
+    """Per-server short-TTL single-flight cache (engine/JD2/NAS browser reads, v0.1.33)."""
+    cache = getattr(server, "cache", None)
+    if cache is None:
+        with SESSION_LOCK:
+            cache = getattr(server, "cache", None)
+            if cache is None:
+                cache = server.cache = ttlcache.SingleFlightCache()
+    return cache
+
+
+def server_state_hub(server):
+    hub = getattr(server, "state_hub", None)
+    if hub is None:
+        with SESSION_LOCK:
+            hub = getattr(server, "state_hub", None)
+            if hub is None:
+                hub = server.state_hub = state_hub.StateHub(server, VERSION, server_cache(server))
+    return hub
+
+
+# Writes under these prefixes change nothing the cached reads show (screen input only).
+RB_QUIET_POSTS = ("/api/rb/input", "/api/rb/viewport", "/api/rb/snapshot", "/api/rb/snapshot/release",
+                  "/api/rb/tap-page", "/api/rb/reader", "/api/rb/probe", "/api/rb/intercepts/open")
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "QnapDownloader"
     sys_version = ""
@@ -414,8 +442,9 @@ class Handler(BaseHTTPRequestHandler):
         # img-src blob: is needed ONLY for the remote-browser screencast: the UI
         # fetches /api/rb/frame.jpg (Hub-controlled JPEG bytes), wraps them in a
         # Blob and sets one <img> to URL.createObjectURL(blob). 'self' alone
-        # cannot display a blob: URL. data: stays for the JSON fallback endpoint
-        # (/api/rb/frame). No other directive changes (default-src 'none', no inline).
+        # cannot display a blob: URL. data: is kept unchanged (security invariant); the
+        # JSON frame endpoint that used it was removed in v0.1.33. No other directive
+        # changes (default-src 'none', no inline).
         self.send_header("Content-Security-Policy", "default-src 'none'; img-src 'self' data: blob:; script-src 'self'; style-src 'self'; connect-src 'self'; frame-src https:; base-uri 'none'; frame-ancestors 'none'; form-action 'self'")
         if getattr(self, "_cookie", None):
             self.send_header("Set-Cookie", self._cookie)
@@ -534,6 +563,28 @@ class Handler(BaseHTTPRequestHandler):
                                delete_files=body.get("delete_files", False),
                                confirm_name=body.get("confirm_name"), download_dir=folder)
 
+    def send_state(self):
+        """GET /api/state?rev=N&wait=S[&full=1]: the unified client state (long-poll)."""
+        query = parse_qs(urlsplit(self.path).query)
+        rev_text = query.get("rev", [None])[0]
+        if rev_text is not None and (not rev_text.isdecimal() or len(rev_text) > 12):
+            raise ValueError("revが不正です")
+        wait_text = query.get("wait", [str(int(state_hub.WAIT_MAX))])[0]
+        if not wait_text.isdecimal() or len(wait_text) > 2 or int(wait_text) > state_hub.WAIT_MAX:
+            raise ValueError("waitが不正です")
+        rev, state = server_state_hub(self.server).poll(
+            None if rev_text is None else int(rev_text), int(wait_text))
+        data = dict(state, rev=rev, https=request_is_https(self.client_address[0], self.headers),
+                    tailnet=tailnet_peer(self.client_address[0]))
+        if query.get("full", ["0"])[0] == "1":
+            # First load only: the data the home view needs, in the same round trip.
+            data["settings"] = self.store.settings()
+            data["bookmarks"] = self.store.bookmarks()
+        return self.send_data(200, data)
+
+    def cached(self, key, ttl, loader):
+        return server_cache(self.server).get(key, ttl, loader)
+
     def do_GET(self):
         if not self.check_host():
             return self.reject("アクセス元Hostが許可されていません", 403)
@@ -558,20 +609,19 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/status":
                 return self.send_data(200, {"version": VERSION, "configured": self.store.has_admin(),
                     "settings_revision": self.store.revision(),
-                    "jd2": self.server.jd2.status(),
-                    "engine": self.server.engine.status(),
+                    "jd2": self.cached("jd2:status", state_hub.COUNTS_TTL, self.server.jd2.status),
+                    "engine": self.cached("engine:status", state_hub.ENGINE_TTL, self.server.engine.status),
                     "mode": "management-shell"})
+            if path == "/api/state":
+                return self.send_state()
             if path == "/api/settings":
                 return self.send_data(200, self.store.settings())
             if path == "/api/diagnostics/io":
                 # Reads /proc/self/io only; no writes or background polling.
                 return self.send_data(200, runtime_diagnostics.snapshot())
-            if path == "/api/jd2/local-preflight":
-                # No legacy API command or Docker socket interaction: TCP
-                # presence alone never authorizes unauthenticated JD2 control.
-                return self.send_data(200, runtime_diagnostics.local_jd2_preflight())
             if path == "/api/engine/status":
-                return self.send_data(200, self.server.engine.status())
+                return self.send_data(200, self.cached("engine:status", state_hub.ENGINE_TTL,
+                                                       self.server.engine.status))
             if path == "/api/engine/config-keys":
                 # Read-only diagnostic; requires a running, listener-verified engine.
                 with self.server.jd2.lock:
@@ -581,7 +631,8 @@ class Handler(BaseHTTPRequestHandler):
                 # RAM ring only; secrets are scrubbed when lines are recorded.
                 return self.send_data(200, {"lines": self.server.engine.log_lines()})
             if path == "/api/jd2/status":
-                return self.send_data(200, self.server.jd2.status())
+                return self.send_data(200, self.cached("jd2:status", state_hub.COUNTS_TTL,
+                                                       self.server.jd2.status))
             if path == "/api/accounts/schema":
                 # Key names and JSON type names only (no values), for confirming
                 # the real accountsV2 field names on the NAS.
@@ -602,10 +653,12 @@ class Handler(BaseHTTPRequestHandler):
                 if not page_text.isdecimal() or len(page_text) > 2:
                     raise ValueError("表示ページが不正です")
                 page = int(page_text)
-                return self.send_data(200, self.server.jd2.downloads_snapshot(page))
+                return self.send_data(200, self.cached(
+                    "jd2:downloads:%d" % page, 2.0, lambda: self.server.jd2.downloads_snapshot(page)))
             if path == "/api/jd2/linkgrabber":
                 # Names and ids of links JD2 holds but has not started (max 50).
-                return self.send_data(200, self.server.jd2.linkgrabber_snapshot())
+                return self.send_data(200, self.cached("jd2:linkgrabber", 2.0,
+                                                       self.server.jd2.linkgrabber_snapshot))
             if path == "/api/jd2/preset/preview":
                 return self.send_data(200, self.server.jd2.preset_preview())
             if path == "/api/bookmarks":
@@ -644,11 +697,11 @@ class Handler(BaseHTTPRequestHandler):
                 # caller-provided file path or the updater's internal directory.
                 return self.send_data(200, {"log": self.server.updates.log_tail()})
             if path == "/api/rb/status":
-                return self.send_data(200, self.server.rb.status())
+                return self.send_data(200, self.cached("rb:status", state_hub.RB_TTL, self.server.rb.status))
             if path == "/api/rb/log":
                 # RAM ring only (early-exit reasons from the browser container).
                 return self.send_data(200, {"lines": self.server.rb.log_lines()})
-            if path in ("/api/rb/frame", "/api/rb/frame.jpg"):
+            if path == "/api/rb/frame.jpg":
                 query = parse_qs(urlsplit(self.path).query)
                 since_text = query.get("since", ["0"])[0]
                 if not since_text.isdecimal() or len(since_text) > 12:
@@ -661,9 +714,6 @@ class Handler(BaseHTTPRequestHandler):
                     raise ValueError("revが不正です")
                 rev = None if rev_text is None else int(rev_text)
                 tab_id = query.get("tab", [""])[0]
-                if path == "/api/rb/frame":
-                    return self.send_data(200, self.server.rb.frame(
-                        tab_id, int(since_text), wait=int(wait_text), rev=rev))
                 result = self.server.rb.frame_image(tab_id, int(since_text), wait=int(wait_text), rev=rev)
                 headers = {
                     "X-Frame-Seq": str(result["seq"]),
@@ -757,6 +807,9 @@ class Handler(BaseHTTPRequestHandler):
             return self.reject(str(exc), 415)
         except remote_browser.ImageUnavailable as exc:
             return self.reject(str(exc), 502)
+        except (BrokenPipeError, ConnectionResetError):
+            self.close_connection = True     # the viewer left (e.g. a held long-poll): nothing to answer
+            return None
         except (OSError, ValueError, RuntimeError, KeyError, sqlite3.Error) as exc:
             return self.reject(str(exc))
         self.reject("APIが存在しません", 404)
@@ -816,11 +869,26 @@ class Handler(BaseHTTPRequestHandler):
                     # A lone https URL (Safari's share of the page itself).
                     found = [self.store.validate_url(single)]
             added = self.store.add_links(found) if found else 0
+        except (BrokenPipeError, ConnectionResetError):
+            self.close_connection = True     # the viewer left (e.g. a held long-poll): nothing to answer
+            return None
         except (OSError, ValueError, KeyError, RuntimeError, json.JSONDecodeError, sqlite3.Error) as exc:
             return self.reject(str(exc))
         return self.send_data(200, {"added": added, "found": len(found)})
 
     def do_POST(self):
+        path = urlsplit(self.path).path
+        if path == "/api/share" or path in RB_QUIET_POSTS:
+            return self.handle_post()
+        try:
+            return self.handle_post()
+        finally:
+            # Any other write may change what the cached reads show: forget them and let the
+            # waiting /api/state pollers re-read now.
+            server_cache(self.server).invalidate()
+            server_state_hub(self.server).poke()
+
+    def handle_post(self):
         if urlsplit(self.path).path == "/api/share":
             return self.handle_share()
         if not self.check_host() or not self.origin_ok():
@@ -1075,6 +1143,9 @@ class Handler(BaseHTTPRequestHandler):
             return self.reject(str(exc), 404)
         except remote_browser.ProbeQueueFull as exc:
             return self.reject(str(exc), 429)
+        except (BrokenPipeError, ConnectionResetError):
+            self.close_connection = True     # the viewer left (e.g. a held long-poll): nothing to answer
+            return None
         except (OSError, ValueError, KeyError, RuntimeError, json.JSONDecodeError, sqlite3.Error) as exc:
             return self.reject(str(exc))
         self.reject("APIが存在しません", 404)

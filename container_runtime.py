@@ -17,6 +17,8 @@ import re
 import subprocess
 from types import SimpleNamespace
 
+import ttlcache
+
 IMAGE_JD2 = ("eclipse-temurin:21-jre@sha256:"
              "0b99b3376fbb50dbf9c0af8535fdd5b8eb0d3fdfc8b1e4967f383b6919f6901a")
 IMAGE_DEBIAN = ("debian:bookworm-slim@sha256:"
@@ -195,6 +197,7 @@ class Runtime:
         self._meminfo = meminfo_path
         self._config_dir = config_dir
         self._stat = stat
+        self._flights = ttlcache.SingleFlightCache()   # concurrent status reads share one docker call
         self._docker_path = False   # False = not yet looked up
 
     # ---------------------------------------------------------- docker CLI
@@ -340,7 +343,9 @@ class Runtime:
             raise ContainerError("コンテナ情報を解析できません") from None
 
     def container_state(self, name):
-        info = self._inspect(name)
+        # Status reads only (never used to authorise an action): callers that overlap in time
+        # share one `docker inspect`. _require_ours / inspect_ip always inspect for themselves.
+        info = self._flights.get("inspect:" + str(name), 0.0, lambda: self._inspect(name))
         if info is None:
             return {"exists": False, "managed": False, "running": False, "status": "absent"}
         return {"exists": True, "managed": info["managed"], "running": info["running"],
@@ -658,6 +663,9 @@ class Runtime:
     def stats(self, name):
         """Memory use of our own named container: {used_bytes, limit_bytes, percent}."""
         self._check_name(name)
+        return self._flights.get("stats:" + name, 0.0, lambda: self._stats_once(name))
+
+    def _stats_once(self, name):
         result = self._docker(["stats", "--no-stream", "--format",
                                "{{.MemUsage}}|{{.MemPerc}}", name], 30)
         if result.returncode != 0:

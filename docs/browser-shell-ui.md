@@ -267,3 +267,14 @@ Cloudflare等で手元のブラウザ（iframe）では開けないサイトを�
 
 ### 速度表示（⋯ › 速度表示）
 - 先頭に表示の種類と方式を出す。ライブ（ストリーム）: 「ライブ(ストリーム)・速度優先 · 9.8 fps · 22 KB/枚 · 応答 120 ms」（応答は最初の画像が出るまで）。ライブ（ポーリング）: 「ライブ(ポーリング)・標準 · …」。高速: 「高速(全体表示)・速度優先 · タイル 4/12 · 撮影 850 ms · 1枚 140 KB」。リーダー: 「リーダー · ブロック 230 · 画像 12/40 · 取得 600 ms」（抽出時間、画像があれば「画像取得 ○ ms」の平均を追記）。fps以外は端末側で計測。
+
+## v0.1.33 UI/UX・処理の全面見直し
+仕様と計測は [ux-review-0131.md](ux-review-0131.md)。要点:
+- **設定は4節**: `#/settings/jd2|browser|connection|system`。節内の小見出し（jd2: engine/accounts/storage/send、browser: nas/rules/bookmarks、connection: https/share、system: updates/diagnostics/about）は `#/settings/jd2/accounts` のように指定するとスクロールする。旧URL（engine, accounts, storage, https, share, bookmarks, updates, diagnostics, about）は新しい位置へ `replaceState` で移る（`#/settings/browser` と `#/settings/jd2` は新しい節の先頭）。
+- **表示の抑制**: 説明は1行（`.set-text`、はみ出しは省略）。長い説明は行末の「ⓘ」（`<details class="hint">`、閉じた状態）。設定行は左ラベル・右コントロール（`.set-row`）。オン/オフは `role="switch"` のスイッチ。既定の表示方法は選択ボックス。保存先はボトムシート（選ぶと閉じる）。リンク画面の履歴削除はヘッダーの「⋯」（履歴があるときだけ表示、未送信を含める操作は別項目）。
+- **通知**: 同時に1件。同種（group）は件数を足して1件にまとめる（例「JD2へ送信しました（3件）」）。エラーは閉じるまで残り、新しいエラーが置き換える。エラー表示中は成功の通知を出さない。更新の進行などの固定バナー（sticky）は別枠。
+- **状態の一本化**: `GET /api/state?rev=N&wait=S[&full=1]`。`{rev, engine:{state, mode, running, can_send, preset_applied, installed, autostart, error, cs, sig}, downloads:{running, waiting, finished}|null, rb:{state, tabs, mem, sig}, settings_rev, version, https, tailnet}`。`full=1`（初回のみ）は settings と bookmarks も返す。`rev` が違えば即時、同じなら最大25秒待つ。`sig` は詳細ステータスの変化検出用で、設定›JD2／NASブラウザが開いているときだけ `/api/engine/status`・`/api/rb/status` を取り直す。`/api/status` `/api/engine/status` `/api/rb/status` `/api/jd2/status` は互換のため残るが、周期的には呼ばない。
+- **スケジューラ**: 周期処理（ダウンロード一覧5秒など）は `sched` に登録し、表示中のみ実行。`setInterval` は使わない。
+- **遅延初期化**: 設定とNASブラウザのイベント設定は初めて開いたときに行う（`ensureSettings` / `ensureRemote`）。
+- **サーバー側のキャッシュ**: `ttlcache.SingleFlightCache`。engine 2秒・JD2件数/状態 5秒・ダウンロード一覧/待機リンク 2秒・NASブラウザ 2秒。同時の呼び出しは1回の取得を共有し、書き込み系のPOST（NASブラウザの画面入力を除く）でキャッシュを捨てる。docker inspect / stats、アカウント一覧・ホスト一覧は同時呼び出しの共有（TTLなし、`_require_ours` と `inspect_ip` は常に自分で確認）。
+- **削除**: `/api/rb/frame`（JSON）、`/api/jd2/local-preflight`（3128番の事前診断）とその画面、個別ポーリング用のタイマー、未使用CSS。

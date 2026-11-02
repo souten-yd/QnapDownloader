@@ -171,7 +171,7 @@ if (bad.length) { console.error("mismatch: " + bad.join(",")); process.exit(1); 
         self.assertNotRegex(self.js, r"\bEXTERNAL_MODE\b")
         self.assertNotIn('data-action="external"', self.html)
         # the iPhone share sheet / bookmarklet settings stay
-        self.assertIn('data-section="share"', self.html)
+        self.assertIn('data-sub="share"', self.html)
 
     def test_stored_external_host_mode_migrates_to_the_nas_browser_default(self):
         if shutil.which("node") is None:
@@ -205,11 +205,10 @@ eq(readHostModes(), [], "unreadable storage is harmless");
                       "engineSteps", "engineLog", "homeEngineSetup", "downloadsEngineAction",
                       "engineTestResult"):
             self.assertIn('id="%s"' % ident, self.html)
-        self.assertIn('data-section="engine"', self.html)
-        self.assertNotIn('data-section="jd2"', self.html)
-        self.assertIn("SECTION_ALIASES", self.js)
-        self.assertIn("#/settings/engine", self.js)
-        self.assertRegex(self.js, r"ENGINE_POLL_MS\s*=\s*1500\b")
+        self.assertIn('data-sub="engine"', self.html)
+        self.assertIn("SETTINGS_REDIRECTS", self.js)
+        self.assertIn("jd2/engine", self.js)
+        self.assertNotIn("ENGINE_POLL_MS", self.js)       # v0.1.33: the state loop replaced the engine poll
         # Log text only via textContent; confirm names sources and sizes.
         self.assertIn('$("engineLog").textContent', self.js)
         for needle in ("installer.jdownloader.org", "github.com/adoptium", "自動開始しません"):
@@ -244,9 +243,12 @@ eq(readHostModes(), [], "unreadable storage is harmless");
 
     def test_settings_order_and_auto_refresh_interval(self):
         order = re.findall(r'<a href="#/settings/(\w+)" data-section', self.html)
-        self.assertEqual(order, ["engine", "accounts", "browser", "storage", "https", "share", "bookmarks", "updates", "diagnostics", "about"])
+        self.assertEqual(order, ["jd2", "browser", "connection", "system"])
+        subs = re.findall(r'data-sub="(\w+)"', self.html)
+        self.assertEqual(subs, ["engine", "accounts", "storage", "send", "nas", "rules", "bookmarks",
+                                "https", "share", "updates", "diagnostics", "about"])
         self.assertRegex(self.js, r"AUTO_REFRESH_MS\s*=\s*5000\b")
-        self.assertRegex(self.js, r"BADGE_REFRESH_MS\s*=\s*30000\b")
+        self.assertNotIn("BADGE_REFRESH_MS", self.js)
         self.assertRegex(self.js, r"PASTE_DEBOUNCE_MS\s*=\s*400\b")
         # Delete APIs are wired, and sending to JD2 still asks for confirmation.
         self.assertIn("/api/links/delete", self.js)
@@ -260,11 +262,11 @@ eq(readHostModes(), [], "unreadable storage is harmless");
                       "shareHttpWarning", "cfHttps"):
             with self.subTest(ident=ident):
                 self.assertIn('id="%s"' % ident, self.html)
-        self.assertIn('data-section="https"', self.html)
-        self.assertIn('data-section="share"', self.html)
-        self.assertIn("HTTPS接続", self.html)
+        self.assertIn('data-sub="https"', self.html)
+        self.assertIn('data-sub="share"', self.html)
+        self.assertIn("HTTPS（Tailscale）", self.html)
         self.assertIn("iPhoneから送る", self.html)
-        self.assertIn('href="#/settings/https"', self.html)
+        self.assertIn('href="#/settings/connection/https"', self.html)
         self.assertIn("HTTPSで開くと通過しやすくなります", self.html)
         self.assertIn("which tailscale", self.html)
         self.assertIn("tailscale serve --bg --https=443 http://127.0.0.1:17864", self.js)
@@ -321,7 +323,7 @@ if (out !== want) { console.error(JSON.stringify(out)); process.exit(1); }
                 with self.subTest(file=path.name, text=gone):
                     self.assertNotIn(gone, path.read_text(encoding="utf-8"))
         # The HTTPS hint now lives only in the HTTPS settings section.
-        https = re.search(r'<section class="settings-section" data-section="https".*?</section>', self.html, re.S).group(0)
+        https = re.search(r'<div class="sub" data-sub="https".*?<div class="sub" data-sub="share"', self.html, re.S).group(0)
         self.assertIn("HTTPSで開くと通過しやすくなります", https)
         view_web = re.search(r'<section id="view-web".*?</section>', self.html, re.S).group(0)
         self.assertNotIn("HTTPSで開くと", view_web)
@@ -439,7 +441,7 @@ if (out !== want) { console.error(JSON.stringify(out)); process.exit(1); }
             self.assertIn('id="%s"' % ident, section)
         for text in ("初期設定（イメージ作成）", "停止", "2GiB", "80%", "5分", "10分", "Container Station"):
             self.assertIn(text, section)
-        self.assertIn('SETTINGS_SECTIONS = ["engine", "accounts", "browser"', self.js)
+        self.assertIn('SETTINGS_SECTIONS = ["jd2", "browser", "connection", "system"]', self.js)
 
     def test_v0116_native_leftover_row(self):
         self.assertRegex(self.html, r'<div id="engineNativeRow"[^>]*hidden')
@@ -456,20 +458,20 @@ if (out !== want) { console.error(JSON.stringify(out)); process.exit(1); }
         self.assertIn('role="status"', self.html)
 
     def test_v0123_accounts_section_ui_and_secret_handling(self):
-        section = re.search(r'<section class="settings-section" data-section="accounts".*?</section>',
+        section = re.search(r'<div class="sub" data-sub="accounts".*?<div class="sub" data-sub="storage"',
                             self.html, re.S).group(0)
         for ident in ("accountsList", "accountForm", "accountHost", "accountHostList", "accountUser",
                       "accountPass", "accountAdd", "accountsSecure", "accountEditPass", "accountResult"):
             self.assertIn('id="%s"' % ident, section)
-        self.assertIn('href="#/settings/https"', section)
+        self.assertIn('href="#/settings/connection/https"', section)
         # Password inputs: masked, never autofilled/saved by the browser.
         for ident in ("accountPass", "accountEditPass"):
             tag = re.search(r'<input id="%s"[^>]*>' % ident, section).group(0)
             self.assertIn('type="password"', tag)
             self.assertIn('autocomplete="new-password"', tag)
         self.assertIn('list="accountHostList"', section)
-        # Settings order: アカウント directly after エンジン.
-        self.assertRegex(self.html, r'data-section="engine">エンジン</a>\s*<a href="#/settings/accounts" data-section="accounts">アカウント</a>')
+        # Settings order: アカウント directly after エンジン (subsections of the JD2 section).
+        self.assertRegex(self.html, r'(?s)data-sub="engine".*?data-sub="accounts"')
         # Onboarding: optional third item, hidden by default.
         self.assertRegex(self.html, r'<li id="obAccounts"[^>]*hidden')
         self.assertIn("プレミアムアカウントを登録（任意）", self.html)
@@ -603,10 +605,14 @@ if (out !== want) { console.error(JSON.stringify(out)); process.exit(1); }
         self.assertRegex(css, r"\.remote-tools\{[^}]*min-height:36px")
 
     def test_v0125_history_clear_and_duplicate_skips(self):
-        for ident in ("clearHistory", "clearStaged", "downloadsClear"):
+        for ident in ("downloadsClear",):
             self.assertIn('id="%s"' % ident, self.html)
-        self.assertIn("履歴を削除", self.html)
-        self.assertIn("未送信のリンクも削除", self.html)
+        # v0.1.33: the history deletion moved from the page body into the header ⋯ menu
+        self.assertIn('id="linksMore"', self.html)
+        self.assertNotIn('id="clearHistory"', self.html)
+        self.assertNotIn('id="clearStaged"', self.html)
+        self.assertIn("送信済み・要確認の履歴を削除", self.js)
+        self.assertIn("未送信のリンクも含めてすべて削除", self.js)
         self.assertIn("完了したものを一覧から消す", self.html)
         self.assertIn("/api/links/clear", self.js)
         self.assertIn("/api/jd2/downloads/cleanup", self.js)
