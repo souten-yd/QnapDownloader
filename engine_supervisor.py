@@ -24,6 +24,7 @@ import threading
 import time
 
 import container_runtime
+import debuglog
 import durability
 import engine_components as components
 import jd2_local
@@ -229,6 +230,7 @@ class EngineManager:
         clean = scrub(str(line).rstrip("\r\n"))
         with self._ring_lock:
             self._ring.append(clean)
+        debuglog.log("engine", "info", clean)
 
     def log_lines(self):
         with self._ring_lock:

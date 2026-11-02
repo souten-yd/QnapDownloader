@@ -15,7 +15,10 @@ import ipaddress
 import json
 import os
 import re
+import time
 import urllib.parse
+
+import debuglog
 
 from jd2_accounts import LIST_QUERY
 from jd2_policy import KNOWN_KEYS, REQUIRED, valid_value
@@ -315,6 +318,22 @@ class LocalAdapter:
         return value
 
     def _call(self, namespace, method, *args):
+        """One RemoteAPI call; with the debug log on, only names, duration and the error text are logged."""
+        if not debuglog.LOG._enabled:
+            return self._call_inner(namespace, method, *args)
+        started = time.monotonic()
+        try:
+            value = self._call_inner(namespace, method, *args)
+        except Exception as error:
+            text = type(error).__name__ if namespace == PRIVATE_NAMESPACE else str(error)[:120]
+            debuglog.log("jd2", "error", "JD2 %s/%s 失敗" % (namespace, method),
+                         {"ms": int((time.monotonic() - started) * 1000), "error": text})
+            raise
+        debuglog.log("jd2", "debug", "JD2 %s/%s" % (namespace, method),
+                     {"ms": int((time.monotonic() - started) * 1000)})
+        return value
+
+    def _call_inner(self, namespace, method, *args):
         if namespace == PRIVATE_NAMESPACE:
             return self._call_private(method, args)
         path = encode_call(namespace, method, args)

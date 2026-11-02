@@ -15,8 +15,10 @@ import json
 import os
 import re
 import subprocess
+import time
 from types import SimpleNamespace
 
+import debuglog
 import ttlcache
 
 IMAGE_JD2 = ("eclipse-temurin:21-jre@sha256:"
@@ -237,7 +239,19 @@ class Runtime:
         docker = self.locate()
         if docker is None:
             raise ContainerError("Container Stationが見つかりません")
-        return self._runner([docker] + list(args), timeout, self._env(docker))
+        if not debuglog.LOG._enabled:
+            return self._runner([docker] + list(args), timeout, self._env(docker))
+        started = time.monotonic()
+        try:
+            result = self._runner([docker] + list(args), timeout, self._env(docker))
+        except Exception as error:
+            debuglog.log("engine", "error", "docker %s 失敗" % " ".join(map(str, args[:2])),
+                         {"ms": int((time.monotonic() - started) * 1000), "error": type(error).__name__})
+            raise
+        debuglog.log("engine", "debug" if result.returncode == 0 else "warn",
+                     "docker %s" % " ".join(map(str, args[:2])),
+                     {"rc": result.returncode, "ms": int((time.monotonic() - started) * 1000)})
+        return result
 
     def _tail(self, result):
         """Sanitized Docker error text (first 300 chars) for the RAM log and step error.
@@ -338,6 +352,8 @@ class Runtime:
                 "networks": settings.get("Networks") or {},
                 "published": bool((item.get("HostConfig") or {}).get("PortBindings")),
                 "exit_code": state.get("ExitCode") if isinstance(state.get("ExitCode"), int) else None,
+                "id": item.get("Id") if isinstance(item.get("Id"), str) else "",
+                "pid": state.get("Pid") if isinstance(state.get("Pid"), int) else 0,
             }
         except (ValueError, IndexError, AttributeError, TypeError):
             raise ContainerError("コンテナ情報を解析できません") from None
@@ -665,6 +681,25 @@ class Runtime:
         self._check_name(name)
         return self._flights.get("stats:" + name, 0.0, lambda: self._stats_once(name))
 
+    def container_ref(self, name):
+        """{id, pid, running} of our own container (for cgroup lookups), or None if absent."""
+        self._check_name(name)
+        info = self._flights.get("ref:" + name, 5.0, lambda: self._inspect(name))
+        if info is None or not info.get("managed"):
+            return None
+        return {"id": info.get("id", ""), "pid": info.get("pid", 0), "running": info["running"]}
+
+    def block_io(self, name):
+        """(read_bytes, write_bytes) from `docker stats --no-stream` BlockIO (fallback of diskio)."""
+        self._check_name(name)
+        return self._flights.get("blockio:" + name, 5.0, lambda: self._block_io_once(name))
+
+    def _block_io_once(self, name):
+        result = self._docker(["stats", "--no-stream", "--format", "{{.BlockIO}}", name], 30)
+        if result.returncode != 0:
+            raise ContainerError("コンテナのディスクI/Oを取得できません")
+        return parse_block_io((result.stdout or "").strip())
+
     def _stats_once(self, name):
         result = self._docker(["stats", "--no-stream", "--format",
                                "{{.MemUsage}}|{{.MemPerc}}", name], 30)
@@ -685,8 +720,8 @@ CAPS_MESSAGE = (
     "（CapEffが0であることを起動時に確認しています）。Container Station/Dockerの権限の扱いを確認してください。"
     "ユーザー名前空間が使えない場合も同様に中止します")
 
-_UNITS = {"b": 1, "kb": 1000, "mb": 1000 ** 2, "gb": 1000 ** 3, "kib": 1024,
-          "mib": 1024 ** 2, "gib": 1024 ** 3}
+_UNITS = {"b": 1, "kb": 1000, "mb": 1000 ** 2, "gb": 1000 ** 3, "tb": 1000 ** 4, "kib": 1024,
+          "mib": 1024 ** 2, "gib": 1024 ** 3, "tib": 1024 ** 4}
 
 
 def _bytes(text):
@@ -694,6 +729,17 @@ def _bytes(text):
     if not match or match.group(2).lower() not in _UNITS:
         raise ValueError("size")
     return int(float(match.group(1)) * _UNITS[match.group(2).lower()])
+
+
+def parse_block_io(line):
+    """Parse '1.5MB / 3.2MB' (docker stats BlockIO) into (read_bytes, write_bytes)."""
+    try:
+        read_text, sep, write_text = line.partition("/")
+        if not sep:
+            raise ValueError("sep")
+        return _bytes(read_text), _bytes(write_text)
+    except ValueError:
+        raise ContainerError("ディスクI/Oの形式を解析できません") from None
 
 
 def parse_stats(line):

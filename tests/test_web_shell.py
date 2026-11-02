@@ -8,9 +8,7 @@ from pathlib import Path
 WEB = Path(__file__).resolve().parent.parent / "web"
 FORBIDDEN_SANDBOX = ("allow-popups", "allow-top-navigation",
                      "allow-downloads", "allow-modals")
-# The origin-sharing token is allowed in exactly one place: the compat constant.
 ORIGIN_TOKEN = "allow-same-origin"
-COMPAT_SANDBOX = "allow-scripts allow-forms allow-same-origin"
 
 
 def text_files():
@@ -42,32 +40,56 @@ class WebShellStaticTests(unittest.TestCase):
                 with self.subTest(file=path.name, token=token):
                     self.assertNotIn(token, body)
 
-    def test_only_allowed_sandbox_values(self):
-        self.assertIn('SANDBOX_STRICT = ""', self.js)
-        values = re.findall(r'SANDBOX_\w+\s*=\s*"([^"]*)"', self.js)
-        self.assertEqual(sorted(values), sorted(["", "allow-scripts allow-forms", COMPAT_SANDBOX]))
-        self.assertIn('"referrerpolicy", "no-referrer"', self.js)
-
-    def test_origin_token_only_in_the_compat_constant(self):
-        self.assertEqual(self.js.count(ORIGIN_TOKEN), 1)
-        self.assertIn('SANDBOX_COMPAT = "%s";' % COMPAT_SANDBOX, self.js)
+    def test_v0135_iframe_modes_are_gone(self):
+        # No iframe, sandbox attribute or sandbox value anywhere: every http(s) tab is a NAS browser tab.
         for path in text_files():
-            if path.name != "app.js":
-                with self.subTest(file=path.name):
-                    self.assertNotIn(ORIGIN_TOKEN, path.read_text(encoding="utf-8"))
-        # The sandbox attribute is only ever set from sandboxFor(mode).
-        self.assertEqual(len(re.findall(r'setAttribute\("sandbox"', self.js)), 1)
-        self.assertIn('frame.setAttribute("sandbox", sandboxFor(tab.mode))', self.js)
-
-    def test_compat_guard_and_remembered_modes(self):
-        self.assertIn("compatAllowedFor", self.js)
-        self.assertIn(".ts.net", self.js)
+            body = path.read_text(encoding="utf-8")
+            for token in (ORIGIN_TOKEN, "SANDBOX_", "sandboxFor", "mountFrame", "compatAllowedFor",
+                          "COMPAT_CONFIRM", "MODE_LABELS", "LEGACY_EXTERNAL_MODE", "enforceLiveLimit",
+                          "MAX_LIVE_FRAMES", "setMode(", "normalizeMode", "applyHostMode", "openInTab",
+                          "leaveRemote", "updateCfHint", "syncFrameVisibility"):
+                with self.subTest(file=path.name, token=token):
+                    self.assertNotIn(token, body)
+        self.assertNotIn("iframe", self.html)
+        self.assertNotRegex(self.js, r"createElement\([\"']iframe[\"']\)")
+        self.assertNotIn('setAttribute("sandbox"', self.js)
+        self.assertNotRegex(self.js, r"const MODES\b")
+        for ident in ("cfHint", "cfCompat", "cfRemote", "cfDismiss", "frames", "menuMode", "menuCompat",
+                      "menuRemote", "remoteReopen"):
+            with self.subTest(ident=ident):
+                self.assertNotIn('id="%s"' % ident, self.html)
+                self.assertNotIn('$("%s")' % ident, self.js)
+        for text in ("強い制限", "限定操作", "互換モード", "互換で再読み込み", "表示されない場合"):
+            for path in text_files():
+                with self.subTest(file=path.name, text=text):
+                    self.assertNotIn(text, path.read_text(encoding="utf-8"))
+        css = (WEB / "style.css").read_text(encoding="utf-8")
+        for selector in (".cf-hint", ".web-frame", ".frames", ".mode-badge.interactive", ".mode-badge.compat"):
+            self.assertNotIn(selector, css)
         self.assertRegex(self.js, r"MAX_HOST_MODES\s*=\s*100\b")
-        self.assertRegex(self.js, r"MAX_LIVE_FRAMES_NARROW\s*=\s*1\b")
-        self.assertRegex(self.js, r"MAX_LIVE_FRAMES_WIDE\s*=\s*3\b")
-        for ident in ("cfHint", "cfCompat", "cfRemote", "cfDismiss"):
-            self.assertIn('id="%s"' % ident, self.html)
         self.assertIn('name="mobile-web-app-capable"', self.html)
+
+    def test_v0135_every_url_opens_in_the_nas_browser(self):
+        # typed / bookmarked / restored URLs all go through openRemote after /api/browser/validate
+        self.assertIn("validateUrl", self.js)
+        self.assertIn("/api/browser/validate", self.js)
+        self.assertIn("const navigateTab = (tab, value) => openRemote(tab, value,", self.js)
+        body = self.js[self.js.index("async function openWebUrl(value)"):self.js.index("// -------------------------------------------------------------- omnibox")]
+        self.assertIn("openRemote(fresh", body)
+        self.assertNotIn("tab.remote", self.js)
+        self.assertNotIn("isRemoteHost", self.js)
+
+    def test_v0135_not_ready_state_has_one_button_to_the_browser_settings(self):
+        panel = re.search(r'<div id="rbNotReady".*?</div>', self.html, re.S).group(0)
+        self.assertIn("NASブラウザが準備できていません", panel)
+        self.assertEqual(len(re.findall(r"<button", panel)), 1)
+        self.assertIn('id="rbNotReadyBtn"', panel)
+        self.assertIn('navigate("#/settings/browser/nas")', self.js)
+        # shown when the image is missing (state.rbReady === false) without any request to the Hub
+        self.assertIn("state.rbReady === false", self.js)
+        gate = self.js[self.js.index("if (state.rbReady === false) {"):]
+        self.assertLess(gate.index("tab.notReady = true"), gate.index('api("/api/rb/tabs"'))
+        self.assertIn("setRbReady(d.rb.ready)", self.js)
 
     def test_update_watch_and_stale_page_notice(self):
         self.assertIn("/api/health", self.js)
@@ -107,16 +129,16 @@ if (bad.length) { console.error("mismatch: " + bad.join(",")); process.exit(1); 
         self.assertIsNone(re.search(r"\sstyle\s*=", self.html))
         self.assertIsNone(re.search(r"\son\w+\s*=", self.html, re.I))
 
-    def test_iframe_src_comes_from_validation(self):
+    def test_image_src_assignments_are_bounded(self):
         self.assertIn("/api/browser/validate", self.js)
-        # Exactly five assignments: the validated iframe URL, the remote-browser
+        # Exactly seven assignments (v0.1.35: the iframe one is gone): the remote-browser
         # screencast (blob: object URLs made from /api/rb/frame.jpg bytes: an
         # off-screen probe image for decoding, then the visible image), since v0.1.28
         # one tile <img> (blob: object URL of /api/rb/tile.jpg bytes) and, since v0.1.30,
         # one reader <img> (blob: object URL of /api/rb/reader/img bytes) and the two places
         # that point the live <img> at the same-origin MJPEG stream URL.
-        self.assertEqual(len(re.findall(r"\.src\s*=", self.js)), 8)
-        self.assertIn("frame.src = validatedUrl", self.js)
+        self.assertEqual(len(re.findall(r"\.src\s*=", self.js)), 7)
+        self.assertNotIn("frame.src", self.js)
         self.assertIn("img.src = next;", self.js)
 
     def test_routes_and_limits(self):
@@ -173,30 +195,103 @@ if (bad.length) { console.error("mismatch: " + bad.join(",")); process.exit(1); 
         # the iPhone share sheet / bookmarklet settings stay
         self.assertIn('data-sub="share"', self.html)
 
-    def test_stored_external_host_mode_migrates_to_the_nas_browser_default(self):
+    def test_stored_host_modes_keep_only_the_display_choices(self):
         if shutil.which("node") is None:
             self.skipTest("node missing")
-        pieces = [self.js[self.js.index("function readHostModes() {"):self.js.index("function rememberHostMode(")],
-                  self.js[self.js.index("// One-time rewrite of stored"):self.js.index("migrateHostModes();\n\n// ----")]]
+        pieces = [self.js[self.js.index("function readHostModes() {"):self.js.index("function rememberedMode(")]]
         script = """
-const MODES = ["strict", "interactive", "compat"], MAX_HOST_MODES = 100, HOST_MODE_KEY = "k";
-const REMOTE_MODE = "remote", REMOTE_FAST_MODE = "remote-fast", REMOTE_LIVE_MODE = "remote-live",
-  REMOTE_READER_MODE = "remote-reader";
-const REMOTE_MODES = [REMOTE_MODE, REMOTE_FAST_MODE, REMOTE_LIVE_MODE, REMOTE_READER_MODE];
-const LEGACY_EXTERNAL_MODE = "external";
+const MAX_HOST_MODES = 100, HOST_MODE_KEY = "k";
+const REMOTE_FAST_MODE = "remote-fast", REMOTE_LIVE_MODE = "remote-live", REMOTE_READER_MODE = "remote-reader";
+const REMOTE_MODES = [REMOTE_FAST_MODE, REMOTE_LIVE_MODE, REMOTE_READER_MODE];
 let store = null, broken = false;
 const readLocal = () => { if (broken) throw new Error("x"); return store; };
 const writeLocal = (k, v) => { store = v; };
 %s
 const eq = (a, b, m) => { if (JSON.stringify(a) !== JSON.stringify(b)) { console.error(m + ": " + JSON.stringify(a)); process.exit(1); } };
-store = JSON.stringify([["a.example", "external"], ["b.example", "compat"], ["c.example", "remote-live"], ["d.example", "bogus"]]);
-eq(readHostModes(), [["a.example", "remote"], ["b.example", "compat"], ["c.example", "remote-live"]], "read maps external");
+store = JSON.stringify([["a.example", "external"], ["b.example", "compat"], ["c.example", "remote-live"],
+  ["d.example", "bogus"], ["e.example", "strict"], ["f.example", "interactive"], ["g.example", "remote"],
+  ["h.example", "remote-reader"], [5, "remote-fast"], "x"]);
+eq(readHostModes(), [["c.example", "remote-live"], ["h.example", "remote-reader"]], "old modes are dropped");
 migrateHostModes();
-eq(JSON.parse(store), [["a.example", "remote"], ["b.example", "compat"], ["c.example", "remote-live"]], "stored copy rewritten");
+eq(JSON.parse(store), [["c.example", "remote-live"], ["h.example", "remote-reader"]], "stored copy rewritten silently");
+rememberHostMode("c.example", "");
+eq(JSON.parse(store), [["h.example", "remote-reader"]], "an empty mode removes the entry");
+rememberHostMode("z.example", "remote-fast");
+eq(JSON.parse(store), [["h.example", "remote-reader"], ["z.example", "remote-fast"]], "display choice stored");
+rememberHostMode("z.example", "compat");
+eq(JSON.parse(store), [["h.example", "remote-reader"]], "a non-display mode is never stored");
+store = "not json";
+eq(readHostModes(), [], "garbage is harmless");
 broken = true;
 migrateHostModes();
 eq(readHostModes(), [], "unreadable storage is harmless");
 """ % "\n".join(pieces)
+        result = subprocess.run(["node", "-e", script], capture_output=True, text=True, timeout=20)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_v0135_debug_log_client_wiring(self):
+        for needle in ("function dlog(category, level, message, data)", "function dlogRate(", "DEBUG_FLUSH_MS = 2000",
+                       "DEBUG_BATCH = 100", '"/api/debug/log"', '"/api/debug/config"', '"/api/debug/clear"',
+                       '"/api/diag/diskio"', 'window.addEventListener("error"', '"unhandledrejection"',
+                       "new Blob([debugJsonl()]", "setDebugState(d.debug)"):
+            with self.subTest(needle=needle):
+                self.assertIn(needle, self.js)
+        # instrumented places
+        for needle in ('dlog("ui", "info", "route"', '"display mode"', '"stream open"', '"stream first frame"',
+                       '"stream fallback to polling"', '"reader render"', '"tile mount"', '"polling frame rate"'):
+            with self.subTest(needle=needle):
+                self.assertIn(needle, self.js)
+        # nothing is stored on the device and nothing is written by the Hub: the file is a client-side Blob
+        self.assertIsNone(re.search(r"(local|session)Storage[^\n]*debug", self.js, re.I))
+        self.assertIn("application/x-ndjson", self.js)
+        self.assertIn("ログを見る", self.html)
+        # the disk table is refreshed by the scheduler only while the diagnostics section is visible
+        self.assertIn('sched.add("disk", DISK_REFRESH_MS, diagVisible, loadDisk)', self.js)
+        for text in ("1分平均", "10分平均", "合計", "取得できません"):
+            self.assertIn(text, self.html + self.js)
+
+    @unittest.skipUnless(shutil.which("node"), "node not installed")
+    def test_v0135_dlog_is_silent_when_off_filters_and_batches(self):
+        block = self.js[self.js.index("const dbgQueue = [];"):self.js.index("function setDebugState(")]
+        script = """
+const DEBUG_CATEGORIES = ["ui", "render", "net", "rb", "jd2", "engine", "disk", "http", "app"];
+const DEBUG_LEVELS = ["debug", "info", "warn", "error"];
+const DEBUG_FLUSH_MS = 2000, DEBUG_BATCH = 100, DEBUG_QUEUE_MAX = 300, DEBUG_RATE_MS = 1000;
+const state = {authed: true, csrf: "c", debug: {enabled: false, level: "debug", categories: []}};
+const timers = []; const posts = [];
+global.setTimeout = (fn, ms) => { timers.push({fn, ms}); return timers.length; };
+global.clearTimeout = () => {};
+global.fetch = async (url, opts) => { posts.push({url, opts, body: JSON.parse(opts.body)}); return {}; };
+%s
+const eq = (a, b, m) => { if (JSON.stringify(a) !== JSON.stringify(b)) { console.error(m + ": " + JSON.stringify(a)); process.exit(1); } };
+(async () => {
+  dlog("ui", "info", "off");
+  eq([dbgQueue.length, timers.length], [0, 0], "nothing while off");
+  state.debug = {enabled: true, level: "info", categories: ["ui", "net"]};
+  dlog("ui", "debug", "below level"); dlog("http", "error", "other category"); dlog("bogus", "info", "x");
+  eq(dbgQueue.length, 0, "filtered");
+  for (let i = 0; i < 250; i++) dlog("ui", "info", "m" + i);
+  eq(dbgQueue.length, 250, "queued");
+  eq(timers.length, 1, "one flush timer");
+  eq(timers[0].ms, 2000, "flush at most every 2 s");
+  await flushDebug();
+  eq(posts.length, 1, "one post");
+  eq(posts[0].url, "/api/debug/log", "url");
+  eq(posts[0].body.entries.length, 100, "at most 100 per post");
+  eq(posts[0].opts.headers["X-CSRF-Token"], "c", "csrf");
+  eq(timers.length, 2, "the rest waits for the next interval");
+  dlog("ui", "info", "y".repeat(900));
+  eq(dbgQueue[dbgQueue.length - 1].message.length, 500, "message capped");
+  dbgQueue.length = 0;
+  dlogRate("k", "ui", "info", "first"); dlogRate("k", "ui", "info", "second");
+  eq(dbgQueue.map(e => e.message), ["first"], "same key is rate limited");
+  for (let i = 0; i < 1000; i++) dlog("ui", "info", "z");
+  eq(dbgQueue.length, 300, "queue is bounded");
+  state.debug.enabled = false;
+  await flushDebug();
+  eq(dbgQueue.length, 0, "dropped when switched off");
+})().catch(e => { console.error(e.stack); process.exit(1); });
+""" % block
         result = subprocess.run(["node", "-e", script], capture_output=True, text=True, timeout=20)
         self.assertEqual(result.returncode, 0, result.stderr)
 
@@ -267,7 +362,7 @@ eq(readHostModes(), [], "unreadable storage is harmless");
         self.assertIn("HTTPS（Tailscale）", self.html)
         self.assertIn("iPhoneから送る", self.html)
         self.assertIn('href="#/settings/connection/https"', self.html)
-        self.assertIn("HTTPSで開くと通過しやすくなります", self.html)
+        self.assertIn("HTTPSで開くと、パスワードやトークンを暗号化して送れます", self.html)
         self.assertIn("which tailscale", self.html)
         self.assertIn("tailscale serve --bg --https=443 http://127.0.0.1:17864", self.js)
         self.assertIn("/api/share/tokens", self.js)
@@ -307,14 +402,11 @@ if (out !== want) { console.error(JSON.stringify(out)); process.exit(1); }
         self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_v0114_host_mode_storage_is_guarded_and_capped(self):
-        modes = re.search(r"const MODES = \[(.*?)\];", self.js).group(1)
-        self.assertNotIn("external", modes)
         for fn in ("readLocal", "writeLocal", "removeLocal"):
             body = re.search(r"function %s\(.*?\n\}\n" % fn, self.js, re.S).group(0)
             self.assertIn("try", body)
             self.assertIn("catch", body)
         self.assertRegex(self.js, r"\.slice\(-MAX_HOST_MODES\)")
-        self.assertRegex(self.js, r"HINT_DELAY_MS\s*=\s*6000\b")
 
     def test_v0114_long_tab_copy_removed(self):
         for gone in ("隔離表示中", "枠内の遷移先URLは", "Cloudflareの確認が進まない場合",
@@ -324,44 +416,26 @@ if (out !== want) { console.error(JSON.stringify(out)); process.exit(1); }
                     self.assertNotIn(gone, path.read_text(encoding="utf-8"))
         # The HTTPS hint now lives only in the HTTPS settings section.
         https = re.search(r'<div class="sub" data-sub="https".*?<div class="sub" data-sub="share"', self.html, re.S).group(0)
-        self.assertIn("HTTPSで開くと通過しやすくなります", https)
+        self.assertIn("HTTPSで開くと", https)
         view_web = re.search(r'<section id="view-web".*?</section>', self.html, re.S).group(0)
         self.assertNotIn("HTTPSで開くと", view_web)
-        self.assertIn("表示されない場合", view_web)
-        self.assertIn("互換で再読み込み", view_web)
 
-    def test_v0116_remote_mode_is_a_host_preference_not_a_sandbox_mode(self):
-        self.assertIn('REMOTE_MODE = "remote"', self.js)
-        modes = re.search(r"const MODES = \[(.*?)\];", self.js).group(1)
-        self.assertNotIn("remote", modes)
+    def test_v0116_remote_display_is_a_host_preference(self):
+        self.assertNotIn('REMOTE_MODE = "remote"', self.js)
+        self.assertIn('REMOTE_MODES = [REMOTE_FAST_MODE, REMOTE_LIVE_MODE, REMOTE_READER_MODE]', self.js)
         for ident in ("remoteView", "remoteImg", "remoteStage", "remoteKbd", "remoteKbdBtn", "remoteLinks",
-                      "remoteSheet", "remoteAdd", "remoteSend", "cfRemote", "menuRemote", "remoteHosts"):
+                      "remoteSheet", "remoteAdd", "remoteSend", "remoteHosts"):
             self.assertIn('id="%s"' % ident, self.html)
-        for text in ("NASブラウザで開く", "リンク", "件を追加", "JD2へ送る"):
+        for text in ("リンク", "件を追加", "JD2へ送る"):
             self.assertIn(text, self.html + self.js)
         for route in ("/api/rb/frame", "/api/rb/input", "/api/rb/tabs", "/api/rb/tabs/close",
                       "/api/rb/links", "/api/rb/navigate", "/api/rb/status", "/api/rb/setup"):
             self.assertIn(route, self.js)
         self.assertIn('"/api/rapidgator/extract"', self.js)
 
-    def test_v0130_fallback_bar_wraps_and_leads_with_the_nas_browser(self):
-        css = (WEB / "style.css").read_text(encoding="utf-8")
-        bar = self.html[self.html.index('id="cfHint"'):self.html.index('id="frames"')]
-        ids = re.findall(r'<button[^>]*id="(cf\w+)"', bar)
-        self.assertEqual(ids[:2], ["cfRemote", "cfCompat"])       # NASブラウザ first, then 互換
-        for label in ("NASブラウザ</button>", "互換</button>"):
-            self.assertIn(label, bar)
-        self.assertRegex(bar, r'id="cfRemote" class="btn small primary" title="NASブラウザで開く"')
-        self.assertIn('title="互換で再読み込み"', bar)
-        rule = re.search(r"\.cf-hint\{([^}]*)\}", css).group(1)
-        self.assertIn("flex-wrap:wrap", rule)
-        self.assertNotIn("overflow:hidden", rule)
-        self.assertIn(".cf-hint .btn.small{flex:none;min-height:36px}", css)
-        self.assertRegex(css, r"@media \(max-width:600px\)\{\.cf-hint-text\{display:none\}\}")
-
     def test_v0122_image_source_is_only_a_blob_url_from_the_binary_api(self):
         assignments = re.findall(r"(\w+)\.src\s*=\s*(.+?);", self.js)
-        self.assertEqual(sorted(a[0] for a in assignments), ["frame", "img", "img", "img", "img", "img", "probe"])
+        self.assertEqual(sorted(a[0] for a in assignments), ["img", "img", "img", "img", "img", "probe"])
         # the only other <img> sources are the same-origin MJPEG stream URLs (v0.1.30)
         self.assertEqual(sorted(v for k, v in assignments if k == "img"),
                          ["e.url", "next", "streamUrl(rb)", "streamUrl(rb)", "t.url"])
@@ -430,8 +504,9 @@ if (out !== want) { console.error(JSON.stringify(out)); process.exit(1); }
         for key in ("Enter", "Backspace", "Tab"):
             self.assertIn('"%s"' % key, self.js)
         self.assertIn("compositionend", self.js)
-        # restored remote tabs are never opened automatically
-        self.assertIn("remote tabs are opened on request only", self.js)
+        # restored tabs are opened by autoReopen when shown (and never while not ready / after an error)
+        self.assertIn("function autoReopen(tab)", self.js)
+        self.assertIn("if (tab.notReady || tab.error || state.rbReady === false) return false;", self.js)
         self.assertIn("rb.width", self.js)    # taps are scaled to the reported frame size
 
     def test_v0116_settings_browser_section(self):
@@ -704,7 +779,7 @@ if (o !== "リーダー · ブロック 3 · 画像 1/2 · 取得 600 ms · 画�
         self.assertIn("RB_STREAM_FIRST_MS = 5000", self.js)
         self.assertIn("RB_STREAM_ERR_WINDOW_MS = 10000", self.js)
         self.assertIn("s.errors.length >= 2", self.js)
-        self.assertRegex(self.js, r"function streamFallback\(tab, rb\) \{\s+rb\.streamFailed = true;")
+        self.assertRegex(self.js, r"function streamFallback\(tab, rb\) \{\s+dlog\([^\n]*\n\s+rb\.streamFailed = true;")
         # closed when hidden / switched / mode changes / the picture is dropped / logout
         sync = re.search(r"function syncRemotePoll\(\) \{.*?\n\}\n", self.js, re.S).group(0)
         self.assertIn("closeStream();", sync)
@@ -757,8 +832,6 @@ if (o !== "リーダー · ブロック 3 · 画像 1/2 · 取得 600 ms · 画�
         self.assertIn("DISPLAY_OF_SETTING[setting] || \"tiles\"", self.js)
         self.assertIn("action.startsWith(\"display:\")", self.js)
         self.assertNotIn("modes.includes(REMOTE_LIVE_MODE)", self.js)
-        modes = re.search(r"const MODES = \[([^\]]*)\]", self.js).group(1)
-        self.assertNotIn("remote", modes)
 
     def test_v0128_hit_testing_taps_and_long_press_use_the_link_map(self):
         for route in ("/api/rb/snapshot", "/api/rb/snapshot/release", "/api/rb/tap-page", "/api/rb/meta",
@@ -789,6 +862,7 @@ if (o !== "リーダー · ブロック 3 · 画像 1/2 · 取得 600 ms · 画�
         self.assertIn('readerAction(rb, meta, Date.now()) === "run"', loop)
         script = """
 const state = {settings: {rb_default_mode: "reader"}};
+const dlog = () => {};
 const REMOTE_MODE = "remote", REMOTE_FAST_MODE = "remote-fast", REMOTE_LIVE_MODE = "remote-live",
   REMOTE_READER_MODE = "remote-reader";
 const DISPLAY_OF_MODE = {[REMOTE_FAST_MODE]: "tiles", [REMOTE_LIVE_MODE]: "live", [REMOTE_READER_MODE]: "reader"};

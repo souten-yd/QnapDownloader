@@ -490,7 +490,7 @@ class HttpTests(unittest.TestCase):
                                          headers={"Host": "192.168.68.57:17864"})
         with self.client.open(request, timeout=4) as response:
             self.assertEqual(response.status, 200)
-            self.assertEqual(json.load(response)["version"], "0.1.34")
+            self.assertEqual(json.load(response)["version"], "0.1.35")
         with self.client.open(self.url + "/icon.svg", timeout=4) as response:
             self.assertEqual(response.status, 200)
             self.assertEqual(response.headers.get_content_type(), "image/svg+xml")
@@ -577,6 +577,10 @@ class HttpTests(unittest.TestCase):
             self.assertNotIn("blob:", csp.replace("img-src 'self' data: blob:;", ""))
             self.assertIn("default-src 'none'", csp)
             self.assertIn("frame-ancestors 'none'", csp)
+            # v0.1.35: no iframe browser any more, so nothing may be framed at all
+            self.assertIn("frame-src 'none'", csp)
+            self.assertNotIn("frame-src https:", csp)
+            self.assertNotIn("child-src", csp)
             self.assertEqual(response.headers.get("X-Frame-Options"), "DENY")
 
     def test_removed_myjd_config_and_probe_requires_running_engine(self):
@@ -725,7 +729,7 @@ class HttpTests(unittest.TestCase):
         code, data=self.req(valid)
         self.assertEqual(code,200)
         self.assertEqual(data["url"],"https://rapidgator.net/file/1234")
-        self.assertFalse(data["server_fetched"])
+        self.assertEqual(sorted(data), ["url"])      # v0.1.35: no iframe-only fields
         for url in ("http://example.com", "https://192.168.68.57:17864",
                     "https://localhost/", "javascript:alert(1)"):
             with self.subTest(url=url):
@@ -734,12 +738,12 @@ class HttpTests(unittest.TestCase):
         with self.client.open(self.url,timeout=4) as response:
             html=response.read().decode()
             csp=response.headers.get("Content-Security-Policy")
-        # Per-tab iframes are created by app.js; the sandbox values live there.
+        # v0.1.35: no iframes at all, so no sandbox values, and nothing may be framed.
         script = (Path(webapp.__file__).parent / "web/app.js").read_text()
-        self.assertIn('SANDBOX_STRICT = ""', script)
-        self.assertIn('"allow-scripts allow-forms"', script)
-        self.assertIn('referrerpolicy', script)
-        self.assertIn("frame-src https:",csp)
+        self.assertNotIn("SANDBOX_", script)
+        self.assertNotIn("createElement(\"iframe\")", script)
+        self.assertIn("frame-src 'none'",csp)
+        self.assertNotIn("frame-src https:",csp)
         self.assertIn("frame-ancestors 'none'",csp)
         self.assertNotIn("allow-same-origin",html)
         self.assertNotIn("allow-downloads",html)
@@ -1395,7 +1399,7 @@ class HttpTests(unittest.TestCase):
         self.assertFalse(info["supported"])
         code, _ = self.req("/api/update/apply", {"version": "v0.1.8"})
         self.assertEqual(code, 400)
-        self.assertEqual(self.req("/api/health")[1]["version"], "0.1.34")
+        self.assertEqual(self.req("/api/health")[1]["version"], "0.1.35")
         self.assertFalse(self.req("/api/jd2/status")[1]["connected"])
         self.assertEqual(self.req("/api/jd2/update/apply", {"confirmed": True})[0], 400)
         self.assertEqual(self.req("/api/jd2/preset/apply", {"confirmed": True})[0], 400)

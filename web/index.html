@@ -90,9 +90,6 @@
      <button type="button" role="menuitem" data-action="newTab">新しいタブ</button>
      <button type="button" role="menuitem" data-action="reopen">閉じたタブを開き直す</button>
      <hr data-scope="web">
-     <button type="button" role="menuitem" data-action="toggleMode" data-scope="web" id="menuMode">限定操作モードに切り替え</button>
-     <button type="button" role="menuitem" data-action="compatMode" data-scope="web" id="menuCompat">互換モードに切り替え</button>
-     <button type="button" role="menuitem" data-action="remoteOpen" data-scope="web" id="menuRemote">NASブラウザで開く</button>
      <button type="button" role="menuitem" data-action="display:reader" data-display="reader" data-scope="remote">表示: リーダー</button>
      <button type="button" role="menuitem" data-action="display:tiles" data-display="tiles" data-scope="remote">表示: 高速（全体表示）</button>
      <button type="button" role="menuitem" data-action="display:live" data-display="live" data-scope="remote">表示: ライブ</button>
@@ -403,7 +400,7 @@
        <h2>サイト別ルール</h2>
        <p class="set-text muted">NASブラウザで開いたページのホストごとの設定（最大200件）</p>
        <div id="siteRules" class="items"></div>
-       <h3 class="sub-h">NASブラウザで開くサイト</h3>
+       <h3 class="sub-h">サイトごとの表示方法</h3>
        <div id="remoteHosts" class="items"></div>
       </div>
 
@@ -426,10 +423,10 @@
         <p id="httpsState" class="engine-state" role="status" aria-live="polite">確認しています…</p>
         <p id="httpsDetail" class="set-text muted"></p>
        </div>
-       <p id="cfHttps" class="set-text muted">HTTPSで開くと通過しやすくなります（Cloudflare確認）</p>
+       <p id="cfHttps" class="set-text muted">HTTPSで開くと、パスワードやトークンを暗号化して送れます</p>
        <details class="fold">
         <summary>Tailscale ServeでHTTPSにする手順</summary>
-        <p class="muted">Hubは新しい待ち受けを増やさず、Tailscale ServeがHTTPS（ts.netの証明書）をNASの中で終端して、Hubへ転送します。Cloudflare確認は、HTTPS＋互換モード＋サイトが埋め込みを許可している場合に通過できる見込みです。iPhoneでは失敗することがあり、その場合は「iPhoneから送る」の共有メニュー方式を使ってください。</p>
+        <p class="muted">Hubは新しい待ち受けを増やさず、Tailscale ServeがHTTPS（ts.netの証明書）をNASの中で終端して、Hubへ転送します。iPhoneの共有メニュー（ショートカット）から送るときのトークンも、HTTPSなら暗号化されます。</p>
         <ol class="guide">
          <li>Tailscale管理画面で MagicDNS と HTTPS証明書 を有効にします。</li>
          <li>NASにSSHで入り、次のコマンドを実行します。
@@ -505,6 +502,34 @@
         <button type="button" id="diagnosticIo" class="btn">HubのI/Oを確認</button>
        </div>
        <p id="diagnosticResult" class="set-text muted" role="status" aria-live="polite"></p>
+
+       <h3 class="sub-h">ディスク書き込み</h3>
+       <div class="set-desc"><span class="set-text">NASのディスクへ書き込んでいる場所を測ります</span>
+        <details class="hint"><summary aria-label="詳しい説明">ⓘ</summary><p>HubとJD2・NASブラウザのコンテナ、NASの各ディスク／RAIDの書き込み量を10秒ごとに記録し（この画面を開いている間だけ。RAMのみでディスクには書きません）、直近1分・10分の平均と、開始からの合計を表示します。コンテナはcgroup、読めなければdocker statsから取得します。取得できない項目は「取得できません」と表示します。</p></details></div>
+       <div class="actions">
+        <button type="button" id="diskToggle" class="btn small primary">計測を開始</button>
+        <span id="diskState" class="set-text muted" role="status"></span>
+       </div>
+       <div class="table-wrap"><table class="data-table" aria-label="ディスク書き込み">
+        <thead><tr><th scope="col">項目</th><th scope="col">1分平均</th><th scope="col">10分平均</th><th scope="col">合計</th></tr></thead>
+        <tbody id="diskRows"><tr><td colspan="4" class="muted">読み込み中…</td></tr></tbody>
+       </table></div>
+
+       <h3 class="sub-h">デバッグログ</h3>
+       <div class="set-row">
+        <div class="set-main"><span class="set-label">ログを記録する</span>
+         <span class="set-desc"><span class="set-text" id="debugNote">オフ（RAMのみ・60分で自動オフ）</span>
+          <details class="hint"><summary aria-label="詳しい説明">ⓘ</summary><p>オンの間だけ、画面操作・通信・NASブラウザ・JD2・ディスクなどの動きをHubのRAM（最大5000件／2MiB）に記録します。ディスクには書きません。パスワード・トークン・Cookieは記録せず、URLはホスト名だけにします。60分で自動的にオフになります。「ダウンロード」を押したときだけ、この端末にファイルとして保存されます。</p></details></span></div>
+        <label class="switch" for="debugEnabled"><input type="checkbox" id="debugEnabled" role="switch" aria-label="デバッグログ"><span class="switch-track" aria-hidden="true"></span></label>
+       </div>
+       <div class="set-row">
+        <div class="set-main"><span class="set-label">記録するレベル</span></div>
+        <select id="debugLevel" class="inline-select" aria-label="記録するレベル"></select>
+       </div>
+       <div id="debugCats" class="switch-grid" role="group" aria-label="記録するカテゴリ"></div>
+       <div class="actions">
+        <button type="button" id="debugView" class="btn small primary">ログを見る</button>
+       </div>
       </div>
 
       <div class="sub" data-sub="about">
@@ -516,10 +541,9 @@
         <ul class="about-list">
          <li>初期開発版です。実機（TS-253Be）でのJD2の動作は未検証です。</li>
          <li>自動ダウンロードとサイトの自動巡回はありません。追加したリンクは手動でJD2へ送ります。</li>
-         <li>Webの閲覧は端末側の隔離表示です。表示できないサイトは「NASブラウザで開く」を使ってください。</li>
-         <li>互換モードでは、そのサイト自身のCookie・ストレージを枠内で使えます（Hub自体のものではありません）。</li>
+         <li>Webの閲覧はすべてNASブラウザ（Container Station上のChromium）で行います。端末側で外部ページを直接表示することはありません。</li>
         </ul>
-        <p class="muted">外部ページの取得はブラウザ側の隔離iframeだけで行い、NASは外部ページを取得しません。JD2とJavaはQPKGに同梱されず、公式の固定URLからSHA-256検証つきで導入します。</p>
+        <p class="muted">外部ページはNASブラウザのコンテナだけが取得し、このHubの画面にはJPEGと検証済みのテキストだけが届きます。JD2とJavaはQPKGに同梱されず、公式の固定URLからSHA-256検証つきで導入します。</p>
        </details>
        <ul class="link-list">
         <li><a href="https://github.com/souten-yd/QnapDownloader/blob/main/docs/browser-shell-ui.md" target="_blank" rel="noopener noreferrer">画面の仕様</a></li>
@@ -537,13 +561,6 @@
   <section id="view-web" class="view view-web" role="tabpanel" aria-label="Web閲覧" hidden>
    <div id="webLoading" class="loading-bar" hidden></div>
    <div id="webStatus" class="web-status"></div>
-   <div id="cfHint" class="cf-hint" role="note" hidden>
-    <span class="cf-hint-text">表示されない場合:</span>
-    <button type="button" id="cfRemote" class="btn small primary" title="NASブラウザで開く">NASブラウザ</button>
-    <button type="button" id="cfCompat" class="btn small" title="互換で再読み込み">互換</button>
-    <button type="button" id="cfDismiss" class="icon-btn small" aria-label="このヒントを閉じる" title="閉じる"><svg class="icon" aria-hidden="true"><use href="#i-x"/></svg></button>
-   </div>
-   <div id="frames" class="frames"></div>
    <div id="remoteView" class="remote-view" hidden>
     <div id="remoteStage" class="remote-stage">
      <img id="remoteImg" class="remote-img" alt="NASブラウザの画面" draggable="false" hidden>
@@ -561,8 +578,12 @@
      </div>
      <div id="liveBoxes" class="link-boxes live-boxes" aria-hidden="true"></div>
      <div id="remoteIdle" class="remote-idle">
-      <p id="remoteIdleText" class="muted">NASブラウザのタブは開かれていません。</p>
-      <button type="button" id="remoteReopen" class="btn primary">NASブラウザで開く</button>
+      <p id="remoteIdleText" class="muted">画面を待っています…</p>
+     </div>
+     <div id="rbNotReady" class="remote-idle remote-notready" role="status" hidden>
+      <p class="remote-notready-title">NASブラウザが準備できていません</p>
+      <p id="rbNotReadyText" class="muted"></p>
+      <button type="button" id="rbNotReadyBtn" class="btn primary">設定 › ブラウザを開く</button>
      </div>
      <div id="remoteLoading" class="loading-bar" hidden></div>
      <button type="button" id="autoLiveChip" class="auto-live-chip" hidden>元の表示に戻す</button>
@@ -666,6 +687,25 @@
   <h2 id="folderSheetTitle">保存先を選ぶ</h2>
   <div id="folderPicker"></div>
   <button type="button" id="folderCancel" class="btn sheet-btn">閉じる</button>
+ </div>
+</div>
+<div id="debugSheet" class="sheet-backdrop" hidden>
+ <div class="sheet-panel debug-panel" role="dialog" aria-modal="true" aria-labelledby="debugSheetTitle">
+  <h2 id="debugSheetTitle">デバッグログ</h2>
+  <div class="debug-filters">
+   <select id="debugFilterLevel" class="inline-select" aria-label="レベルで絞り込み"></select>
+   <select id="debugFilterCat" class="inline-select" aria-label="カテゴリで絞り込み"></select>
+   <input id="debugSearch" type="search" placeholder="検索" aria-label="ログを検索" autocomplete="off" maxlength="80">
+  </div>
+  <div class="debug-actions">
+   <button type="button" id="debugFollow" class="btn small">追従中</button>
+   <button type="button" id="debugCopy" class="btn small">コピー</button>
+   <button type="button" id="debugDownload" class="btn small">ダウンロード</button>
+   <button type="button" id="debugClear" class="btn small danger">消去</button>
+  </div>
+  <p id="debugMeta" class="set-text muted" role="status"></p>
+  <div id="debugList" class="debug-list" role="log"></div>
+  <button type="button" id="debugClose" class="btn sheet-btn">閉じる</button>
  </div>
 </div>
 <div id="notice" class="toasts" role="status" aria-live="polite"></div>

@@ -278,3 +278,9 @@ Cloudflare等で手元のブラウザ（iframe）では開けないサイトを�
 - **遅延初期化**: 設定とNASブラウザのイベント設定は初めて開いたときに行う（`ensureSettings` / `ensureRemote`）。
 - **サーバー側のキャッシュ**: `ttlcache.SingleFlightCache`。engine 2秒・JD2件数/状態 5秒・ダウンロード一覧/待機リンク 2秒・NASブラウザ 2秒。同時の呼び出しは1回の取得を共有し、書き込み系のPOST（NASブラウザの画面入力を除く）でキャッシュを捨てる。docker inspect / stats、アカウント一覧・ホスト一覧は同時呼び出しの共有（TTLなし、`_require_ours` と `inspect_ip` は常に自分で確認）。
 - **削除**: `/api/rb/frame`（JSON）、`/api/jd2/local-preflight`（3128番の事前診断）とその画面、個別ポーリング用のタイマー、未使用CSS。
+
+
+## v0.1.35 NASブラウザ専用化・ディスク書き込み計測・デバッグログ
+- 端末側のiframe表示（強い制限／限定操作／互換）、そのメニュー、表示されない場合のバー、サイト別のモード記憶を削除。httpsのWebタブはすべてNASブラウザ（`openRemote`）で開く。サイトごとに記憶するのは表示方法（リーダー／高速／ライブ）だけで、古い記憶（iframeモード・`external`・`remote`）は読み込み時に破棄する。CSPは `frame-src 'none'`。
+- NASブラウザが未設定・開けないときは、タブに「NASブラウザが準備できていません」と設定 › ブラウザへのボタン1つだけを表示（`/api/state` の `rb.ready` を使い、未設定ならHubへ要求しない）。
+- 設定 › システム › 診断: 「ディスク書き込み」（`GET /api/diag/diskio`、`POST /api/diag/diskio/start|stop`）と「デバッグログ」（`GET /api/debug/log?since=&limit=`、`POST /api/debug/log|config|clear`）。どちらもRAMのみ。

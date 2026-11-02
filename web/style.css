@@ -175,14 +175,8 @@ label{display:block;margin:12px 0;color:var(--muted);font-size:13px}
 .web-status:empty{display:none}
 .web-status-text{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .web-status .btn.small,.web-status .icon-btn{flex:none;min-height:28px}
-.mode-badge{flex:none;border:0;font:inherit;cursor:pointer;padding:1px 8px;border-radius:10px;background:var(--ok-soft);color:var(--ok);font-weight:700}
-.mode-badge.interactive{background:var(--danger-soft);color:var(--danger)}
-.mode-badge.compat{background:var(--accent-soft);color:var(--accent)}
-.cf-hint{display:flex;flex-wrap:wrap;white-space:nowrap;align-items:center;gap:6px;padding:3px 12px;background:var(--accent-soft);border-bottom:1px solid var(--border);font-size:12px;color:var(--text)}
+.mode-badge{flex:none;padding:1px 8px;border-radius:10px;background:var(--ok-soft);color:var(--ok);font-weight:700}
 .btn.small{min-height:28px;padding:2px 10px;font-size:12px;font-weight:600}
-.cf-hint .icon-btn.small{margin-left:auto}
-.frames{flex:1;min-height:0;position:relative}
-.web-frame{position:absolute;inset:0;width:100%;height:100%;margin:0;border:0;background:#fff}
 
 /* ---- toasts ---- */
 .toasts{position:fixed;right:14px;bottom:14px;z-index:60;display:flex;flex-direction:column;gap:8px;max-width:min(420px,calc(100vw - 28px));pointer-events:none}
@@ -351,9 +345,6 @@ label{display:block;margin:12px 0;color:var(--muted);font-size:13px}
 .share-new p{margin:0 0 6px}
 
 /* ---- v0.1.14: compact web row / external mode ---- */
-.cf-hint .btn.small{flex:none;min-height:36px}
-@media (max-width:600px){.cf-hint-text{display:none}}
-.cf-hint-text{flex:none}
 
 /* ---- NASブラウザ (remote browser, v0.1.16) */
 .sub-h{font-size:14px;margin:18px 0 6px}
@@ -365,6 +356,7 @@ label{display:block;margin:12px 0;color:var(--muted);font-size:13px}
 .remote-img[hidden]{display:none}
 .remote-idle{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px;padding:16px;background:var(--page);text-align:center}
 .remote-idle[hidden]{display:none}
+.remote-notready-title{margin:0;font-size:17px;font-weight:700}
 /* fast full-page display (v0.1.28): native scrolling over lazily loaded JPEG tiles */
 .tile-scroll{position:absolute;inset:0;overflow-x:hidden;overflow-y:auto;-webkit-overflow-scrolling:touch;overscroll-behavior-y:contain;touch-action:pan-y;background:#fff;user-select:none;-webkit-user-select:none;-webkit-touch-callout:none}
 .tile-scroll[hidden]{display:none}
@@ -539,3 +531,21 @@ h5.reader-h,h6.reader-h{font-size:1em}
 .reader-card-size{flex:none;color:var(--muted);font-weight:400}
 .reader-card-title{color:var(--accent);overflow-wrap:anywhere;word-break:break-all}
 .reader-card-host{color:var(--muted);font-size:.8em}
+
+/* v0.1.35: disk write table and debug log */
+.table-wrap{overflow-x:auto;margin:6px 0 4px;border:1px solid var(--border);border-radius:8px;background:var(--surface)}
+.data-table{width:100%;border-collapse:collapse;font-size:12px;font-variant-numeric:tabular-nums}
+.data-table th,.data-table td{padding:6px 8px;text-align:right;border-bottom:1px solid var(--border);white-space:nowrap}
+.data-table th:first-child,.data-table td:first-child{text-align:left;white-space:normal;overflow-wrap:anywhere;min-width:96px}
+.data-table th{color:var(--muted);font-weight:600}
+.data-table tr:last-child td{border-bottom:0}
+.data-table .na{color:var(--muted);text-align:left}
+.switch-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(130px,1fr));gap:2px 12px;margin:6px 0}
+.debug-panel{display:flex;flex-direction:column;gap:8px;max-width:640px;height:85vh}
+.debug-filters,.debug-actions{display:flex;flex-wrap:wrap;gap:6px;align-items:center}
+.debug-filters input{flex:1;min-width:100px;margin:0;padding:4px 8px;font-size:13px}
+.debug-list{flex:1;min-height:120px;overflow:auto;border:1px solid var(--border);border-radius:8px;background:var(--surface-2);font:11.5px/1.45 ui-monospace,Menlo,Consolas,monospace}
+.debug-row{padding:3px 8px;border-bottom:1px solid var(--border);overflow-wrap:anywhere}
+.debug-row.warn{color:var(--warn)}
+.debug-row.error{color:var(--danger)}
+.debug-row .dbg-meta{color:var(--muted)}

@@ -124,7 +124,7 @@ class LinksAndTimersTests(unittest.TestCase):
         for call in re.finditer(r'api\("/api/(engine|rb)/status"\)', JS):
             before = JS[max(0, call.start() - 400):call.start()]
             self.assertNotRegex(before, r"setTimeout\(\w*Tick")
-        self.assertEqual(len(re.findall(r"sched\.add\(", JS)), 4)
+        self.assertEqual(len(re.findall(r"sched\.add\(", JS)), 8)
         self.assertIn('document.visibilityState !== "visible"', JS[JS.index("const sched = {"):])
         self.assertIn("/api/state?rev=", JS)
 
@@ -134,8 +134,8 @@ class LinksAndTimersTests(unittest.TestCase):
 
     def test_every_css_selector_refers_to_an_existing_id_or_class(self):
         hay = HTML + JS
-        dynamic = ("is-", "link-", "mode-", "state-", "pkg", "running", "finished", "waiting", "strict",
-                   "interactive", "compat", "remote", "success", "error", "info", "progress", "sticky")
+        dynamic = ("is-", "link-", "mode-", "state-", "pkg", "running", "finished", "waiting",
+                   "remote", "success", "error", "info", "progress", "sticky")
         missing = set()
         for selector, _ in re.findall(r"([^{}]+)\{([^{}]*)\}", CSS):
             for name in re.findall(r"[.#]([A-Za-z_][\w-]*)", selector):
