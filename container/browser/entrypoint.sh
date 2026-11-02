@@ -4,8 +4,9 @@
 set -eu
 
 # Exit 79: the process has effective capabilities. The container is created with
-# `--cap-drop ALL --cap-add SYS_ADMIN` only so Docker's default seccomp profile
-# lets Chromium create *unprivileged* user namespaces; as uid 1000 with
+# `--cap-drop ALL --cap-add SYS_ADMIN --cap-add SYS_CHROOT` only so Docker's
+# default seccomp profile lets Chromium create *unprivileged* user namespaces
+# (SYS_ADMIN) and chroot inside them (SYS_CHROOT); as uid 1000 with
 # no-new-privileges the effective set must stay empty. Refuse to run anything
 # (including the selftest) otherwise, so Chromium never has real privileges.
 if ! grep -q '^CapEff:[[:space:]]*0000000000000000$' /proc/self/status; then
@@ -18,6 +19,14 @@ fi
 if ! unshare --user --map-root-user --pid --fork --net true >/dev/null 2>&1; then
   echo "user namespaces unavailable" >&2
   exit 78
+fi
+# Exit 77: chroot not permitted inside a user namespace. Chromium's namespace
+# sandbox chroots (to /proc/self/fdinfo/) inside its own user namespace; Docker's
+# default seccomp allows chroot only when CAP_SYS_CHROOT is in the container's
+# capability set. Reproduce that need here.
+if ! unshare --user --map-root-user --pid --fork --net chroot / /bin/true >/dev/null 2>&1; then
+  echo "chroot unavailable in user namespace" >&2
+  exit 77
 fi
 if [ "${1:-}" = "selftest" ]; then
   exit 0

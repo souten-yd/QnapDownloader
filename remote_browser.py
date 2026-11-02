@@ -750,6 +750,8 @@ class RemoteBrowser:
             info = self.runtime.container_state(cr.BROWSER_NAME)
             if not info["running"]:
                 code = info.get("exit_code")
+                if code == cr.BROWSER_EXIT_NO_CHROOT:
+                    raise BrowserError(cr.NO_CHROOT_MESSAGE)
                 if code == cr.BROWSER_EXIT_NO_USERNS:
                     raise BrowserError(cr.NO_USERNS_MESSAGE)
                 if code == cr.BROWSER_EXIT_CAPS:

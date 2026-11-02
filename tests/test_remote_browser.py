@@ -373,6 +373,13 @@ class LifecycleTests(BrowserBase):
         self.assertNotIn("qnapdl-browser", self.fake.containers)
         self.assertEqual(self.rb.status()["phase"], "stopped")
 
+    def test_chroot_failure_message_and_cleanup(self):
+        self.fake.run_exits = cr.BROWSER_EXIT_NO_CHROOT
+        with self.assertRaises(rb.BrowserError) as ctx:
+            self.open()
+        self.assertIn("chroot", str(ctx.exception))
+        self.assertNotIn("qnapdl-browser", self.fake.containers)
+
     def test_capability_guard_exit_is_reported_and_cleaned_up(self):
         self.fake.run_exits = cr.BROWSER_EXIT_CAPS
         with self.assertRaises(rb.BrowserError) as ctx:
