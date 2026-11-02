@@ -93,5 +93,63 @@ class ControllerTests(unittest.TestCase):
             ctl.restart_and_update()
 
 
+class LinkGrabberAdapter(Adapter):
+    def __init__(self):
+        super().__init__()
+        self.calls = []
+        self.items = [{"id": "11", "package_id": "5", "name": "a", "host": "", "bytes_total": 1},
+                      {"id": "12", "package_id": "5", "name": "b", "host": "", "bytes_total": 1},
+                      {"id": "13", "package_id": "6", "name": "c", "host": "", "bytes_total": 1}]
+
+    def list_linkgrabber(self):
+        self.calls.append("list")
+        return {"items": list(self.items), "count": len(self.items), "has_more": False}
+
+    def move_to_downloadlist(self, links, packages):
+        self.calls.append(("move", links, packages))
+
+    def start_downloads(self):
+        self.calls.append("start")
+
+    def stop_downloads(self):
+        self.calls.append("stop")
+
+
+class DownloadControlTests(unittest.TestCase):
+    def setUp(self):
+        self.adapter = LinkGrabberAdapter()
+        self.ctrl = jd2_control.JD2Controller(self.adapter)
+
+    def test_start_waiting_moves_everything_then_starts(self):
+        out = self.ctrl.start_waiting(confirmed=True)
+        self.assertEqual(out, {"moved": 3, "started": True})
+        self.assertEqual(self.adapter.calls, ["list", ("move", [11, 12, 13], [5, 6]), "start"])
+
+    def test_start_waiting_requires_confirmation_and_does_nothing_otherwise(self):
+        for value in (False, None, "yes", 1):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                self.ctrl.start_waiting(confirmed=value)
+        self.assertEqual(self.adapter.calls, [])
+
+    def test_empty_linkgrabber_just_starts(self):
+        self.adapter.items = []
+        self.assertEqual(self.ctrl.start_waiting(confirmed=True), {"moved": 0, "started": True})
+        self.assertEqual(self.adapter.calls, ["list", "start"])
+
+    def test_start_and_stop(self):
+        self.assertEqual(self.ctrl.start_downloads(), {"started": True})
+        with self.assertRaises(ValueError):
+            self.ctrl.stop_downloads()
+        self.assertEqual(self.ctrl.stop_downloads(confirmed=True), {"stopped": True})
+        self.assertEqual(self.adapter.calls, ["start", "stop"])
+
+    def test_without_an_engine_everything_fails_closed(self):
+        ctrl = jd2_control.JD2Controller()
+        for call in (ctrl.linkgrabber_snapshot, ctrl.start_downloads,
+                     lambda: ctrl.start_waiting(confirmed=True), lambda: ctrl.stop_downloads(confirmed=True)):
+            with self.assertRaises(jd2_policy.PresetUnavailable):
+                call()
+
+
 if __name__ == "__main__":
     unittest.main()

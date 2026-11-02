@@ -174,7 +174,7 @@ class HttpTests(unittest.TestCase):
         code, frame = self.req("/api/rb/frame?tab=b1&since=0&wait=0")
         self.assertEqual(code, 200)
         self.assertEqual(set(frame), {"seq", "jpeg_base64", "width", "height", "url", "title",
-                                      "loading", "blocked", "intercepts", "rev"})
+                                      "loading", "blocked", "intercepts", "rev", "popups"})
         self.assertIsNone(frame["jpeg_base64"])
         self.rb_ws.emit("Page.screencastFrame", {"data": "QUJD", "sessionId": 1, "metadata": {
             "deviceWidth": 1280, "deviceHeight": 2000}}, "SESSION1")
@@ -226,7 +226,7 @@ class HttpTests(unittest.TestCase):
         code, body = self.req("/api/rb/viewport", {"tab": "b1", "width": 390, "height": 700, "dpr": 3})
         self.assertEqual((code, body), (200, {"ok": True, "changed": True}))
         sent = [m for m in self.rb_ws.sent if m["method"] == "Emulation.setDeviceMetricsOverride"]
-        self.assertEqual(sent[0]["params"], {"width": 390, "height": 700, "deviceScaleFactor": 2.0, "mobile": True})
+        self.assertEqual(sent[0]["params"], {"width": 390, "height": 700, "deviceScaleFactor": 1.0, "mobile": True})
         before = len(self.rb_ws.sent)
         for bad in ({"width": 100, "height": 700, "dpr": 2}, {"width": 390, "height": 5000, "dpr": 2},
                     {"width": 390, "height": 700, "dpr": 4}, {"width": "390", "height": 700, "dpr": 2},
@@ -349,7 +349,8 @@ class HttpTests(unittest.TestCase):
             adapter.can_send = True
             code, body = self.req("/api/rb/intercepts/send", {"tab": "b1", "id": 1})
             self.assertEqual((code, body), (200, {"state": "sent"}))
-            transfer.assert_called_once_with(adapter, "https://files.example/a.zip", str(self.allowed.resolve()))
+            transfer.assert_called_once_with(adapter, "https://files.example/a.zip", str(self.allowed.resolve()),
+                                             autostart=True)
             prepare.assert_called_with(adapter, str(self.allowed.resolve()))
             # sending the same event again must not re-send
             self.assertEqual(self.req("/api/rb/intercepts/send", {"tab": "b1", "id": 1})[0], 400)
@@ -399,7 +400,7 @@ class HttpTests(unittest.TestCase):
                                          headers={"Host": "192.168.68.57:17864"})
         with self.client.open(request, timeout=4) as response:
             self.assertEqual(response.status, 200)
-            self.assertEqual(json.load(response)["version"], "0.1.23")
+            self.assertEqual(json.load(response)["version"], "0.1.24")
         with self.client.open(self.url + "/icon.svg", timeout=4) as response:
             self.assertEqual(response.status, 200)
             self.assertEqual(response.headers.get_content_type(), "image/svg+xml")
@@ -1228,10 +1229,285 @@ class HttpTests(unittest.TestCase):
         self.assertFalse(info["supported"])
         code, _ = self.req("/api/update/apply", {"version": "v0.1.8"})
         self.assertEqual(code, 400)
-        self.assertEqual(self.req("/api/health")[1]["version"], "0.1.23")
+        self.assertEqual(self.req("/api/health")[1]["version"], "0.1.24")
         self.assertFalse(self.req("/api/jd2/status")[1]["connected"])
         self.assertEqual(self.req("/api/jd2/update/apply", {"confirmed": True})[0], 400)
         self.assertEqual(self.req("/api/jd2/preset/apply", {"confirmed": True})[0], 400)
+
+
+    # ---- v0.1.24: send-and-start, site rules, probe, quality ------------------
+    V24_GET = ("/api/rb/site-rules", "/api/jd2/linkgrabber")
+    V24_POST = (("/api/rb/site-rules", {"host": "example.com", "auto_send": True}),
+                ("/api/rb/site-rules/delete", {"host": "example.com"}),
+                ("/api/rb/probe", {"tab": "b1", "x": 1, "y": 1}),
+                ("/api/settings/options", {"send_autostart": False}),
+                ("/api/jd2/linkgrabber/start", {"confirmed": True}),
+                ("/api/jd2/downloads/start", {}),
+                ("/api/jd2/downloads/stop", {"confirmed": True}))
+
+    def test_v0124_endpoints_require_login_csrf_and_origin(self):
+        for path in self.V24_GET:
+            with self.subTest(path=path):
+                self.assertEqual(self.req(path)[0], 401)
+        for path, body in self.V24_POST:
+            with self.subTest(path=path):
+                self.assertIn(self.req(path, body)[0], (401, 403))
+        self.login()
+        for path, body in self.V24_POST:
+            with self.subTest(path=path, case="no csrf"):
+                self.assertEqual(self.req(path, body, csrf=False)[0], 403)
+            with self.subTest(path=path, case="no origin"):
+                self.assertEqual(self.req(path, body, origin=False)[0], 403)
+        self.assertEqual(self.store.site_rules(), [])
+        self.assertIs(self.store.settings()["send_autostart"], True)
+
+    def test_site_rules_api_validates_and_persists(self):
+        self.login()
+        code, body = self.req("/api/rb/site-rules")
+        self.assertEqual((code, body["items"], body["block_ads"], body["max"]), (200, [], True, 200))
+        for bad in ({"host": "localhost"}, {"host": "http://example.com"}, {"host": "192.168.0.1"},
+                    {"host": "example.com/x"}, {"host": ""}, {"host": 5}, {},
+                    {"host": "example.com", "popup": "maybe"}, {"host": "example.com", "auto_send": "yes"},
+                    {"host": "example.com", "block_ads": 1}):
+            with self.subTest(bad=bad):
+                self.assertEqual(self.req("/api/rb/site-rules", bad)[0], 400)
+        self.assertEqual(self.req("/api/rb/site-rules")[1]["items"], [])
+        code, rule = self.req("/api/rb/site-rules", {"host": "Example.com", "auto_send": True})
+        self.assertEqual((code, rule), (200, {"host": "example.com", "auto_send": True, "popup": "ask",
+                                              "block_ads": True}))
+        self.req("/api/rb/site-rules", {"host": "example.com", "popup": "block", "block_ads": False})
+        items = self.req("/api/rb/site-rules")[1]["items"]
+        self.assertEqual(items, [{"host": "example.com", "auto_send": True, "popup": "block", "block_ads": False}])
+        self.assertEqual(self.req("/api/rb/site-rules/delete", {"host": "nope.example.com"})[0], 400)
+        self.assertEqual(self.req("/api/rb/site-rules/delete", {"host": "example.com"})[1], {"deleted": True})
+        self.assertEqual(self.req("/api/rb/site-rules")[1]["items"], [])
+
+    def test_site_rules_api_enforces_the_200_cap(self):
+        self.login()
+        for i in range(200):
+            self.store.set_site_rule("h%d.example.com" % i, auto_send=True)
+        code, body = self.req("/api/rb/site-rules", {"host": "extra.example.com", "auto_send": True})
+        self.assertEqual(code, 400)
+        self.assertIn("200", body["error"])
+
+    def test_settings_options_toggle_persists_and_rejects_everything_else(self):
+        self.login()
+        settings = self.req("/api/settings")[1]
+        self.assertEqual((settings["send_autostart"], settings["block_ads"]), (True, True))
+        code, saved = self.req("/api/settings/options", {"send_autostart": False})
+        self.assertEqual((code, saved["send_autostart"], saved["block_ads"]), (200, False, True))
+        self.assertIs(self.req("/api/settings")[1]["send_autostart"], False)
+        self.assertEqual(self.req("/api/settings/options", {"block_ads": False})[0], 200)
+        reopened = storage.Store(self.root)
+        try:
+            self.assertEqual((reopened.settings()["send_autostart"], reopened.settings()["block_ads"]),
+                             (False, False))
+        finally:
+            reopened.close()
+        for bad in ({}, {"send_autostart": "no"}, {"send_autostart": 0}, {"download_dir": True},
+                    {"send_autostart": True, "auto_delete": True}, {"nope": True}):
+            with self.subTest(bad=bad):
+                self.assertEqual(self.req("/api/settings/options", bad)[0], 400)
+        self.assertEqual(self.req("/api/settings")[1]["auto_delete"], False)
+
+    def jd2_ready(self, can_send=True):
+        adapter = unittest.mock.MagicMock()
+        adapter.can_send = can_send
+        return adapter
+
+    def test_manual_send_uses_autostart_by_default_and_not_when_the_setting_is_off(self):
+        self.login()
+        self.assertEqual(self.req("/api/settings/folder", {"path": str(self.allowed)})[0], 200)
+        adapter = self.jd2_ready()
+        with patch.object(self.server.jd2, "_require", return_value=adapter), \
+                patch("jd2_transfer.prepare_transfer"), \
+                patch("jd2_transfer.transfer", return_value={"state": "sent"}) as transfer:
+            first = self.req("/api/links", {"url": "https://rapidgator.net/file/111"})[1]["id"]
+            self.assertEqual(self.req("/api/links/send", {"id": first})[0], 200)
+            transfer.assert_called_with(adapter, "https://rapidgator.net/file/111",
+                                        str(self.allowed.resolve()), autostart=True)
+            self.req("/api/settings/options", {"send_autostart": False})
+            second = self.req("/api/links", {"url": "https://rapidgator.net/file/222"})[1]["id"]
+            self.assertEqual(self.req("/api/links/send", {"id": second})[0], 200)
+            transfer.assert_called_with(adapter, "https://rapidgator.net/file/222", str(self.allowed.resolve()))
+
+    def open_tab_on(self, url="https://example.com/a"):
+        self.assertEqual(self.req("/api/rb/tabs", {"url": url})[0], 201)
+
+    def wait_items(self, since=0, count=1):
+        items = []
+        for _ in range(300):
+            items = self.req("/api/rb/intercepts?tab=b1&since=%d" % since)[1]["items"]
+            if len(items) >= count:
+                break
+            time.sleep(0.01)
+        return items
+
+    def hoster_paused(self, request_id="r1", url="https://rapidgator.net/file/0123456789abcdef0123456789abcdef"):
+        self.rb_ws.emit("Fetch.requestPaused", {"requestId": request_id, "resourceType": "Document",
+                                                "request": {"url": url}}, "SESSION1")
+
+    def test_auto_send_rule_sends_through_the_existing_path_and_dedupes(self):
+        self.login()
+        webapp.wire_remote_browser(self.server)
+        self.assertEqual(self.req("/api/settings/folder", {"path": str(self.allowed)})[0], 200)
+        self.req("/api/rb/site-rules", {"host": "example.com", "auto_send": True})
+        self.open_tab_on("https://www.example.com/a")
+        adapter = self.jd2_ready()
+        hoster = "https://rapidgator.net/file/0123456789abcdef0123456789abcdef"
+        with patch.object(self.server.jd2, "_require", return_value=adapter), \
+                patch("jd2_transfer.prepare_transfer") as prepare, \
+                patch("jd2_transfer.transfer", return_value={"state": "sent"}) as transfer:
+            self.hoster_paused()
+            items = self.wait_items()
+            self.assertEqual(items, [{"id": 1, "kind": "auto_sent", "url": hoster, "dup": False}])
+            transfer.assert_called_once_with(adapter, hoster, str(self.allowed.resolve()), autostart=True)
+            prepare.assert_called_with(adapter, str(self.allowed.resolve()))
+            self.assertEqual([(l["url"], l["state"]) for l in self.req("/api/links")[1]["items"]],
+                             [(hoster, "sent")])
+            # the same link again (a different file name in the URL) is never sent twice
+            self.hoster_paused("r2", hoster + "/again.rar.html")
+            time.sleep(0.3)
+            self.assertEqual(transfer.call_count, 1)
+            self.assertEqual(len(self.req("/api/links")[1]["items"]), 1)
+
+    def test_auto_send_falls_back_to_the_sheet_when_the_engine_cannot_send(self):
+        self.login()
+        webapp.wire_remote_browser(self.server)
+        self.req("/api/settings/folder", {"path": str(self.allowed)})
+        self.req("/api/rb/site-rules", {"host": "example.com", "auto_send": True})
+        self.open_tab_on()
+        with patch.object(self.server.jd2, "_require", return_value=self.jd2_ready(False)), \
+                patch("jd2_transfer.transfer") as transfer:
+            self.hoster_paused()
+            items = self.wait_items()
+        self.assertEqual([i["kind"] for i in items], ["hoster"])
+        transfer.assert_not_called()
+        self.assertEqual(self.req("/api/links")[1]["items"], [])
+
+    def test_auto_send_without_a_rule_or_with_the_rule_off_shows_the_sheet(self):
+        self.login()
+        webapp.wire_remote_browser(self.server)
+        self.req("/api/settings/folder", {"path": str(self.allowed)})
+        self.req("/api/rb/site-rules", {"host": "example.com", "auto_send": False, "popup": "block"})
+        self.open_tab_on()
+        with patch.object(self.server.jd2, "_require", return_value=self.jd2_ready()), \
+                patch("jd2_transfer.transfer") as transfer:
+            self.hoster_paused()
+            items = self.wait_items()
+        self.assertEqual([i["kind"] for i in items], ["hoster"])
+        transfer.assert_not_called()
+
+    def test_auto_send_failure_is_reported_and_leaves_the_sheet(self):
+        self.login()
+        webapp.wire_remote_browser(self.server)
+        self.req("/api/rb/site-rules", {"host": "example.com", "auto_send": True})
+        self.open_tab_on()        # no download folder chosen: the send path refuses
+        with patch.object(self.server.jd2, "_require", return_value=self.jd2_ready()):
+            self.hoster_paused()
+            items = self.wait_items()
+        self.assertEqual([i["kind"] for i in items], ["hoster"])
+        code, headers, _ = self.get_raw("/api/rb/frame.jpg?tab=b1&since=0&wait=0")
+        self.assertIn("%E8%87%AA%E5%8B%95%E9%80%81%E4%BF%A1", headers["X-Frame-Blocked"])    # 自動送信
+
+    def test_popup_block_rule_counts_in_the_frame_header(self):
+        self.login()
+        webapp.wire_remote_browser(self.server)
+        self.req("/api/rb/site-rules", {"host": "example.com", "popup": "block"})
+        self.open_tab_on()
+        self.rb_ws.emit("Target.targetCreated", {"targetInfo": {
+            "targetId": "POPUP000001", "type": "page", "openerId": "TARGET00001", "url": "https://shop.example/p"}})
+        for _ in range(300):
+            code, headers, _ = self.get_raw("/api/rb/frame.jpg?tab=b1&since=0&wait=0")
+            if headers["X-Frame-Popups"] == "1":
+                break
+            time.sleep(0.01)
+        self.assertEqual(headers["X-Frame-Popups"], "1")
+        self.assertEqual(self.req("/api/rb/intercepts?tab=b1&since=0")[1]["items"], [])
+
+    def test_ad_blocking_follows_the_hub_setting_and_the_site_rule(self):
+        self.login()
+        webapp.wire_remote_browser(self.server)
+        self.open_tab_on("https://example.com/a")
+        self.assertTrue([m for m in self.rb_ws.sent if m["method"] == "Network.setBlockedURLs"])
+        self.req("/api/rb/tabs/close", {"id": "b1"})
+        self.req("/api/settings/options", {"block_ads": False})
+        count = len([m for m in self.rb_ws.sent if m["method"] == "Network.setBlockedURLs"])
+        self.assertEqual(self.req("/api/rb/tabs", {"url": "https://example.com/a"})[0], 201)
+        self.assertEqual(len([m for m in self.rb_ws.sent if m["method"] == "Network.setBlockedURLs"]), count)
+
+    def test_probe_endpoint_returns_links_and_closes_its_target(self):
+        self.login()
+        webapp.wire_remote_browser(self.server)
+        self.open_tab_on()
+        hoster = "https://rapidgator.net/file/0123456789abcdef0123456789abcdef"
+        self.rb_ws.eval_map = [("elementFromPoint", "https://blog.example.org/go?id=7")]
+
+        def hook(message):
+            if message["method"] == "Page.navigate" and message.get("sessionId") == "SESSION2":
+                self.rb_ws.emit("Fetch.requestPaused", {"requestId": "rp", "resourceType": "Document",
+                                                        "request": {"url": hoster}}, "SESSION2")
+        self.rb_ws.hook = hook
+        code, body = self.req("/api/rb/probe", {"tab": "b1", "x": 40, "y": 80})
+        self.assertEqual(code, 200)
+        self.assertEqual(body, {"start_url": "https://blog.example.org/go?id=7", "final_url": hoster,
+                                "links": [hoster], "redirects": 0})
+        closed = [m["params"]["targetId"] for m in self.rb_ws.sent if m["method"] == "Target.closeTarget"]
+        self.assertEqual(closed, ["TARGET00002"])
+        for bad in ({"tab": "b1", "x": -1, "y": 0}, {"tab": "b1", "x": "a", "y": 0}, {"tab": "b1"},
+                    {"tab": "../x", "x": 1, "y": 1}, {"x": 1, "y": 1}):
+            with self.subTest(bad=bad):
+                self.assertEqual(self.req("/api/rb/probe", bad)[0], 400)
+        self.assertEqual(self.req("/api/rb/probe", {"tab": "b9", "x": 1, "y": 1})[0], 404)
+
+    def test_probe_refuses_the_hub_origin_and_non_https_without_opening_a_page(self):
+        self.login()
+        self.open_tab_on()
+        created = len([m for m in self.rb_ws.sent if m["method"] == "Target.createTarget"])
+        for value in ("https://nas.tail1234.ts.net/x", "http://blog.example.org/", None):
+            with self.subTest(value=value):
+                self.rb_ws.eval_map = [("elementFromPoint", value)]
+                self.assertEqual(self.req("/api/rb/probe", {"tab": "b1", "x": 5, "y": 5})[0], 400)
+        self.assertEqual(len([m for m in self.rb_ws.sent if m["method"] == "Target.createTarget"]), created)
+
+    def test_viewport_quality_parameter(self):
+        self.login()
+        self.open_tab_on()
+        self.assertEqual(self.req("/api/rb/viewport", {"tab": "b1", "width": 400, "height": 800, "dpr": 3,
+                                                       "quality": "high"})[0], 200)
+        override = [m for m in self.rb_ws.sent if m["method"] == "Emulation.setDeviceMetricsOverride"][-1]
+        self.assertEqual(override["params"]["deviceScaleFactor"], 2.0)
+        for bad in ("ultra", 3, "", ["high"]):
+            with self.subTest(bad=bad):
+                self.assertEqual(self.req("/api/rb/viewport", {"tab": "b1", "width": 401, "height": 800, "dpr": 3,
+                                                               "quality": bad})[0], 400)
+
+    def test_linkgrabber_listing_and_start_all(self):
+        self.login()
+        # engine not running: fails closed
+        self.assertEqual(self.req("/api/jd2/linkgrabber")[0], 400)
+        adapter = unittest.mock.MagicMock()
+        adapter.list_linkgrabber.return_value = {
+            "items": [{"id": "11", "package_id": "5", "name": "a.rar", "host": "rapidgator.net", "bytes_total": 1}],
+            "count": 1, "has_more": False}
+        with patch.object(self.server.jd2, "_require", return_value=adapter):
+            code, body = self.req("/api/jd2/linkgrabber")
+            self.assertEqual((code, body["count"], body["items"][0]["name"]), (200, 1, "a.rar"))
+            self.assertEqual(self.req("/api/jd2/linkgrabber/start", {})[0], 400)
+            self.assertEqual(self.req("/api/jd2/linkgrabber/start", {"confirmed": "yes"})[0], 400)
+            adapter.move_to_downloadlist.assert_not_called()
+            code, body = self.req("/api/jd2/linkgrabber/start", {"confirmed": True})
+            self.assertEqual((code, body), (200, {"moved": 1, "started": True}))
+            adapter.move_to_downloadlist.assert_called_once_with([11], [5])
+            adapter.start_downloads.assert_called_once_with()
+            self.assertEqual(self.req("/api/jd2/downloads/start", {})[1], {"started": True})
+            self.assertEqual(adapter.start_downloads.call_count, 2)
+            self.assertEqual(self.req("/api/jd2/downloads/stop", {})[0], 400)
+            adapter.stop_downloads.assert_not_called()
+            self.assertEqual(self.req("/api/jd2/downloads/stop", {"confirmed": True})[1], {"stopped": True})
+            adapter.stop_downloads.assert_called_once_with()
+        for path in ("/api/jd2/linkgrabber/start", "/api/jd2/downloads/start"):
+            self.assertEqual(self.req(path, {"confirmed": True})[0], 400)     # no engine: refused
 
 
 if __name__ == "__main__":

@@ -26,6 +26,7 @@ from urllib.parse import urlsplit
 import browser_safety
 import container_runtime as cr
 import rapidgator_extract
+import rb_blocklist
 
 MAX_TABS = 3
 MIN_AVAILABLE_KIB = cr.BROWSER_MIN_AVAILABLE_KIB     # MemAvailable >= 2 GiB
@@ -44,17 +45,19 @@ WS_MAX_SEND = 1024 * 1024
 FRAME_MAX_CHARS = 6 * 1024 * 1024
 LINK_CAP = 5000
 LINK_RESULT_CAP = rapidgator_extract.HARD_LIMIT
-SCREENCAST = {"format": "jpeg", "quality": 60, "maxWidth": 1280, "maxHeight": 2000,
+# Per-session render quality (v0.1.24): device scale factor cap and JPEG quality.
+# The default favours speed: a 1x page is a quarter of the pixels of a 2x one.
+QUALITY_MODES = {"speed": (1.0, 40), "standard": (1.5, 55), "high": (2.0, 70)}
+DEFAULT_QUALITY = "speed"
+SCREENCAST = {"format": "jpeg", "quality": 40, "maxWidth": 1280, "maxHeight": 2000,
               "everyNthFrame": 1}
 DEFAULT_SIZE = (1280, 2000)
 WINDOW_SIZE = (1600, 2400)     # matches the Xvfb screen: emulated viewports always fit
 VIEWPORT_W = (320, 1600)       # CSS pixels accepted from the viewer
 VIEWPORT_H = (320, 2400)
 VIEWPORT_DPR = (1.0, 3.0)
-MAX_SCALE = 2.0                # device scale factor / screencast scale is capped here
 MOBILE_WIDTH = 760             # narrower viewports are emulated as a touch device
-QUALITY_MOBILE = 50
-QUALITY_DESKTOP = 60
+REDUCED_MOTION = {"features": [{"name": "prefers-reduced-motion", "value": "reduce"}]}
 # Hoster pages that are intercepted (aborted) instead of rendered. Only these
 # Document requests are ever paused; every other request is untouched.
 FETCH_PATTERNS = tuple({"urlPattern": pattern, "resourceType": "Document"} for pattern in (
@@ -63,6 +66,18 @@ INTERCEPT_CAP = 20             # events kept per tab (RAM only)
 INTERCEPT_DEDUP = 2.0          # an identical event within this many seconds is one event
 BYPASS_TTL = 30.0              # a "page open" bypass is valid for one navigation, this long
 POPUP_WAIT = 3.0               # popups: wait this long for the first URL
+# Long-press probe (v0.1.24): a hidden background target follows the link.
+MAX_PROBES = 2                 # at most this many probe targets exist at once (all tabs)
+PROBE_TIMEOUT = 15.0           # give up waiting for a hoster URL after this long
+PROBE_SETTLE = 4.0             # a loaded page with no navigation for this long is final
+PROBE_LINK_CAP = 50
+PROBE_CDP_TIMEOUT = 8.0
+PROBE_JS = (
+    "(function(x,y){var e=document.elementFromPoint(x,y);"
+    "var a=e&&e.closest?e.closest('a'):null;"
+    "return a&&typeof a.href==='string'?a.href:null;})(%.1f,%.1f)")
+LOCATION_JS = "String(location.href)"
+EVENT_EXTRAS = ("where", "dup")
 POPUP_BLOCKED = "ポップアップをブロックしました"
 SETUP_CACHE_TTL = 30.0
 CS_CACHE_TTL = 60.0
@@ -463,6 +478,28 @@ class Tab:
         self.intercepts = deque(maxlen=INTERCEPT_CAP)
         self.intercept_seq = 0     # id of the newest intercept event (monotonic per tab)
         self.bypass = {}           # exact URL -> expiry; lets one navigation through the Fetch pattern
+        self.page_host = ""        # host of the last https page shown (site rules key)
+        self.ads = False           # ad blocking currently applied to this tab
+        self.popups_blocked = 0    # popups closed silently by a "block" rule
+        self.quality = DEFAULT_QUALITY
+        self.probing = False
+
+
+class Probe:
+    """One hidden background target following a long-pressed link (RAM only)."""
+
+    def __init__(self, tab_id, now):
+        self.tab_id = tab_id
+        self.target = None
+        self.session = None
+        self.links = []            # hoster URLs, normalized, deduplicated, in order found
+        self.redirects = 0
+        self.last_doc = None
+        self.loaded = False
+        self.started = False
+        self.loading = set()
+        self.popups = set()        # popup target ids opened by the probe page
+        self.activity = now
 
 
 def _scheme_ok(url):
@@ -473,7 +510,8 @@ def _scheme_ok(url):
 class RemoteBrowser:
     def __init__(self, runtime, context_dir, *, meminfo_path="/proc/meminfo", connect=None,
                  clock=time.monotonic, sleep=time.sleep, monitor=True,
-                 frame_interval=MIN_FRAME_INTERVAL, start_timeout=START_TIMEOUT):
+                 frame_interval=MIN_FRAME_INTERVAL, start_timeout=START_TIMEOUT,
+                 rules=None, auto_send=None, spawn=None):
         self.runtime = runtime
         self.context_dir = str(context_dir)
         self._meminfo = meminfo_path
@@ -506,6 +544,21 @@ class RemoteBrowser:
         self._stale = False
         self._ring = deque(maxlen=LOG_LINES)
         self._ring_lock = threading.Lock()
+        # v0.1.24: `rules` provides settings() and site_rule_for(host) (storage.Store);
+        # `auto_send(url)` sends a hoster link to JD2 and returns "sent", "dup" or None
+        # (not possible now); `spawn(fn)` runs blocking work off the CDP reader thread.
+        self.rules = rules
+        self.auto_send = auto_send
+        self._spawn = spawn if spawn is not None else self._spawn_thread
+        self._auto_inflight = set()
+        self._probes = 0
+        self._probe_targets = {}   # probe target id -> Probe
+        self._probe_sessions = {}  # CDP session id -> Probe
+        self._probe_popups = {}    # popup target id -> Probe
+
+    @staticmethod
+    def _spawn_thread(fn):
+        threading.Thread(target=fn, daemon=True).start()
 
     # ------------------------------------------------------------- RAM log
     def log(self, text):
@@ -844,6 +897,9 @@ class RemoteBrowser:
             self._tabs.clear()
             self._by_session.clear()
             self._popups.clear()
+            self._probe_targets.clear()
+            self._probe_sessions.clear()
+            self._probe_popups.clear()
             self._anchor = None
             self._state = "stopped"
             self._stats_cache = None
@@ -977,12 +1033,60 @@ class RemoteBrowser:
             except BrowserError as error:
                 # Not a safety control: without it hoster pages simply load.
                 self.log("Fetch.enable failed: %s" % error)
+            try:
+                # Fewer animations means less to encode and send.
+                self._call("Emulation.setEmulatedMedia", REDUCED_MOTION, session=session)
+            except BrowserError as error:
+                self.log("setEmulatedMedia failed: %s" % error)
+            tab.page_host = self._host_of(checked)
+            if self._ads_wanted(tab.page_host):
+                try:
+                    for method, params in self._ads_commands(True):
+                        self._call(method, params, session=session)
+                    tab.ads = True
+                except BrowserError as error:
+                    self.log("ad blocking failed: %s" % error)
             self._call("Page.navigate", {"url": checked}, session=session)
         except BrowserError:
             self._drop_tab(tab, close=True)
             raise
         self._touch()
         return {"id": tab.id, "url": checked}
+
+    # ------------------------------------------------- site rules / ad blocking
+    @staticmethod
+    def _host_of(url):
+        try:
+            return (urlsplit(url).hostname or "").lower().rstrip(".")
+        except ValueError:
+            return ""
+
+    def _rule_for(self, host):
+        """The site rule for a page host, or None (also when the store fails)."""
+        if self.rules is None or not host:
+            return None
+        try:
+            return self.rules.site_rule_for(host)
+        except Exception:
+            return None
+
+    def _ads_wanted(self, host):
+        """Global switch AND the per-site exception (block_ads=0 turns it off)."""
+        on = True
+        if self.rules is not None:
+            try:
+                on = self.rules.settings().get("block_ads", True) is not False
+            except Exception:
+                on = True
+        rule = self._rule_for(host)
+        return on and not (rule is not None and rule.get("block_ads") is False)
+
+    @staticmethod
+    def _ads_commands(on):
+        if on:
+            return [("Network.enable", None),
+                    ("Network.setBlockedURLs", {"urls": list(rb_blocklist.patterns())})]
+        return [("Network.setBlockedURLs", {"urls": []})]
 
     def _drop_tab(self, tab, close):
         with self._cv:
@@ -1025,24 +1129,26 @@ class RemoteBrowser:
         view = tab.viewport
         if view is None:
             return dict(SCREENCAST)
-        width, height, scale = view
-        return {"format": "jpeg",
-                "quality": QUALITY_MOBILE if width < MOBILE_WIDTH else QUALITY_DESKTOP,
+        width, height, scale, mode = view
+        return {"format": "jpeg", "quality": QUALITY_MODES[mode][1],
                 "maxWidth": int(round(width * scale)), "maxHeight": int(round(height * scale)),
                 "everyNthFrame": 1}
 
-    def set_viewport(self, ident, width, height, dpr):
+    def set_viewport(self, ident, width, height, dpr, quality=None):
         """Size the page to the viewer (CSS pixels) so no pixels are wasted."""
         width = self._dimension(width, VIEWPORT_W, "width")
         height = self._dimension(height, VIEWPORT_H, "height")
         if (isinstance(dpr, bool) or not isinstance(dpr, (int, float)) or dpr != dpr or
                 not VIEWPORT_DPR[0] <= dpr <= VIEWPORT_DPR[1]):
             raise BrowserError("dprは1〜3で指定してください")
+        if quality is not None and (not isinstance(quality, str) or quality not in QUALITY_MODES):
+            raise BrowserError("画質はspeed・standard・highのいずれかで指定してください")
         tab = self._tab(ident)
         self._touch()
-        scale = min(float(dpr), MAX_SCALE)
+        mode = quality if quality is not None else tab.quality
+        scale = min(float(dpr), QUALITY_MODES[mode][0])
         mobile = width < MOBILE_WIDTH
-        view = (width, height, scale)
+        view = (width, height, scale, mode)
         with self._lock:
             if tab.viewport == view:
                 return {"ok": True, "changed": False}
@@ -1053,7 +1159,7 @@ class RemoteBrowser:
         if mobile != touch:
             self._call("Emulation.setTouchEmulationEnabled", {"enabled": mobile}, session)
         with self._lock:
-            tab.viewport, tab.touch = view, mobile
+            tab.viewport, tab.touch, tab.quality = view, mobile, mode
             running = tab.screencast
         if running:
             # New frame size / quality: restart the already running screencast.
@@ -1082,7 +1188,14 @@ class RemoteBrowser:
                 tab = self._find_by_target(params.get("targetId"))
             if tab is not None:
                 self._drop_tab(tab, close=False)
-        elif method in ("Page.frameStartedLoading", "Page.frameStoppedLoading"):
+        elif method in ("Page.frameStartedLoading", "Page.frameStoppedLoading",
+                        "Page.loadEventFired", "Network.requestWillBeSent"):
+            probe = self._probe_sessions.get(message.get("sessionId"))
+            if probe is not None:
+                self._probe_event(probe, method, params)
+                return
+            if method not in ("Page.frameStartedLoading", "Page.frameStoppedLoading"):
+                return
             with self._cv:
                 tab = self._by_session.get(message.get("sessionId"))
                 frame_id = params.get("frameId")
@@ -1100,10 +1213,12 @@ class RemoteBrowser:
         elif method == "Browser.downloadWillBegin":
             self._on_download(params)
         elif method == "Page.javascriptDialogOpening":
-            tab = self._by_session.get(message.get("sessionId"))
-            if tab is not None and conn is not None:
+            session = message.get("sessionId")
+            tab = self._by_session.get(session)
+            owner = tab if tab is not None else self._probe_sessions.get(session)
+            if owner is not None and conn is not None:
                 # Dialogs would freeze the page: always dismiss, never accept.
-                conn.send_nowait("Page.handleJavaScriptDialog", {"accept": False}, session=tab.session)
+                conn.send_nowait("Page.handleJavaScriptDialog", {"accept": False}, session=session)
 
     def _on_frame(self, session, params, conn):
         data = params.get("data")
@@ -1131,7 +1246,7 @@ class RemoteBrowser:
                 pass
 
     # ------------------------------------------------- intercepts (RAM only)
-    def _add_intercept(self, tab, kind, url):
+    def _record_event(self, tab, kind, url, **extra):
         now = self._clock()
         with self._cv:
             last = tab.intercepts[-1] if tab.intercepts else None
@@ -1139,15 +1254,60 @@ class RemoteBrowser:
                     now - last["t"] < INTERCEPT_DEDUP):
                 return
             tab.intercept_seq += 1
-            tab.intercepts.append({"id": tab.intercept_seq, "kind": kind, "url": url, "t": now})
+            event = {"id": tab.intercept_seq, "kind": kind, "url": url, "t": now}
+            event.update({k: v for k, v in extra.items() if k in EVENT_EXTRAS})
+            tab.intercepts.append(event)
             tab.rev += 1
             self._cv.notify_all()
+
+    def _add_intercept(self, tab, kind, url):
+        if kind == "hoster" and self._maybe_auto_send(tab, url):
+            return
+        self._record_event(tab, kind, url)
+
+    def _maybe_auto_send(self, tab, url):
+        """True when this hoster link is being sent to JD2 by a site's auto_send rule."""
+        if self.auto_send is None:
+            return False
+        rule = self._rule_for(tab.page_host)
+        if rule is None or rule.get("auto_send") is not True:
+            return False
+        with self._lock:
+            if url in self._auto_inflight:
+                return True
+            self._auto_inflight.add(url)
+        self._spawn(lambda: self._auto_send_worker(tab, url))
+        return True
+
+    def _auto_send_worker(self, tab, url):
+        try:
+            outcome = self.auto_send(url)
+        except Exception as error:
+            # Fall back to the sheet, and tell the viewer why it was not automatic.
+            reason = str(error)[:200] if isinstance(error, (ValueError, RuntimeError)) else ""
+            with self._cv:
+                tab.blocked = "自動送信できませんでした" + (": " + reason if reason else "")
+                tab.rev += 1
+                self._cv.notify_all()
+            self._record_event(tab, "hoster", url)
+            return
+        finally:
+            with self._lock:
+                self._auto_inflight.discard(url)
+        if outcome in ("sent", "dup"):
+            self._record_event(tab, "auto_sent", url, dup=(outcome == "dup"))
+        else:
+            self._record_event(tab, "hoster", url)    # not possible now: show the sheet
 
     def _on_request_paused(self, session, params, conn):
         request_id = params.get("requestId")
         request = params.get("request") if isinstance(params.get("request"), dict) else {}
         url = request.get("url") if isinstance(request.get("url"), str) else ""
         if conn is None or not isinstance(request_id, str):
+            return
+        probe = self._probe_sessions.get(session)
+        if probe is not None:
+            self._probe_paused(probe, request_id, url, params.get("resourceType"), conn)
             return
         now = self._clock()
         with self._cv:
@@ -1173,6 +1333,8 @@ class RemoteBrowser:
         if not isinstance(url, str) or not url.startswith("https://") or len(url) > 2048:
             return
         frame_id = params.get("frameId")
+        if isinstance(frame_id, str) and frame_id in self._probe_targets:
+            return      # a probe never reports downloads to a tab
         with self._cv:
             tab = self._find_by_target(frame_id) if isinstance(frame_id, str) else None
             if tab is None and self._tabs:
@@ -1209,8 +1371,9 @@ class RemoteBrowser:
             return
         if not alive:
             return
+        policy = (self._rule_for(owner.page_host) or {}).get("popup", "ask")
         if not self._real_url(url):
-            self._popup_note(owner)
+            self._popup_denied(owner, policy)
             return
         normalized = rapidgator_extract.normalize(url)
         if normalized is not None:
@@ -1219,11 +1382,46 @@ class RemoteBrowser:
         try:
             checked = browser_safety.validate(url)
         except ValueError:
-            self._popup_note(owner)
+            self._popup_denied(owner, policy)
             return
-        # Never navigate the opener on its own (ad popups would hijack the tab):
-        # the viewer decides through "intercepts/open".
-        self._add_intercept(owner, "popup", checked)
+        if policy == "block":
+            self._popup_counted(owner)
+        elif policy == "allow":
+            self._spawn(lambda: self._popup_allow(owner, checked))
+        else:
+            # Never navigate the opener on its own (ad popups would hijack the tab):
+            # the viewer decides through "intercepts/open".
+            self._add_intercept(owner, "popup", checked)
+
+    def _popup_denied(self, tab, policy):
+        if policy == "block":
+            self._popup_counted(tab)
+        else:
+            self._popup_note(tab)
+
+    def _popup_counted(self, tab):
+        with self._cv:
+            tab.popups_blocked += 1
+            tab.rev += 1
+            self._cv.notify_all()
+
+    def _popup_allow(self, owner, checked):
+        """An "allow" site: a NEW tab when the tab and memory limits permit, else
+        the opener tab itself. Runs off the CDP reader thread (it may call docker)."""
+        with self._lock:
+            alive = self._tabs.get(owner.id) is owner
+            room = len(self._tabs) < MAX_TABS
+        if not alive:
+            return
+        if room and self.memory_reason() is None:
+            self._record_event(owner, "popup_opened", checked, where="new")
+            return
+        try:
+            self._call("Page.navigate", {"url": checked}, session=owner.session)
+        except BrowserError:
+            self._add_intercept(owner, "popup", checked)
+            return
+        self._record_event(owner, "popup_opened", checked, where="current")
 
     def _popup_note(self, tab):
         with self._cv:
@@ -1234,6 +1432,10 @@ class RemoteBrowser:
     def _on_target_info(self, method, info, conn):
         target = info.get("targetId")
         if info.get("type") != "page" or not isinstance(target, str):
+            return
+        if target in self._probe_targets:
+            return      # the hidden probe page itself
+        if self._probe_target_event(method, info, conn):
             return
         with self._cv:
             tab = self._find_by_target(target)
@@ -1263,6 +1465,14 @@ class RemoteBrowser:
         url = info.get("url") if isinstance(info.get("url"), str) else ""
         title = info.get("title") if isinstance(info.get("title"), str) else ""
         block = not _scheme_ok(url)
+        new_host = self._host_of(url) if url.startswith("https://") else ""
+        ads_change = None
+        if new_host and new_host != tab.page_host:
+            tab.page_host = new_host
+            wanted = self._ads_wanted(new_host)
+            if wanted != tab.ads:
+                tab.ads = wanted
+                ads_change = wanted
         with self._cv:
             before = (tab.url, tab.title, tab.blocked)
             tab.url = url[:2048] if not block else tab.url
@@ -1272,6 +1482,12 @@ class RemoteBrowser:
             if before != (tab.url, tab.title, tab.blocked):
                 tab.rev += 1
             self._cv.notify_all()
+        if ads_change is not None and conn is not None and tab.session:
+            try:
+                for method_name, params in self._ads_commands(ads_change):
+                    conn.send_nowait(method_name, params, session=tab.session)
+            except CDPError:
+                pass
         if block and conn is not None and tab.session:
             try:
                 conn.send_nowait("Page.navigate", {"url": "about:blank"}, session=tab.session)
@@ -1334,6 +1550,7 @@ class RemoteBrowser:
                     "url": tab.url, "title": tab.title,
                     "loading": bool(tab.loading), "blocked": tab.blocked,
                     "intercepts": tab.intercept_seq, "rev": tab.rev,
+                    "popups": tab.popups_blocked,
                 }
             self._touch()
             return result
@@ -1448,12 +1665,17 @@ class RemoteBrowser:
         return {"items": items, "count": len(items), "scanned": min(len(hrefs), LINK_CAP)}
 
     # ------------------------------------------------------------ intercepts
+    @staticmethod
+    def _public_event(event):
+        item = {"id": event["id"], "kind": event["kind"], "url": event["url"]}
+        item.update({k: event[k] for k in EVENT_EXTRAS if k in event})
+        return item
+
     def intercepts(self, ident, since=0):
         tab = self._tab(ident)
         self._touch()
         with self._lock:
-            return [{"id": e["id"], "kind": e["kind"], "url": e["url"]}
-                    for e in tab.intercepts if e["id"] > since]
+            return [self._public_event(e) for e in tab.intercepts if e["id"] > since]
 
     def intercept(self, ident, event_id):
         tab = self._tab(ident)
@@ -1463,13 +1685,13 @@ class RemoteBrowser:
         with self._lock:
             for e in tab.intercepts:
                 if e["id"] == event_id:
-                    return {"id": e["id"], "kind": e["kind"], "url": e["url"]}
+                    return self._public_event(e)
         raise BrowserError("検出リンクは見つかりません（古いため消えました）")
 
     def open_intercept(self, ident, event_id):
         """Show an intercepted hoster page: that exact URL passes the Fetch pattern once."""
         item = self.intercept(ident, event_id)
-        if item["kind"] not in ("hoster", "popup"):
+        if item["kind"] not in ("hoster", "popup", "popup_opened"):
             raise BrowserError("ページとして開けるのはホスターとポップアップのリンクだけです")
         checked = browser_safety.validate(item["url"])
         tab = self._tab(ident)
@@ -1484,3 +1706,214 @@ class RemoteBrowser:
                 tab.bypass.pop(checked, None)
             raise
         return {"id": tab.id, "url": checked}
+
+    # ------------------------------------------------------------ link probe
+    # A long press on a link follows it in a hidden background target (never
+    # screencast, same browser context, closed in every case) and reports the
+    # hoster links found on the way: Fetch-intercepted hoster pages, redirect
+    # hops, popups the page opens, and anchors on the final page.
+    def _probe_add(self, probe, url):
+        with self._cv:
+            if url not in probe.links and len(probe.links) < PROBE_LINK_CAP:
+                probe.links.append(url)
+            probe.activity = self._clock()
+            self._cv.notify_all()
+
+    def _probe_event(self, probe, method, params):
+        with self._cv:
+            probe.activity = self._clock()
+            frame_id = params.get("frameId")
+            if method == "Page.frameStartedLoading" and isinstance(frame_id, str):
+                probe.started = True
+                probe.loaded = False
+                probe.loading.add(frame_id)
+            elif method == "Page.frameStoppedLoading" and isinstance(frame_id, str):
+                probe.loading.discard(frame_id)
+            elif method == "Page.loadEventFired":
+                probe.loaded = True
+            elif method == "Network.requestWillBeSent" and params.get("type") == "Document":
+                request = params.get("request") if isinstance(params.get("request"), dict) else {}
+                url = request.get("url")
+                if isinstance(url, str) and len(url) <= 4096:
+                    probe.last_doc = url
+                    if params.get("redirectResponse"):
+                        probe.redirects += 1
+                    normalized = rapidgator_extract.normalize(url)
+                    if (normalized is not None and normalized not in probe.links and
+                            len(probe.links) < PROBE_LINK_CAP):
+                        probe.links.append(normalized)
+            self._cv.notify_all()
+
+    def _probe_paused(self, probe, request_id, url, resource_type, conn):
+        normalized = rapidgator_extract.normalize(url) if len(url) <= 4096 else None
+        try:
+            if resource_type != "Document" or normalized is None or conn is None:
+                if conn is not None:
+                    conn.send_nowait("Fetch.continueRequest", {"requestId": request_id},
+                                     session=probe.session)
+                return
+            conn.send_nowait("Fetch.failRequest", {"requestId": request_id, "errorReason": "Aborted"},
+                             session=probe.session)
+        except CDPError:
+            return
+        self._probe_add(probe, normalized)
+
+    def _probe_target_event(self, method, info, conn):
+        """True when this target is a popup opened (directly or not) by a probe page."""
+        target = info["targetId"]
+        with self._cv:
+            probe = self._probe_popups.get(target)
+            if probe is None and method == "Target.targetCreated":
+                opener = info.get("openerId")
+                probe = self._probe_targets.get(opener) or self._probe_popups.get(opener)
+                if probe is not None:
+                    self._probe_popups[target] = probe
+                    probe.popups.add(target)
+        if probe is None:
+            return False
+        url = info.get("url") if isinstance(info.get("url"), str) else ""
+        if self._real_url(url) and conn is not None:
+            normalized = rapidgator_extract.normalize(url) if len(url) <= 4096 else None
+            if normalized is not None:
+                self._probe_add(probe, normalized)
+            try:
+                conn.send_nowait("Target.closeTarget", {"targetId": target})
+            except CDPError:
+                pass
+            with self._cv:
+                self._probe_popups.pop(target, None)
+                probe.popups.discard(target)
+        return True
+
+    def _wait_probe(self, probe, deadline):
+        with self._cv:
+            while True:
+                if probe.links:
+                    return "hoster"
+                if self._state != "running":
+                    return "lost"
+                now = self._clock()
+                if probe.loaded and not probe.loading and now - probe.activity >= PROBE_SETTLE:
+                    return "settled"
+                remaining = deadline - now
+                if remaining <= 0:
+                    return "timeout"
+                self._cv.wait(min(remaining, 0.25))
+
+    def _probe_close(self, probe):
+        with self._cv:
+            self._probe_targets.pop(probe.target, None)
+            self._probe_sessions.pop(probe.session, None)
+            targets = list(probe.popups)
+            for target in targets:
+                self._probe_popups.pop(target, None)
+            probe.popups.clear()
+            if probe.target:
+                targets.append(probe.target)
+        for target in targets:
+            try:
+                self._call("Target.closeTarget", {"targetId": target}, timeout=5.0)
+            except BrowserError as error:
+                self.log("probe target close failed: %s" % error)
+
+    def probe(self, ident, x, y, url_check=None):
+        """Follow the link under (x, y) in a hidden target; see the section comment.
+
+        `url_check(url)` may raise ValueError to refuse a start URL (the Hub's own
+        origin). Returns {start_url, final_url, links, redirects}.
+        """
+        x = self._number(x, 0, MAX_COORD, "x")
+        y = self._number(y, 0, MAX_COORD, "y")
+        tab = self._tab(ident)
+        self._touch()
+        with self._lock:
+            if tab.probing:
+                raise BrowserError("このタブではリンク先を確認中です")
+            if self._probes >= MAX_PROBES:
+                raise BrowserError("リンク先の確認が混み合っています。少し待ってください")
+            tab.probing = True
+            self._probes += 1
+        try:
+            reason = self.memory_reason()
+            if reason:
+                raise BrowserError(reason)
+            result = self._call("Runtime.evaluate", {
+                "expression": PROBE_JS % (x, y), "returnByValue": True, "timeout": 5000},
+                session=tab.session, timeout=PROBE_CDP_TIMEOUT)
+            href = (result.get("result") or {}).get("value")
+            if not isinstance(href, str) or not href:
+                raise BrowserError("この位置にリンクが見つかりません")
+            try:
+                start = browser_safety.validate(href)
+                if url_check is not None:
+                    url_check(start)
+            except ValueError:
+                raise BrowserError("リンク先は公開されたhttpsのアドレスだけ確認できます") from None
+            direct = rapidgator_extract.normalize(start)
+            if direct is not None:
+                return {"start_url": start, "final_url": start, "links": [direct], "redirects": 0}
+            return self._run_probe(tab, start)
+        finally:
+            with self._lock:
+                tab.probing = False
+                self._probes -= 1
+
+    def _run_probe(self, tab, start):
+        probe = Probe(tab.id, self._clock())
+        try:
+            created = self._call("Target.createTarget", {"url": "about:blank", "background": True})
+            target = created.get("targetId")
+            if not isinstance(target, str) or not TARGET_ID.match(target):
+                raise BrowserError("リンク先の確認用ページを作成できません")
+            with self._lock:
+                probe.target = target
+                self._probe_targets[target] = probe
+            session = self._call("Target.attachToTarget",
+                                 {"targetId": target, "flatten": True}).get("sessionId")
+            if not isinstance(session, str) or not session:
+                raise BrowserError("リンク先の確認用ページに接続できません")
+            with self._lock:
+                probe.session = session
+                self._probe_sessions[session] = probe
+            self._call("Page.enable", session=session)
+            self._call("Fetch.enable", {"patterns": [dict(p) for p in FETCH_PATTERNS]},
+                       session=session)
+            if self._ads_wanted(tab.page_host):
+                try:
+                    for method, params in self._ads_commands(True):
+                        self._call(method, params, session=session)
+                except BrowserError as error:
+                    self.log("probe ad blocking failed: %s" % error)
+            self._call("Page.navigate", {"url": start}, session=session)
+            self._wait_probe(probe, self._clock() + PROBE_TIMEOUT)
+            final = None
+            if not probe.links:
+                # No hoster URL on the way: read the anchors of the page we ended on.
+                try:
+                    value = (self._call("Runtime.evaluate", {
+                        "expression": LOCATION_JS, "returnByValue": True, "timeout": 3000},
+                        session=session, timeout=PROBE_CDP_TIMEOUT).get("result") or {}).get("value")
+                    final = value if isinstance(value, str) else None
+                    hrefs = (self._call("Runtime.evaluate", {
+                        "expression": LINKS_JS, "returnByValue": True, "timeout": 5000},
+                        session=session, timeout=PROBE_CDP_TIMEOUT).get("result") or {}).get("value")
+                    for url in self.extract_links(hrefs[:LINK_CAP] if isinstance(hrefs, list) else []):
+                        self._probe_add(probe, url)
+                except BrowserError as error:
+                    self.log("probe page read failed: %s" % error)
+            with self._lock:
+                links = list(probe.links)[:PROBE_LINK_CAP]
+                last_doc, redirects = probe.last_doc, probe.redirects
+            final_url = start
+            for candidate in (final, last_doc, links[0] if links else None):
+                if not isinstance(candidate, str) or candidate == "about:blank":
+                    continue
+                try:
+                    final_url = browser_safety.validate(candidate)
+                    break
+                except ValueError:
+                    continue
+            return {"start_url": start, "final_url": final_url, "links": links,
+                    "redirects": redirects}
+        finally:
+            self._probe_close(probe)

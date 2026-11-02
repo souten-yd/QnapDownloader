@@ -380,6 +380,41 @@ class StaticTests(unittest.TestCase):
             self.assertIn(ref, spec)
 
 
+class PerformanceFlagTests(unittest.TestCase):
+    """v0.1.24: raster threads, no smooth scrolling, autoplay gesture; no CPU cap."""
+
+    @classmethod
+    def setUpClass(cls):
+        root = Path(__file__).resolve().parents[1]
+        cls.entry = (root / "container" / "browser" / "entrypoint.sh").read_text()
+        cls.source = (root / "container_runtime.py").read_text()
+
+    def test_new_chromium_flags(self):
+        for flag in ("--num-raster-threads=4", "--disable-smooth-scrolling",
+                     "--autoplay-policy=user-gesture-required"):
+            self.assertIn(flag, self.entry)
+        chromium = self.entry[self.entry.index("chromium \\"):self.entry.index("about:blank")]
+        self.assertEqual(chromium.count("--num-raster-threads"), 1)
+
+    def test_flags_that_would_reduce_quality_or_throttle_are_not_used(self):
+        for flag in ("--enable-low-end-device-mode", "--disable-background-timer-throttling",
+                     "--disable-renderer-backgrounding", "--in-process-gpu"):
+            self.assertNotIn(flag, self.entry)
+
+    def test_container_has_no_cpu_limit(self):
+        runtime = cr.Runtime(FakeDocker(), isfile=lambda p: True, access=lambda p, m: True)
+        tag = "qnapdl-browser:" + "0" * 12
+        args = runtime.browser_run_args(tag)
+        for arg in args:
+            self.assertFalse(arg.startswith("--cpu"), arg)
+        self.assertNotIn("--cpuset-cpus", args)
+        self.assertNotIn("--cpus", self.source)
+        self.assertNotIn("cpu-quota", self.source)
+        # memory, pids and caps keep their limits
+        self.assertIn("--memory", args)
+        self.assertIn("--pids-limit", args)
+
+
 if __name__ == "__main__":
     unittest.main()
 

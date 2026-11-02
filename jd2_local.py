@@ -35,6 +35,11 @@ ALLOWED_CALLS = frozenset((
     ("downloadsV2", "queryPackages"),
     ("downloadsV2", "queryLinks"),
     ("linkgrabberv2", "addLinks"),
+    # v0.1.24: start/stop the download controller and move LinkGrabber links.
+    ("downloadcontroller", "start"),
+    ("downloadcontroller", "stop"),
+    ("linkgrabberv2", "queryLinks"),
+    ("linkgrabberv2", "moveToDownloadlist"),
     # Premium accounts (v0.1.23). Secrets travel in the request line of these
     # calls, so the adapter routes the whole namespace through _call_private.
     ("accountsV2", "listAccounts"),
@@ -423,20 +428,43 @@ class LocalAdapter:
         links = self._call("downloadsV2", "queryLinks", *query_options(LINK_FIELDS, page))
         return snapshot(packages, links, page)
 
-    def add_link(self, url, destination):
-        # No auto-start. This adapter only ever talks to the Hub-owned engine, so
-        # the explicit destination wins over any Packagizer rule (flat layout).
+    def add_link(self, url, destination, autostart=False):
+        # `autostart` is the per-call flag of addLinks (Hub setting send_autostart);
+        # JD2's own auto-confirm/auto-start settings stay OFF. This adapter only ever
+        # talks to the Hub-owned engine, so the explicit destination wins over any
+        # Packagizer rule (flat layout).
         if not isinstance(url, str) or not url.startswith("https://"):
             raise LocalUnavailable("HTTPSリンクのみ転送できます")
         if not isinstance(destination, str) or not destination.startswith("/"):
             raise LocalUnavailable("JD2側の保存先が不正です")
         return self._call("linkgrabberv2", "addLinks", {
             "links": url,
-            "autostart": False,
+            "autostart": autostart is True,
             "destinationFolder": destination,
             "overwritePackagizerRules": True,
             "priority": "DEFAULT",
         })
+
+    # ------------------------------------------- download controller / LinkGrabber
+    def start_downloads(self):
+        self._call("downloadcontroller", "start")
+
+    def stop_downloads(self):
+        self._call("downloadcontroller", "stop")
+
+    def list_linkgrabber(self):
+        from jd2_downloads import linkgrabber_query_options, linkgrabber_snapshot
+        raw = self._call("linkgrabberv2", "queryLinks", *linkgrabber_query_options())
+        return linkgrabber_snapshot(raw)
+
+    def move_to_downloadlist(self, link_ids, package_ids):
+        def check(values, maximum):
+            if (not isinstance(values, list) or len(values) > maximum or
+                    any(type(i) is not int or not 0 <= i < 2 ** 63 for i in values)):
+                raise LocalUnavailable("LinkGrabberのIDが不正です")
+            return list(values)
+        self._call("linkgrabberv2", "moveToDownloadlist",
+                   check(link_ids, 50), check(package_ids, 50))
 
     # ---------------------------------------------------- premium accounts
     # list_* return JD2's raw objects for jd2_accounts to project onto the

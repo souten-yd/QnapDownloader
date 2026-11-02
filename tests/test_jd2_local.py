@@ -410,5 +410,73 @@ class AccountAdapterTests(unittest.TestCase):
         self.assertFalse(self.adapter.engine_running)
 
 
+class ControllerCallTests(unittest.TestCase):
+    """v0.1.24: download controller and LinkGrabber calls."""
+
+    def setUp(self):
+        self.server = HTTPServer(("127.0.0.1", 0), StubHandler)
+        self.server.paths = []
+        self.server.responses = {}
+        self.server.status = 200
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.addCleanup(lambda: (self.server.shutdown(), self.server.server_close()))
+        self.adapter = jl.LocalAdapter(Engine(self.server.server_port))
+
+    def decoded(self):
+        prefix, _, query = self.server.paths[-1].partition("?")
+        return prefix, [json.loads(urllib.parse.unquote(a)) for a in query.split("&")] if query else []
+
+    def test_new_calls_are_allowlisted_and_nothing_wider(self):
+        for call in (("downloadcontroller", "start"), ("downloadcontroller", "stop"),
+                     ("linkgrabberv2", "queryLinks"), ("linkgrabberv2", "moveToDownloadlist")):
+            self.assertIn(call, jl.ALLOWED_CALLS)
+        for call in (("downloadcontroller", "pause"), ("downloadcontroller", "forceDownload"),
+                     ("linkgrabberv2", "removeLinks"), ("linkgrabberv2", "clearList"),
+                     ("downloadsV2", "removeLinks")):
+            self.assertNotIn(call, jl.ALLOWED_CALLS)
+            with self.assertRaises(jl.LocalUnavailable):
+                jl.encode_call(call[0], call[1], ())
+
+    def test_start_and_stop_take_no_arguments(self):
+        self.adapter.start_downloads()
+        self.assertEqual(self.decoded(), ("/downloadcontroller/start", []))
+        self.adapter.stop_downloads()
+        self.assertEqual(self.decoded(), ("/downloadcontroller/stop", []))
+
+    def test_add_link_autostart_is_a_per_call_flag(self):
+        self.adapter.add_link("https://example.com/a", "/downloads", autostart=True)
+        self.assertIs(self.decoded()[1][0]["autostart"], True)
+        self.adapter.add_link("https://example.com/a", "/downloads")
+        self.assertIs(self.decoded()[1][0]["autostart"], False)
+        self.adapter.add_link("https://example.com/a", "/downloads", autostart="yes")
+        self.assertIs(self.decoded()[1][0]["autostart"], False)
+
+    def test_linkgrabber_query_requests_only_minimal_fields_and_returns_names_and_ids(self):
+        self.server.responses["/linkgrabberv2/queryLinks"] = {"data": [
+            {"name": "a.rar", "host": "rapidgator.net", "bytesTotal": 100, "uuid": 11, "packageUUID": 5,
+             "url": "https://rapidgator.net/file/secret", "saveTo": "/share/x", "password": "pw"}]}
+        out = self.adapter.list_linkgrabber()
+        prefix, args = self.decoded()
+        self.assertEqual(prefix, "/linkgrabberv2/queryLinks")
+        self.assertEqual(args, [{"name": True, "host": True, "bytesTotal": True, "uuid": True,
+                                 "packageUUID": True, "maxResults": 50, "startAt": 0}])
+        self.assertEqual(out["items"], [{"id": "11", "package_id": "5", "name": "a.rar",
+                                         "host": "rapidgator.net", "bytes_total": 100}])
+        self.assertNotIn("secret", str(out))
+        self.assertNotIn("/share/x", str(out))
+
+    def test_move_to_downloadlist_sends_link_ids_then_package_ids(self):
+        self.adapter.move_to_downloadlist([11, 12], [5])
+        self.assertEqual(self.decoded(), ("/linkgrabberv2/moveToDownloadlist", [[11, 12], [5]]))
+
+    def test_move_to_downloadlist_validates_ids_before_any_request(self):
+        before = len(self.server.paths)
+        for links, packages in (("1", []), ([True], []), ([-1], []), ([2 ** 63], []), ([], [1.5]),
+                                (list(range(51)), []), ([], list(range(51))), (None, [])):
+            with self.subTest(links=links, packages=packages), self.assertRaises(jl.LocalUnavailable):
+                self.adapter.move_to_downloadlist(links, packages)
+        self.assertEqual(len(self.server.paths), before)
+
+
 if __name__ == "__main__":
     unittest.main()

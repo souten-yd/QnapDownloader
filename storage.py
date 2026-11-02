@@ -5,6 +5,7 @@ import hmac
 import json
 import os
 from pathlib import Path
+import re
 import secrets
 import sqlite3
 import threading
@@ -17,7 +18,12 @@ DEFAULTS = {
     "auto_extract": False,
     "create_package_folders": False,
     "auto_delete": False,
+    # v0.1.24: ask JD2 to start downloads right after the Hub sends a link.
+    "send_autostart": True,
+    # v0.1.24: block known ad / tracker / popunder requests in the NAS browser.
+    "block_ads": True,
 }
+BOOL_OPTIONS = ("send_autostart", "block_ads")
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY,value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS accounts(id INTEGER PRIMARY KEY CHECK(id=1),
@@ -37,6 +43,18 @@ CREATE TABLE IF NOT EXISTS share_tokens(id INTEGER PRIMARY KEY AUTOINCREMENT,
 name TEXT NOT NULL,token_hash TEXT NOT NULL UNIQUE,created_at REAL NOT NULL,
 last_used_at REAL);
 """
+# v0.1.24: per-site rules of the NAS browser, keyed by the top-level page host.
+# A fresh table has every column; an older one (a development build without
+# block_ads) is upgraded by the guarded ALTER in Store._upgrade_site_rules.
+SITE_RULES_SCHEMA = """
+CREATE TABLE IF NOT EXISTS site_rules(host TEXT PRIMARY KEY,
+auto_send INTEGER NOT NULL DEFAULT 0,
+popup TEXT NOT NULL DEFAULT 'ask' CHECK(popup IN ('ask','allow','block')),
+block_ads INTEGER NOT NULL DEFAULT 1);
+"""
+MAX_SITE_RULES = 200
+POPUP_POLICIES = ("ask", "allow", "block")
+HOST_LABEL = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\Z")
 MAX_SHARE_TOKENS = 10
 SHARE_TOUCH_INTERVAL = 3600
 
@@ -66,12 +84,21 @@ class Store:
                 if db.execute("PRAGMA quick_check").fetchone()[0] != "ok":
                     raise RuntimeError("設定DBの整合性に異常があります")
             db.executescript(SHARE_SCHEMA)
+            db.executescript(SITE_RULES_SCHEMA)
+            self._upgrade_site_rules(db)
+        self._rules = None
         if fresh:
             marker.write_text("v1\n", encoding="utf-8")
             os.chmod(marker, 0o600)
         # Keep one connection alive to avoid avoidable WAL/SHM create/remove churn.
         self._keeper = self._open_connection()
         self._keeper.execute("PRAGMA query_only=ON")
+
+    @staticmethod
+    def _upgrade_site_rules(db):
+        columns = {row[1] for row in db.execute("PRAGMA table_info(site_rules)")}
+        if "block_ads" not in columns:
+            db.execute("ALTER TABLE site_rules ADD COLUMN block_ads INTEGER NOT NULL DEFAULT 1")
 
     def _open_connection(self, initial=False):
         db = sqlite3.connect(self.path, timeout=5, isolation_level="DEFERRED")
@@ -114,6 +141,105 @@ class Store:
                        (json.dumps(value),))
             db.execute("UPDATE meta SET value=value+1 WHERE key='revision'")
         return self.settings()
+
+    def set_option(self, key, value):
+        """Boolean option in the settings table; written only when it changes."""
+        if key not in BOOL_OPTIONS or type(value) is not bool:
+            raise ValueError("設定の項目または値が不正です")
+        with self._guard, self.connect() as db:
+            row = db.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+            current = json.loads(row[0]) if row else DEFAULTS[key]
+            if row is not None and current is value:
+                return self.settings()
+            if row is None and value is DEFAULTS[key]:
+                return self.settings()
+            db.execute("INSERT OR REPLACE INTO settings VALUES(?,?)", (key, json.dumps(value)))
+            db.execute("UPDATE meta SET value=value+1 WHERE key='revision'")
+        return self.settings()
+
+    # ---- NAS browser site rules (v0.1.24) -----------------------------------
+    @staticmethod
+    def valid_host(value):
+        """Lower-case DNS name (no scheme, port, path or IP address), else ValueError."""
+        if not isinstance(value, str):
+            raise ValueError("ホスト名が不正です")
+        host = value.strip().lower().rstrip(".")
+        labels = host.split(".")
+        if (not 3 <= len(host) <= 253 or len(labels) < 2 or
+                not re.fullmatch("[a-z]{2,63}|xn--[a-z0-9-]{1,59}", labels[-1]) or
+                any(HOST_LABEL.match(label) is None for label in labels)):
+            raise ValueError("ホスト名はDNS名（例: example.com）で指定してください")
+        return host
+
+    def _rules_map(self):
+        with self._guard:
+            if self._rules is None:
+                with self.connect() as db:
+                    self._rules = {r[0]: {"host": r[0], "auto_send": bool(r[1]), "popup": r[2],
+                                          "block_ads": bool(r[3])} for r in db.execute(
+                        "SELECT host,auto_send,popup,block_ads FROM site_rules ORDER BY host")}
+            return self._rules
+
+    def site_rules(self):
+        return [dict(rule) for rule in self._rules_map().values()]
+
+    def site_rule_for(self, page_host):
+        """Rule for a page host: the host itself, then its parent domains (not the TLD)."""
+        if not isinstance(page_host, str) or not page_host:
+            return None
+        rules = self._rules_map()
+        labels = page_host.lower().rstrip(".").split(".")
+        for start in range(max(len(labels) - 1, 0)):
+            rule = rules.get(".".join(labels[start:]))
+            if rule is not None:
+                return dict(rule)
+        return None
+
+    def set_site_rule(self, host, auto_send=None, popup=None, block_ads=None):
+        """Create or update one rule; only given fields change, nothing is written
+        when the stored values already match."""
+        host = self.valid_host(host)
+        for value in (auto_send, block_ads):
+            if value is not None and type(value) is not bool:
+                raise ValueError("ルールの値が不正です")
+        if popup is not None and popup not in POPUP_POLICIES:
+            raise ValueError("ポップアップの設定が不正です")
+        with self._guard:
+            current = self._rules_map().get(host)
+            new = {"host": host,
+                   "auto_send": current["auto_send"] if current else False,
+                   "popup": current["popup"] if current else "ask",
+                   "block_ads": current["block_ads"] if current else True}
+            if auto_send is not None:
+                new["auto_send"] = auto_send
+            if popup is not None:
+                new["popup"] = popup
+            if block_ads is not None:
+                new["block_ads"] = block_ads
+            if current is not None and current == new:
+                return dict(current)
+            if current is None and len(self._rules_map()) >= MAX_SITE_RULES:
+                raise ValueError("サイトごとの設定は%d件までです。不要な設定を削除してください" % MAX_SITE_RULES)
+            with self.connect() as db:
+                db.execute("INSERT OR REPLACE INTO site_rules(host,auto_send,popup,block_ads) "
+                           "VALUES(?,?,?,?)", (host, int(new["auto_send"]), new["popup"],
+                                               int(new["block_ads"])))
+                db.execute("UPDATE meta SET value=value+1 WHERE key='revision'")
+            self._rules = None
+            return new
+
+    def delete_site_rule(self, host):
+        host = self.valid_host(host)
+        with self._guard, self.connect() as db:
+            if db.execute("DELETE FROM site_rules WHERE host=?", (host,)).rowcount != 1:
+                raise ValueError("設定が見つかりません")
+            db.execute("UPDATE meta SET value=value+1 WHERE key='revision'")
+            self._rules = None
+
+    def link_state(self, url):
+        with self.connect() as db:
+            row = db.execute("SELECT state FROM link_intents WHERE url=?", (url,)).fetchone()
+        return row[0] if row else None
 
     @staticmethod
     def _hash(password, salt):

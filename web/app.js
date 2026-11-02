@@ -33,6 +33,7 @@ const FRAME_LOAD_TIMEOUT_MS = 12000;
 const HINT_DELAY_MS = 6000;         // offer the "not showing?" bar after this long
 const EXTERNAL_TOAST_MS = 8000;
 const PAGE_SIZE = 30;
+const WAITING_MAX = 50;
 // Remote pages never get popups, downloads, modals or top navigation.
 const SANDBOX_STRICT = "";
 const SANDBOX_INTERACTIVE = "allow-scripts allow-forms";
@@ -61,6 +62,14 @@ const RB_VIEWPORT_DEBOUNCE_MS = 250;
 const RB_INTERCEPT_QUEUE = 20;
 const RB_POPUP_TOAST_MS = 8000;
 const RB_STAGE_MIN_PX = 100;     // a hidden / not yet laid out stage reports ~0
+const RB_LONGPRESS_MS = 550;        // long press on the remote page: follow the link in the background
+const RB_LONGPRESS_MOVE_PX = 10;
+const RB_RING_DELAY_MS = 150;       // the press ring appears after this (taps never show it)
+const RB_QUALITY_KEY = "qnapdl.rbquality.v1";
+const RB_QUALITIES = ["speed", "standard", "high"];
+const RB_QUALITY_LABELS = {speed: "速度優先", standard: "標準", high: "高画質"};
+const RB_PERF_WINDOW_MS = 5000;
+const RB_POPUP_NEW_TAB = "new";
 const RB_KEYS = ["Enter", "Backspace", "Tab", "Escape", "Delete",
   "ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown"];
 const MODE_LABELS = {strict: "強い制限", interactive: "限定操作", compat: "互換"};
@@ -100,6 +109,8 @@ const state = {
   https: false, tailnet: false,
   rbPolling: "", rbGen: 0, rbStatus: null, rbTimer: null, rbBusy: false,
   rbIntercepts: [],
+  rbQuality: loadRbQuality(), rbPerf: false, rbPerfSamples: [], rbPerfTimer: 0,
+  rbPerfSince: 0, probeSeq: 0, probeResult: null, siteRules: null, waiting: null,
   accounts: null, accountsTruncated: false, accountHosts: [], accountBusy: false, accountEditId: "",
 };
 
@@ -167,6 +178,10 @@ function writeSession(key, value) {
     if (value === null) sessionStorage.removeItem(key);
     else sessionStorage.setItem(key, value);
   } catch (e) { /* private mode / blocked: ignore */ }
+}
+function loadRbQuality() {
+  const value = readLocal(RB_QUALITY_KEY);
+  return RB_QUALITIES.includes(value) ? value : "speed";
 }
 function readLocal(key) {
   try { return localStorage.getItem(key); } catch (e) { return null; }
@@ -1113,7 +1128,7 @@ async function openRemote(tab, value, commit) {
       }
       tab.rb = {id: made.id, seq: 0, url: "", title: "", width: 0, height: 0,
         loading: true, links: [], linksTimer: 0, blocked: null,
-        rev: null, icptSeen: 0, present: 0, vp: ""};
+        rev: null, icptSeen: 0, present: 0, vp: "", popups: 0};
     }
   } catch (e) {
     if (token === tab.token) { tab.loading = false; tab.error = e.message; updateChrome(); }
@@ -1144,6 +1159,7 @@ function releaseRemote(tab) {
   dropRemoteImage(rb);
   state.rbIntercepts = state.rbIntercepts.filter(item => item.tab !== rb.id);
   if (rbPopup.item && rbPopup.item.tab === rb.id) hidePopupToast();
+  closeProbeSheet();
   renderIntercept();
   api("/api/rb/tabs/close", {id: rb.id}).catch(() => {});
 }
@@ -1250,6 +1266,7 @@ function frameHeaders(res) {
     loading: res.headers.get("X-Frame-Loading") === "1",
     intercepts: number("X-Frame-Intercepts"), rev: number("X-Frame-Rev"),
     blocked: text("X-Frame-Blocked") || null,
+    popups: number("X-Frame-Popups"),
   };
 }
 
@@ -1280,6 +1297,7 @@ function applyRemoteMeta(tab, f) {
     changed = true;
     if (!loading) scheduleRemoteLinks(tab);
   }
+  if (Number.isFinite(f.popups) && f.popups !== rb.popups) { rb.popups = f.popups; changed = true; }
   if (f.blocked && f.blocked !== rb.blocked) toast(String(f.blocked), "error");
   rb.blocked = f.blocked || null;
   tab.loading = loading;
@@ -1303,11 +1321,11 @@ async function sendViewport(tab) {
   const rb = tab.rb;
   const view = stageViewport();
   if (!rb || !view) return;
-  const key = view.width + "x" + view.height + "@" + view.dpr;
+  const key = view.width + "x" + view.height + "@" + view.dpr + "/" + state.rbQuality;
   if (key === rb.vp) return;
   rb.vp = key;
   try {
-    await api("/api/rb/viewport", Object.assign({tab: rb.id}, view));
+    await api("/api/rb/viewport", Object.assign({tab: rb.id, quality: state.rbQuality}, view));
   } catch (e) {
     rb.vp = "";
     if (e.status === 404) remoteLost(tab);
@@ -1329,7 +1347,9 @@ async function remoteLoop(tab, gen) {
     try {
       let target = "/api/rb/frame.jpg?tab=" + encodeURIComponent(rb.id) + "&since=" + rb.seq;
       if (rb.rev !== null) target += "&rev=" + rb.rev;
+      const requestedAt = performance.now();
       const res = await fetch(target, {credentials: "same-origin", cache: "no-store"});
+      const latency = performance.now() - requestedAt;
       if (gen !== state.rbGen || tab.rb !== rb) return;
       if (res.status === 401 && state.authed) {
         state.authed = false;
@@ -1347,7 +1367,12 @@ async function remoteLoop(tab, gen) {
       if (res.status === 200) {
         const blob = await res.blob();
         if (gen !== state.rbGen || tab.rb !== rb) return;
-        if (blob.size > 0 && blob.type === "image/jpeg") presentRemoteFrame(tab, rb, blob).catch(() => {});
+        if (blob.size > 0 && blob.type === "image/jpeg") {
+          presentRemoteFrame(tab, rb, blob).catch(() => {});
+          recordPerf(blob.size, latency);
+        }
+      } else {
+        recordPerf(0, latency);
       }
       applyRemoteMeta(tab, meta);
     } catch (e) {
@@ -1391,6 +1416,9 @@ function updateRemoteView(tab) {
   const count = live ? tab.rb.links.length : 0;
   setShown("remoteLinks", count > 0);
   $("remoteLinks").textContent = "リンク " + count + "件";
+  const blockedPopups = live ? tab.rb.popups : 0;
+  setShown("remotePopups", blockedPopups > 0);
+  $("remotePopups").textContent = "ポップアップ " + blockedPopups + "件ブロック";
   renderIntercept();
 }
 
@@ -1432,7 +1460,10 @@ async function openRemoteSheet() {
 
 // Stage through the existing extract/commit path (the Hub re-validates every URL).
 async function stageRemoteLinks(tab) {
-  const items = tab.rb.links.slice();
+  return stageLinks(tab.rb.links.slice());
+}
+
+async function stageLinks(items) {
   if (!items.length) return items;
   const content = items.join("\n");
   const preview = await api("/api/rapidgator/extract", {content, limit: items.length});
@@ -1451,7 +1482,12 @@ async function remoteAdd() {
 async function remoteSend() {
   const tab = remoteTab();
   if (!tab) return;
-  const items = await stageRemoteLinks(tab);
+  await sendUrls(tab.rb.links.slice());
+}
+
+// Stage (the Hub re-validates every URL), then hand the staged rows to JD2.
+async function sendUrls(links) {
+  const items = await stageLinks(links);
   await loadQueue(true);
   const wanted = new Set(items);
   const staged = state.queueData ? state.queueData.items.filter(l => l.state === "staged" && wanted.has(l.url)) : [];
@@ -1471,7 +1507,19 @@ async function fetchIntercepts(tab) {
       if (!Number.isInteger(item.id) || item.id <= rb.icptSeen) continue;
       rb.icptSeen = item.id;
       if (typeof item.url !== "string" || !item.url.startsWith("https://")) continue;
-      if (item.kind === "popup") { showPopupToast({tab: rb.id, id: item.id, url: item.url}); continue; }
+      if (item.kind === "popup") {
+        showPopupToast({tab: rb.id, id: item.id, url: item.url, host: hostOf(tab.current)});
+        continue;
+      }
+      if (item.kind === "auto_sent") {
+        swrDrop("links");
+        flash(item.dup ? "すでにJD2へ送信済みのリンクです" : "JD2へ自動送信しました");
+        continue;
+      }
+      if (item.kind === "popup_opened") {
+        handlePopupOpened(tab, item).catch(e => toast(e.message, "error"));
+        continue;
+      }
       if (item.kind !== "hoster" && item.kind !== "download") continue;
       state.rbIntercepts.push({tab: rb.id, id: item.id, kind: item.kind, url: item.url});
     }
@@ -1513,6 +1561,49 @@ async function openPopupToast() {
   await api("/api/rb/intercepts/open", {tab: item.tab, id: item.id});
 }
 
+async function setSiteRule(host, rule) {
+  const saved = await api("/api/rb/site-rules", Object.assign({host}, rule));
+  state.siteRules = null;
+  swrDrop("site-rules");
+  return saved;
+}
+
+// 常に許可 / 常にブロック: remember the policy for the page's host (the Hub
+// applies it from the next popup on); "allow" also opens this one now.
+async function popupRule(policy) {
+  const item = rbPopup.item;
+  if (!item || !item.host) return;
+  hidePopupToast();
+  await setSiteRule(item.host, {popup: policy});
+  if (policy === "allow") await api("/api/rb/intercepts/open", {tab: item.tab, id: item.id});
+  flash(item.host + (policy === "allow" ? " のポップアップを今後は新しいタブで開きます" :
+    " のポップアップを今後はブロックします"));
+}
+
+// A site set to "allow": the Hub tells us a popup should open in a NEW NAS tab
+// (or already navigated the current tab when the tab/memory limits are reached).
+async function handlePopupOpened(tab, item) {
+  const host = hostLabel(item.url);
+  if (item.where !== RB_POPUP_NEW_TAB) {
+    flash("ポップアップ（" + host + "）をこのタブで開きました");
+    return;
+  }
+  if (state.tabs.length < MAX_WEB_TABS) {
+    const fresh = createTab();
+    try {
+      await openRemote(fresh, item.url, url => pushHistory(fresh, url));
+      flash("ポップアップ（" + host + "）を新しいタブで開きました");
+      return;
+    } catch (e) {
+      closeTab(fresh.id);
+    }
+  }
+  if (tab.rb) {
+    await api("/api/rb/intercepts/open", {tab: tab.rb.id, id: item.id});
+    flash("ポップアップ（" + host + "）をこのタブで開きました");
+  }
+}
+
 function currentIntercept() {
   const tab = remoteTab();
   if (!tab) return null;
@@ -1533,11 +1624,13 @@ function renderIntercept() {
   $("interceptUrl").title = cur.item.url;
   $("interceptMore").textContent = cur.more > 0 ? "ほか" + cur.more + "件が待機中" : "";
   setShown("interceptSend", canSend);
+  setShown("interceptAutoRow", canSend && cur.item.kind === "hoster" && Boolean(hostOf(tab.current)));
   setShown("interceptOpen", cur.item.kind === "hoster");
   $("interceptAdd").classList.toggle("primary", !canSend);
 }
 
 function dropIntercept(item) {
+  $("interceptAuto").checked = false;
   state.rbIntercepts = state.rbIntercepts.filter(other => other !== item);
   renderIntercept();
 }
@@ -1548,11 +1641,17 @@ async function interceptAction(action) {
   const item = cur.item;
   const body = {tab: item.tab, id: item.id};
   if (action === "send") {
-    if (!confirm("このリンクをJD2のLinkGrabberへ送ります。自動開始はOFFです。既存のPackagizerルールによりフォルダが変わる可能性があります。続けますか？")) return;
+    if (!confirm("このリンクをJD2へ送ります。" + sendStartText() + "既存のPackagizerルールによりフォルダが変わる可能性があります。続けますか？")) return;
+    const autoHost = $("interceptAuto").checked ? hostOf(remoteTab().current) : "";
     await api("/api/rb/intercepts/send", body);
     swrDrop("links");
     await loadQueue(true).catch(() => {});
-    flash("JD2のLinkGrabberへ送りました（ダウンロードは未開始）");
+    flash(sentText());
+    if (autoHost) {
+      $("interceptAuto").checked = false;
+      await setSiteRule(autoHost, {auto_send: true});
+      flash(autoHost + " は今後自動でJD2へ送ります");
+    }
   } else if (action === "add") {
     await api("/api/rb/intercepts/add", body);
     swrDrop("links");
@@ -1561,6 +1660,159 @@ async function interceptAction(action) {
     await api("/api/rb/intercepts/open", body);
   }
   dropIntercept(item);
+}
+
+// ---- speed overlay (client side only): frames/s and bytes over the last 5 s,
+// and request-to-response time of the frame poll.
+function recordPerf(bytes, latency) {
+  if (!state.rbPerf) return;
+  const now = performance.now();
+  state.rbPerfSamples.push({t: now, bytes, latency});
+  const cutoff = now - RB_PERF_WINDOW_MS;
+  while (state.rbPerfSamples.length && state.rbPerfSamples[0].t < cutoff) state.rbPerfSamples.shift();
+}
+
+function perfText() {
+  const now = performance.now();
+  const recent = state.rbPerfSamples.filter(x => x.t >= now - RB_PERF_WINDOW_MS);
+  const frames = recent.filter(x => x.bytes > 0);
+  const elapsed = Math.max(1, Math.min(RB_PERF_WINDOW_MS, now - state.rbPerfSince) / 1000);
+  const fps = frames.length / elapsed;
+  const bytes = frames.length ? frames.reduce((sum, x) => sum + x.bytes, 0) / frames.length : 0;
+  const wait = recent.length ? recent.reduce((sum, x) => sum + x.latency, 0) / recent.length : 0;
+  return fps.toFixed(1) + " fps · " + (bytes / 1024).toFixed(0) + " KB/枚 · 応答 " + Math.round(wait) + " ms";
+}
+
+function renderPerf() {
+  $("perfOverlay").textContent = perfText();
+}
+
+function setPerf(on) {
+  state.rbPerf = on;
+  state.rbPerfSamples = [];
+  state.rbPerfSince = performance.now();
+  clearInterval(state.rbPerfTimer);
+  state.rbPerfTimer = 0;
+  setShown("perfOverlay", on);
+  if (on) {
+    renderPerf();
+    state.rbPerfTimer = setInterval(renderPerf, 1000);
+  }
+}
+
+// ---- render quality (speed / standard / high), remembered on this device
+function setRbQuality(mode) {
+  if (!RB_QUALITIES.includes(mode)) return;
+  state.rbQuality = mode;
+  writeLocal(RB_QUALITY_KEY, mode);
+  const tab = remoteTab();
+  if (tab) {
+    tab.rb.vp = "";
+    sendViewport(tab).catch(e => toast(e.message, "error"));
+  }
+  flash("画質: " + RB_QUALITY_LABELS[mode]);
+}
+
+// ---- long press: follow the link in a hidden background page on the NAS
+const rbPress = {timer: 0, ringTimer: 0, fired: false};
+
+function showPressRing(clientX, clientY) {
+  const box = $("remoteStage").getBoundingClientRect();
+  const ring = $("remoteRing");
+  ring.style.left = Math.round(clientX - box.left) + "px";
+  ring.style.top = Math.round(clientY - box.top) + "px";
+  ring.classList.remove("is-done");
+  setShown("remoteRing", true);
+}
+
+function hidePressRing() {
+  setShown("remoteRing", false);
+  $("remoteRing").classList.remove("is-done");
+}
+
+function cancelPress() {
+  clearTimeout(rbPress.timer);
+  clearTimeout(rbPress.ringTimer);
+  rbPress.timer = rbPress.ringTimer = 0;
+  if (!rbPress.fired) hidePressRing();
+}
+
+function longPress(clientX, clientY) {
+  const tab = remoteTab();
+  const point = tab ? remotePoint({clientX, clientY}) : null;
+  if (!tab || !point) { cancelPress(); return; }
+  rbPress.fired = true;
+  $("remoteRing").classList.add("is-done");
+  setTimeout(() => { rbPress.fired = false; hidePressRing(); }, 350);
+  perform(() => startProbe(tab, point));
+}
+
+function closeProbeSheet() {
+  state.probeSeq++;
+  setShown("probeSheet", false);
+}
+
+function renderProbe(view, tab) {
+  const busy = view.busy === true;
+  const result = view.result || null;
+  const links = result ? result.links : [];
+  $("probeTitle").textContent = busy ? "リンク先を確認しています…" : "リンク先を確認しました";
+  let status = "最大15秒かかります。確認用のページは自動で閉じます";
+  if (result) {
+    status = "リダイレクト " + result.redirects + "回 · 最終: " + (hostLabel(result.final_url) || "不明") +
+      (links.length ? "" : "（Rapidgatorのリンクは見つかりませんでした）");
+  }
+  $("probeStatus").textContent = status;
+  $("probeStatus").title = result ? result.final_url : "";
+  const canSend = jd2CanSend();
+  const rows = links.map(url => {
+    const row = element("div", undefined, "probe-link");
+    row.appendChild(element("span", url, "link-url"));
+    const actions = element("span", undefined, "probe-link-actions");
+    if (canSend) {
+      const send = element("button", "送る", "btn small");
+      send.type = "button";
+      send.addEventListener("click", () => perform(() => sendUrls([url])));
+      actions.appendChild(send);
+    }
+    const add = element("button", "追加", "btn small");
+    add.type = "button";
+    add.addEventListener("click", () => perform(async () => {
+      await stageLinks([url]);
+      flash("追加したリンクに入れました（JD2へは未送信）");
+    }));
+    actions.appendChild(add);
+    row.appendChild(actions);
+    return row;
+  });
+  $("probeList").replaceChildren(...rows);
+  $("probeSendAll").textContent = "すべてJD2へ送る（" + links.length + "件）";
+  $("probeAddAll").textContent = "リンクに追加（" + links.length + "件）";
+  setShown("probeSendAll", !busy && canSend && links.length > 0);
+  setShown("probeAddAll", !busy && links.length > 0);
+  setShown("probeOpen", !busy && Boolean(result) && links.length === 0 && Boolean(result.final_url));
+  state.probeResult = result;
+}
+
+async function startProbe(tab, point) {
+  const rb = tab.rb;
+  if (!rb || rb.probing) { toast("リンク先を確認中です", "error"); return; }
+  const seq = ++state.probeSeq;
+  rb.probing = true;
+  renderProbe({busy: true}, tab);
+  setShown("probeSheet", true);
+  loadJd2Status().then(() => { if (seq === state.probeSeq && state.probeResult) renderProbe({result: state.probeResult}, tab); }).catch(() => {});
+  try {
+    const result = await api("/api/rb/probe", {tab: rb.id, x: point.x, y: point.y});
+    if (seq !== state.probeSeq || tab.rb !== rb) return;
+    renderProbe({result}, tab);
+  } catch (e) {
+    if (seq === state.probeSeq) setShown("probeSheet", false);
+    if (e.status === 404) remoteLost(tab);
+    else throw e;
+  } finally {
+    rb.probing = false;
+  }
 }
 
 // Pointer to page coordinates: scaled to the frame size reported by the Hub.
@@ -1611,11 +1863,21 @@ function wireRemote() {
     rbPointer.t0 = Date.now();
     rbPointer.moved = false;
     try { stage.setPointerCapture(event.pointerId); } catch (e) { /* not supported */ }
+    cancelPress();
+    rbPress.fired = false;
+    const startX = event.clientX, startY = event.clientY;
+    rbPress.ringTimer = setTimeout(() => showPressRing(startX, startY), RB_RING_DELAY_MS);
+    rbPress.timer = setTimeout(() => {
+      if (rbPointer.id !== null && !rbPointer.moved) longPress(startX, startY);
+    }, RB_LONGPRESS_MS);
   });
+  stage.addEventListener("contextmenu", event => event.preventDefault());
   stage.addEventListener("pointermove", event => {
     if (event.pointerId !== rbPointer.id) return;
-    if (Math.hypot(event.clientX - rbPointer.startX, event.clientY - rbPointer.startY) > RB_TAP_MOVE_PX) {
+    if (Math.hypot(event.clientX - rbPointer.startX, event.clientY - rbPointer.startY) >
+        Math.min(RB_TAP_MOVE_PX, RB_LONGPRESS_MOVE_PX)) {
       rbPointer.moved = true;
+      cancelPress();
     }
     if (!rbPointer.moved) return;
     const point = remotePoint(event);
@@ -1630,8 +1892,10 @@ function wireRemote() {
   const finish = event => {
     if (event.pointerId !== rbPointer.id) return;
     rbPointer.id = null;
+    const longPressed = rbPress.fired;
+    cancelPress();
     const point = remotePoint(event);
-    if (event.type === "pointercancel" || !point) return;
+    if (event.type === "pointercancel" || !point || longPressed) return;
     if (!rbPointer.moved && Date.now() - rbPointer.t0 <= RB_TAP_MAX_MS) {
       rbInput({type: "tap", x: point.x, y: point.y});
     }
@@ -1674,6 +1938,24 @@ function wireRemote() {
   $("remoteKeyTab").addEventListener("click", () => rbInput({type: "key", key: "Tab"}));
   $("remoteLinks").addEventListener("click", () => perform(openRemoteSheet));
   $("popupToastOpen").addEventListener("click", () => perform(openPopupToast));
+  $("popupToastAllow").addEventListener("click", () => perform(() => popupRule("allow")));
+  $("popupToastBlock").addEventListener("click", () => perform(() => popupRule("block")));
+  $("probeClose").addEventListener("click", closeProbeSheet);
+  $("probeSendAll").addEventListener("click", () => perform(async () => {
+    if (state.probeResult) await sendUrls(state.probeResult.links.slice());
+  }));
+  $("probeAddAll").addEventListener("click", () => perform(async () => {
+    const links = state.probeResult ? state.probeResult.links.slice() : [];
+    await stageLinks(links);
+    flash(links.length + "件を追加したリンクに入れました（JD2へは未送信）");
+  }));
+  $("probeOpen").addEventListener("click", () => perform(async () => {
+    const tab = remoteTab();
+    const result = state.probeResult;
+    if (!tab || !result) return;
+    closeProbeSheet();
+    await api("/api/rb/navigate", {tab: tab.rb.id, url: result.final_url});
+  }));
   $("interceptSend").addEventListener("click", () => perform(() => interceptAction("send")));
   $("interceptAdd").addEventListener("click", () => perform(() => interceptAction("add")));
   $("interceptOpen").addEventListener("click", () => perform(() => interceptAction("open")));
@@ -1865,6 +2147,14 @@ function configureMenu() {
   $("menuMode").textContent = tab && tab.mode === "interactive" ?
     "強い制限モードに戻す" : "限定操作モードに切り替え";
   $("menuRemote").textContent = tab && tab.remote ? "NASブラウザをやめる（通常表示へ）" : "NASブラウザで開く";
+  const remoteMenu = Boolean(tab && tab.remote && tab.history.length);
+  $("menu").querySelectorAll("[data-scope='remote']").forEach(n => { n.hidden = !remoteMenu; });
+  $("menu").querySelectorAll("[data-quality]").forEach(n => {
+    const on = n.dataset.quality === state.rbQuality;
+    n.textContent = (on ? "✓ " : "") + "画質: " + RB_QUALITY_LABELS[n.dataset.quality];
+    n.setAttribute("aria-checked", String(on));
+  });
+  $("menuPerf").textContent = state.rbPerf ? "速度表示をやめる" : "速度表示";
   $("menuMode").hidden = Boolean(tab && tab.remote) || !web;
   $("menuCompat").hidden = Boolean(tab && tab.remote) || !web;
   $("menuCompat").textContent = tab && tab.mode === "compat" ?
@@ -1887,6 +2177,8 @@ async function menuAction(action) {
   else if (action === "toggleMode" && tab) await setMode(tab, tab.mode === "interactive" ? "strict" : "interactive");
   else if (action === "compatMode" && tab) await setMode(tab, tab.mode === "compat" ? "strict" : "compat");
   else if (action === "remoteOpen" && tab) await (tab.remote ? leaveRemote(tab) : openInRemote(tab));
+  else if (action.startsWith("quality:")) setRbQuality(action.slice(8));
+  else if (action === "perf") setPerf(!state.rbPerf);
   else if (action === "external" && tab) openExternal(tab);
   else if (action === "stageUrl" && tab) await stageTabUrl(tab);
   else if (action === "bookmark" && tab) await bookmarkTab(tab);
@@ -2128,6 +2420,7 @@ function renderDownloadsShell() {
   setShown("downloadsEmpty", Boolean(e) && !running);
   setShown("downloadsBody", running);
   $("downloadsRefresh").hidden = !running;
+  $("downloadsToggle").hidden = !running;
   $("downloadsUpdated").hidden = !running;
   if (!e || running) return;
   const needSetup = !e.installed || e.phase === "setup";
@@ -2195,6 +2488,54 @@ function renderDownloads() {
     counts.waiting + " · 完了 " + counts.finished : "";
 }
 
+// Links JD2 holds in the LinkGrabber (names only, max 50) with a one-click start.
+async function loadWaiting() {
+  try {
+    state.waiting = await api("/api/jd2/linkgrabber");
+  } catch (e) {
+    state.waiting = null;   // optional section: never blocks the download list
+  }
+  renderWaiting();
+}
+
+function renderWaiting() {
+  const w = state.waiting;
+  const count = w ? w.count : 0;
+  setShown("waitingBox", count > 0);
+  $("downloadsToggle").textContent = state.dlRunning > 0 ? "停止" : "開始";
+  if (!count) { $("waitingList").replaceChildren(); return; }
+  $("waitingCount").textContent = (w.has_more ? count + "件以上" : count + "件");
+  $("waitingList").replaceChildren(...w.items.slice(0, WAITING_MAX).map(item => {
+    const row = element("div", undefined, "waiting-item");
+    row.appendChild(element("span", item.name, "waiting-name"));
+    if (item.host) row.appendChild(element("span", item.host, "muted"));
+    return row;
+  }));
+}
+
+async function startWaiting() {
+  const count = state.waiting ? state.waiting.count : 0;
+  if (!count || !confirm("JD2で待機中の" + (state.waiting.has_more ? count + "件以上" : count + "件") +
+      "をダウンロードリストへ移して開始します。よろしいですか？")) return;
+  const result = await api("/api/jd2/linkgrabber/start", {confirmed: true});
+  flash(result.moved + "件を開始しました");
+  state.downloadsFails = 0;
+  await loadDownloads(state.downloadsPage);
+}
+
+async function toggleDownloads() {
+  if (state.dlRunning > 0) {
+    if (!confirm("JD2のダウンロードをすべて停止します。よろしいですか？")) return;
+    await api("/api/jd2/downloads/stop", {confirmed: true});
+    flash("ダウンロードを停止しました");
+  } else {
+    await api("/api/jd2/downloads/start", {});
+    flash("ダウンロードを開始しました");
+  }
+  state.downloadsFails = 0;
+  await loadDownloads(state.downloadsPage);
+}
+
 // Entering the downloads view: fetch immediately when the engine is running.
 function refreshDownloadsNow() {
   if (!engineRunning()) return;
@@ -2215,6 +2556,7 @@ async function loadDownloads(page, options = {}) {
     state.downloadsPage = snap.page;
     state.downloadsFails = 0;
     if (snap.page === 0) state.dlRunning = countRunning(snap);
+    if (snap.page === 0) await loadWaiting();
     renderDownloads();
     updateBadge();
     $("downloadsMessage").textContent = "";
@@ -2341,11 +2683,20 @@ async function loadJd2Status(force = false) {
   await swr("jd2-status", "/api/jd2/status", renderJd2Status, {force});
 }
 
+function sendAutostartOn() { return !state.settings || state.settings.send_autostart !== false; }
+function sendStartText() {
+  return sendAutostartOn() ? "送信後すぐにダウンロードを開始します。" : "自動開始はOFFです。";
+}
+function sentText() {
+  return sendAutostartOn() ? "JD2へ送り、ダウンロードを開始しました" :
+    "JD2のLinkGrabberへ送りました（ダウンロードは未開始）";
+}
+
 // Sequential hand-off with one confirmation; stops at the first error.
 async function sendLinks(links) {
   const many = links.length > 1;
-  if (!confirm(many ? links.length + "件のリンクをJD2のLinkGrabberへ順に送ります。自動開始はOFFです。既存のPackagizerルールによりフォルダが変わる可能性があります。続けますか？" :
-      "このリンクをJD2のLinkGrabberへ送ります。自動開始はOFFです。既存のPackagizerルールによりフォルダが変わる可能性があります。続けますか？")) return;
+  if (!confirm(many ? links.length + "件のリンクをJD2へ順に送ります。" + sendStartText() + "既存のPackagizerルールによりフォルダが変わる可能性があります。続けますか？" :
+      "このリンクをJD2へ送ります。" + sendStartText() + "既存のPackagizerルールによりフォルダが変わる可能性があります。続けますか？")) return;
   let sent = 0;
   try {
     for (const link of links) {
@@ -2359,7 +2710,8 @@ async function sendLinks(links) {
   }
   swrDrop("links");
   await loadQueue(true);
-  flash(sent + "件をJD2のLinkGrabberへ送りました（ダウンロードは未開始）");
+  flash(sent + "件を" + (sendAutostartOn() ? "JD2へ送り、ダウンロードを開始しました" :
+    "JD2のLinkGrabberへ送りました（ダウンロードは未開始）"));
 }
 
 function sendAllStaged() {
@@ -2451,6 +2803,8 @@ function showSettingsSection(section) {
 
 function renderDownloadDir(s) {
   state.settings = s;
+  $("sendAutostart").checked = s.send_autostart !== false;
+  $("blockAds").checked = s.block_ads !== false;
   $("selectedFolder").textContent = s.download_dir || "未選択";
   $("folderChange").textContent = s.download_dir ? "変更" : "選ぶ";
   renderHome();
@@ -2487,7 +2841,8 @@ async function enterSettings(section, force = false) {
     if (engineRunning()) await Promise.all([loadAccounts(force), loadAccountHosts(force)]);
   } else if (section === "browser") {
     renderRemoteHosts();
-    await loadBrowserStatus(force);
+    await Promise.all([loadBrowserStatus(force), loadSettings(force),
+      swr("site-rules", "/api/rb/site-rules", renderSiteRules, {force})]);
   } else if (section === "https") {
     renderHttps();
   } else if (section === "share") {
@@ -2753,6 +3108,12 @@ function teardownSession() {
   state.rbGen++;
   state.rbStatus = null;
   clearTimeout(state.rbTimer);
+  setPerf(false);
+  closeProbeSheet();
+  hidePopupToast();
+  state.siteRules = null;
+  state.waiting = null;
+  cancelPress();
   $("remoteImg").removeAttribute("src");
   $("frames").replaceChildren();   // unload every external page
   state.tabs = [];
@@ -2997,6 +3358,8 @@ function wireDownloads() {
     state.downloadsFails = 0;
     loadDownloads(state.downloadsPage);
   });
+  $("waitingStart").addEventListener("click", () => perform(startWaiting));
+  $("downloadsToggle").addEventListener("click", () => perform(toggleDownloads));
   $("downloadsPrev").addEventListener("click", () => loadDownloads(state.downloadsPage - 1));
   $("downloadsNext").addEventListener("click", () => loadDownloads(state.downloadsPage + 1));
   document.querySelectorAll(".chip").forEach(c => c.addEventListener("click", () => setFilter(c.dataset.filter)));
@@ -3580,6 +3943,71 @@ function renderRemoteHosts() {
   box.replaceChildren(...nodes);
 }
 
+// Settings › NASブラウザ: per-site rules (top-level page host of the NAS browser tab).
+const POPUP_LABELS = {ask: "確認する", allow: "許可（新しいタブ）", block: "ブロック"};
+
+function ruleToggle(label, checked, onChange) {
+  const wrap = element("label", undefined, "rule-toggle");
+  const input = document.createElement("input");
+  input.type = "checkbox";
+  input.checked = checked;
+  input.addEventListener("change", () => perform(async () => {
+    try { await onChange(input.checked); } catch (e) { input.checked = !input.checked; throw e; }
+  }));
+  wrap.appendChild(input);
+  wrap.appendChild(document.createTextNode(" " + label));
+  return wrap;
+}
+
+function renderSiteRules(data) {
+  state.siteRules = data;
+  const box = $("siteRules");
+  if (!box) return;
+  const items = Array.isArray(data.items) ? data.items : [];
+  if (!items.length) {
+    box.replaceChildren(element("p", "サイトごとの設定はありません。リンク検出シートの「このサイトでは今後自動で送る」やポップアップの「常に許可／常にブロック」で追加されます。", "empty-state"));
+    return;
+  }
+  box.replaceChildren(...items.map(rule => {
+    const row = element("div", undefined, "item rule-item");
+    row.appendChild(element("span", rule.host, "rule-host"));
+    const controls = element("span", undefined, "rule-controls");
+    controls.appendChild(ruleToggle("自動送信", rule.auto_send === true,
+      checked => setSiteRule(rule.host, {auto_send: checked})));
+    const select = document.createElement("select");
+    select.setAttribute("aria-label", rule.host + " のポップアップ");
+    for (const [value, label] of Object.entries(POPUP_LABELS)) {
+      const option = document.createElement("option");
+      option.value = value;
+      option.textContent = "ポップアップ: " + label;
+      select.appendChild(option);
+    }
+    select.value = rule.popup;
+    select.addEventListener("change", () => perform(() => setSiteRule(rule.host, {popup: select.value})));
+    controls.appendChild(select);
+    controls.appendChild(ruleToggle("広告ブロック", rule.block_ads !== false,
+      checked => setSiteRule(rule.host, {block_ads: checked})));
+    const del = element("button", "削除", "btn small quiet");
+    del.type = "button";
+    del.addEventListener("click", () => perform(async () => {
+      await api("/api/rb/site-rules/delete", {host: rule.host});
+      swrDrop("site-rules");
+      renderSiteRules(await api("/api/rb/site-rules"));
+    }));
+    controls.appendChild(del);
+    row.appendChild(controls);
+    return row;
+  }));
+}
+
+async function saveOption(key, value) {
+  const saved = await api("/api/settings/options", {[key]: value});
+  swrDrop("settings", "status");
+  state.settings = saved;
+  renderHome();
+  return saved;
+}
+
 function renderBrowserStatus(r) {
   state.rbStatus = r;
   const cs = r.container_station || {};
@@ -3628,6 +4056,18 @@ async function loadBrowserStatus(force = false) {
 }
 
 function wireBrowser() {
+  $("blockAds").addEventListener("change", () => perform(async () => {
+    try {
+      await saveOption("block_ads", $("blockAds").checked);
+      flash($("blockAds").checked ? "広告をブロックします（次に開くタブから）" : "広告ブロックをやめました（次に開くタブから）");
+    } catch (e) { $("blockAds").checked = !$("blockAds").checked; throw e; }
+  }));
+  $("sendAutostart").addEventListener("change", () => perform(async () => {
+    try {
+      await saveOption("send_autostart", $("sendAutostart").checked);
+      flash($("sendAutostart").checked ? "JD2へ送ったらすぐダウンロードを開始します" : "JD2へ送るだけにします（開始は手動）");
+    } catch (e) { $("sendAutostart").checked = !$("sendAutostart").checked; throw e; }
+  }));
   $("rbSetup").addEventListener("click", () => perform(async () => {
     if (!confirm("NASブラウザの初期設定を始めます。\n\n" +
         "・Container Station上で、同梱のDockerfileからイメージ qnapdl-browser を作ります（Debian bookworm-slim をダイジェスト固定で取得し、Chromium・Xvfb・日本語フォントをaptで導入。数分かかり、約1GBのディスクを使います）\n" +
