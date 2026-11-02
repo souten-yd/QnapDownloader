@@ -22,6 +22,7 @@ class FakeDocker:
         self.stats_fail = False
         self.container_logs = ""
         self.logs_fail = False
+        self.run_fail = None      # stderr text: `docker run -d` fails, leaving a "created" container
         self.run_exits = None     # exit code: the started container is already exited
 
     def isfile(self, path):
@@ -102,6 +103,9 @@ class FakeDocker:
                                      "exit": self.run_exits or 0}
             if self.run_exits is not None:
                 self.containers[name]["running"] = False
+            if self.run_fail:
+                self.containers[name]["running"] = False
+                return self.result(125, "", self.run_fail)
             return self.result(0, "abcdef123456\n")
         if a[0] == "stop":
             self.containers[a[-1]]["running"] = False

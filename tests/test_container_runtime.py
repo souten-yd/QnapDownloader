@@ -432,6 +432,7 @@ class BrowserRuntimeTests(RuntimeBase):
             "run", "-d", "--name", "qnapdl-browser", "--label", "org.qnapdownloader.managed=1",
             "--network", "qnapdl-browser-net", "--restart", "no", "--read-only",
             "--log-driver", "local", "--log-opt", "max-size=256k", "--log-opt", "max-file=1",
+            "--log-opt", "compress=false",
             "--memory", "2g", "--memory-swap", "2g",
             "--shm-size", "512m", "--pids-limit", "1024", "--cap-drop", "ALL",
             "--cap-add", "SYS_ADMIN",
@@ -512,6 +513,33 @@ class BrowserRuntimeTests(RuntimeBase):
             self.rt.inspect_ip(cr.BROWSER_NAME, cr.JD2_NET)   # name/network must pair up
         with self.assertRaises(cr.ContainerError):
             self.rt.run_browser(tag)    # leftover with the same name
+
+    def test_failed_run_removes_leftover_created_container(self):
+        tag = self.rt.browser_build(self.context())
+        self.set_mem(2200 * 1024)
+        self.fake.run_fail = ("failed to create task for container: failed to initialize "
+                              "logging driver: compression cannot be enabled when max file count is 1")
+        with self.assertRaises(cr.ContainerError) as ctx:
+            self.rt.run_browser(tag)
+        self.assertIn("compression cannot be enabled", str(ctx.exception))
+        self.assertNotIn(cr.BROWSER_NAME, self.fake.containers)
+        self.assertIn(["rm", "-f", cr.BROWSER_NAME], self.fake.docker_calls())
+        self.fake.run_fail = None
+        self.rt.run_browser(tag)    # no name conflict on the next attempt
+        self.assertIn(cr.BROWSER_NAME, self.fake.containers)
+
+    def test_failed_run_never_removes_a_foreign_container(self):
+        tag = self.rt.browser_build(self.context())
+        self.set_mem(2200 * 1024)
+        self.fake.run_fail = "boom"
+        with self.assertRaises(cr.ContainerError):
+            self.rt.run_browser(tag)
+        self.fake.containers[cr.BROWSER_NAME] = {"labels": {}, "running": False, "net": "x",
+                                                 "ip": "", "ports": {}, "extra_nets": [], "exit": 0}
+        self.assertFalse(self.rt._inspect(cr.BROWSER_NAME)["managed"])
+        with self.assertRaises(cr.ContainerError):
+            self.rt.remove(cr.BROWSER_NAME)
+        self.assertIn(cr.BROWSER_NAME, self.fake.containers)
 
     def test_run_without_image_is_refused(self):
         with self.assertRaises(cr.ContainerError):
