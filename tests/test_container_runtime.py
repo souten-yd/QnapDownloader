@@ -435,7 +435,7 @@ class BrowserRuntimeTests(RuntimeBase):
             "--log-opt", "compress=false",
             "--memory", "2g", "--memory-swap", "2g",
             "--shm-size", "512m", "--pids-limit", "1024", "--cap-drop", "ALL",
-            "--cap-add", "SYS_ADMIN",
+            "--cap-add", "SYS_ADMIN", "--cap-add", "SYS_CHROOT",
             "--security-opt", "no-new-privileges", "--user", "1000:1000",
             "--tmpfs", "/profile:rw,nosuid,nodev,size=512m,uid=1000,gid=1000,mode=0700",
             "--tmpfs", "/tmp:rw,nosuid,nodev,size=256m,mode=1777", tag])
@@ -486,9 +486,9 @@ class BrowserRuntimeTests(RuntimeBase):
             self.assertNotIn(forbidden, args)
         for forbidden in ("no-sandbox", "disable-web-security", "user-agent"):
             self.assertNotIn(forbidden, joined)
-        # SYS_ADMIN only, after ALL is dropped, on a non-root user with no-new-privileges.
+        # SYS_ADMIN + SYS_CHROOT only, after ALL is dropped, on a non-root user with no-new-privileges.
         caps = [args[i + 1] for i, a in enumerate(args) if a == "--cap-add"]
-        self.assertEqual(caps, ["SYS_ADMIN"])
+        self.assertEqual(caps, ["SYS_ADMIN", "SYS_CHROOT"])
         self.assertLess(args.index("--cap-drop"), args.index("--cap-add"))
         self.assertIn("no-new-privileges", args)
         self.assertEqual(args[args.index("--user") + 1], "1000:1000")
@@ -564,7 +564,14 @@ class BrowserRuntimeTests(RuntimeBase):
             self.rt.browser_selftest(tag)
         self.assertIn("CapEff", str(err.exception))
         self.assertIn("ユーザー名前空間", str(err.exception))
-        self.assertEqual(self.rt.browser_selftest_args(tag).count("--cap-add"), 1)
+        self.assertEqual(self.rt.browser_selftest_args(tag).count("--cap-add"), 2)
+        sargs = self.rt.browser_selftest_args(tag)
+        self.assertEqual([sargs[i + 1] for i, a in enumerate(sargs) if a == "--cap-add"],
+                         ["SYS_ADMIN", "SYS_CHROOT"])
+        self.fake.selftest_code = cr.BROWSER_EXIT_NO_CHROOT
+        with self.assertRaises(cr.ContainerError) as err:
+            self.rt.browser_selftest(tag)
+        self.assertIn("サンドボックスに必要なchrootが許可されていません", str(err.exception))
 
     def test_stats_for_own_container_only_and_parsing(self):
         self.fake.containers["qnapdl-browser"] = {
@@ -633,6 +640,16 @@ class BrowserDockerfileStaticTests(unittest.TestCase):
         self.assertIn("socat TCP-LISTEN:9223,fork,reuseaddr,bind=0.0.0.0 TCP:127.0.0.1:9222", self.entry)
         self.assertIn("exit 78", self.entry)
 
+    def test_entrypoint_probes_chroot_in_userns_and_exits_77(self):
+        probe = "unshare --user --map-root-user --pid --fork --net chroot / /bin/true"
+        self.assertIn(probe, self.entry)
+        self.assertIn("exit 77", self.entry)
+        self.assertIn("chroot unavailable in user namespace", self.entry)
+        self.assertEqual(cr.BROWSER_EXIT_NO_CHROOT, 77)
+        self.assertLess(self.entry.index("unshare --user --map-root-user --pid --fork --net true"),
+                        self.entry.index(probe))
+        self.assertLess(self.entry.index(probe), self.entry.index('= "selftest"'))
+
     def test_entrypoint_logs_to_tmpfs_and_distinct_exit_codes_with_tail(self):
         for text in ('>"$XVFB_LOG" 2>&1', '>"$CHROMIUM_LOG" 2>&1', "XVFB_LOG=/tmp/xvfb.log",
                      "CHROMIUM_LOG=/tmp/chromium.log", "tail -n 60", "qnapdl-browser: $1 exited",
@@ -655,6 +672,7 @@ class BrowserDockerfileStaticTests(unittest.TestCase):
     def test_runtime_source_has_the_reasoning_comment_and_no_sandbox_off_switch(self):
         source = (Path(__file__).resolve().parents[1] / "container_runtime.py").read_text()
         self.assertIn("CAP_SYS_ADMIN", source)
+        self.assertIn("CAP_SYS_CHROOT", source)
         self.assertIn("bounding", source)
         self.assertNotIn("no-sandbox", source.lower())
 

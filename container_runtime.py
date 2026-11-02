@@ -63,6 +63,7 @@ BROWSER_EXIT_XVFB_TIMEOUT = 70  # entrypoint exit code: Xvfb socket never appear
 BROWSER_EXIT_XVFB = 71         # entrypoint exit code: Xvfb died
 BROWSER_EXIT_CHROMIUM = 72     # entrypoint exit code: Chromium died
 BROWSER_EXIT_SOCAT = 73        # entrypoint exit code: socat relay died
+BROWSER_EXIT_NO_CHROOT = 77    # entrypoint exit code: chroot unavailable in a user namespace
 BROWSER_EXIT_NO_USERNS = 78    # entrypoint exit code: user namespaces unavailable
 BROWSER_EXIT_CAPS = 79         # entrypoint exit code: process has effective capabilities
 BROWSER_TAG = re.compile(r"qnapdl-browser:[0-9a-f]{12}\Z")
@@ -543,7 +544,15 @@ class Runtime:
         or file-capability binary able to raise them) they cannot be raised
         later. The process can therefore only create *unprivileged* user
         namespaces, which is exactly what Chromium's namespace sandbox uses.
-        Everything else stays dropped (ALL minus SYS_ADMIN), the default
+        WHY `--cap-add SYS_CHROOT` TOO: the namespace sandbox also chroots
+        (to /proc/self/fdinfo/) inside its own user namespace, and Docker's
+        default seccomp allows chroot only when the container's capability set
+        includes CAP_SYS_CHROOT. Without it Chromium dies with
+        `Check failed: sys_chroot("/proc/self/fdinfo/") == 0`. Like SYS_ADMIN
+        it lands in the bounding set only for uid 1000 + no-new-privileges;
+        the effective set stays empty (CapEff guard below). The entrypoint
+        selftest probes unshare + chroot (exit 77 if chroot is refused).
+        Everything else stays dropped (ALL minus SYS_ADMIN/SYS_CHROOT), the default
         seccomp profile stays on, and the root filesystem is read-only.
 
         entrypoint.sh enforces the assumption at runtime: it exits 79 if
@@ -561,6 +570,7 @@ class Runtime:
             "--pids-limit", BROWSER_PIDS,
             "--cap-drop", "ALL",
             "--cap-add", "SYS_ADMIN",
+            "--cap-add", "SYS_CHROOT",
             "--security-opt", "no-new-privileges",
             "--user", "%d:%d" % (BROWSER_UID, BROWSER_UID),
             "--tmpfs", "/profile:rw,nosuid,nodev,size=512m,uid=%d,gid=%d,mode=0700" %
@@ -594,6 +604,8 @@ class Runtime:
     def browser_selftest(self, tag):
         """Can Chromium's sandbox start here? Raises a clear error if not."""
         result = self._docker(self.browser_selftest_args(tag), 90)
+        if result.returncode == BROWSER_EXIT_NO_CHROOT:
+            raise ContainerError(NO_CHROOT_MESSAGE)
         if result.returncode == BROWSER_EXIT_NO_USERNS:
             raise ContainerError(NO_USERNS_MESSAGE)
         if result.returncode == BROWSER_EXIT_CAPS:
@@ -657,6 +669,9 @@ NO_USERNS_MESSAGE = (
     "このNASのカーネルまたはContainer Stationではユーザー名前空間が使えず、Chromiumのサンドボックスを"
     "有効にできません。安全のためサンドボックスを無効にする方法へは切り替えません。"
     "カーネル設定（ユーザー名前空間）またはContainer Stationのseccomp設定を確認してください")
+NO_CHROOT_MESSAGE = (
+    "サンドボックスに必要なchrootが許可されていません。Container StationのDocker設定（seccomp/capability）を"
+    "確認してください。安全のためサンドボックスを無効にする方法へは切り替えません")
 CAPS_MESSAGE = (
     "ブラウザのプロセスが実効的な権限(capability)を持っていたため、安全のため起動を中止しました"
     "（CapEffが0であることを起動時に確認しています）。Container Station/Dockerの権限の扱いを確認してください。"

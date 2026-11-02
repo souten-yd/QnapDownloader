@@ -52,6 +52,11 @@
 > - **原因対策（推定）**: `--tmpfs /profile:rw,nosuid,nodev,size=512m,uid=1000,gid=1000,mode=0700`（非rootのChromiumが書けるように所有者を指定）、`--tmpfs /tmp:rw,nosuid,nodev,size=256m,mode=1777`。Chromiumに `--disable-gpu --password-store=basic` を追加。`HOME=/tmp` と `/tmp/.config`・`/tmp/.cache` を起動前に作成。サンドボックスは無効にしない。
 > - **イメージ更新**: `entrypoint.sh` が変わるためタグ（内容ハッシュ）が変わる。新タグが無く、古いHub製イメージだけがある場合、`/api/rb/status` は `update_needed: true`、理由「NASブラウザの更新が必要です（初期設定を再実行）」を返し、タブを開こうとしても同文言で拒否する（存在しないタグでの `docker run` は行わない）。設定画面のボタンは「初期設定を再実行」になる。
 
+> **v0.1.20 実機修正メモ（SYS_CHROOT）**: 実機で Chromium が `Check failed: sys_chroot("/proc/self/fdinfo/") == 0` → "Zygote process exited prematurely" で終了した。名前空間サンドボックスは自前のユーザー名前空間内で chroot するが、Dockerの既定seccompは `chroot` を、コンテナのcapabilityセットに `CAP_SYS_CHROOT` が含まれる場合にだけ許可する。そこでブラウザの起動引数を `--cap-drop ALL --cap-add SYS_ADMIN --cap-add SYS_CHROOT` とした（JD2は変更なし、selftestも同じ引数）。
+>   - **許容できる理由**: SYS_ADMINと同様、uid 1000＋`no-new-privileges` ではSYS_CHROOTもbounding setにだけ入り、effective/permitted/ambientは空のまま（`entrypoint.sh` の `CapEff==0` 検査＝終了コード79は不変）。SYS_CHROOT単体の権限はユーザー名前空間内のchrootに限られ、ホストのルートを変更できない。
+>   - **selftest拡張**: `unshare --user --map-root-user --pid --fork --net chroot / /bin/true` でサンドボックスの必要条件を再現し、失敗なら終了コード77（「サンドボックスに必要なchrootが許可されていません」）。
+>   - エントリポイントが変わるためイメージタグが変わり、旧イメージでは「NASブラウザの更新が必要です（初期設定を再実行）」と表示される。
+
 > **v0.1.19 実機修正メモ**: 実機で `docker: ... failed to initialize logging driver: compression cannot be enabled when max file count is 1` となった。`local` ドライバは既定で圧縮が有効なため、ブラウザのログ引数に `--log-opt compress=false` を追加（`--log-driver local --log-opt max-size=256k --log-opt max-file=1 --log-opt compress=false`）。また `docker run -d` 自体が失敗して「created」状態のコンテナが残る場合に備え、`run_browser` は失敗時にHubラベルを確認したうえで `qnapdl-browser` を削除する（次回の名前衝突を防ぐ。Hub管理外の同名コンテナは削除しない）。UIの同一エラートーストは5秒以内の重複を1つにまとめる。
 
 （以下は元の設計）
