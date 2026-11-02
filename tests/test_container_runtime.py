@@ -122,6 +122,54 @@ class ImageNetworkTests(RuntimeBase):
             self.rt.network_ensure(cr.JD2_NET)
 
 
+class NotFoundTests(RuntimeBase):
+    def _res(self, rc, err="", out=""):
+        return SimpleNamespace(returncode=rc, stderr=err, stdout=out)
+
+    def test_not_found_variants(self):
+        for err in ("Error response from daemon: network qnapdl-jd2-net not found",
+                    "Error: No such container: x", "Error: No such image: y",
+                    "Error: No such object: z", "Error: image foo:1 not found",
+                    "NETWORK X NOT FOUND"):
+            with self.subTest(err=err):
+                self.assertTrue(cr._not_found(self._res(1, err)))
+                self.assertTrue(cr._not_found(self._res(1, "", err)))
+
+    def test_other_errors_are_not_not_found(self):
+        for err in ("permission denied", "Cannot connect to the Docker daemon at unix:///x",
+                    "notfound", "cannot find", ""):
+            with self.subTest(err=err):
+                self.assertFalse(cr._not_found(self._res(1, err)))
+        self.assertFalse(cr._not_found(self._res(0, "not found")))
+
+    def test_network_ensure_creates_on_container_station_message(self):
+        real = "Error response from daemon: network qnapdl-jd2-net not found"
+        runtime = self.rt
+        inner = runtime._docker
+
+        def patched(args, timeout=60):
+            if args[:2] == ["network", "inspect"] and cr.JD2_NET not in self.fake.networks:
+                return self._res(1, real)
+            return inner(args, timeout)
+        runtime._docker = patched
+        self.assertTrue(runtime.network_ensure(cr.JD2_NET))
+        self.assertIn(cr.JD2_NET, self.fake.networks)
+
+    def test_network_ensure_raises_on_permission_or_daemon_errors(self):
+        for err in ("permission denied", "Cannot connect to the Docker daemon"):
+            with self.subTest(err=err):
+                self.rt._docker = lambda a, t=60, e=err: self._res(1, e)
+                with self.assertRaises(cr.ContainerError):
+                    self.rt.network_ensure(cr.JD2_NET)
+
+    def test_container_inspect_not_found_vs_error(self):
+        self.rt._docker = lambda a, t=60: self._res(1, "Error: container qnapdl-jd2 not found")
+        self.assertIsNone(self.rt._inspect("qnapdl-jd2"))
+        self.rt._docker = lambda a, t=60: self._res(1, "permission denied")
+        with self.assertRaises(cr.ContainerError):
+            self.rt._inspect("qnapdl-jd2")
+
+
 class RunCommandTests(RuntimeBase):
     def test_exact_run_arguments(self):
         self.rt.run_jd2(str(self.jd2), str(self.dl), 1000, 1000)
