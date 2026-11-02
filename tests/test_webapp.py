@@ -23,6 +23,7 @@ import jd2_local
 import container_runtime
 import remote_browser
 import jd2_accounts
+import state_hub
 import webapp
 from fake_docker import FakeDocker
 from test_remote_browser import FakeWS
@@ -121,7 +122,7 @@ class HttpTests(unittest.TestCase):
         self.assertEqual(code, 200)
         self.csrf = body["csrf"]
 
-    RB_GET = ("/api/rb/status", "/api/rb/log", "/api/rb/frame?tab=b1&since=0", "/api/rb/links?tab=b1",
+    RB_GET = ("/api/rb/status", "/api/rb/log", "/api/rb/links?tab=b1",
               "/api/rb/frame.jpg?tab=b1&since=0&wait=0", "/api/rb/intercepts?tab=b1&since=0",
               "/api/rb/stream.mjpg?tab=b1")
     RB_POST = (("/api/rb/setup", {"confirmed": True}), ("/api/rb/stop", {"confirmed": True}),
@@ -172,23 +173,25 @@ class HttpTests(unittest.TestCase):
         self.login()
         code, tab = self.req("/api/rb/tabs", {"url": "https://example.com/a"})
         self.assertEqual((code, tab["id"]), (201, "b1"))
-        code, frame = self.req("/api/rb/frame?tab=b1&since=0&wait=0")
-        self.assertEqual(code, 200)
-        self.assertEqual(set(frame), {"seq", "jpeg_base64", "width", "height", "url", "title",
-                                      "loading", "blocked", "intercepts", "rev", "popups", "editable", "challenge",
-                                  "links_rev"})
-        self.assertIsNone(frame["jpeg_base64"])
+        code, headers, data = self.get_raw("/api/rb/frame.jpg?tab=b1&since=0&wait=0")
+        self.assertEqual(code, 204)                         # nothing newer yet: metadata headers only
+        for name in ("X-Frame-Seq", "X-Frame-Width", "X-Frame-Height", "X-Frame-Url", "X-Frame-Title",
+                     "X-Frame-Loading", "X-Frame-Intercepts", "X-Frame-Rev", "X-Frame-Blocked",
+                     "X-Frame-Popups", "X-Frame-Editable", "X-Frame-Challenge", "X-Frame-Links-Rev"):
+            self.assertIsNotNone(headers.get(name), name)
         self.rb_ws.emit("Page.screencastFrame", {"data": "QUJD", "sessionId": 1, "metadata": {
             "deviceWidth": 1280, "deviceHeight": 2000}}, "SESSION1")
         for _ in range(100):
-            code, frame = self.req("/api/rb/frame?tab=b1&since=0&wait=0")
-            if frame["jpeg_base64"]:
+            code, headers, data = self.get_raw("/api/rb/frame.jpg?tab=b1&since=0&wait=0")
+            if code == 200:
                 break
-        self.assertEqual(frame["jpeg_base64"], "QUJD")
+        self.assertEqual((code, data), (200, b"ABC"))
         # The web UI omits `wait`; the server default must be accepted (v0.1.20 NAS bug).
-        code, frame = self.req("/api/rb/frame?tab=b1&since=0")
-        self.assertEqual((code, frame["jpeg_base64"]), (200, "QUJD"))
-        self.assertEqual(self.req("/api/rb/frame?tab=b1&since=0&wait=11")[0], 400)
+        code, headers, data = self.get_raw("/api/rb/frame.jpg?tab=b1&since=0")
+        self.assertEqual((code, data), (200, b"ABC"))
+        self.assertEqual(self.get_raw("/api/rb/frame.jpg?tab=b1&since=0&wait=11")[0], 400)
+        # the JSON frame endpoint was removed in v0.1.33
+        self.assertEqual(self.req("/api/rb/frame?tab=b1&since=0&wait=0")[0], 404)
         self.assertEqual(self.req("/api/rb/input", {"tab": "b1", "type": "tap", "x": 5, "y": 6})[0], 200)
         for bad in ({"tab": "b1", "type": "eval"}, {"tab": "b1", "type": "tap", "x": -5, "y": 1},
                     {"tab": "b1", "type": "key", "key": "F5"}, {"tab": "../x", "type": "reload"}):
@@ -199,9 +202,9 @@ class HttpTests(unittest.TestCase):
         self.assertEqual(self.req("/api/rb/navigate", {"tab": "b1", "url": "http://x.example/"})[0], 400)
         self.assertEqual(self.req("/api/rb/navigate", {"tab": "b1", "url": "https://example.org/"})[0], 200)
         self.assertEqual(self.req("/api/rb/tabs/close", {"id": "b1"})[1], {"closed": True})
-        self.assertEqual(self.req("/api/rb/frame?tab=b1&since=0&wait=0")[0], 404)
+        self.assertEqual(self.get_raw("/api/rb/frame.jpg?tab=b1&since=0&wait=0")[0], 404)
         self.assertEqual(self.req("/api/rb/tabs/close", {"id": "b1"})[0], 404)
-        self.assertEqual(self.req("/api/rb/frame?tab=b1&since=abc")[0], 400)
+        self.assertEqual(self.get_raw("/api/rb/frame.jpg?tab=b1&since=abc")[0], 400)
         code, body = self.req("/api/rb/stop", {"confirmed": True})
         self.assertEqual(code, 200)
         self.assertNotIn("qnapdl-browser", self.rb_fake.containers)
@@ -355,8 +358,7 @@ class HttpTests(unittest.TestCase):
         self.assertEqual(self.get_raw("/api/rb/frame.jpg?tab=b1&since=0&wait=11")[0], 400)
         self.assertEqual(self.get_raw("/api/rb/frame.jpg?tab=b1&since=0&wait=0&rev=x")[0], 400)
         self.assertEqual(self.get_raw("/api/rb/frame.jpg?tab=b9&since=0&wait=0")[0], 404)
-        self.assertEqual(self.req("/api/rb/frame?tab=b1&since=0&wait=0")[1]["jpeg_base64"],
-                         base64.b64encode(jpeg).decode())
+        self.assertEqual(self.get_raw("/api/rb/frame.jpg?tab=b1&since=0&wait=0")[2], jpeg)
 
     def test_rb_intercepts_list_open_add_flow(self):
         self.login()
@@ -488,7 +490,7 @@ class HttpTests(unittest.TestCase):
                                          headers={"Host": "192.168.68.57:17864"})
         with self.client.open(request, timeout=4) as response:
             self.assertEqual(response.status, 200)
-            self.assertEqual(json.load(response)["version"], "0.1.32")
+            self.assertEqual(json.load(response)["version"], "0.1.33")
         with self.client.open(self.url + "/icon.svg", timeout=4) as response:
             self.assertEqual(response.status, 200)
             self.assertEqual(response.headers.get_content_type(), "image/svg+xml")
@@ -1259,7 +1261,7 @@ class HttpTests(unittest.TestCase):
     def test_accounts_in_version_and_static_files(self):
         with self.client.open(self.url + "/", timeout=4) as response:
             html = response.read().decode()
-        self.assertIn('data-section="accounts"', html)
+        self.assertIn('data-sub="accounts"', html)
         self.assertEqual(webapp.ACCOUNT_BODY_MAX, 4096)
 
     def test_delete_apis_require_auth_csrf_and_only_staged_links(self):
@@ -1292,9 +1294,8 @@ class HttpTests(unittest.TestCase):
         self.assertEqual(self.req("/api/bookmarks")[1]["items"], [])
         self.assertEqual(self.req("/api/bookmarks/delete", {"id": mark["id"]})[0], 400)
 
-    def test_low_io_and_local_jd2_preflight_are_login_protected(self):
+    def test_low_io_diagnostic_is_login_protected_and_preflight_is_gone(self):
         self.assertEqual(self.req("/api/diagnostics/io")[0], 401)
-        self.assertEqual(self.req("/api/jd2/local-preflight")[0], 401)
         self.login()
         status, data = self.req("/api/diagnostics/io")
         self.assertEqual(status, 200)
@@ -1302,14 +1303,91 @@ class HttpTests(unittest.TestCase):
         self.assertIn("events", data)
         self.assertTrue(data["local_only"])
         self.assertFalse(data["log_persistence"])
-        with patch.object(webapp.runtime_diagnostics, "local_jd2_preflight",
-                          return_value={"tcp_reachable": True,
-                                        "operations_enabled": False}) as probe:
-            status, result = self.req("/api/jd2/local-preflight")
-        self.assertEqual(status, 200)
-        self.assertTrue(result["tcp_reachable"])
-        self.assertFalse(result["operations_enabled"])
-        probe.assert_called_once_with()
+        self.assertEqual(self.req("/api/jd2/local-preflight")[0], 404)
+
+    # ---- v0.1.33: unified state, caches ------------------------------------------
+    def test_state_requires_login(self):
+        self.assertEqual(self.req("/api/state")[0], 401)
+
+    def test_state_shape_and_first_load_bundle(self):
+        self.login()
+        code, data = self.req("/api/state?full=1")
+        self.assertEqual(code, 200)
+        self.assertEqual(data["version"], webapp.VERSION)
+        for key in ("rev", "engine", "downloads", "rb", "settings_rev", "https", "tailnet", "settings", "bookmarks"):
+            self.assertIn(key, data)
+        for key in ("state", "mode", "running", "can_send", "preset_applied"):
+            self.assertIn(key, data["engine"])
+        self.assertFalse(data["engine"]["running"])
+        self.assertIsNone(data["downloads"])                      # engine not running
+        for key in ("state", "tabs", "mem"):
+            self.assertIn(key, data["rb"])
+        # no bundle unless asked for
+        self.assertNotIn("settings", self.req("/api/state")[1])
+        self.assertEqual(self.req("/api/state?rev=x")[0], 400)
+        self.assertEqual(self.req("/api/state?rev=1&wait=26")[0], 400)
+
+    def test_long_poll_returns_immediately_on_a_different_rev_and_waits_when_unchanged(self):
+        self.login()
+        rev = self.req("/api/state")[1]["rev"]
+        started = time.monotonic()
+        code, same = self.req("/api/state?rev=%d&wait=1" % rev)
+        self.assertEqual((code, same["rev"]), (200, rev))
+        self.assertGreaterEqual(time.monotonic() - started, 0.9)   # held until the wait ran out
+        started = time.monotonic()
+        self.assertEqual(self.req("/api/state?rev=%d&wait=3" % (rev + 99))[1]["rev"], rev)
+        self.assertLess(time.monotonic() - started, 1.0)
+
+    def test_rev_bumps_when_a_write_changes_the_state_and_wakes_the_poller(self):
+        self.login()
+        rev = self.req("/api/state")[1]["rev"]
+        result = {}
+
+        def poll():
+            result["data"] = self.req("/api/state?rev=%d&wait=3" % rev)[1]
+
+        t = threading.Thread(target=poll)
+        t.start()
+        time.sleep(0.3)
+        self.assertEqual(self.req("/api/bookmarks", {"title": "x", "url": "https://example.com/"})[0], 201)
+        t.join(5)
+        self.assertGreater(result["data"]["rev"], rev)
+        self.assertGreater(result["data"]["settings_rev"], 0)
+
+    def test_sources_are_cached_between_requests(self):
+        self.login()
+        engine = self.server.engine
+        real = engine.status
+        with patch.object(engine, "status", side_effect=real) as spy:
+            for _ in range(3):
+                self.req("/api/state")
+                self.req("/api/engine/status")
+        self.assertEqual(spy.call_count, 1)                       # engine status cache (2 s)
+        with patch.object(self.server.rb, "status", side_effect=self.server.rb.status) as rb_spy:
+            for _ in range(3):
+                self.req("/api/rb/status")
+                self.req("/api/state")
+        self.assertLessEqual(rb_spy.call_count, 1)
+
+    def test_a_write_drops_the_cached_reads(self):
+        self.login()
+        engine = self.server.engine
+        with patch.object(engine, "status", side_effect=engine.status) as spy:
+            self.req("/api/engine/status")
+            self.req("/api/bookmarks", {"title": "x", "url": "https://example.com/"})
+            self.req("/api/engine/status")
+        self.assertEqual(spy.call_count, 2)
+
+    def test_download_counts_follow_the_list_rows(self):
+        rows = {"packages": [{"running": True}, {"finished": True}, {}], "links": []}
+        self.assertEqual(state_hub.download_counts(rows), {"running": 1, "waiting": 1, "finished": 1})
+        self.assertEqual(state_hub.download_counts({"packages": [], "links": [{"running": True}]}),
+                         {"running": 1, "waiting": 0, "finished": 0})
+
+    def test_removed_endpoints(self):
+        self.login()
+        self.assertEqual(self.req("/api/jd2/local-preflight")[0], 404)
+        self.assertEqual(self.req("/api/rb/frame?tab=b1&since=0&wait=0")[0], 404)
 
     def test_update_apply_fails_closed_when_not_qpkg(self):
         self.login()
@@ -1317,7 +1395,7 @@ class HttpTests(unittest.TestCase):
         self.assertFalse(info["supported"])
         code, _ = self.req("/api/update/apply", {"version": "v0.1.8"})
         self.assertEqual(code, 400)
-        self.assertEqual(self.req("/api/health")[1]["version"], "0.1.32")
+        self.assertEqual(self.req("/api/health")[1]["version"], "0.1.33")
         self.assertFalse(self.req("/api/jd2/status")[1]["connected"])
         self.assertEqual(self.req("/api/jd2/update/apply", {"confirmed": True})[0], 400)
         self.assertEqual(self.req("/api/jd2/preset/apply", {"confirmed": True})[0], 400)

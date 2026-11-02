@@ -124,7 +124,7 @@
       <li id="obStorage" class="check-row">
        <span class="check-mark" aria-hidden="true"></span>
        <span class="check-body"><b>保存先を選ぶ</b><span id="obStorageText" class="muted"></span></span>
-       <a id="obStorageBtn" class="btn small primary" href="#/settings/storage">選ぶ</a>
+       <a id="obStorageBtn" class="btn small primary" href="#/settings/jd2/storage">選ぶ</a>
       </li>
       <li id="obEngine" class="check-row">
        <span class="check-mark" aria-hidden="true"></span>
@@ -134,7 +134,7 @@
       <li id="obAccounts" class="check-row" hidden>
        <span class="check-mark" aria-hidden="true"></span>
        <span class="check-body"><b>プレミアムアカウントを登録（任意）</b><span class="muted">Rapidgatorなどのプレミアムを使う場合に、JD2へ登録します</span></span>
-       <a class="btn small primary" href="#/settings/accounts">登録</a>
+       <a class="btn small primary" href="#/settings/jd2/accounts">登録</a>
       </li>
      </ol>
     </section>
@@ -200,7 +200,10 @@
 
   <section id="view-links" class="view" role="tabpanel" aria-label="リンク" hidden>
    <div class="page">
-    <h1>リンク</h1>
+    <div class="page-head">
+     <h1>リンク</h1>
+     <span class="head-tools"><button type="button" id="linksMore" class="icon-btn small" aria-label="リンクの操作" aria-haspopup="dialog" title="履歴の削除" hidden><svg class="icon" aria-hidden="true"><use href="#i-more"/></svg></button></span>
+    </div>
     <label for="pasteBox">リンクを貼り付け（URL・テキスト・HTML）</label>
     <textarea id="pasteBox" rows="3" maxlength="65536" placeholder="https://…" autocomplete="off" autocapitalize="off" spellcheck="false"></textarea>
     <div id="pasteResult" class="paste-result" role="status" aria-live="polite" hidden>
@@ -213,299 +216,319 @@
      <button type="button" id="sendAll" class="btn small" hidden>すべてJD2へ送る</button>
     </div>
     <div id="queueItems" class="items"></div>
-    <div class="history-clear">
-     <label class="rule-toggle option-row"><input type="checkbox" id="clearStaged"> 未送信のリンクも削除</label>
-     <button type="button" id="clearHistory" class="btn small">履歴を削除</button>
-    </div>
    </div>
   </section>
 
   <section id="view-settings" class="view" role="tabpanel" aria-label="設定" hidden>
    <div class="settings-layout">
     <nav class="settings-nav" aria-label="設定の項目">
-     <a href="#/settings/engine" data-section="engine">エンジン</a>
-     <a href="#/settings/accounts" data-section="accounts">アカウント</a>
-     <a href="#/settings/browser" data-section="browser">NASブラウザ</a>
-     <a href="#/settings/storage" data-section="storage">保存先</a>
-     <a href="#/settings/https" data-section="https">HTTPS接続</a>
-     <a href="#/settings/share" data-section="share">iPhoneから送る</a>
-     <a href="#/settings/bookmarks" data-section="bookmarks">ブックマーク</a>
-     <a href="#/settings/updates" data-section="updates">更新</a>
-     <a href="#/settings/diagnostics" data-section="diagnostics">診断</a>
-     <a href="#/settings/about" data-section="about">このアプリについて</a>
+     <a href="#/settings/jd2" data-section="jd2">JD2</a>
+     <a href="#/settings/browser" data-section="browser">ブラウザ</a>
+     <a href="#/settings/connection" data-section="connection">接続</a>
+     <a href="#/settings/system" data-section="system">システム</a>
     </nav>
     <div class="settings-body">
-     <section class="settings-section" data-section="engine" hidden>
-      <h1>JD2エンジン</h1>
-      <div class="engine-head">
-       <p id="engineState" class="engine-state" role="status" aria-live="polite">確認しています…</p>
-       <div class="engine-actions">
-        <button type="button" id="engineSetup" class="btn primary" hidden>初期設定を開始</button>
-        <button type="button" id="engineStart" class="btn primary" hidden>起動</button>
-        <button type="button" id="engineStop" class="btn quiet" hidden>停止</button>
-       </div>
-      </div>
-      <p id="engineMode" class="muted"></p>
-      <button type="button" id="engineMigrate" class="btn small" hidden>コンテナへ移行</button>
-      <p id="engineNoContainer" class="engine-error" hidden>QTSのApp CenterでContainer Stationをインストールしてください（JD2を隔離して動かすために使います。入れない場合は「詳細」からQTS直接実行も選べます）</p>
-      <p id="engineProgressText" class="muted" hidden></p>
-      <progress id="engineProgress" max="100" class="wide-progress" hidden></progress>
-      <p id="engineError" class="engine-error" hidden></p>
-      <p id="engineTestResult" class="muted" role="status" aria-live="polite"></p>
-      <label class="switch" id="engineAutostartRow" for="engineAutostart" hidden>
-       <input type="checkbox" id="engineAutostart" role="switch">
-       <span class="switch-track" aria-hidden="true"></span>
-       <span>Hub起動時にエンジンも起動</span>
-      </label>
-      <div id="engineJd2" class="engine-row" hidden>
-       <span id="jd2Status" class="muted"></span>
-       <button type="button" id="jd2Check" class="btn small">JD2の更新を確認</button>
-       <button type="button" id="jd2Update" class="btn small" hidden>JD2を更新</button>
-       <button type="button" id="jd2Preset" class="btn small">推奨設定を再適用</button>
-      </div>
-      <details id="engineStepsBox" class="fold" hidden>
-       <summary id="engineStepsSummary">初期設定の進行状況</summary>
-       <ol id="engineSteps" class="engine-steps"></ol>
-      </details>
-      <details id="engineDetails" class="fold">
-       <summary>詳細</summary>
-       <div id="engineComponents" class="items"></div>
-       <p id="engineMeta" class="muted"></p>
-       <p class="muted">JD2とJavaはQPKGに同梱されません。公式の固定URLから取得し、SHA-256で検証して永続データ領域に置きます。コンテナ方式ではJavaはダイジェスト固定の公式イメージに含まれます。</p>
-       <div id="engineNativeRow" class="engine-row" hidden>
-        <button type="button" id="engineNativeRemove" class="btn small">従来方式のJavaを削除</button>
-       </div>
-       <button type="button" id="engineSetupNative" class="btn small" hidden>QTS直接実行で初期設定（非推奨・Container Stationなし用）</button>
-       <button type="button" id="engineResetup" class="btn small" hidden>初期設定をやり直す</button>
-       <div id="engineKeysRow" hidden>
-        <button type="button" id="engineKeys" class="btn small">推奨設定の項目を調べる</button>
-        <button type="button" id="engineKeysCopy" class="btn small" hidden>コピー</button>
-        <pre id="engineKeysOut" class="update-log" hidden></pre>
-       </div>
-      </details>
-      <details id="engineLogBox" class="fold">
-       <summary>ログ</summary>
-       <pre id="engineLog" class="update-log">開くと表示します</pre>
-      </details>
-     </section>
-
-     <section class="settings-section" data-section="accounts" hidden>
-      <h1>アカウント</h1>
-      <p class="muted">Rapidgatorなどのプレミアムアカウントを、Hub管理のJD2エンジンに登録して管理します。パスワードはHubには保存せず、JD2のアカウント管理にだけ渡します。ユーザー名は一部を伏せて表示します。</p>
-      <p id="accountsState" class="muted" role="status" aria-live="polite"></p>
-      <div class="engine-row">
-       <button type="button" id="accountsReload" class="btn small">再読み込み</button>
-      </div>
-      <div id="accountsList" class="items"></div>
-      <div id="accountEdit" class="card account-edit" hidden>
-       <h2 id="accountEditTitle">認証情報を更新</h2>
-       <form id="accountEditForm" class="account-form" autocomplete="off">
-        <input id="accountEditUser" maxlength="200" placeholder="ユーザー名またはメールアドレス" aria-label="新しいユーザー名" autocomplete="off" autocapitalize="off" spellcheck="false">
-        <input id="accountEditPass" type="password" maxlength="500" placeholder="パスワード" aria-label="新しいパスワード" autocomplete="new-password">
-        <div class="engine-row">
-         <button type="submit" id="accountEditSave" class="btn primary">更新して再確認</button>
-         <button type="button" id="accountEditCancel" class="btn">キャンセル</button>
+     <section class="settings-section" data-section="jd2" hidden>
+      <h1>JD2</h1>
+      <div class="sub" data-sub="engine">
+       <h2>エンジン</h2>
+       <div class="engine-head">
+        <p id="engineState" class="engine-state" role="status" aria-live="polite">確認しています…</p>
+        <div class="engine-actions">
+         <button type="button" id="engineSetup" class="btn primary" hidden>初期設定を開始</button>
+         <button type="button" id="engineStart" class="btn primary" hidden>起動</button>
+         <button type="button" id="engineStop" class="btn quiet" hidden>停止</button>
         </div>
+       </div>
+       <p id="engineMode" class="set-text muted"></p>
+       <button type="button" id="engineMigrate" class="btn small" hidden>コンテナへ移行</button>
+       <p id="engineNoContainer" class="engine-error" hidden>QTSのApp CenterでContainer Stationをインストールしてください（JD2を隔離して動かすために使います。入れない場合は「詳細」からQTS直接実行も選べます）</p>
+       <p id="engineProgressText" class="muted" hidden></p>
+       <progress id="engineProgress" max="100" class="wide-progress" hidden></progress>
+       <p id="engineError" class="engine-error" hidden></p>
+       <p id="engineTestResult" class="set-text muted" role="status" aria-live="polite"></p>
+       <div class="set-row" id="engineAutostartRow" hidden>
+        <div class="set-main"><span class="set-label">Hub起動時にエンジンも起動</span></div>
+        <label class="switch" for="engineAutostart"><input type="checkbox" id="engineAutostart" role="switch" aria-label="Hub起動時にエンジンも起動"><span class="switch-track" aria-hidden="true"></span></label>
+       </div>
+       <div id="engineJd2" class="engine-row" hidden>
+        <span id="jd2Status" class="set-text muted"></span>
+        <button type="button" id="jd2Check" class="btn small">JD2の更新を確認</button>
+        <button type="button" id="jd2Update" class="btn small" hidden>JD2を更新</button>
+        <button type="button" id="jd2Preset" class="btn small">推奨設定を再適用</button>
+       </div>
+       <details id="engineStepsBox" class="fold" hidden>
+        <summary id="engineStepsSummary">初期設定の進行状況</summary>
+        <ol id="engineSteps" class="engine-steps"></ol>
+       </details>
+       <details id="engineDetails" class="fold">
+        <summary>詳細</summary>
+        <div id="engineComponents" class="items"></div>
+        <p id="engineMeta" class="muted"></p>
+        <p class="muted">JD2とJavaはQPKGに同梱されません。公式の固定URLから取得し、SHA-256で検証して永続データ領域に置きます。</p>
+        <div id="engineNativeRow" class="engine-row" hidden>
+         <button type="button" id="engineNativeRemove" class="btn small">従来方式のJavaを削除</button>
+        </div>
+        <button type="button" id="engineSetupNative" class="btn small" hidden>QTS直接実行で初期設定（非推奨・Container Stationなし用）</button>
+        <button type="button" id="engineResetup" class="btn small" hidden>初期設定をやり直す</button>
+        <div id="engineKeysRow" hidden>
+         <button type="button" id="engineKeys" class="btn small">推奨設定の項目を調べる</button>
+         <button type="button" id="engineKeysCopy" class="btn small" hidden>コピー</button>
+         <pre id="engineKeysOut" class="update-log" hidden></pre>
+        </div>
+       </details>
+       <details id="engineLogBox" class="fold">
+        <summary>ログ</summary>
+        <pre id="engineLog" class="update-log">開くと表示します</pre>
+       </details>
+      </div>
+
+      <div class="sub" data-sub="accounts">
+       <h2>アカウント</h2>
+       <div class="set-desc"><span class="set-text">プレミアムアカウントをJD2に登録します</span>
+        <details class="hint"><summary aria-label="詳しい説明">ⓘ</summary><p>パスワードはHubには保存せず、JD2のアカウント管理にだけ渡します。ユーザー名は一部を伏せて表示します。追加するとJD2が各サイトへログインして状態を確認します。頻繁な再確認はサイト側の制限につながることがあります。削除してもダウンロード済みのファイルやキューには触れません。</p></details></div>
+       <p id="accountsState" class="set-text muted" role="status" aria-live="polite"></p>
+       <div class="engine-row">
+        <button type="button" id="accountsReload" class="btn small">再読み込み</button>
+       </div>
+       <div id="accountsList" class="items"></div>
+       <div id="accountEdit" class="card account-edit" hidden>
+        <h3 id="accountEditTitle">認証情報を更新</h3>
+        <form id="accountEditForm" class="account-form" autocomplete="off">
+         <input id="accountEditUser" maxlength="200" placeholder="ユーザー名またはメールアドレス" aria-label="新しいユーザー名" autocomplete="off" autocapitalize="off" spellcheck="false">
+         <input id="accountEditPass" type="password" maxlength="500" placeholder="パスワード" aria-label="新しいパスワード" autocomplete="new-password">
+         <div class="engine-row">
+          <button type="submit" id="accountEditSave" class="btn primary">更新して再確認</button>
+          <button type="button" id="accountEditCancel" class="btn">キャンセル</button>
+         </div>
+        </form>
+       </div>
+       <div id="accountsSecure" class="notice lan-warning" role="note" hidden>
+        <span id="accountsSecureText">パスワードはHTTPSまたはTailscale経由でのみ送信できます。</span>
+        <a href="#/settings/connection/https">HTTPS接続の設定へ</a>
+       </div>
+       <form id="accountForm" class="account-form" autocomplete="off">
+        <input id="accountHost" list="accountHostList" maxlength="100" placeholder="ホスト（例: rapidgator.net）" aria-label="ホスト" autocomplete="off" autocapitalize="off" spellcheck="false">
+        <datalist id="accountHostList"></datalist>
+        <input id="accountUser" maxlength="200" placeholder="ユーザー名またはメールアドレス" aria-label="ユーザー名" autocomplete="off" autocapitalize="off" spellcheck="false">
+        <input id="accountPass" type="password" maxlength="500" placeholder="パスワード" aria-label="パスワード" autocomplete="new-password">
+        <button type="submit" id="accountAdd" class="btn primary">追加</button>
        </form>
+       <p id="accountResult" class="set-text muted" role="status" aria-live="polite"></p>
+       <details id="accountSchemaBox" class="fold">
+        <summary>詳細</summary>
+        <p class="muted">一覧に出ないアカウントがある場合は、この結果を開発者に送ってください</p>
+        <button type="button" id="accountSchema" class="btn small quiet">アカウント情報の項目を調べる</button>
+        <button type="button" id="accountSchemaCopy" class="btn small" hidden>コピー</button>
+        <pre id="accountSchemaOut" class="update-log" hidden></pre>
+       </details>
       </div>
-      <h2>アカウントを追加</h2>
-      <div id="accountsSecure" class="notice lan-warning" role="note" hidden>
-       <span id="accountsSecureText">パスワードはHTTPSまたはTailscale経由でのみ送信できます。</span>
-       <a href="#/settings/https">HTTPS接続の設定へ</a>
+
+      <div class="sub" data-sub="storage">
+       <h2>保存先</h2>
+       <div class="set-row">
+        <div class="set-main"><span class="set-label">現在の保存先</span><span id="selectedFolder" class="set-text path-big">未選択</span></div>
+        <button type="button" id="folderChange" class="btn">変更</button>
+       </div>
+       <p class="set-text muted">フォルダ作成・自動解凍・自動削除はOFF</p>
       </div>
-      <form id="accountForm" class="account-form" autocomplete="off">
-       <input id="accountHost" list="accountHostList" maxlength="100" placeholder="ホスト（例: rapidgator.net）" aria-label="ホスト" autocomplete="off" autocapitalize="off" spellcheck="false">
-       <datalist id="accountHostList"></datalist>
-       <input id="accountUser" maxlength="200" placeholder="ユーザー名またはメールアドレス" aria-label="ユーザー名" autocomplete="off" autocapitalize="off" spellcheck="false">
-       <input id="accountPass" type="password" maxlength="500" placeholder="パスワード" aria-label="パスワード" autocomplete="new-password">
-       <button type="submit" id="accountAdd" class="btn primary">追加</button>
-      </form>
-      <p id="accountResult" class="muted" role="status" aria-live="polite"></p>
-      <details id="accountSchemaBox" class="fold">
-       <summary>詳細</summary>
-       <p class="muted">一覧に出ないアカウントがある場合は、この結果を開発者に送ってください</p>
-       <button type="button" id="accountSchema" class="btn small quiet">アカウント情報の項目を調べる</button>
-       <button type="button" id="accountSchemaCopy" class="btn small" hidden>コピー</button>
-       <pre id="accountSchemaOut" class="update-log" hidden></pre>
-      </details>
-      <p class="muted">追加すると、JD2が各サイトへログインして状態（有効期限・残り容量）を確認します。頻繁な再確認はサイト側の制限につながることがあります。削除してもダウンロード済みのファイルやキューには触れません。</p>
+
+      <div class="sub" data-sub="send">
+       <h2>送信の動作</h2>
+       <div class="set-row">
+        <div class="set-main"><span class="set-label">JD2へ送ったらすぐダウンロード開始</span>
+         <span class="set-desc"><span class="set-text">待機（LinkGrabber）に残さず開始します</span>
+          <details class="hint"><summary aria-label="詳しい説明">ⓘ</summary><p>ONのとき、Hubから送ったリンクはJD2の待機に残らず、すぐダウンロードが始まります。JD2自体の自動確定・自動開始の設定は変更しません。</p></details></span></div>
+        <label class="switch" for="sendAutostart"><input type="checkbox" id="sendAutostart" role="switch" aria-label="JD2へ送ったらすぐダウンロード開始"><span class="switch-track" aria-hidden="true"></span></label>
+       </div>
+       <div class="set-row">
+        <div class="set-main"><span class="set-label">長押しで見つかったリンクを自動でJD2へ送る</span>
+         <span class="set-desc"><span class="set-text">NASブラウザの長押しで見つかったリンクを送ります</span>
+          <details class="hint"><summary aria-label="詳しい説明"> ⓘ</summary><p>ONのとき、長押しでRapidgatorのリンクが見つかると確認なしでJD2へ送ります（送信済みのリンクは除外）。JD2へ送れない状態や送信に失敗したときは、従来どおりシートを開きます。</p></details></span></div>
+        <label class="switch" for="probeAutosend"><input type="checkbox" id="probeAutosend" role="switch" aria-label="長押しで見つかったリンクを自動でJD2へ送る"><span class="switch-track" aria-hidden="true"></span></label>
+       </div>
+      </div>
      </section>
 
      <section class="settings-section" data-section="browser" hidden>
-      <h1>NASブラウザ</h1>
-      <p class="muted">Cloudflareなどで手元のブラウザでは開けないサイトを、NAS上のコンテナ内ブラウザ（Chromium）で開き、画面だけを受け取って操作します。外部サイトの通信やスクリプトは端末に届きません。ファイルのダウンロードは無効です。</p>
-      <div class="engine-head">
-       <p id="rbState" class="engine-state" role="status" aria-live="polite">確認しています…</p>
-       <div class="engine-actions">
-        <button type="button" id="rbSetup" class="btn primary" hidden>初期設定（イメージ作成）</button>
-        <button type="button" id="rbStop" class="btn quiet" hidden>停止</button>
+      <h1>ブラウザ</h1>
+      <div class="sub" data-sub="nas">
+       <h2>NASブラウザ</h2>
+       <div class="set-desc"><span class="set-text">表示できないサイトをNAS上のChromiumで開きます</span>
+        <details class="hint"><summary aria-label="詳しい説明">ⓘ</summary><p>Cloudflareなどで手元のブラウザでは開けないサイトを、NAS上のコンテナ内ブラウザで開き、画面だけを受け取って操作します。外部サイトの通信やスクリプトは端末に届きません。ファイルのダウンロードは無効です。空きメモリが2GiB未満、またはブラウザが上限(2GiB)の80%に達しているときはタブを開きません。同時に開けるのは3枚までです。タブが0枚のまま5分、または10分間操作がないと、コンテナごと停止してメモリを解放します。</p></details></div>
+       <div class="engine-head">
+        <p id="rbState" class="engine-state" role="status" aria-live="polite">確認しています…</p>
+        <div class="engine-actions">
+         <button type="button" id="rbSetup" class="btn primary" hidden>初期設定（イメージ作成）</button>
+         <button type="button" id="rbStop" class="btn quiet" hidden>停止</button>
+        </div>
+       </div>
+       <p id="rbMemory" class="set-text muted"></p>
+       <p id="rbNoContainer" class="engine-error" hidden>QTSのApp CenterでContainer Stationをインストールしてください（NASブラウザはコンテナ内でのみ動かします）</p>
+       <p id="rbReason" class="set-text muted" hidden></p>
+       <p id="rbError" class="engine-error" hidden></p>
+       <details id="rbLogBox" class="fold">
+        <summary>ログ</summary>
+        <pre id="rbLog" class="update-log">開くと表示します</pre>
+       </details>
+       <details id="rbStepsBox" class="fold" hidden>
+        <summary id="rbStepsSummary">初期設定の進行状況</summary>
+        <ol id="rbSteps" class="engine-steps"></ol>
+       </details>
+       <div class="set-row">
+        <div class="set-main"><span class="set-label">既定の表示方法</span>
+         <span class="set-desc"><span class="set-text">リーダー・高速・ライブから選びます</span>
+          <details class="hint"><summary aria-label="詳しい説明">ⓘ</summary><p>リーダーは本文・見出し・画像・リンクだけをNASで取り出して端末で組み立て直す表示、高速はページ全体を画像のタイルにして端末側でスクロール、ライブは画面をそのまま中継します。サイトごとに「⋯」メニューの「表示」で選んだ内容が優先されます。Cloudflareの確認画面は自動でライブ表示になります。</p></details></span></div>
+        <select id="rbDefaultMode" name="rbDefaultMode" class="inline-select" aria-label="既定の表示方法">
+         <option value="reader">リーダー</option>
+         <option value="fast" selected>高速（全体表示）</option>
+         <option value="live">ライブ</option>
+        </select>
+       </div>
+       <div class="set-row">
+        <div class="set-main"><span class="set-label">リンクの枠を表示</span>
+         <span class="set-desc"><span class="set-text">認識範囲に薄い枠線を重ねます（確認用）</span>
+          <details class="hint"><summary aria-label="詳しい説明">ⓘ</summary><p>高速・ライブ表示で、リンクと認識されている範囲に薄い枠線を重ねます。タップや長押しには影響しません。長押しが外れるときの確認用です。</p></details></span></div>
+        <label class="switch" for="rbLinkBoxes"><input type="checkbox" id="rbLinkBoxes" role="switch" aria-label="リンクの枠を表示"><span class="switch-track" aria-hidden="true"></span></label>
+       </div>
+       <div class="set-row">
+        <div class="set-main"><span class="set-label">広告をブロック</span>
+         <span class="set-desc"><span class="set-text">既知の広告・トラッカーへの通信を止めます</span>
+          <details class="hint"><summary aria-label="詳しい説明">ⓘ</summary><p>既知の広告・トラッカー・ポップアンダー配信元（Hub内の固定リスト）への通信をChromiumで止め、表示を軽くします。Rapidgatorなどのホスターは止めません。サイトごとに下の一覧でOFFにできます。</p></details></span></div>
+        <label class="switch" for="blockAds"><input type="checkbox" id="blockAds" role="switch" aria-label="広告をブロック"><span class="switch-track" aria-hidden="true"></span></label>
        </div>
       </div>
-      <p id="rbMemory" class="muted"></p>
-      <p id="rbNoContainer" class="engine-error" hidden>QTSのApp CenterでContainer Stationをインストールしてください（NASブラウザはコンテナ内でのみ動かします）</p>
-      <p id="rbReason" class="muted" hidden></p>
-      <p id="rbError" class="engine-error" hidden></p>
-      <details id="rbLogBox" class="fold">
-       <summary>ログ</summary>
-       <pre id="rbLog" class="update-log">開くと表示します</pre>
-      </details>
-      <details id="rbStepsBox" class="fold" hidden>
-       <summary id="rbStepsSummary">初期設定の進行状況</summary>
-       <ol id="rbSteps" class="engine-steps"></ol>
-      </details>
-      <p class="muted">メモリの保護: 空きメモリが2GiB未満、またはブラウザが上限(2GiB)の80%に達しているときはタブを開きません（他のアプリは止めません）。同時に開けるのは3枚までです。</p>
-      <p class="muted">自動停止: タブが0枚のまま5分、または10分間操作がないと、コンテナごと停止してメモリを解放します（次回は数秒で再起動）。Webタブを閉じると、対応するNASブラウザのタブも閉じます。</p>
-      <fieldset class="option-group">
-       <legend>既定の表示方法</legend>
-       <label class="rule-toggle"><input type="radio" name="rbDefaultMode" value="reader"> リーダー</label>
-       <label class="rule-toggle"><input type="radio" name="rbDefaultMode" value="fast" checked> 高速（全体表示）</label>
-       <label class="rule-toggle"><input type="radio" name="rbDefaultMode" value="live"> ライブ</label>
-      </fieldset>
-      <p class="muted">NASブラウザのタブを開いたときの表示です。リーダーはページの本文・見出し・画像・リンクだけをNASで取り出して、この端末で組み立て直す読みやすい表示（外部サイトのHTMLやスクリプトは届きません）。高速はページ全体を画像のタイルにして端末側でスクロール、ライブは画面をそのまま中継します。サイトごとに「⋯」メニューの「表示」で選んだ内容が優先されます。Cloudflareの確認画面は自動でライブ表示になり、終わると元の表示に戻ります。</p>
-      <label class="rule-toggle option-row"><input type="checkbox" id="rbLinkBoxes"> リンクの枠を表示</label>
-      <p class="muted">高速・ライブ表示で、リンクと認識されている範囲に薄い枠線を重ねます（タップや長押しには影響しません）。長押しが外れるときの確認用です。</p>
-      <label class="rule-toggle option-row"><input type="checkbox" id="probeAutosend" checked> 長押しで見つかったリンクを自動でJD2へ送る</label>
-      <p class="muted">ONのとき、長押しでRapidgatorのリンクが見つかると確認なしでJD2へ送ります（送信済みのリンクは除外）。JD2へ送れない状態や送信に失敗したときは、従来どおりシートを開きます。</p>
-      <label class="rule-toggle option-row"><input type="checkbox" id="blockAds" checked> 広告をブロック</label>
-      <p class="muted">既知の広告・トラッカー・ポップアンダー配信元（Hub内の固定リスト）への通信をChromiumで止め、表示を軽くします。Rapidgatorなどのホスターは止めません。サイトごとに下の一覧でOFFにできます。</p>
-      <h2 class="sub-h">サイトごとの設定</h2>
-      <p class="muted">NASブラウザのタブで開いているページのホストごとの設定です（最大200件）。</p>
-      <div id="siteRules" class="items"></div>
-      <h2 class="sub-h">NASブラウザで開くサイト</h2>
-      <div id="remoteHosts" class="items"></div>
+
+      <div class="sub" data-sub="rules">
+       <h2>サイト別ルール</h2>
+       <p class="set-text muted">NASブラウザで開いたページのホストごとの設定（最大200件）</p>
+       <div id="siteRules" class="items"></div>
+       <h3 class="sub-h">NASブラウザで開くサイト</h3>
+       <div id="remoteHosts" class="items"></div>
+      </div>
+
+      <div class="sub" data-sub="bookmarks">
+       <h2>ブックマーク</h2>
+       <form id="bookmarkForm" class="inline-form">
+        <input id="bookmarkName" maxlength="200" placeholder="名前" aria-label="名前">
+        <input id="bookmarkUrl" type="url" placeholder="https://example.com" aria-label="URL">
+        <button type="submit" id="bookmarkAdd" class="btn primary">追加</button>
+       </form>
+       <div id="bookmarkItems" class="items"></div>
+      </div>
      </section>
 
-     <section class="settings-section" data-section="storage" hidden>
-      <h1>保存先</h1>
-      <div class="card folder-card">
-       <span class="muted">現在の保存先</span>
-       <p id="selectedFolder" class="path-big">未選択</p>
-       <button type="button" id="folderChange" class="btn">変更</button>
+     <section class="settings-section" data-section="connection" hidden>
+      <h1>接続</h1>
+      <div class="sub" data-sub="https">
+       <h2>HTTPS（Tailscale）</h2>
+       <div class="card">
+        <p id="httpsState" class="engine-state" role="status" aria-live="polite">確認しています…</p>
+        <p id="httpsDetail" class="set-text muted"></p>
+       </div>
+       <p id="cfHttps" class="set-text muted">HTTPSで開くと通過しやすくなります（Cloudflare確認）</p>
+       <details class="fold">
+        <summary>Tailscale ServeでHTTPSにする手順</summary>
+        <p class="muted">Hubは新しい待ち受けを増やさず、Tailscale ServeがHTTPS（ts.netの証明書）をNASの中で終端して、Hubへ転送します。Cloudflare確認は、HTTPS＋互換モード＋サイトが埋め込みを許可している場合に通過できる見込みです。iPhoneでは失敗することがあり、その場合は「iPhoneから送る」の共有メニュー方式を使ってください。</p>
+        <ol class="guide">
+         <li>Tailscale管理画面で MagicDNS と HTTPS証明書 を有効にします。</li>
+         <li>NASにSSHで入り、次のコマンドを実行します。
+          <div class="copy-row"><code id="httpsCmd" class="code-box">tailscale serve --bg --https=443 http://127.0.0.1:17864</code><button type="button" id="httpsCmdCopy" class="btn small">コピー</button></div>
+          <span class="muted">QNAPのTailscaleアプリではコマンドの場所が異なることがあります。<code>which tailscale</code> で探すか、App Centerのインストール先（<code>/share/CACHEDEV1_DATA/.qpkg/Tailscale/</code> など）を確認してください。</span>
+         </li>
+         <li><code>https://&lt;NAS名&gt;.&lt;tailnet名&gt;.ts.net/</code> を開き、ホーム画面に追加し直します。</li>
+        </ol>
+       </details>
       </div>
-      <div id="folderPickerBox" class="folder-box" hidden>
-       <div id="folderPicker"></div>
-       <button type="button" id="folderCancel" class="btn small">閉じる</button>
+
+      <div class="sub" data-sub="share">
+       <h2>iPhoneから送る</h2>
+       <div class="set-desc"><span class="set-text">共有メニューからリンクを「追加したリンク」へ送ります</span>
+        <details class="hint"><summary aria-label="詳しい説明">ⓘ</summary><p>iPhoneの共有メニュー（ショートカット）からリンクを「追加したリンク」に送ります。JD2への送信やダウンロード開始は行いません。エンドポイントはiPhoneから届く必要があります（Tailscale接続）。トークンを平文で送らないようHTTPSを推奨します。</p></details></div>
+       <div id="shareHttpWarning" class="notice lan-warning" role="note" hidden>この画面はHTTPで開かれています。トークンが暗号化されずに送られるため、HTTPS（「HTTPS」参照）またはTailscale経由での利用をおすすめします。</div>
+       <div id="shareDevices" class="items"></div>
+       <form id="shareForm" class="inline-form">
+        <input id="shareName" maxlength="40" placeholder="端末名（例: iPhone）" aria-label="端末名" autocomplete="off">
+        <button type="submit" id="shareAdd" class="btn primary">端末を追加</button>
+       </form>
+       <div id="shareNew" class="card share-new" role="status" hidden>
+        <p><b>トークン</b>（この画面を離れると二度と表示されません。今すぐショートカットに貼り付けてください）</p>
+        <div class="copy-row"><code id="shareToken" class="code-box"></code><button type="button" id="shareTokenCopy" class="btn small">コピー</button></div>
+       </div>
+       <details class="fold">
+        <summary>ショートカットの作り方・エンドポイント</summary>
+        <h3 class="sub-h">エンドポイント</h3>
+        <div class="copy-row"><code id="shareEndpoint" class="code-box"></code><button type="button" id="shareEndpointCopy" class="btn small">コピー</button></div>
+        <ol class="guide">
+         <li>ショートカットApp → 新規 → 詳細で「共有シートに表示」をONにし、入力を「URL・テキスト・Safari Webページ」にします。</li>
+         <li>アクション「WebページでJavaScriptを実行」を追加し、次のコードを貼り付けます（Safariから共有したときだけ動きます。テキストを共有する場合はこのアクションを省きます）。
+          <div class="copy-row"><code id="shareJs" class="code-box"></code><button type="button" id="shareJsCopy" class="btn small">コピー</button></div>
+         </li>
+         <li>アクション「URLの内容を取得」を追加し、URLに上のエンドポイント、方法を POST、ヘッダに <code>Authorization</code> = <code>Bearer &lt;トークン&gt;</code> と <code>Content-Type</code> = <code>application/json</code>、本文はJSONで <code>text</code> = 前のアクションの結果 にします。</li>
+         <li>アクション「通知を表示」を追加し、結果を表示します。</li>
+        </ol>
+        <h3 class="sub-h">ブックマークレット（任意）</h3>
+        <p class="muted">Safariのブックマークとして登録すると、開いているページのURLを「リンク」の貼り付け欄に入れます（自動では保存しません）。</p>
+        <div class="copy-row"><code id="shareBookmarklet" class="code-box"></code><button type="button" id="shareBookmarkletCopy" class="btn small">コピー</button></div>
+       </details>
       </div>
-      <label class="rule-toggle option-row"><input type="checkbox" id="sendAutostart"> JD2へ送ったらすぐダウンロード開始</label>
-      <p class="muted">ONのとき、Hubから送ったリンクはJD2の待機（LinkGrabber）に残らず、すぐダウンロードが始まります。JD2自体の自動確定・自動開始の設定は変更しません。</p>
-      <p class="muted">フォルダ作成・自動解凍・自動削除はOFF</p>
      </section>
 
-     <section class="settings-section" data-section="https" hidden>
-      <h1>HTTPS接続</h1>
-      <div class="card">
-       <p id="httpsState" class="engine-state" role="status" aria-live="polite">確認しています…</p>
-       <p id="httpsDetail" class="muted"></p>
+     <section class="settings-section" data-section="system" hidden>
+      <h1>システム</h1>
+      <div class="sub" data-sub="updates">
+       <h2>更新</h2>
+       <div class="update-line">
+        <span>現在 <b class="js-version-bare"></b></span>
+        <button type="button" id="updateCheck" class="btn small primary">最新を確認</button>
+        <select id="updateChannel" class="inline-select" aria-label="更新チャンネル">
+         <option value="rc" selected>RC版を含む</option>
+         <option value="stable">正式版のみ</option>
+        </select>
+       </div>
+       <div class="update-line">
+        <span id="updateResult"></span>
+        <button type="button" id="updateApply" class="btn small primary" hidden>更新</button>
+       </div>
+       <p id="updateStatus" class="set-text muted"></p>
+       <details class="fold" id="updateLogBox">
+        <summary>更新ログ</summary>
+        <pre id="updateLog" class="update-log">開くと表示します</pre>
+       </details>
+       <p class="set-text muted">QPKGとして導入した環境のみ更新できます（JD2本体はJD2の「エンジン」）</p>
       </div>
-      <h2>Tailscale ServeでHTTPSにする</h2>
-      <p class="muted">Hubは新しい待ち受けを増やさず、Tailscale ServeがHTTPS（ts.netの証明書）をNASの中で終端して、Hubへ転送します。</p>
-      <ol class="guide">
-       <li>Tailscale管理画面で MagicDNS と HTTPS証明書 を有効にします。</li>
-       <li>NASにSSHで入り、次のコマンドを実行します。
-        <div class="copy-row"><code id="httpsCmd" class="code-box">tailscale serve --bg --https=443 http://127.0.0.1:17864</code><button type="button" id="httpsCmdCopy" class="btn small">コピー</button></div>
-        <span class="muted">QNAPのTailscaleアプリではコマンドの場所が異なることがあります。<code>which tailscale</code> で探すか、App Centerのインストール先（<code>/share/CACHEDEV1_DATA/.qpkg/Tailscale/</code> など）を確認してください。</span>
-       </li>
-       <li><code>https://&lt;NAS名&gt;.&lt;tailnet名&gt;.ts.net/</code> を開き、ホーム画面に追加し直します。</li>
-      </ol>
-      <p id="cfHttps" class="muted">HTTPSで開くと通過しやすくなります。Cloudflare確認は、HTTPS＋互換モード＋サイトが埋め込みを許可している場合に通過できる見込みです。iPhoneでは失敗することがあり、その場合は「iPhoneから送る」の共有メニュー方式（Safariで開いてリンクを送る）を使ってください。</p>
-     </section>
 
-     <section class="settings-section" data-section="share" hidden>
-      <h1>iPhoneから送る</h1>
-      <p class="muted">iPhoneの共有メニュー（ショートカット）からリンクを「追加したリンク」に送ります。JD2への送信やダウンロード開始は行いません。</p>
-      <div id="shareHttpWarning" class="notice lan-warning" role="note" hidden>この画面はHTTPで開かれています。トークンが暗号化されずに送られるため、HTTPS（「HTTPS接続」参照）またはTailscale経由での利用をおすすめします。</div>
-      <h2>登録した端末</h2>
-      <div id="shareDevices" class="items"></div>
-      <form id="shareForm" class="inline-form">
-       <input id="shareName" maxlength="40" placeholder="端末名（例: iPhone）" aria-label="端末名" autocomplete="off">
-       <button type="submit" id="shareAdd" class="btn primary">端末を追加</button>
-      </form>
-      <div id="shareNew" class="card share-new" role="status" hidden>
-       <p><b>トークン</b>（この画面を離れると二度と表示されません。今すぐショートカットに貼り付けてください）</p>
-       <div class="copy-row"><code id="shareToken" class="code-box"></code><button type="button" id="shareTokenCopy" class="btn small">コピー</button></div>
+      <div class="sub" data-sub="diagnostics">
+       <h2>診断</h2>
+       <p class="set-text muted">手動で実行する読取専用の診断です</p>
+       <div class="actions">
+        <button type="button" id="diagnosticIo" class="btn">HubのI/Oを確認</button>
+       </div>
+       <p id="diagnosticResult" class="set-text muted" role="status" aria-live="polite"></p>
       </div>
-      <h2>エンドポイント</h2>
-      <div class="copy-row"><code id="shareEndpoint" class="code-box"></code><button type="button" id="shareEndpointCopy" class="btn small">コピー</button></div>
-      <h2>ショートカットの作り方</h2>
-      <ol class="guide">
-       <li>ショートカットApp → 新規 → 詳細で「共有シートに表示」をONにし、入力を「URL・テキスト・Safari Webページ」にします。</li>
-       <li>アクション「WebページでJavaScriptを実行」を追加し、次のコードを貼り付けます（Safariから共有したときだけ動きます。テキストを共有する場合はこのアクションを省きます）。
-        <div class="copy-row"><code id="shareJs" class="code-box"></code><button type="button" id="shareJsCopy" class="btn small">コピー</button></div>
-       </li>
-       <li>アクション「URLの内容を取得」を追加し、URLに上のエンドポイント、方法を POST、ヘッダに <code>Authorization</code> = <code>Bearer &lt;トークン&gt;</code> と <code>Content-Type</code> = <code>application/json</code>、本文はJSONで <code>text</code> = 前のアクションの結果 にします。</li>
-       <li>アクション「通知を表示」を追加し、結果を表示します。</li>
-      </ol>
-      <p class="muted">エンドポイントはiPhoneから届く必要があります（Tailscale接続）。トークンを平文で送らないようHTTPSを推奨します。</p>
-      <h2>ブックマークレット（任意）</h2>
-      <p class="muted">Safariのブックマークとして登録すると、開いているページのURLを「リンク」の貼り付け欄に入れます（自動では保存しません）。</p>
-      <div class="copy-row"><code id="shareBookmarklet" class="code-box"></code><button type="button" id="shareBookmarkletCopy" class="btn small">コピー</button></div>
-     </section>
 
-     <section class="settings-section" data-section="bookmarks" hidden>
-      <h1>ブックマーク</h1>
-      <form id="bookmarkForm" class="inline-form">
-       <input id="bookmarkName" maxlength="200" placeholder="名前" aria-label="名前">
-       <input id="bookmarkUrl" type="url" placeholder="https://example.com" aria-label="URL">
-       <button type="submit" id="bookmarkAdd" class="btn primary">追加</button>
-      </form>
-      <div id="bookmarkItems" class="items"></div>
-     </section>
-
-     <section class="settings-section" data-section="updates" hidden>
-      <h1>更新</h1>
-      <div class="update-line">
-       <span>現在 <b class="js-version-bare"></b></span>
-       <button type="button" id="updateCheck" class="btn small primary">最新を確認</button>
-       <select id="updateChannel" class="inline-select" aria-label="更新チャンネル">
-        <option value="rc" selected>RC版を含む</option>
-        <option value="stable">正式版のみ</option>
-       </select>
+      <div class="sub" data-sub="about">
+       <h2>このアプリについて</h2>
+       <p><b>QnapDownloader</b> <span class="js-version"></span></p>
+       <p class="set-text muted">JDownloader 2とWeb管理画面を組み合わせたQNAP向けダウンロード管理ツール</p>
+       <details class="fold">
+        <summary>詳細</summary>
+        <ul class="about-list">
+         <li>初期開発版です。実機（TS-253Be）でのJD2の動作は未検証です。</li>
+         <li>自動ダウンロードとサイトの自動巡回はありません。追加したリンクは手動でJD2へ送ります。</li>
+         <li>Webの閲覧は端末側の隔離表示です。表示できないサイトは「NASブラウザで開く」を使ってください。</li>
+         <li>互換モードでは、そのサイト自身のCookie・ストレージを枠内で使えます（Hub自体のものではありません）。</li>
+        </ul>
+        <p class="muted">外部ページの取得はブラウザ側の隔離iframeだけで行い、NASは外部ページを取得しません。JD2とJavaはQPKGに同梱されず、公式の固定URLからSHA-256検証つきで導入します。</p>
+       </details>
+       <ul class="link-list">
+        <li><a href="https://github.com/souten-yd/QnapDownloader/blob/main/docs/browser-shell-ui.md" target="_blank" rel="noopener noreferrer">画面の仕様</a></li>
+        <li><a href="https://github.com/souten-yd/QnapDownloader/blob/main/docs/engine-setup.md" target="_blank" rel="noopener noreferrer">エンジンの初期設定</a></li>
+        <li><a href="https://github.com/souten-yd/QnapDownloader/blob/main/docs/security.md" target="_blank" rel="noopener noreferrer">セキュリティ設計</a></li>
+        <li><a href="https://github.com/souten-yd/QnapDownloader/blob/main/docs/browser-sandbox.md" target="_blank" rel="noopener noreferrer">隔離ブラウザ</a></li>
+        <li><a href="https://github.com/souten-yd/QnapDownloader/blob/main/docs/roadmap.md" target="_blank" rel="noopener noreferrer">ロードマップ</a></li>
+       </ul>
       </div>
-      <div class="update-line">
-       <span id="updateResult"></span>
-       <button type="button" id="updateApply" class="btn small primary" hidden>更新</button>
-      </div>
-      <p id="updateStatus" class="muted"></p>
-      <details class="fold" id="updateLogBox">
-       <summary>更新ログ</summary>
-       <pre id="updateLog" class="update-log">開くと表示します</pre>
-      </details>
-      <p class="muted">QNAPにQPKGとして導入した環境のみ更新できます。JD2本体の更新は「エンジン」で行います。</p>
-     </section>
-
-     <section class="settings-section" data-section="diagnostics" hidden>
-      <h1>診断</h1>
-      <p class="muted">手動で実行する読取専用の診断です。自動では取得しません。</p>
-      <div class="actions">
-       <button type="button" id="diagnosticIo" class="btn">HubのI/Oを確認</button>
-       <button type="button" id="diagnosticJd2" class="btn">ポート3128を確認</button>
-      </div>
-      <p id="diagnosticResult" class="muted" role="status" aria-live="polite"></p>
-     </section>
-
-     <section class="settings-section" data-section="about" hidden>
-      <h1>このアプリについて</h1>
-      <p><b>QnapDownloader</b> <span class="js-version"></span></p>
-      <p class="muted">JDownloader 2とWeb管理画面を組み合わせた、QNAP向けのダウンロード管理ツールです。</p>
-      <ul class="about-list">
-       <li>初期開発版です。実機（TS-253Be）でのJD2の動作は未検証です。</li>
-       <li>自動ダウンロードとサイトの自動巡回はありません。追加したリンクは手動でJD2へ送ります。</li>
-       <li>Rapidgatorのリンクは、貼り付けたテキストやHTMLから抽出できます。</li>
-       <li>Webの閲覧は端末側の隔離表示です。表示できないサイトは「NASブラウザで開く」を使ってください。</li>
-       <li>枠内で遷移した先のURLは読み取れません。サイトが埋め込みを禁止している場合は空白になります。</li>
-       <li>互換モードでは、そのサイト自身のCookie・ストレージを枠内で使えます（Hub自体のものではありません）。</li>
-      </ul>
-      <details class="fold">
-       <summary>詳細</summary>
-       <p class="muted">外部ページの取得はブラウザ側の隔離iframeだけで行い、NASは外部ページを取得しません。JD2とJavaはQPKGに同梱されず、公式の固定URLからSHA-256検証つきで導入します。JD2本体の更新はJD2の公式機能が行い、Hubの更新は影響しません。</p>
-      </details>
-      <ul class="link-list">
-       <li><a href="https://github.com/souten-yd/QnapDownloader/blob/main/docs/browser-shell-ui.md" target="_blank" rel="noopener noreferrer">画面の仕様</a></li>
-       <li><a href="https://github.com/souten-yd/QnapDownloader/blob/main/docs/engine-setup.md" target="_blank" rel="noopener noreferrer">エンジンの初期設定</a></li>
-       <li><a href="https://github.com/souten-yd/QnapDownloader/blob/main/docs/security.md" target="_blank" rel="noopener noreferrer">セキュリティ設計</a></li>
-       <li><a href="https://github.com/souten-yd/QnapDownloader/blob/main/docs/browser-sandbox.md" target="_blank" rel="noopener noreferrer">隔離ブラウザ</a></li>
-       <li><a href="https://github.com/souten-yd/QnapDownloader/blob/main/docs/roadmap.md" target="_blank" rel="noopener noreferrer">ロードマップ</a></li>
-      </ul>
      </section>
     </div>
    </div>
@@ -583,7 +606,7 @@
      <div class="intercept-body">
       <p id="interceptKind" class="muted"></p>
       <p id="interceptUrl" class="intercept-url"></p>
-      <label id="interceptAutoRow" class="rule-toggle" hidden><input type="checkbox" id="interceptAuto"> このサイトでは今後自動で送る</label>
+      <label id="interceptAutoRow" class="switch" hidden><input type="checkbox" id="interceptAuto" role="switch"><span class="switch-track" aria-hidden="true"></span><span>このサイトでは今後自動で送る</span></label>
      </div>
      <div class="remote-sheet-actions intercept-actions">
       <button type="button" id="interceptSend" class="btn primary" hidden>JD2へ送る</button>
@@ -635,6 +658,13 @@
  <div class="sheet-panel" role="dialog" aria-modal="true" aria-labelledby="sheetTitle">
   <h2 id="sheetTitle"></h2>
   <div id="sheetOptions" class="sheet-options"></div>
+ </div>
+</div>
+<div id="folderSheet" class="sheet-backdrop" hidden>
+ <div class="sheet-panel" role="dialog" aria-modal="true" aria-labelledby="folderSheetTitle">
+  <h2 id="folderSheetTitle">保存先を選ぶ</h2>
+  <div id="folderPicker"></div>
+  <button type="button" id="folderCancel" class="btn sheet-btn">閉じる</button>
  </div>
 </div>
 <div id="notice" class="toasts" role="status" aria-live="polite"></div>

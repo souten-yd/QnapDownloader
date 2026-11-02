@@ -1,6 +1,6 @@
 "use strict";
 /*
- * QnapDownloader browser-style shell (v0.1.16).
+ * QnapDownloader browser-style shell (v0.1.33).
  * Spec: docs/browser-shell-ui.md. Single file, no build step.
  *
  * Security notes (see "Security invariants" in the spec):
@@ -23,12 +23,13 @@ const MAX_LIVE_FRAMES_WIDE = 3;
 const SWR_TTL_MS = 10000;
 const MAX_HOST_MODES = 100;
 const UPDATE_POLL_MS = 2000;
+const STATE_WAIT_S = 25;           // /api/state long-poll
+const LOCAL_WRITE_QUIET_MS = 3000; // a revision change this soon after our own write is ignored
+const TOAST_MS = 6000;
 const UPDATE_WATCH_MS = 5 * 60 * 1000;
-const STALE_CHECK_MS = 30000;
 const MAX_CLOSED_TABS = 10;
 const MAX_HISTORY = 50;
 const AUTO_REFRESH_MS = 5000;     // downloads view: local data, refreshed while visible
-const BADGE_REFRESH_MS = 30000;   // header badge: only while the engine is running
 const FRAME_LOAD_TIMEOUT_MS = 12000;
 const HINT_DELAY_MS = 6000;         // offer the "not showing?" bar after this long
 const PAGE_SIZE = 30;
@@ -76,7 +77,6 @@ const RB_MAX_POLL_FAILS = 3;
 const RB_TAP_MOVE_PX = 10;
 const RB_TAP_MAX_MS = 600;
 const RB_LINKS_DELAY_MS = 1200;
-const RB_STATUS_POLL_MS = 1500;
 const RB_VIEWPORT_DEBOUNCE_MS = 250;
 const RB_INTERCEPT_QUEUE = 20;
 const RB_POPUP_TOAST_MS = 8000;
@@ -105,9 +105,14 @@ const SHELL_KEY = "qnapdl.shell.v1";
 const HOST_MODE_KEY = "qnapdl.hostmodes.v1";
 const TAB_STORAGE_KEY = "qnapdl.webtabs.v1";
 const LEGACY_AUTO_KEY = "qnapdl.downloads.auto";   // v0.1.11 switch; removed silently
-const SETTINGS_SECTIONS = ["engine", "accounts", "browser", "storage", "https", "share", "bookmarks", "updates", "diagnostics", "about"];
-const SECTION_ALIASES = {jd2: "engine"};   // old #/settings/jd2 links
-const ENGINE_POLL_MS = 1500;
+// v0.1.33: four sections, each with in-page subsections (#/settings/jd2/accounts scrolls to one).
+const SETTINGS_SECTIONS = ["jd2", "browser", "connection", "system"];
+const SETTINGS_SUBS = {jd2: ["engine", "accounts", "storage", "send"], browser: ["nas", "rules", "bookmarks"],
+  connection: ["https", "share"], system: ["updates", "diagnostics", "about"]};
+// Old one-section routes land on their new place.
+const SETTINGS_REDIRECTS = {engine: "jd2/engine", accounts: "jd2/accounts", storage: "jd2/storage",
+  https: "connection/https", share: "connection/share", bookmarks: "browser/bookmarks",
+  updates: "system/updates", diagnostics: "system/diagnostics", about: "system/about"};
 const SVG_NS = "http://www.w3.org/2000/svg";
 const PASTE_LIMIT = 65536;
 const PASTE_DEBOUNCE_MS = 400;
@@ -122,19 +127,21 @@ const state = {
   tabs: [], nextTabId: 1, closed: [], lastWebTabId: null,
   bookmarks: [], status: null, omniDisplay: "",
   snapshot: null, snapshotAt: 0, downloadsPage: 0, downloadsBusy: false,
-  filter: "all", query: "", autoTimer: null, downloadsFails: 0,
-  dlRunning: null, badgeTimer: null, badgeAt: 0, expanded: new Set(),
+  filter: "all", query: "", downloadsFails: 0,
+  dlRunning: null, expanded: new Set(),
+  live: null, stateRev: null, stateGen: 0, stateRunning: false, stateAbort: null, stateFails: 0,
+  settingsRev: null, engineSig: "", rbSig: "", localWriteAt: 0,
   settings: null, jd2: null, queueData: null, pasteSeq: 0, pasteTimer: null, paste: null,
-  pickerOpen: false, connChecking: false, stepsMode: "",
+  pickerOpen: false, stepsMode: "",
   selectedVersion: "", selectedChannel: "rc",
   menuReturnFocus: null,
   snapshotJson: "", downloadsSig: "", folderPath: "",
-  bootVersion: "", statusCheckedAt: 0, updateWatching: false,
-  engine: null, engineTimer: null, engineBusy: false,
+  bootVersion: "", updateWatching: false,
+  engine: null,
   https: false, tailnet: false,
-  rbPolling: "", rbPollMode: "", rbGen: 0, rbStatus: null, rbTimer: null, rbBusy: false,
+  rbPolling: "", rbPollMode: "", rbGen: 0, rbStatus: null,
   rbIntercepts: [],
-  rbQuality: loadRbQuality(), rbStream: null, rbPerf: false, rbPerfSamples: [], rbPerfTimer: 0,
+  rbQuality: loadRbQuality(), rbStream: null, rbPerf: false, rbPerfSamples: [],
   rbPerfSince: 0, probeResult: null, probeResults: [], siteRules: null, waiting: null,
   accounts: null, accountsTruncated: false, accountHosts: [], accountBusy: false, accountEditId: "",
 };
@@ -317,14 +324,15 @@ function swrReset() {
 }
 
 // ---------------------------------------------------------------------- API
-async function api(path, body = null) {
+async function api(path, body = null, extra = null) {
   const headers = {};
-  const opts = {credentials: "same-origin", headers};
+  const opts = Object.assign({credentials: "same-origin", headers}, extra || {});
   if (body !== null) {
     opts.method = "POST";
     headers["Content-Type"] = "application/json";
     headers["X-CSRF-Token"] = state.csrf;
     opts.body = JSON.stringify(body);
+    if (!path.startsWith("/api/rb/")) state.localWriteAt = Date.now();
   }
   const res = await fetch(path, opts);
   let data = {};
@@ -348,43 +356,49 @@ async function perform(fn) {
 }
 
 // ------------------------------------------------------------------- toasts
-function pruneToasts(box) {
-  const normal = Array.from(box.children).filter(n => !n.dataset.sticky);
-  while (normal.length > 4) normal.shift().remove();
+// One transient toast at a time (v0.1.33). Toasts of the same group and kind merge into one with
+// a running count ("JD2へ送信しました（3件）"). An error stays until it is dismissed and replaces an
+// older error; a success toast never hides a visible error. Sticky banners (update progress, stale
+// page) are separate and keep their own key.
+function planToast(cur, next) {
+  if (cur && next.group && cur.group === next.group && cur.kind === next.kind) {
+    const count = (cur.count || 1) + (next.count || 1);
+    return Object.assign({}, next, {count, message: next.format ? next.format(count) : next.message});
+  }
+  return next;
 }
 
-const recentErrorToasts = new Map();
-function toast(message, kind = "success") {
-  const box = $("notice");
-  if (kind === "error") {
-    // The same failure can surface from more than one handler for one click:
-    // show it once per 5 s.
-    const now = Date.now();
-    const last = recentErrorToasts.get(message);
-    if (last !== undefined && now - last < 5000) return;
-    recentErrorToasts.set(message, now);
-    for (const [key, at] of recentErrorToasts) if (now - at >= 5000) recentErrorToasts.delete(key);
-  }
-  for (const old of Array.from(box.children)) {
-    if (old.dataset.message === message) old.remove();
-  }
+const toastSlot = {cur: null, node: null, timer: 0};
+
+function clearToast() {
+  clearTimeout(toastSlot.timer);
+  if (toastSlot.node) toastSlot.node.remove();
+  toastSlot.cur = null; toastSlot.node = null; toastSlot.timer = 0;
+}
+
+function toast(message, kind = "success", opts = {}) {
+  if (kind !== "error" && toastSlot.cur && toastSlot.cur.kind === "error") return;
+  const next = planToast(toastSlot.cur, {kind, message, group: opts.group || "", count: opts.count || 1,
+    format: opts.format || null});
+  clearToast();
   const node = element("div", undefined, "toast " + kind);
-  node.dataset.message = message;
-  node.appendChild(element("span", message, "toast-text"));
+  node.appendChild(element("span", next.message, "toast-text"));
   if (kind === "error") {
     const close = element("button", undefined, "toast-close");
     close.type = "button";
     close.setAttribute("aria-label", "通知を閉じる");
     close.appendChild(icon("x"));
-    close.addEventListener("click", () => node.remove());
+    close.addEventListener("click", clearToast);
     node.appendChild(close);
   } else {
-    setTimeout(() => node.remove(), 6000);
+    toastSlot.timer = setTimeout(clearToast, TOAST_MS);
   }
-  box.appendChild(node);
-  pruneToasts(box);
+  toastSlot.cur = next; toastSlot.node = node;
+  $("notice").appendChild(node);
 }
-function flash(message) { toast(message, "success"); }
+function flash(message, opts) { toast(message, "success", opts); }
+// "N件を..." style messages that add up while they keep coming.
+function flashCount(group, count, format) { toast(format(count), "success", {group, count, format}); }
 
 // Persistent toast (no close button, no timeout) replaced by key. `actions`
 // is [{label, run}]. Used for the update progress and stale-page notices.
@@ -421,18 +435,25 @@ function parseRoute() {
     return paste ? {view: "links", paste} : {view: "links"};
   }
   if (head === "downloads") return {view: head};
-  if (head === "settings") {
-    const wanted = SECTION_ALIASES[parts[1]] || parts[1];
-    return {view: "settings",
-      section: SETTINGS_SECTIONS.includes(wanted) ? wanted : defaultSection()};
-  }
+  if (head === "settings") return settingsRoute(parts[1], parts[2]);
   if (head === "tab" && /^t\d+$/.test(parts[1] || "")) return {view: "tab", tabId: parts[1]};
   return {view: "home"};
 }
 
-// Engine first until it is running; then the save folder.
-function defaultSection() {
-  return state.engine && state.engine.phase === "running" ? "storage" : "engine";
+function defaultSection() { return "jd2"; }
+
+// #/settings/<section>[/<sub>]; an old one-section route carries `redirect` (its new hash).
+function settingsRoute(first, second) {
+  if (SETTINGS_SECTIONS.includes(first)) {
+    const sub = (SETTINGS_SUBS[first] || []).includes(second) ? second : "";
+    return {view: "settings", section: first, sub};
+  }
+  const moved = SETTINGS_REDIRECTS[first];
+  if (moved) {
+    const [section, sub] = moved.split("/");
+    return {view: "settings", section, sub, redirect: "#/settings/" + moved};
+  }
+  return {view: "settings", section: defaultSection(), sub: ""};
 }
 
 function settingsHash() { return "#/settings/" + (state.lastSection || defaultSection()); }
@@ -463,7 +484,7 @@ function currentViewName() {
 function applyRoute() {
   if (!state.authed) return;
   const route = parseRoute();
-  if (/^#\/settings\/jd2\/?$/.test(location.hash)) { replaceRoute("#/settings/engine"); return; }
+  if (route.redirect) { replaceRoute(route.redirect); return; }
   if (route.view === "tab" && !findTab(route.tabId)) { replaceRoute("#/home"); return; }
   state.route = route;
   if (route.view === "links" && route.paste) {
@@ -484,11 +505,8 @@ function applyRoute() {
   syncFrameVisibility();
   renderWebTabs();
   updateChrome();
-  syncAutoRefresh();
-  syncEnginePoll();
-  syncBadgeTimer();
   syncRemotePoll();
-  syncBrowserPoll();
+  sched.kick();
   // Last route (a hash, never a secret) lets a reloaded iOS web app resume.
   writeSession(SHELL_KEY, JSON.stringify({v: 1, hash: location.hash || "#/home"}));
   perform(() => enterView(route));
@@ -499,12 +517,11 @@ async function enterView(route, force = false) {
     await loadHome(force);
   } else if (route.view === "downloads") {
     renderDownloads();
-    await loadEngine(force);
     refreshDownloadsNow();
   } else if (route.view === "links") {
-    await Promise.all([loadQueue(force), loadJd2Status(force)]);
+    await loadQueue(force);
   } else if (route.view === "settings") {
-    await enterSettings(route.section, force);
+    await enterSettings(route, force);
   } else if (route.view === "tab") {
     await ensureLoaded(findTab(route.tabId));
   }
@@ -536,7 +553,7 @@ function updateChrome() {
   } else if (route.view === "links") {
     display = "qnap://links"; iconName = "link";
   } else if (route.view === "settings") {
-    display = "qnap://settings/" + route.section; iconName = "gear";
+    display = "qnap://settings/" + route.section + (route.sub ? "/" + route.sub : ""); iconName = "gear";
   } else {
     iconName = "home";
   }
@@ -655,30 +672,14 @@ function updateCfHint(tab) {
 }
 
 // ------------------------------------------------------------- status/home
-function renderStatusData(s) {
-  state.status = s;
-  if (s.engine) applyEngine(s.engine);
-  if (s.jd2) state.jd2 = s.jd2;
-  document.querySelectorAll(".js-version").forEach(n => { n.textContent = "v" + s.version; });
-  document.querySelectorAll(".js-version-bare").forEach(n => { n.textContent = s.version; });
-  renderHome();
-}
-
-async function loadStatus(force = false) {
-  const s = await swr("status", "/api/status", renderStatusData, {force});
-  state.statusCheckedAt = Date.now();
-  checkBootVersion(s.version);
-}
-
 async function loadSettings(force = false) {
   await swr("settings", "/api/settings", renderDownloadDir, {force});
 }
 
+// Settings and bookmarks arrive with the first /api/state call (seeded into the swr cache), so
+// entering the home view costs no request.
 async function loadHome(force = false) {
-  await Promise.all([loadStatus(force), loadSettings(force)]);
-  refreshBadge();
-  // Quiet: only decides whether the optional "register an account" item shows.
-  if (engineRunning() && state.accounts === null) loadAccounts().catch(() => {});
+  await Promise.all([loadSettings(force), loadBookmarks(force)]);
 }
 
 // The Hub may have been updated (from this or another device) since this page
@@ -736,7 +737,7 @@ function renderHome() {
       busy ? setupProgressText(e) :
       e.error ? "失敗しました: " + e.error :
       folderDone ? ((e.container || {}).available === false ?
-        "Container Stationが必要です（設定 › エンジン）" : "JDownloader 2を導入します") :
+        "Container Stationが必要です（設定 › JD2）" : "JDownloader 2を導入します") :
       "先に保存先を選んでください";
     return;
   }
@@ -1056,6 +1057,7 @@ async function openInTab(tab, value, commit, opts = {}) {
 // set of inputs. The only image source is a blob: object URL made from
 // the Hub's /api/rb/frame.jpg bytes; it is never a remote URL.
 async function openRemote(tab, value, commit) {
+  ensureRemote();
   const token = ++tab.token;
   tab.error = "";
   tab.loading = true;
@@ -1084,7 +1086,7 @@ async function openRemote(tab, value, commit) {
         loading: true, links: [], linksTimer: 0, blocked: null,
         rev: null, icptSeen: 0, present: 0, vp: "", popups: 0,
         shown: "", autoLive: false, autoSince: 0, autoClean: 0, autoChip: false,
-        autoTimer: 0, autoBusy: false, autoOff: "", view: null, snap: null, snapKey: "", snapBusy: false,
+        autoBusy: false, autoOff: "", view: null, snap: null, snapKey: "", snapBusy: false,
         snapAgain: null, snapTimer: 0, busy: 0, scrollTop: 0, owner: tab,
         vmap: null, vmapRev: -1, vmapTimer: 0, vmapBusy: false, vmapAt: 0, linksRev: -1,
         reader: null, readerBusy: false, readerPending: false, readerAgain: false,
@@ -1348,18 +1350,10 @@ function syncChallenge(tab, challenge, loading) {
   }
 }
 
-function startAutoPoll(tab) {
-  const rb = tab.rb;
-  if (!rb || rb.autoTimer) return;
-  rb.autoTimer = setInterval(() => autoPollTick(tab, rb), AUTO_POLL_MS);
-}
-
-function stopAutoPoll(rb) {
-  if (rb && rb.autoTimer) { clearInterval(rb.autoTimer); rb.autoTimer = 0; }
-}
+function startAutoPoll(tab) { sched.kick(); }   // the scheduler task "rb-auto" does the polling
 
 async function autoPollTick(tab, rb) {
-  if (tab.rb !== rb || !rb.autoLive) { stopAutoPoll(rb); return; }
+  if (tab.rb !== rb || !rb.autoLive) return;
   if (document.visibilityState !== "visible" || activeWebTab() !== tab || rb.autoBusy) return;
   rb.autoBusy = true;
   try {
@@ -1370,7 +1364,6 @@ async function autoPollTick(tab, rb) {
     if (tab.rb !== rb || !rb.autoLive) return;
     const step = challengeStep(rb, meta.challenge === true, meta.loading === true, Date.now(), false);
     if (step === "return") {
-      stopAutoPoll(rb);
       applyDisplay(tab);   // tiles again: the tile loop takes a fresh snapshot on start
     } else if (step === "chip") {
       updateRemoteView(tab);
@@ -1387,7 +1380,6 @@ async function autoPollTick(tab, rb) {
 function returnToFast(tab) {
   const rb = tab && tab.rb;
   if (!rb) return;
-  stopAutoPoll(rb);
   rb.autoLive = false; rb.autoChip = false; rb.autoClean = 0; rb.autoOff = rb.url;
   applyDisplay(tab);
 }
@@ -1615,7 +1607,7 @@ async function remoteLoop(tab, gen) {
         toast("NASブラウザの画面を取得できません: " + e.message, "error");
         return;
       }
-      await new Promise(resolve => setTimeout(resolve, 1000));
+      await delay(1000);
     }
   }
 }
@@ -1650,6 +1642,7 @@ function syncRemotePoll() {
 
 function updateRemoteView(tab) {
   const remote = Boolean(tab && tab.remote && tab.history.length);
+  if (remote) ensureRemote();
   setShown("remoteView", remote);
   $("frames").hidden = remote;
   if (!remote) { closeRemoteSheet(); setShown("interceptSheet", false); return; }
@@ -1734,7 +1727,6 @@ async function openRemoteSheet() {
   await refreshRemoteLinks(tab).catch(() => {});
   renderRemoteSheet(tab);
   setShown("remoteSheet", true);
-  loadJd2Status().then(() => { if (!$("remoteSheet").hidden) renderRemoteSheet(tab); }).catch(() => {});
 }
 
 // Stage through the existing extract/commit path (the Hub re-validates every URL).
@@ -1805,7 +1797,6 @@ async function fetchIntercepts(tab) {
     }
     state.rbIntercepts = state.rbIntercepts.slice(-RB_INTERCEPT_QUEUE);
     renderIntercept();
-    loadJd2Status().then(renderIntercept).catch(() => {});
   } finally {
     rb.icptFetching = false;
   }
@@ -1994,13 +1985,9 @@ function setPerf(on) {
   state.rbPerf = on;
   state.rbPerfSamples = [];
   state.rbPerfSince = performance.now();
-  clearInterval(state.rbPerfTimer);
-  state.rbPerfTimer = 0;
   setShown("perfOverlay", on);
-  if (on) {
-    renderPerf();
-    state.rbPerfTimer = setInterval(renderPerf, 1000);
-  }
+  if (on) renderPerf();
+  sched.kick();
 }
 
 // ---- render quality (speed / standard / high), remembered on this device
@@ -2049,7 +2036,6 @@ function setUserDisplay(tab, mode) {
   if (!tab || !tab.rb || !RB_DISPLAY_LABELS[mode]) return;
   const host = hostOf(tab.current || "");
   if (host) rememberHostMode(host, MODE_OF_DISPLAY[mode]);
-  stopAutoPoll(tab.rb);
   tab.rb.autoLive = false; tab.rb.autoChip = false;   // a manual choice is respected
   tab.rb.tilesFor = ""; tab.rb.readerFail = null;
   renderRemoteHosts();
@@ -3152,7 +3138,6 @@ function longPress(clientX, clientY) {
 let probeSerial = 0;
 const probeFlight = new Map();   // id -> {n, started}
 let probeFlightOpen = false;
-let probeTicker = 0;
 
 function closeProbeSheet() {
   state.probeResults = [];
@@ -3164,9 +3149,9 @@ function renderProbeChip() {
   const count = probeFlight.size;
   $("probeChip").textContent = "確認中 " + count + "件";
   setShown("probeChip", count > 0);
-  if (!count) { probeFlightOpen = false; clearInterval(probeTicker); probeTicker = 0; }
-  else if (!probeTicker) probeTicker = setInterval(renderProbeFlight, 1000);
+  if (!count) probeFlightOpen = false;
   renderProbeFlight();
+  sched.kick();
 }
 
 function renderProbeFlight() {
@@ -3224,7 +3209,7 @@ function renderProbe() {
 // Returns true when handled (toast shown); false means the result goes to the sheet.
 async function autoSendProbe(result, rb, item) {
   if (!result.links.length || !result.probe_id) return false;
-  await Promise.all([loadSettings().catch(() => {}), loadJd2Status().catch(() => {})]);
+  await loadSettings().catch(() => {});   // cached; can_send comes from the state loop
   if (!(state.settings && state.settings.probe_autosend !== false) || !jd2CanSend()) return false;
   try {
     const r = await api("/api/rb/probe/send", {tab: rb.id, probe_id: result.probe_id});
@@ -3235,8 +3220,8 @@ async function autoSendProbe(result, rb, item) {
     } else if (r.sent === 0) {
       flash("送信済みのためスキップしました（" + r.skipped + "件）");
     } else {
-      flash("JD2へ送信しました（" + r.sent + "件）" +
-            (r.skipped ? "・" + r.skipped + "件は重複のためスキップ" : ""));
+      const dupText = r.skipped ? "・" + r.skipped + "件は重複のためスキップ" : "";
+      flashCount("sent", r.sent, n => "JD2へ送信しました（" + n + "件）" + dupText);
     }
     return true;
   } catch (e) {
@@ -3311,6 +3296,14 @@ function queueScroll(x, y, dx, dy) {
   rbScroll.x = x; rbScroll.y = y;
   rbScroll.dx += dx; rbScroll.dy += dy;
   if (!rbScroll.raf) rbScroll.raf = requestAnimationFrame(flushScroll);
+}
+
+// Lazy: the NAS browser handlers are attached the first time a remote tab is opened or shown.
+let remoteWired = false;
+function ensureRemote() {
+  if (remoteWired) return;
+  remoteWired = true;
+  wireRemote();
 }
 
 function wireRemote() {
@@ -3444,6 +3437,7 @@ function wireRemote() {
     const tab = activeWebTab();
     if (tab) perform(() => openInRemote(tab));
   });
+  $("autoLiveChip").addEventListener("click", () => returnToFast(activeWebTab()));
   document.addEventListener("visibilitychange", syncRemotePoll);
   wireTiles();
   wireReader();
@@ -3549,8 +3543,10 @@ function classifyInput(raw) {
     if (path[0] === "links" && path.length === 1) return {kind: "route", value: "#/links"};
     if (path[0] === "home" || path[0] === "") return {kind: "route", value: "#/home"};
     if (path[0] === "settings" && path.length <= 2) {
-      const section = SECTION_ALIASES[path[1]] || path[1] || defaultSection();
-      if (SETTINGS_SECTIONS.includes(section)) return {kind: "route", value: "#/settings/" + section};
+      const section = path[1] || defaultSection();
+      if (SETTINGS_SECTIONS.includes(section) || SETTINGS_REDIRECTS[section]) {
+        return {kind: "route", value: "#/settings/" + section};
+      }
     }
     return {kind: "unknown-qnap"};
   }
@@ -3648,7 +3644,7 @@ async function menuAction(action) {
   else if (action === "stageUrl" && tab) await stageTabUrl(tab);
   else if (action === "bookmark" && tab) await bookmarkTab(tab);
   else if (action === "closeTab" && tab) closeTab(tab.id);
-  else if (action === "bookmarks") navigate("#/settings/bookmarks");
+  else if (action === "bookmarks") navigate("#/settings/browser/bookmarks");
   else if (action === "settings") navigate(settingsHash());
   else if (action === "logout") await logout();
 }
@@ -4415,15 +4411,27 @@ async function clearFinished() {
   await loadDownloads(state.downloadsPage);
 }
 
-async function clearHistory() {
-  const includeStaged = $("clearStaged").checked;
+// Links header ⋯ menu: only offers what exists.
+function linksMenu() {
+  const items = state.queueData ? state.queueData.items : [];
+  const history = items.filter(l => l.state === "sent" || l.state === "uncertain").length;
+  const staged = items.filter(l => l.state === "staged").length;
+  const options = [];
+  if (history) options.push({label: "送信済み・要確認の履歴を削除（" + history + "件）", run: () => clearHistory(false)});
+  if (history + staged) {
+    options.push({label: "未送信のリンクも含めてすべて削除（" + (history + staged) + "件）", destructive: true,
+      run: () => clearHistory(true)});
+  }
+  if (options.length) openSheet("リンクの履歴", options, $("linksMore"));
+}
+
+async function clearHistory(includeStaged) {
   const items = state.queueData ? state.queueData.items : [];
   const count = items.filter(l => l.state === "sent" || l.state === "uncertain" ||
     (includeStaged && l.state === "staged")).length;
-  if (!count) { flash("削除できる履歴はありません"); return; }
+  if (!count) return;
   if (!confirm("送信履歴を" + count + "件削除します（ダウンロード済みファイルやJD2のダウンロードは削除しません）")) return;
   const r = await api("/api/links/clear", {include_staged: includeStaged});
-  $("clearStaged").checked = false;
   swrDrop("links");
   await loadQueue(true);
   flash(r.removed + "件の履歴を削除しました");
@@ -4458,7 +4466,6 @@ async function loadDownloads(page, options = {}) {
     state.snapshot = snap;
     state.snapshotJson = JSON.stringify(snap);
     state.snapshotAt = Date.now();
-    state.badgeAt = state.snapshotAt;
     state.downloadsPage = snap.page;
     state.downloadsFails = 0;
     if (snap.page === 0) state.dlRunning = countRunning(snap);
@@ -4475,56 +4482,17 @@ async function loadDownloads(page, options = {}) {
   } catch (error) {
     state.downloadsFails++;
     $("downloadsMessage").textContent = "取得できませんでした: " + error.message;
-    loadEngine(true).catch(() => {});   // the engine may have stopped meanwhile
+    swrDrop("engine");   // the engine may have stopped meanwhile: the next state tick says so
   } finally {
     state.downloadsBusy = false;
     $("downloadsRefresh").disabled = false;
-    syncAutoRefresh();
+    sched.kick();
   }
 }
 
-function autoRefreshAllowed() {
-  return state.authed && state.route.view === "downloads" && engineRunning() &&
-    document.visibilityState === "visible" && state.downloadsFails < 3;
-}
-
-// Local data, so refresh every few seconds, but only while the downloads view is
-// on screen and the page is visible. One request at a time; gives up after 3 errors.
-function syncAutoRefresh() {
-  clearTimeout(state.autoTimer);
-  state.autoTimer = null;
-  if (!autoRefreshAllowed() || state.downloadsBusy) return;
-  const wait = state.snapshot ? Math.max(0, AUTO_REFRESH_MS - (Date.now() - state.snapshotAt)) : 0;
-  state.autoTimer = setTimeout(autoTick, wait);
-}
-
-async function autoTick() {
-  state.autoTimer = null;
-  if (!autoRefreshAllowed() || state.downloadsBusy) return;
-  await loadDownloads(state.downloadsPage, {auto: true});
-}
-
-// Header badge: light page-0 fetch every 30s while the engine runs and the page
-// is visible. The downloads view refreshes the count itself.
-async function refreshBadge() {
-  if (!state.authed || document.visibilityState !== "visible" || !engineRunning() ||
-      state.downloadsBusy || state.route.view === "downloads") return;
-  if (Date.now() - state.badgeAt < 10000) return;
-  state.downloadsBusy = true;
-  try {
-    const snap = await api("/api/jd2/downloads?page=0");
-    state.dlRunning = countRunning(snap);
-    state.badgeAt = Date.now();
-    updateBadge();
-    renderHome();
-  } catch (e) { /* silent: the badge just keeps its last value */ }
-  finally { state.downloadsBusy = false; }
-}
-
-function syncBadgeTimer() {
-  const want = state.authed && engineRunning();
-  if (want && !state.badgeTimer) state.badgeTimer = setInterval(refreshBadge, BADGE_REFRESH_MS);
-  else if (!want && state.badgeTimer) { clearInterval(state.badgeTimer); state.badgeTimer = null; }
+function downloadsTaskWanted() {
+  return state.route.view === "downloads" && engineRunning() && state.downloadsFails < 3 &&
+    !state.downloadsBusy;
 }
 
 function setFilter(filter) {
@@ -4535,7 +4503,7 @@ function setFilter(filter) {
 }
 
 // ----------------------------------------------------------------- links
-function jd2CanSend() { return Boolean(state.jd2 && state.jd2.can_send === true); }
+function jd2CanSend() { return Boolean(state.live && state.live.engine && state.live.engine.can_send === true); }
 
 const LINK_STATE_LABELS = {staged: "未送信", sending: "送信中", uncertain: "要確認", sent: "送信済み"};
 
@@ -4545,6 +4513,7 @@ function renderQueue(q) {
   const canSend = jd2CanSend();
   const staged = q.items.filter(l => l.state === "staged");
   setShown("sendAll", canSend && staged.length >= 2);
+  setShown("linksMore", q.items.length > 0);   // history deletion only exists when there is something
   if (!q.items.length) nodes.push(element("p", "追加したリンクはありません", "empty-state"));
   for (const link of q.items) {
     const container = element("div", undefined, "item link-item");
@@ -4581,7 +4550,6 @@ async function loadQueue(force = false) {
 
 function renderJd2Status(jd) {
   state.jd2 = jd;
-  if (state.queueData) renderQueue(state.queueData);
   renderEngineJd2();
 }
 
@@ -4618,7 +4586,7 @@ async function sendLinks(links, opts = {}) {
   swrDrop("links");
   await loadQueue(true);
   const dupText = opts.skipped ? "・" + opts.skipped + "件は重複のためスキップ" : "";
-  flash(sent + "件を" + (sendAutostartOn() ? "JD2へ送り、ダウンロードを開始しました" :
+  flashCount("sent", sent, n => n + "件を" + (sendAutostartOn() ? "JD2へ送り、ダウンロードを開始しました" :
     "JD2のLinkGrabberへ送りました（ダウンロードは未開始）") + dupText);
 }
 
@@ -4709,13 +4677,22 @@ function showSettingsSection(section) {
   });
 }
 
+// #/settings/<section>/<sub>: scroll the subsection into view (the top of the page without one).
+function scrollToSub(route) {
+  const body = document.querySelector(".settings-section[data-section='" + route.section + "']");
+  const target = route.sub && body ? body.querySelector("[data-sub='" + route.sub + "']") : null;
+  try {
+    if (target) target.scrollIntoView({block: "start"});
+    else $("content").scrollTo(0, 0);
+  } catch (e) { /* older browser: stay where we are */ }
+}
+
 function renderDownloadDir(s) {
   state.settings = s;
   $("sendAutostart").checked = s.send_autostart !== false;
   $("probeAutosend").checked = s.probe_autosend !== false;
   $("blockAds").checked = s.block_ads !== false;
-  const displayMode = DISPLAY_OF_SETTING[s.rb_default_mode] ? s.rb_default_mode : "fast";
-  document.querySelectorAll('input[name="rbDefaultMode"]').forEach(radio => { radio.checked = radio.value === displayMode; });
+  $("rbDefaultMode").value = DISPLAY_OF_SETTING[s.rb_default_mode] ? s.rb_default_mode : "fast";
   $("rbLinkBoxes").checked = s.rb_link_boxes === true;
   $("selectedFolder").textContent = s.download_dir || "未選択";
   $("folderChange").textContent = s.download_dir ? "変更" : "選ぶ";
@@ -4723,51 +4700,50 @@ function renderDownloadDir(s) {
   syncRemoteSettings();
 }
 
+// The folder picker is a bottom sheet; choosing a folder closes it.
 function setPicker(open) {
   state.pickerOpen = open;
-  setShown("folderPickerBox", open);
+  setShown("folderSheet", open);
+  if (open) $("folderCancel").focus();
 }
 
-async function enterSettings(section, force = false) {
+// Lazy: the settings handlers are attached the first time the view is opened.
+let settingsWired = false;
+function ensureSettings() {
+  if (settingsWired) return;
+  settingsWired = true;
+  wireSettings();
+  wireBrowser();
+}
+
+async function enterSettings(route, force = false) {
+  ensureSettings();
+  const section = route.section;
   showSettingsSection(section);
-  if (section !== "share") hideShareToken();
-  if (section !== "accounts") clearAccountForms();
-  if (section === "storage") {
-    await loadSettings(force);
-    // Nothing chosen yet: go straight to the picker.
-    if (!state.settings || !state.settings.download_dir) setPicker(true);
-    if (state.pickerOpen) {
-      await folders(state.folderPath, force).catch(e => {
-        if (!state.folderPath) throw e;
-        return folders("", force);   // remembered folder vanished: back to the shares
-      });
-    }
-  } else if (section === "engine") {
-    await loadEngine(force);
+  if (section !== "connection") hideShareToken();
+  if (section !== "jd2") clearAccountForms();
+  if (section === "jd2") {
+    await Promise.all([loadEngine(force), loadSettings(force)]);
     if (engineRunning()) {
-      await loadJd2Status(force);
-      checkConnection();
+      // JD2 status (connected / update) and the account list: two requests, only while it runs.
+      await Promise.all([loadJd2Status(force), loadAccounts(force)]);
     }
-  } else if (section === "accounts") {
-    await loadEngine(force);
-    renderAccountsAvailability();
-    if (engineRunning()) await Promise.all([loadAccounts(force), loadAccountHosts(force)]);
+    if (route.sub === "storage" && state.settings && !state.settings.download_dir) {
+      setPicker(true);
+      await folders(state.folderPath, force).catch(() => folders("", force));
+    }
   } else if (section === "browser") {
     renderRemoteHosts();
-    await Promise.all([loadBrowserStatus(force), loadSettings(force),
+    await Promise.all([loadBrowserStatus(force), loadSettings(force), loadBookmarks(force),
       swr("site-rules", "/api/rb/site-rules", renderSiteRules, {force})]);
-  } else if (section === "https") {
+  } else if (section === "connection") {
     renderHttps();
-  } else if (section === "share") {
     renderShareStatic();
     await swr("share-tokens", "/api/share/tokens", renderShareDevices, {force});
-  } else if (section === "bookmarks") {
-    await loadBookmarks(force);
-  } else if (section === "updates") {
-    await Promise.all([loadStatus(force), updateStatus(force)]);
-  } else if (section === "about") {
-    await loadStatus(force);
+  } else if (section === "system") {
+    await updateStatus(force);
   }
+  scrollToSub(route);
 }
 
 // ---- HTTPS / iPhone share (v0.1.13)
@@ -4982,7 +4958,7 @@ async function watchForUpdate(before) {
   stickyToast("update", "更新中… 完了後に自動で再読み込みします（再読み込み後に再ログインが必要です）", "progress");
   const deadline = Date.now() + UPDATE_WATCH_MS;
   while (Date.now() < deadline) {
-    await new Promise(resolve => setTimeout(resolve, UPDATE_POLL_MS));
+    await delay(UPDATE_POLL_MS);
     const version = await fetchHealthVersion();
     if (version && before && version !== before) {
       location.reload();
@@ -4999,11 +4975,10 @@ async function watchForUpdate(before) {
 function teardownSession() {
   state.authed = false;
   state.shellReady = false;
-  clearTimeout(state.autoTimer);
-  state.autoTimer = null;
+  stopStateLoop();
+  state.live = null; state.stateRev = null; state.settingsRev = null; state.engineSig = ""; state.rbSig = "";
   clearTimeout(state.pasteTimer);
-  clearInterval(state.badgeTimer);
-  state.badgeTimer = null;
+  clearToast();
   state.pasteSeq++;
   state.paste = null;
   state.settings = null;
@@ -5019,7 +4994,6 @@ function teardownSession() {
   state.rbPolling = "";
   state.rbGen++;
   state.rbStatus = null;
-  clearTimeout(state.rbTimer);
   setPerf(false);
   closeProbeSheet();
   hidePopupToast();
@@ -5105,9 +5079,9 @@ async function go() {
       setShown("authArea", false);
       setShown("app", true);
       initShellState();
-      loadBookmarks().catch(() => {});
-      loadStatus().catch(() => {});   // also detects "Hub updated since this page loaded"
+      await primeState();      // one request: engine, downloads, NAS browser, settings, bookmarks
       applyRoute();
+      syncStateLoop();
     } else {
       teardownSession();
       setShown("app", false);
@@ -5166,14 +5140,10 @@ function onTabstripKeydown(event) {
 
 function wireShell() {
   window.addEventListener("hashchange", applyRoute);
-  document.addEventListener("visibilitychange", syncAutoRefresh);
+  // One visibility gate for everything periodic: the state long-poll and the scheduler.
   document.addEventListener("visibilitychange", () => {
-    if (document.visibilityState === "visible") refreshBadge();
-    // Long-open page: notice a Hub update done elsewhere (toast only, no reload).
-    if (document.visibilityState === "visible" && state.authed &&
-        Date.now() - state.statusCheckedAt > STALE_CHECK_MS) {
-      loadStatus(true).catch(() => {});
-    }
+    syncStateLoop();
+    sched.kick();
   });
   $("cfCompat").addEventListener("click", () => {
     const tab = activeWebTab();
@@ -5268,11 +5238,16 @@ function wireDownloads() {
     loadDownloads(state.downloadsPage);
   });
   wireSheet();
-  $("autoLiveChip").addEventListener("click", () => returnToFast(activeWebTab()));
+  $("linksMore").addEventListener("click", linksMenu);
+  $("homeEngineSetup").addEventListener("click", () => perform(() => startEngineSetup()));
+  $("homeEngineStart").addEventListener("click", () => perform(startEngine));
+  $("downloadsEngineAction").addEventListener("click", () => {
+    if ($("downloadsEngineAction").dataset.action === "setup") navigate("#/settings/jd2/engine");
+    else perform(startEngine);
+  });
   $("waitingStart").addEventListener("click", () => perform(startWaiting));
   $("downloadsToggle").addEventListener("click", () => perform(toggleDownloads));
   $("downloadsClear").addEventListener("click", () => perform(clearFinished));
-  $("clearHistory").addEventListener("click", () => perform(clearHistory));
   $("downloadsPrev").addEventListener("click", () => loadDownloads(state.downloadsPage - 1));
   $("downloadsNext").addEventListener("click", () => loadDownloads(state.downloadsPage + 1));
   document.querySelectorAll(".chip").forEach(c => c.addEventListener("click", () => setFilter(c.dataset.filter)));
@@ -5288,6 +5263,145 @@ function wireLinks() {
   $("sendAll").addEventListener("click", () => perform(sendAllStaged));
 }
 
+// ------------------------------------------------- scheduler and unified state (v0.1.33)
+// One scheduler runs every periodic task, and only while the page is visible: each task says
+// when it is wanted (`when`), how often it runs (`every`) and what it does (`run`). Nothing else
+// in this file starts an interval or a polling timeout.
+const sched = {
+  tasks: [], timer: 0,
+  add(name, every, when, run) { this.tasks.push({name, every, when, run, last: 0, busy: false}); },
+  kick() {
+    clearTimeout(this.timer);
+    this.timer = 0;
+    if (document.visibilityState !== "visible" || !state.authed) return;
+    const now = Date.now();
+    let next = Infinity;
+    for (const task of this.tasks) {
+      if (task.busy || !task.when()) continue;
+      const due = task.last + task.every;
+      if (due <= now) {
+        task.busy = true;
+        Promise.resolve().then(task.run).catch(() => {}).finally(() => {
+          task.busy = false;
+          task.last = Date.now();
+          this.kick();
+        });
+      } else {
+        next = Math.min(next, due);
+      }
+    }
+    if (next !== Infinity) this.timer = setTimeout(() => this.kick(), Math.max(50, next - now));
+  },
+};
+
+function registerTasks() {
+  sched.add("downloads", AUTO_REFRESH_MS, downloadsTaskWanted,
+    () => loadDownloads(state.downloadsPage, {auto: true}));
+  sched.add("rb-auto", AUTO_POLL_MS, () => {
+    const tab = activeWebTab();
+    return Boolean(tab && tab.rb && tab.rb.autoLive);
+  }, () => { const tab = activeWebTab(); return tab && tab.rb ? autoPollTick(tab, tab.rb) : null; });
+  sched.add("rb-perf", 1000, () => state.rbPerf, renderPerf);
+  sched.add("probe-flight", 1000, () => probeFlight.size > 0 && probeFlightOpen, renderProbeFlight);
+}
+
+function stateWanted() { return state.authed && document.visibilityState === "visible"; }
+
+function stopStateLoop() {
+  state.stateGen++;
+  state.stateRunning = false;
+  if (state.stateAbort) { try { state.stateAbort.abort(); } catch (e) { /* ignore */ } }
+  state.stateAbort = null;
+}
+
+function syncStateLoop() {
+  if (!stateWanted()) { if (state.stateRunning) stopStateLoop(); return; }
+  if (!state.stateRunning && state.stateRev !== null) runStateLoop();
+}
+
+// The first call (no rev) answers at once and carries settings and bookmarks.
+async function primeState() {
+  try {
+    applyState(await api("/api/state?full=1"));
+  } catch (e) {
+    /* the loop below retries; the views fetch what they need meanwhile */
+  }
+}
+
+async function runStateLoop() {
+  const gen = ++state.stateGen;
+  state.stateRunning = true;
+  while (gen === state.stateGen && stateWanted()) {
+    try {
+      const ctl = new AbortController();
+      state.stateAbort = ctl;
+      const data = await api("/api/state?rev=" + state.stateRev + "&wait=" + STATE_WAIT_S, null,
+        {signal: ctl.signal, cache: "no-store"});
+      if (gen !== state.stateGen) return;
+      state.stateFails = 0;
+      applyState(data);
+    } catch (e) {
+      if (gen !== state.stateGen) return;
+      state.stateFails++;
+      await delay(Math.min(15000, 1000 * Math.pow(2, state.stateFails)));
+    }
+  }
+  if (gen === state.stateGen) state.stateRunning = false;
+}
+
+// Seed the swr cache so loadSettings()/loadBookmarks() paint without a request.
+function swrSeed(key, data, render) {
+  swrCache.set(key, {data, json: JSON.stringify(data), at: Date.now()});
+  swrPaint(key, swrCache.get(key), render, key);
+}
+
+function applyState(d) {
+  const first = state.stateRev === null;
+  state.live = d;
+  state.stateRev = d.rev;
+  state.https = d.https === true;
+  state.tailnet = d.tailnet === true;
+  document.querySelectorAll(".js-version").forEach(n => { n.textContent = "v" + d.version; });
+  document.querySelectorAll(".js-version-bare").forEach(n => { n.textContent = d.version; });
+  checkBootVersion(d.version);
+  if (d.settings) swrSeed("settings", d.settings, renderDownloadDir);
+  if (d.bookmarks) swrSeed("bookmarks", {items: d.bookmarks}, renderBookmarks);
+  const e = d.engine;
+  // download counts for the badge / home line
+  state.dlRunning = d.downloads ? d.downloads.running : null;
+  updateBadge();
+  // engine: the full record only where it is shown, the compact block otherwise
+  const engineChanged = e.sig !== state.engineSig;
+  state.engineSig = e.sig;
+  if (engineChanged || !state.engine) {
+    if (engineDetailWanted() && !first) {
+      swrDrop("engine");
+      loadEngine(true).then(() => { if ($("engineLogBox").open) return loadEngineLog(); }).catch(() => {});
+      if (e.running) loadJd2Status(true).catch(() => {});
+    } else {
+      applyEngineLight(e);
+    }
+  } else {
+    renderHome();
+  }
+  if (state.queueData && state.route.view === "links") renderQueue(state.queueData);
+  // NAS browser: refetch the status only while its settings are on screen
+  if (d.rb.sig !== state.rbSig) {
+    state.rbSig = d.rb.sig;
+    if (browserSectionVisible()) { swrDrop("rb-status"); loadBrowserStatus(true).catch(() => {}); }
+  }
+  // settings revision: someone else changed data -> forget what is cached, refresh what is shown
+  const rev = d.settings_rev;
+  if (state.settingsRev !== null && rev !== state.settingsRev &&
+      Date.now() - state.localWriteAt > LOCAL_WRITE_QUIET_MS) {
+    swrDrop("settings", "bookmarks", "links", "share-tokens", "site-rules");
+    if (state.route.view === "links") loadQueue(true).catch(() => {});
+    else if (currentViewName() === "home") loadHome(true).catch(() => {});
+  }
+  state.settingsRev = rev;
+  sched.kick();
+}
+
 // ------------------------------------------------------------------ engine
 const PHASE_LABELS = {
   not_installed: "未導入", setup: "初期設定中", starting: "起動中…", running: "稼働中",
@@ -5297,39 +5411,16 @@ const STEP_MARKS = {pending: "○", running: "…", done: "✓", skipped: "↷",
 const STEP_TEXT = {pending: "待機", running: "実行中", done: "完了", skipped: "スキップ", warn: "警告", failed: "失敗"};
 
 function engineSectionVisible() {
-  return state.route.view === "settings" && state.route.section === "engine";
+  return state.route.view === "settings" && state.route.section === "jd2";
 }
 
-// Poll only while a setup/start is in progress AND a view that shows it (engine
-// section, home or downloads) is on screen and the page is visible.
-function enginePollWanted() {
+// The full engine status (steps, components, log) is only needed where it is shown; the compact
+// engine block of /api/state covers everything else.
+function engineDetailWanted() {
   const e = state.engine;
-  return Boolean(state.authed && e && (e.phase === "setup" || e.phase === "starting") &&
-    document.visibilityState === "visible" &&
-    (engineSectionVisible() || currentViewName() === "home" || state.route.view === "downloads"));
-}
-
-function syncEnginePoll() {
-  clearTimeout(state.engineTimer);
-  state.engineTimer = null;
-  if (!enginePollWanted() || state.engineBusy) return;
-  state.engineTimer = setTimeout(engineTick, ENGINE_POLL_MS);
-}
-
-async function engineTick() {
-  state.engineTimer = null;
-  if (!enginePollWanted() || state.engineBusy) return;
-  state.engineBusy = true;
-  try {
-    applyEngine(await api("/api/engine/status"));
-    if ($("engineLogBox").open) await loadEngineLog();
-  } catch (e) {
-    toast("エンジンの状態を取得できませんでした: " + e.message, "error");
-    state.engineBusy = false;
-    return;   // polling stops until the next user action
-  }
-  state.engineBusy = false;
-  syncEnginePoll();
+  if (engineSectionVisible()) return true;
+  return Boolean(e && (e.phase === "setup" || e.phase === "starting") &&
+    (currentViewName() === "home" || state.route.view === "downloads"));
 }
 
 function applyEngine(e) {
@@ -5342,14 +5433,28 @@ function applyEngine(e) {
   if (e.phase !== "running") {
     state.dlRunning = null;
     updateBadge();
-  } else if (before !== "running") {
-    state.badgeAt = 0;
-    refreshBadge();
-    if (engineSectionVisible()) { loadJd2Status(true).catch(() => {}); checkConnection(); }
+  } else if (before !== "running" && engineSectionVisible()) {
+    loadJd2Status(true).catch(() => {});
   }
-  syncEnginePoll();
-  syncBadgeTimer();
-  syncAutoRefresh();
+  sched.kick();
+}
+
+// Compact engine block of /api/state (no steps / components): enough for home, downloads, links.
+function applyEngineLight(c) {
+  const previous = state.engine;
+  swrDrop("engine");
+  if (previous && previous.light !== true && previous.phase === c.state && !engineDetailWanted()) {
+    // keep the detailed record while the phase is unchanged
+    state.engine = Object.assign({}, previous, {installed: c.installed, error: c.error,
+      preset_applied: c.preset_applied, autostart: c.autostart});
+  } else {
+    state.engine = {light: true, phase: c.state, mode: c.mode, installed: c.installed, error: c.error,
+      preset_applied: c.preset_applied, autostart: c.autostart, container: {available: c.cs}, steps: []};
+  }
+  renderHome();
+  renderDownloadsShell();
+  if (c.state !== "running") { state.dlRunning = null; updateBadge(); }
+  sched.kick();
 }
 
 async function loadEngine(force = false) {
@@ -5470,25 +5575,11 @@ function renderEngineJd2() {
   if (connected && jd.update_available) notes.push("JD2の更新があります");
   if (e && e.preset_applied !== true) notes.push("推奨設定が未適用のため、リンクを送れません");
   $("jd2Status").textContent = notes.join(" · ");
+  $("engineTestResult").textContent = jd ? (connected ? "JD2に接続できています" : "接続できません" +
+    (jd.reason ? ": " + jd.reason : "")) : "";
   setShown("jd2Check", connected && jd.can_update === true);
   setShown("jd2Update", connected && jd.can_update === true && jd.update_available === true);
   setShown("jd2Preset", connected && jd.can_preset === true);
-}
-
-// Inline, automatic and read-only: runs when the engine section opens.
-async function checkConnection() {
-  if (state.connChecking || !engineRunning()) return;
-  state.connChecking = true;
-  const out = $("engineTestResult");
-  out.textContent = "接続を確認しています…";
-  try {
-    await api("/api/jd2/connect/test", {});
-    out.textContent = "接続OK";
-  } catch (err) {
-    out.textContent = "接続できません: " + err.message;
-  } finally {
-    state.connChecking = false;
-  }
 }
 
 async function loadEngineKeys() {
@@ -5610,7 +5701,7 @@ function renderAccountsAvailability() {
   }
   $("accountsReload").disabled = !running;
   if (!running) {
-    $("accountsState").textContent = "JD2エンジンが起動していません。設定 › エンジン で起動すると、アカウントを管理できます。";
+    $("accountsState").textContent = "JD2エンジンが起動していません";
     $("accountsList").replaceChildren();
   }
 }
@@ -5660,7 +5751,7 @@ function renderAccounts(data) {
   if (engineRunning()) {
     $("accountsState").textContent = state.accounts.length ?
       state.accounts.length + "件のアカウント" + (data.truncated ? "（上限200件まで表示）" : "") :
-      "登録されているアカウントはありません。下のフォームから追加できます。";
+      "登録されているアカウントはありません";
     $("accountsList").replaceChildren(...state.accounts.map(accountCard));
   }
   renderHome();
@@ -5711,6 +5802,7 @@ function showAccountResult(item, fallback) {
 async function addAccount() {
   if (!accountsSecureNow()) throw new Error(ACCOUNT_SECURE_MESSAGE);
   const host = $("accountHost").value.trim().toLowerCase();
+  if (!state.accountHosts.length) await loadAccountHosts();
   if (!state.accountHosts.includes(host)) throw new Error("一覧にあるホストを選んでください");
   const body = {host, username: $("accountUser").value, password: $("accountPass").value};
   $("accountPass").value = "";
@@ -5798,6 +5890,7 @@ function wireAccounts() {
     state.accountEditId = "";
   });
   $("accountsReload").addEventListener("click", () => perform(() => loadAccounts(true)));
+  $("accountHost").addEventListener("focus", () => { if (engineRunning()) loadAccountHosts().catch(() => {}); });
 }
 
 // ---- Settings › NASブラウザ (v0.1.16)
@@ -5808,39 +5901,12 @@ function browserSectionVisible() {
   return state.route.view === "settings" && state.route.section === "browser";
 }
 
-function rbPollWanted() {
-  const e = state.rbStatus;
-  return Boolean(state.authed && browserSectionVisible() && document.visibilityState === "visible" &&
-    e && (e.phase === "setup" || e.phase === "starting" || e.phase === "stopping"));
-}
-
-function syncBrowserPoll() {
-  clearTimeout(state.rbTimer);
-  state.rbTimer = null;
-  if (!rbPollWanted() || state.rbBusy) return;
-  state.rbTimer = setTimeout(browserTick, RB_STATUS_POLL_MS);
-}
-
-async function browserTick() {
-  state.rbTimer = null;
-  if (!rbPollWanted() || state.rbBusy) return;
-  state.rbBusy = true;
-  try {
-    renderBrowserStatus(await api("/api/rb/status"));
-  } catch (e) {
-    state.rbBusy = false;
-    return;
-  }
-  state.rbBusy = false;
-  syncBrowserPoll();
-}
-
 function renderRemoteHosts() {
   const box = $("remoteHosts");
   if (!box) return;
   const hosts = remoteHosts();
   if (!hosts.length) {
-    box.replaceChildren(element("p", "設定されたサイトはありません。Webタブの表示がうまくいかないとき「NASブラウザで開く」を選ぶと追加されます。", "empty-state"));
+    box.replaceChildren(element("p", "設定されたサイトはありません", "empty-state"));
     return;
   }
   const nodes = [];
@@ -5861,15 +5927,17 @@ function renderRemoteHosts() {
 const POPUP_LABELS = {ask: "確認する", allow: "許可（新しいタブ）", block: "ブロック"};
 
 function ruleToggle(label, checked, onChange) {
-  const wrap = element("label", undefined, "rule-toggle");
+  const wrap = element("label", undefined, "switch compact");
   const input = document.createElement("input");
   input.type = "checkbox";
+  input.setAttribute("role", "switch");
   input.checked = checked;
   input.addEventListener("change", () => perform(async () => {
     try { await onChange(input.checked); } catch (e) { input.checked = !input.checked; throw e; }
   }));
   wrap.appendChild(input);
-  wrap.appendChild(document.createTextNode(" " + label));
+  wrap.appendChild(element("span", undefined, "switch-track"));
+  wrap.appendChild(element("span", label));
   return wrap;
 }
 
@@ -5879,7 +5947,7 @@ function renderSiteRules(data) {
   if (!box) return;
   const items = Array.isArray(data.items) ? data.items : [];
   if (!items.length) {
-    box.replaceChildren(element("p", "サイトごとの設定はありません。リンク検出シートの「このサイトでは今後自動で送る」やポップアップの「常に許可／常にブロック」で追加されます。", "empty-state"));
+    box.replaceChildren(element("p", "サイトごとの設定はありません", "empty-state"));
     return;
   }
   box.replaceChildren(...items.map(rule => {
@@ -5958,7 +6026,6 @@ function renderBrowserStatus(r) {
     li.appendChild(body);
     return li;
   }));
-  syncBrowserPoll();
 }
 
 async function loadBrowserLog() {
@@ -5977,18 +6044,16 @@ function wireBrowser() {
       flash($("blockAds").checked ? "広告をブロックします（次に開くタブから）" : "広告ブロックをやめました（次に開くタブから）");
     } catch (e) { $("blockAds").checked = !$("blockAds").checked; throw e; }
   }));
-  document.querySelectorAll('input[name="rbDefaultMode"]').forEach(radio => {
-    radio.addEventListener("change", () => perform(async () => {
-      if (!radio.checked) return;
-      try {
-        await saveOption("rb_default_mode", radio.value);
-        flash("既定の表示方法: " + RB_DISPLAY_LABELS[DISPLAY_OF_SETTING[radio.value]]);
-      } catch (e) {
-        renderDownloadDir(state.settings || {});
-        throw e;
-      }
-    }));
-  });
+  $("rbDefaultMode").addEventListener("change", () => perform(async () => {
+    const value = $("rbDefaultMode").value;
+    try {
+      await saveOption("rb_default_mode", value);
+      flash("既定の表示方法: " + RB_DISPLAY_LABELS[DISPLAY_OF_SETTING[value]]);
+    } catch (e) {
+      renderDownloadDir(state.settings || {});
+      throw e;
+    }
+  }));
   $("rbLinkBoxes").addEventListener("change", () => perform(async () => {
     try {
       await saveOption("rb_link_boxes", $("rbLinkBoxes").checked);
@@ -6032,13 +6097,11 @@ function wireBrowser() {
     updateChrome();
     flash("NASブラウザを停止しました");
   }));
-  document.addEventListener("visibilitychange", syncBrowserPoll);
 }
 
 function wireEngine() {
   $("engineSetup").addEventListener("click", () => perform(() => startEngineSetup()));
   $("engineResetup").addEventListener("click", () => perform(() => startEngineSetup()));
-  $("homeEngineSetup").addEventListener("click", () => perform(() => startEngineSetup()));
   $("engineSetupNative").addEventListener("click", () => perform(() => startEngineSetup("native")));
   $("engineMigrate").addEventListener("click", () => perform(migrateEngine));
   $("engineNativeRemove").addEventListener("click", () => perform(async () => {
@@ -6051,11 +6114,6 @@ function wireEngine() {
     applyEngine(await api("/api/engine/status"));
   }));
   $("engineStart").addEventListener("click", () => perform(startEngine));
-  $("homeEngineStart").addEventListener("click", () => perform(startEngine));
-  $("downloadsEngineAction").addEventListener("click", () => {
-    if ($("downloadsEngineAction").dataset.action === "setup") navigate("#/settings/engine");
-    else perform(startEngine);
-  });
   $("engineStop").addEventListener("click", () => perform(async () => {
     if (!confirm("JD2エンジンを停止します。実行中のダウンロードは中断されます（最大30秒かかります）。よろしいですか？")) return;
     $("engineStop").disabled = true;
@@ -6092,7 +6150,6 @@ function wireEngine() {
   $("rbLogBox").addEventListener("toggle", () => {
     if ($("rbLogBox").open) perform(loadBrowserLog);
   });
-  document.addEventListener("visibilitychange", syncEnginePoll);
 }
 
 function wireSettings() {
@@ -6101,6 +6158,8 @@ function wireSettings() {
     await folders("", true);
   }));
   $("folderCancel").addEventListener("click", () => setPicker(false));
+  $("folderSheet").addEventListener("click", e => { if (e.target === $("folderSheet")) setPicker(false); });
+  $("folderSheet").addEventListener("keydown", e => { if (e.key === "Escape") setPicker(false); });
   $("bookmarkForm").addEventListener("submit", event => {
     event.preventDefault();
     perform(async () => {
@@ -6117,12 +6176,6 @@ function wireSettings() {
       " / 書込取消: " + readableSize(io.cancelled_write_bytes) +
       "（累積値。JD2や他アプリのI/Oは含みません）" :
       "この環境では/proc/self/ioを読み取れません。";
-  }));
-  $("diagnosticJd2").addEventListener("click", () => perform(async () => {
-    const data = await api("/api/jd2/local-preflight");
-    $("diagnosticResult").textContent = (data.tcp_reachable ?
-      "127.0.0.1:3128にTCP接続できました。" : "127.0.0.1:3128に接続できません。") +
-      "接続できてもJD2の認証や外部からの隔離は確認できません。";
   }));
   wireEngine();
   wireAccounts();
@@ -6182,14 +6235,11 @@ function updateLanWarning(tailnet, https) {
 
 document.addEventListener("DOMContentLoaded", () => {
   updateLanWarning(false, false);
+  registerTasks();
   wireAuth();
   wireShell();
   wireDownloads();
   wireLinks();
-  wireSettings();
-  wireRemote();
-  wireBrowser();
   paintShellEarly();
-  fetchHealthVersion().then(v => { if (v && !state.bootVersion) state.bootVersion = v; });
   go();
 });

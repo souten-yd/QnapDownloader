@@ -3,7 +3,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
-python3 -m py_compile webapp.py storage.py durability.py updater.py self_update.py jd2_policy.py jd2_control.py jd2_local.py jd2_transfer.py jd2_downloads.py jd2_accounts.py engine_components.py engine_supervisor.py container_runtime.py runtime_diagnostics.py browser_safety.py rb_blocklist.py remote_browser.py qpkg/shared/downloader_pid.py
+python3 -m py_compile webapp.py ttlcache.py state_hub.py storage.py durability.py updater.py self_update.py jd2_policy.py jd2_control.py jd2_local.py jd2_transfer.py jd2_downloads.py jd2_accounts.py engine_components.py engine_supervisor.py container_runtime.py runtime_diagnostics.py browser_safety.py rb_blocklist.py remote_browser.py qpkg/shared/downloader_pid.py
 python3 -m unittest discover -s tests -v
 
 sh -n qpkg/shared/downloader.sh

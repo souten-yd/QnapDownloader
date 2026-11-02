@@ -16,6 +16,8 @@ import re
 import threading
 import time
 
+import ttlcache
+
 MAX_ACCOUNTS = 200
 MAX_HOSTS = 1000
 LIST_TTL = 30.0
@@ -256,6 +258,7 @@ class AccountService:
         self._sleep = sleep
         self._lock = threading.Lock()          # caches and rate-limit hits
         self._write_lock = threading.Lock()    # one account change at a time
+        self._flights = ttlcache.SingleFlightCache()   # concurrent reads share one JD2 call
         self._accounts = None                  # (at, items, truncated)
         self._hosts = None                     # (at, items)
         self._hits = []
@@ -307,7 +310,7 @@ class AccountService:
             hit = self._accounts
         if hit and not refresh and now - hit[0] < LIST_TTL:
             return {"items": hit[1], "truncated": hit[2], "age_seconds": int(now - hit[0])}
-        items, truncated = self._fetch_accounts(jd2)
+        items, truncated = self._flights.get("accounts", 0.0, lambda: self._fetch_accounts(jd2))
         return {"items": items, "truncated": truncated, "age_seconds": 0}
 
     def hosts(self, jd2, refresh=False):
@@ -316,13 +319,17 @@ class AccountService:
             hit = self._hosts
         if hit and not refresh and now - hit[0] < HOSTS_TTL:
             return {"items": hit[1]}
+        items = self._flights.get("hosts", 0.0, lambda: self._fetch_hosts(jd2))
+        return {"items": items}
+
+    def _fetch_hosts(self, jd2):
         try:
             items = normalize_hosts(self._call(jd2, "list_premium_hosters"))
         except ValueError:
             raise ServiceError("JD2のホスト一覧の形式が不正です", 502) from None
         with self._lock:
             self._hosts = (self._clock(), items)
-        return {"items": items}
+        return items
 
     def schema(self, jd2):
         """Schema-only diagnostic: key names and JSON type names, never values."""
