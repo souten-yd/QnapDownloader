@@ -28,8 +28,10 @@ DEFAULTS = {
     # (reader / fast = full-page tiles / live = screencast), and the optional link-box outlines.
     "rb_default_mode": "fast",
     "rb_link_boxes": False,
+    # v0.1.38: keep the NAS browser container running with no tabs (starts with the Hub).
+    "rb_resident": False,
 }
-BOOL_OPTIONS = ("send_autostart", "block_ads", "probe_autosend", "rb_link_boxes")
+BOOL_OPTIONS = ("send_autostart", "block_ads", "probe_autosend", "rb_link_boxes", "rb_resident")
 ENUM_OPTIONS = {"rb_default_mode": ("reader", "fast", "live")}
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY,value TEXT NOT NULL);

@@ -125,6 +125,7 @@ const state = {
   engine: null,
   https: false, tailnet: false,
   rbPolling: "", rbPollMode: "", rbGen: 0, rbStatus: null, rbReady: null,
+  rbRestarts: null, rbLost: null, rbCrashAt: 0,
   debug: {enabled: false, level: "debug", categories: [], until: 0, endsAt: 0},
   rbIntercepts: [],
   rbQuality: loadRbQuality(), rbStream: null, rbPerf: false, rbPerfSamples: [],
@@ -1085,6 +1086,21 @@ async function rbInput(event) {
   }
 }
 
+const RB_LOST_TEXT = "NASブラウザのタブが閉じられました";
+const RB_CRASH_QUIET_MS = 120000;
+
+// The NAS browser stopped by itself (v0.1.38): its tabs are gone on the NAS side. Forget them
+// quietly so that autoReopen opens the current URL again as soon as the tab is shown.
+function resetTabsAfterCrash() {
+  state.rbCrashAt = Date.now();
+  for (const tab of state.tabs) {
+    if (tab.rb) remoteLost(tab);
+    if (tab.error === RB_LOST_TEXT) tab.error = "";
+    tab.reopenAt = 0;
+  }
+  if (state.authed) updateChrome();
+}
+
 function remoteLost(tab) {
   if (tab.rb) {
     dropRemoteImage(tab.rb);
@@ -1095,7 +1111,9 @@ function remoteLost(tab) {
     renderIntercept();
   }
   tab.rb = null;
-  tab.error = "NASブラウザのタブが閉じられました";
+  // v0.1.38: right after the watchdog restarted the NAS browser the tab is simply reopened when shown.
+  tab.error = Date.now() - state.rbCrashAt < RB_CRASH_QUIET_MS ? "" : RB_LOST_TEXT;
+  if (!tab.error) tab.reopenAt = 0;
   state.rbPolling = "";
   state.rbPollMode = "";
   state.rbGen++;
@@ -5395,6 +5413,8 @@ function renderDownloadDir(s) {
   $("blockAds").checked = s.block_ads !== false;
   $("rbDefaultMode").value = DISPLAY_OF_SETTING[s.rb_default_mode] ? s.rb_default_mode : "fast";
   $("rbLinkBoxes").checked = s.rb_link_boxes === true;
+  $("rbResident").checked = s.rb_resident === true;
+  renderResidentQuick(s.rb_resident === true);
   $("selectedFolder").textContent = s.download_dir || "未選択";
   $("folderChange").textContent = s.download_dir ? "変更" : "選ぶ";
   renderHome();
@@ -5998,6 +6018,7 @@ function registerTasks() {
     return Boolean(tab && tab.rb && tab.rb.autoLive);
   }, () => { const tab = activeWebTab(); return tab && tab.rb ? autoPollTick(tab, tab.rb) : null; });
   sched.add("disk", DISK_REFRESH_MS, diagVisible, loadDisk);
+  sched.add("rb-mem", 5000, browserSectionVisible, () => loadBrowserStatus(true));
   sched.add("debug-view", DEBUG_VIEW_MS, () => dbgView.open && !dbgView.paused, () => pollDebugView(false));
   sched.add("debug-fps", 10000, () => state.debug.enabled, debugFps);
   sched.add("debug-remaining", 5000, () => state.debug.enabled && diagVisible(), renderDebugCard);
@@ -6088,6 +6109,14 @@ function applyState(d) {
   // NAS browser: refetch the status only while its settings are on screen
   if (typeof d.rb.ready === "boolean") setRbReady(d.rb.ready);
   if (d.debug) setDebugState(d.debug);
+  if (typeof d.rb.restarts === "number") {
+    if (state.rbRestarts !== null && d.rb.restarts > state.rbRestarts) flash("NASブラウザを再起動しました");
+    state.rbRestarts = d.rb.restarts;
+  }
+  if (typeof d.rb.lost === "number") {
+    if (state.rbLost !== null && d.rb.lost > state.rbLost) resetTabsAfterCrash();
+    state.rbLost = d.rb.lost;
+  }
   if (d.rb.sig !== state.rbSig) {
     state.rbSig = d.rb.sig;
     if (browserSectionVisible()) { swrDrop("rb-status"); loadBrowserStatus(true).catch(() => {}); }
@@ -6936,8 +6965,30 @@ function renderBrowserStatus(r) {
   if (typeof r.image_ready === "boolean") setRbReady(r.image_ready);
   const cs = r.container_station || {};
   const setup = r.phase === "setup";
-  $("rbState").textContent = r.update_needed && !setup ? "更新が必要" : !r.image_ready && !setup ? "未設定" : RB_PHASE_LABELS[r.phase] || r.phase;
+  const res = r.resident || {};
+  const wd = res.watchdog || {};
+  let label = r.update_needed && !setup ? "更新が必要" : !r.image_ready && !setup ? "未設定" : RB_PHASE_LABELS[r.phase] || r.phase;
+  if (!setup && r.image_ready) {
+    if (res.state === "resident") label = "常駐中";
+    else if (res.state === "restarting") label = "再起動中（" + wd.restart_n + "回目）";
+    else if (res.state === "gave_up") label = "自動再起動を停止";
+    else if (res.state === "memory_wait") label = "メモリ不足のため待機中";
+  }
+  $("rbState").textContent = label;
   $("rbState").classList.toggle("is-ok", r.phase === "running");
+  $("rbRetry").hidden = res.state !== "gave_up";
+  const wdText = res.state === "gave_up" ? wd.message : res.state === "memory_wait" ? "メモリ不足のため待機中" : "";
+  $("rbWatchdog").hidden = !wdText;
+  $("rbWatchdog").textContent = wdText || "";
+  if (typeof res.on === "boolean") {
+    $("rbResident").checked = res.on;
+    renderResidentQuick(res.on);
+  }
+  $("rbResidentLine").textContent = residentLines(r);
+  $("rbWdLog").textContent = (wd.events || []).map(e => {
+    const t = new Date(e.at * 1000);
+    return t.toLocaleTimeString("ja-JP", {hour12: false}) + "  " + e.text;
+  }).join("\n") || "まだありません";
   setShown("rbNoContainer", cs.available === false);
   $("rbSetup").hidden = setup || cs.available === false || r.phase !== "stopped";
   $("rbSetup").textContent = r.image_ready ? "イメージを再作成" :
@@ -6978,7 +7029,52 @@ async function loadBrowserStatus(force = false) {
   await swr("rb-status", "/api/rb/status", renderBrowserStatus, {force});
 }
 
+// v0.1.38: the 常駐 switch sits right under the status (one control, no duplicate button).
+function renderResidentQuick(on) {
+  $("rbResident").checked = on;
+}
+
+async function setResident(on, revert) {
+  try {
+    await saveOption("rb_resident", on);
+    flash(on ? "NASブラウザを常駐させます" : "NASブラウザの常駐をやめました（使わなければ自動で停止）");
+  } catch (e) { revert(); throw e; }
+  swrDrop("rb-status");
+  renderBrowserStatus(await api("/api/rb/status"));
+}
+
+function fmtMib(value) { return typeof value === "number" ? value + " MiB" : "取得できません"; }
+
+function residentLines(r) {
+  const res = r.resident || {};
+  const parts = [];
+  const idle = res.idle;
+  const total = typeof res.total_mib === "number" ? Math.round(res.total_mib / 1024) + " GB" : "";
+  if (idle) {
+    parts.push("待機時 約 " + idle.latest_mib + " MiB" +
+      (typeof idle.percent_of_total === "number" && total ? "（" + total + "の" + idle.percent_of_total + "%）" : "") +
+      (idle.min_mib < idle.latest_mib ? " 最小 " + idle.min_mib + " MiB" : ""));
+  } else {
+    parts.push(res.on ? "待機時 未測定（タブを閉じて60秒後に測ります）" : "待機時 未測定（常駐をオンにすると測ります）");
+  }
+  if (r.phase === "running") {
+    const cur = res.memory;
+    parts.push("現在 " + (cur ? cur.used_mib + " MiB" + (typeof cur.anon_mib === "number" ? "（匿名 " + cur.anon_mib + "）" : "") : "取得できません"));
+  }
+  parts.push("Hub " + fmtMib(res.hub_rss_mib));
+  return parts.join(" · ");
+}
+
 function wireBrowser() {
+  $("rbResident").addEventListener("change", () => perform(() =>
+    setResident($("rbResident").checked, () => { $("rbResident").checked = !$("rbResident").checked; })));
+  $("rbRetry").addEventListener("click", () => perform(async () => {
+    $("rbRetry").disabled = true;
+    try { await api("/api/rb/retry", {}); } finally { $("rbRetry").disabled = false; }
+    swrDrop("rb-status");
+    renderBrowserStatus(await api("/api/rb/status"));
+    flash("NASブラウザを再起動します");
+  }));
   $("blockAds").addEventListener("change", () => perform(async () => {
     try {
       await saveOption("block_ads", $("blockAds").checked);

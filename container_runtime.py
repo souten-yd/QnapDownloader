@@ -354,6 +354,10 @@ class Runtime:
                 "exit_code": state.get("ExitCode") if isinstance(state.get("ExitCode"), int) else None,
                 "id": item.get("Id") if isinstance(item.get("Id"), str) else "",
                 "pid": state.get("Pid") if isinstance(state.get("Pid"), int) else 0,
+                # v0.1.38: why it stopped (watchdog reason text); short, display-only.
+                "oom": state.get("OOMKilled") is True,
+                "error": _clip_text(state.get("Error")),
+                "finished_at": _clip_text(state.get("FinishedAt"), 40),
             }
         except (ValueError, IndexError, AttributeError, TypeError):
             raise ContainerError("コンテナ情報を解析できません") from None
@@ -365,7 +369,8 @@ class Runtime:
         if info is None:
             return {"exists": False, "managed": False, "running": False, "status": "absent"}
         return {"exists": True, "managed": info["managed"], "running": info["running"],
-                "status": info["status"], "exit_code": info["exit_code"]}
+                "status": info["status"], "exit_code": info["exit_code"], "oom": info["oom"],
+                "error": info["error"], "finished_at": info["finished_at"]}
 
     def _require_ours(self, name):
         info = self._inspect(name)
@@ -706,6 +711,13 @@ class Runtime:
         if result.returncode != 0:
             raise ContainerError("コンテナのメモリ使用量を取得できません")
         return parse_stats((result.stdout or "").strip())
+
+
+def _clip_text(value, limit=120):
+    """Short single-line display text from a docker State field ('' when absent)."""
+    if not isinstance(value, str):
+        return ""
+    return " ".join("".join(c if c.isprintable() else " " for c in value).split())[:limit]
 
 
 NO_USERNS_MESSAGE = (

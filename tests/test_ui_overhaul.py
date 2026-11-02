@@ -124,7 +124,7 @@ class LinksAndTimersTests(unittest.TestCase):
         for call in re.finditer(r'api\("/api/(engine|rb)/status"\)', JS):
             before = JS[max(0, call.start() - 400):call.start()]
             self.assertNotRegex(before, r"setTimeout\(\w*Tick")
-        self.assertEqual(len(re.findall(r"sched\.add\(", JS)), 8)
+        self.assertEqual(len(re.findall(r"sched\.add\(", JS)), 9)
         self.assertIn('document.visibilityState !== "visible"', JS[JS.index("const sched = {"):])
         self.assertIn("/api/state?rev=", JS)
 

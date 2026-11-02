@@ -101,3 +101,9 @@
 - Hubは管理者権限でDocker CLIを使う。操作は固定関数のみ、引数はコード内定数とHubが検証した値だけ。
 - ブラウザコンテナはインターネットとLANへ出られる（ブラウザとして必要）。悪意あるページがLAN内機器へ要求を出す可能性はある（通常のブラウザと同等）。将来、LAN宛て通信の遮断を検討。
 - イメージ取得時のダイジェスト照合はDocker自体が行う。ビルドで入るDebianパッケージは署名検証付きのapt。
+
+## 6. NASブラウザの常駐とウォッチドッグ（v0.1.38、実機未検証）
+- **設定 `rb_resident`**（既定オフ）。オンの間、Hub起動時と切替直後に、イメージがあり `MemAvailable ≥ 2GiB` のときだけコンテナを起動し、タブ0枚でも止めない（5分/10分のアイドル停止を無効化。操作が10分ないタブは閉じてメモリを返すがコンテナは残す）。最後のタブを閉じると `Memory.simulatePressureNotification {level:"critical"}` と、`about:blank` の錨ターゲットでの `HeapProfiler.collectGarbage` を試す（失敗は無視）。オフは従来どおり。
+- **待機時メモリ**: 常駐・タブ0枚のまま、トリムから60秒後に1回記録（以後5分ごとに更新、最小値・最新値・時刻をRAMに保持）。cgroupは `diskio.container_cgroup_paths` を再利用: v2 は `memory.current`（`memory.stat` の anon/file を別表示）、v1 は `memory.usage_in_bytes − total_inactive_file`。読めなければ `docker stats`（5秒キャッシュ）。Hub本体は `/proc/self/status` の VmRSS。表示は `/api/rb/status` の `resident`、`/api/state` の `rb.res/rs/idle_mib/cur_mib/restarts/lost`。
+- **ウォッチドッグ**: コンテナが走っているはずの間（常駐オン、またはタブあり）に、DevTools接続が閉じた／30秒ごとの `docker inspect` で停止していたら「予期せぬ停止」とみなす。`State.ExitCode/OOMKilled/Error/FinishedAt` を読み、コンテナを片付けて再起動を予約。間隔 5秒→15秒→60秒、15分に5回まで。超えたら停止して「NASブラウザが繰り返し停止したため自動再起動を止めました（理由: …）」と「再試行」（`POST /api/rb/retry`）。各再起動の前に既存のメモリ確認（空き2GiB）を行い、足りなければ試行回数を消費せず「メモリ不足のため待機中」。Hub／利用者による停止、初期設定中、イメージ無しでは再起動しない。接続断で再接続は試みず、コンテナを作り直す（タブはどのみち失われる）。再起動後、クライアントは `lost` カウンタの変化でタブを静かに初期化し、表示時に autoReopen が現在のURLを開き直す。トーストは `restarts` の増加で1回。履歴は直近20件をRAMに保持。
+- **Docker の `--restart` を使わない理由**: Dockerが自動で再起動すると、Hubのメモリ確認（NAS全体が逼迫しているときに2GiBのブラウザを立ち上げ直してしまう）と回数上限・理由表示を迂回し、再起動したコンテナにHubが接続し直す保証もない。OOMで落ちたコンテナが再び即座にOOMを繰り返す危険もあるため、再起動の判断はHubが持つ。

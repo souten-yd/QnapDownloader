@@ -120,11 +120,20 @@ class FakeDocker:
         nets = {box["net"]: {"IPAddress": box["ip"]}}
         for extra in box["extra_nets"]:
             nets[extra] = {"IPAddress": "172.31.0.2"}
-        return {"Name": "/" + name, "Config": {"Labels": box["labels"]},
+        return {"Name": "/" + name, "Id": box.get("id", "ab" * 32), "Config": {"Labels": box["labels"]},
                 "State": {"Status": "running" if box["running"] else "exited",
-                          "Running": box["running"], "ExitCode": box.get("exit", 0)},
+                          "Running": box["running"], "ExitCode": box.get("exit", 0),
+                          "Pid": box.get("pid", 4242) if box["running"] else 0,
+                          "OOMKilled": box.get("oom", False), "Error": box.get("error", ""),
+                          "FinishedAt": box.get("finished", "0001-01-01T00:00:00Z")},
                 "HostConfig": {"PortBindings": box["ports"]},
                 "NetworkSettings": {"Networks": nets}}
+
+    def crash(self, name, code=137, oom=False, error=""):
+        """The container dies by itself (not through `docker stop`)."""
+        box = self.containers[name]
+        box.update(running=False, exit=code, oom=oom, error=error,
+                   finished="2026-11-03T01:02:03.000000000Z")
 
     def docker_calls(self):
         return [c[1:] for c in self.calls if c[0] == DOCKER]

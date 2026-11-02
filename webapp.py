@@ -32,7 +32,7 @@ import state_hub
 import ttlcache
 import updater
 
-VERSION = "0.1.37"
+VERSION = "0.1.38"
 PORT = 17864
 ROOT = Path(__file__).resolve().parent
 FILES = {"/": ("web/index.html", "text/html; charset=utf-8"),
@@ -357,6 +357,17 @@ def wire_remote_browser(server):
     """Give the NAS browser its site rules (DB) and the existing JD2 send path."""
     server.rb.rules = server.store
     server.rb.auto_send = lambda url: auto_send_link(server, url)
+
+
+def boot_remote_browser(server):
+    """Hub start: drop a leftover browser container, then start the resident one if the switch is on."""
+    try:
+        server.rb.startup_cleanup()
+    finally:
+        try:
+            server.rb.set_resident(server.store.settings().get("rb_resident") is True)
+        except Exception:
+            pass
 
 
 def server_cache(server):
@@ -1037,6 +1048,9 @@ class Handler(BaseHTTPRequestHandler):
                     raise ValueError("変更できる設定項目を指定してください")
                 for key in known:
                     self.store.set_option(key, body[key])
+                if "rb_resident" in known:
+                    # v0.1.38: apply at once (start / let go of the resident NAS browser)
+                    self.server.rb.set_resident(self.store.settings().get("rb_resident") is True)
                 return self.send_data(200, self.store.settings())
             if path == "/api/bookmarks":
                 identifier = self.store.add_bookmark(body.get("title"), body.get("url"))
@@ -1107,6 +1121,10 @@ class Handler(BaseHTTPRequestHandler):
                 except remote_browser.SetupBusy as exc:
                     return self.reject(str(exc), 409)
                 return self.send_data(202, {"started": True})
+            if path == "/api/rb/retry":
+                # v0.1.38: after the watchdog gave up. Starts the browser again (memory guard applies).
+                started = self.server.rb.retry()
+                return self.send_data(202, {"retrying": started})
             if path == "/api/rb/stop":
                 if body.get("confirmed") is not True:
                     raise ValueError("NASブラウザの停止には確認が必要です")
@@ -1287,7 +1305,7 @@ def main():
         server.engine.runtime, ROOT / "container" / "browser")
     wire_remote_browser(server)
     # A labelled browser container surviving a Hub crash would hold memory.
-    threading.Thread(target=server.rb.startup_cleanup, daemon=True).start()
+    threading.Thread(target=boot_remote_browser, args=(server,), daemon=True).start()
     runtime_diagnostics.event("web_started")
 
     def request_shutdown(signum, frame):
