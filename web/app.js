@@ -1667,9 +1667,12 @@ function updateRemoteView(tab) {
   $("remoteIdle").hidden = live && (tiles ? Boolean(tab.rb.view) :
     reader ? Boolean(tab.rb.reader && tab.rb.reader.data) : !$("remoteImg").hidden);
   if (!live || display !== "live") paintLiveBoxes(null);
-  $("remoteIdleText").textContent = tab.error || (live ? "画面を待っています…" :
-    "NASブラウザのタブは開かれていません（メモリ節約のため自動で閉じました）。");
-  setShown("remoteReopen", !live);
+  // A tab closed to save memory reopens by itself when it is shown again (v0.1.32);
+  // the button only appears when that automatic reopen failed.
+  const reopening = !live && autoReopen(tab);
+  $("remoteIdleText").textContent = tab.error || (live || reopening ? "画面を待っています…" :
+    "NASブラウザのタブを開けませんでした。");
+  setShown("remoteReopen", !live && !reopening);
   setShown("remoteLoading", Boolean(tab.loading));
   setShown("autoLiveChip", live && tab.rb.autoLive === true && tab.rb.autoChip === true);
   const count = live ? tab.rb.links.length : 0;
@@ -1679,6 +1682,23 @@ function updateRemoteView(tab) {
   setShown("remotePopups", blockedPopups > 0);
   $("remotePopups").textContent = "ポップアップ " + blockedPopups + "件ブロック";
   renderIntercept();
+}
+
+const RB_AUTO_REOPEN_MS = 30000;
+function autoReopen(tab) {
+  if (tab.reopening) return true;
+  if (document.hidden || activeWebTab() !== tab) return false;
+  const now = Date.now();
+  if (tab.reopenAt && now - tab.reopenAt < RB_AUTO_REOPEN_MS) return false;   // failed recently: show the button
+  tab.reopenAt = now;
+  tab.reopening = true;
+  tab.error = "";
+  perform(() => openInRemote(tab)).finally(() => {
+    tab.reopening = false;
+    if (tab.rb) tab.reopenAt = 0;
+    if (activeWebTab() === tab) updateRemoteView(tab);
+  });
+  return true;
 }
 
 function scheduleRemoteLinks(tab) {

@@ -242,7 +242,7 @@ IFRAME:1,OBJECT:1,EMBED:1,CANVAS:1,SELECT:1,BUTTON:1,INPUT:1,TEXTAREA:1,AUDIO:1,
 var INLINE={'inline':1,'inline-block':1,'inline-flex':1,'inline-grid':1,'inline-table':1,
 'contents':1,'ruby':1,'table-cell':1};
 var blocks=[],images=[],imgIndex={},size=0,trunc=false,visited=0,depth=0,inA=0,anchorImgs=[];
-var hid=false,root=null;
+var hid=false,root=null,pseudoLeft=8000;
 var buf=[],ctx={kind:'p',depth:0,level:0};
 function norm(s){return s.replace(/[ \t\r\n\f ]+/g,' ');}
 function addRun(text,href){
@@ -296,6 +296,7 @@ function adLike(el){
  return true;
 }
 function pseudo(node,which){
+ if(pseudoLeft<=0)return '';pseudoLeft--;
  try{
   var ps=getComputedStyle(node,which),c=ps.content;
   if(!c||c==='none'||c==='normal'||c.charAt(0)!=='"'||ps.display==='none'||ps.visibility==='hidden')return '';
