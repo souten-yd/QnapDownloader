@@ -32,7 +32,7 @@ import state_hub
 import ttlcache
 import updater
 
-VERSION = "0.1.35"
+VERSION = "0.1.36"
 PORT = 17864
 ROOT = Path(__file__).resolve().parent
 FILES = {"/": ("web/index.html", "text/html; charset=utf-8"),

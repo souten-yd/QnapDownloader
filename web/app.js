@@ -2715,9 +2715,15 @@ function readerLink(text, href) {
 const READER_LONG_TOKEN = 28;
 const READER_SIZE_RE = /^\s*[(（［\[]?\s*(\d[\d.,]*\s*[KMGT]i?B)\s*[)）］\]]?/i;
 
+// "Long" = a raw URL or a run of 24+ URL / file-name characters (Japanese prose has no spaces,
+// so length alone would wrongly turn ordinary link sentences into cards).
+const READER_LONG_RUN = /[A-Za-z0-9._~%+=&?#:\/\\@!$'*,;\[\]{}-]{24,}/;
+const READER_TRAIL_SIZE = /\s*[(（［\[]\s*(\d[\d.,]*\s*[KMGT]i?B)\s*[)）］\]]\s*$/i;
+const READER_ONLY_SIZE = /^\s*[(（［\[]?\s*(\d[\d.,]*\s*[KMGT]i?B)\s*[)）］\]]?\s*$/i;
+
 function readerLongText(text) {
   const t = text.trim();
-  return /^https?:\/\//i.test(t) || (t.length >= READER_LONG_TOKEN && !/\s/.test(t));
+  return /^https?:\/\//i.test(t) || READER_LONG_RUN.test(t);
 }
 
 function middleEllipsis(text, max) {
@@ -2744,7 +2750,11 @@ function readerCardItems(runs) {
   let pending = "";
   for (const r of runs) {
     if (r.href) {
-      items.push({label: readerLabel(pending), text: r.text.trim(), href: r.href, size: ""});
+      // The size is often part of the link text itself: "name.rar (66.76 MB)".
+      const own = READER_TRAIL_SIZE.exec(r.text);
+      const text = own ? r.text.slice(0, own.index) : r.text;
+      items.push({label: readerLabel(pending), text: text.trim() || r.text.trim(), href: r.href,
+        size: own ? own[1].replace(/\s+/g, " ") : ""});
       pending = "";
       continue;
     }
@@ -2754,8 +2764,8 @@ function readerCardItems(runs) {
     if (m) { last.size = m[1].replace(/\s+/g, " "); text = text.slice(m[0].length); }
     pending += text;
   }
-  if (readerLabel(pending).length > 40) return null;          // trailing prose: not a link list
-  if (items.some(it => it.label.length > 40)) return null;
+  if (readerLabel(pending).length > 16) return null;          // trailing prose: not a link list
+  if (items.some(it => it.label.length > 24)) return null;
   return items;
 }
 
@@ -2905,7 +2915,34 @@ function renderReaderBody(rb) {
   }
   const renderStart = performance.now();
   const frag = document.createDocumentFragment();
-  for (const block of data.blocks) frag.appendChild(readerNode(rb, block));
+  // A label ("RapidGator") or a size ("(66.76 MB)") laid out in its own column comes as a
+  // separate short block: it is folded into the neighbouring link card when it fits.
+  let prev = null;
+  const blocks = data.blocks;
+  for (let k = 0; k < blocks.length; k++) {
+    const block = blocks[k];
+    const runs = (block.t === "p" || block.t === "li") ? block.runs : null;
+    const items = runs && !readerLinkRow(runs) ? readerCardItems(runs) : null;
+    if (items) {
+      if (!items[0].label && prev && prev.label) { items[0].label = prev.label; prev.node.remove(); }
+      const next = blocks[k + 1];
+      const last = items[items.length - 1];
+      const nextText = next && next.t === "p" && next.runs.every(r => !r.href) ? next.runs.map(r => r.text).join("") : "";
+      const m = nextText && !last.size ? READER_ONLY_SIZE.exec(nextText) : null;
+      if (m) { last.size = m[1].replace(/\s+/g, " "); k++; }
+      frag.appendChild(readerCards(items));
+      prev = null;
+      continue;
+    }
+    const node = readerNode(rb, block);
+    frag.appendChild(node);
+    let label = "";
+    if (block.t === "p" && block.runs.every(r => !r.href)) {
+      const text = readerLabel(block.runs.map(r => r.text).join(""));
+      if (text && text.length <= 30) label = text;
+    }
+    prev = label ? {node, label} : null;
+  }
   dlog("render", "info", "reader render", {ms: Math.round(performance.now() - renderStart), blocks: data.blocks.length});
   if (data.truncated) frag.appendChild(element("p", "長いページのため、途中までを表示しています。", "reader-empty"));
   body.appendChild(frag);
@@ -3600,6 +3637,8 @@ function focusOmnibox() {
 }
 
 // ---------------------------------------------------------------- menu
+const MENU_ITEMS = "[role='menuitem'],[role='menuitemradio'],[role='menuitemcheckbox']";
+
 function closeMenu(returnFocus = true) {
   if ($("menu").hidden) return;
   $("menu").hidden = true;
@@ -3610,33 +3649,31 @@ function closeMenu(returnFocus = true) {
 function configureMenu() {
   const tab = activeWebTab();
   const web = Boolean(tab && tab.history.length);
-  $("menu").querySelectorAll("[data-scope='web']").forEach(n => { n.hidden = !web; });
+  const menu = $("menu");
+  menu.querySelectorAll("[data-scope='web']").forEach(n => { n.hidden = !web; });
   const usable = Boolean(tab && tab.current);
   for (const action of ["stageUrl", "bookmark"]) {
-    $("menu").querySelector("[data-action='" + action + "']").disabled = !usable;
+    menu.querySelector("[data-action='" + action + "']").disabled = !usable;
   }
-  $("menu").querySelector("[data-action='reopen']").disabled = state.closed.length === 0;
-  const remoteMenu = Boolean(tab && tab.history.length);
-  $("menu").querySelectorAll("[data-scope='remote']").forEach(n => { n.hidden = !remoteMenu; });
-  $("menu").querySelectorAll("[data-quality]").forEach(n => {
-    const on = n.dataset.quality === state.rbQuality;
-    n.textContent = (on ? "✓ " : "") + "画質: " + RB_QUALITY_LABELS[n.dataset.quality];
-    n.setAttribute("aria-checked", String(on));
-  });
+  menu.querySelector("[data-action='reopen']").disabled = state.closed.length === 0;
+  menu.querySelectorAll("[data-scope='remote']").forEach(n => { n.hidden = !web; });
   const display = tab && tab.rb ? tabDisplay(tab) : "tiles";
-  $("menu").querySelectorAll("[data-display]").forEach(n => {
-    const on = n.dataset.display === display;
-    n.textContent = (on ? "✓ " : "") + "表示: " + RB_DISPLAY_LABELS[n.dataset.display];
-    n.setAttribute("aria-checked", String(on));
+  // Picture quality only matters for the fast and live displays (v0.1.36).
+  menu.querySelectorAll("[data-scope='quality']").forEach(n => { n.hidden = !web || display === "reader"; });
+  menu.querySelectorAll("[data-quality]").forEach(n => {
+    n.setAttribute("aria-checked", String(n.dataset.quality === state.rbQuality));
   });
-  $("menuPerf").textContent = state.rbPerf ? "速度表示をやめる" : "速度表示";
+  menu.querySelectorAll("[data-display]").forEach(n => {
+    n.setAttribute("aria-checked", String(n.dataset.display === display));
+  });
+  $("menuPerf").setAttribute("aria-checked", String(Boolean(state.rbPerf)));
 }
 
 function openMenu() {
   configureMenu();
   $("menu").hidden = false;
   $("menuButton").setAttribute("aria-expanded", "true");
-  const first = Array.from($("menu").querySelectorAll("[role='menuitem']"))
+  const first = Array.from($("menu").querySelectorAll(MENU_ITEMS))
     .find(n => !n.hidden && !n.disabled);
   if (first) first.focus();
 }
@@ -5130,7 +5167,7 @@ function onKeydown(event) {
 
 function onMenuKeydown(event) {
   if (event.key !== "ArrowDown" && event.key !== "ArrowUp") return;
-  const items = Array.from($("menu").querySelectorAll("[role='menuitem']")).filter(n => !n.hidden && !n.disabled);
+  const items = Array.from($("menu").querySelectorAll(MENU_ITEMS)).filter(n => !n.disabled && n.offsetParent !== null);
   if (!items.length) return;
   event.preventDefault();
   const at = items.indexOf(document.activeElement);

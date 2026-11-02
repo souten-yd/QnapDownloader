@@ -173,7 +173,7 @@ if (bad.length) { console.error("mismatch: " + bad.join(",")); process.exit(1); 
         self.assertRegex(css, r"\.reader-scroll\{[^}]*touch-action:pan-x pan-y pinch-zoom")
         self.assertRegex(css, r"\.reader-scroll\{[^}]*user-select:text")
         self.assertRegex(css, r"\.link-boxes\{[^}]*pointer-events:none")
-        for text in ("既定の表示方法", "リンクの枠を表示", "元のページ表示に切替", "表示: リーダー"):
+        for text in ("既定の表示方法", "リンクの枠を表示", "元のページ表示に切替", 'data-display="reader">リーダー'):
             self.assertIn(text, self.html)
         self.assertIn('name="rbDefaultMode"', self.html)
 
@@ -823,7 +823,8 @@ if (o !== "リーダー · ブロック 3 · 画像 1/2 · 取得 600 ms · 画�
     def test_v0128_display_menu_and_default(self):
         self.assertIn('data-action="display:tiles"', self.html)
         self.assertIn('data-action="display:live"', self.html)
-        for text in ("表示: 高速（全体表示）", "表示: ライブ"):
+        # v0.1.36: a segmented 表示 control in the grouped menu
+        for text in ('aria-label="表示方法"', '>高速</button>', '>ライブ</button>'):
             self.assertIn(text, self.html)
         self.assertIn('RB_DISPLAY_LABELS = {reader: "リーダー", tiles: "高速（全体表示）", live: "ライブ"}', self.js)
         self.assertIn('const REMOTE_LIVE_MODE = "remote-live"', self.js)
@@ -1161,3 +1162,15 @@ class ReaderLinkCardsTest(unittest.TestCase):
         # cards stay data-href anchors: taps and long presses keep going through the NAS browser
         self.assertIn('readerLink("", it.href)', app)
         self.assertIn(".reader-card{", css)
+
+
+class ReaderLinkCardsFoldTest(unittest.TestCase):
+    """v0.1.36: size inside the link text, label/size in neighbouring blocks, Japanese prose stays text."""
+
+    def test_card_detection(self):
+        app = (Path(__file__).resolve().parents[1] / "web" / "app.js").read_text(encoding="utf-8")
+        self.assertIn("READER_TRAIL_SIZE", app)
+        self.assertIn("READER_ONLY_SIZE", app)
+        self.assertIn("prev.node.remove()", app)
+        # long = URL or an ASCII file-name run, never plain length (Japanese has no spaces)
+        self.assertIn("READER_LONG_RUN.test(t)", app)

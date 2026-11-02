@@ -87,23 +87,36 @@
    <div class="menu-wrap">
     <button type="button" id="menuButton" class="icon-btn" aria-label="メニュー" title="メニュー" aria-haspopup="menu" aria-expanded="false" aria-controls="menu"><svg class="icon" aria-hidden="true"><use href="#i-more"/></svg></button>
     <div id="menu" class="menu" role="menu" aria-label="メニュー" hidden>
-     <button type="button" role="menuitem" data-action="newTab">新しいタブ</button>
-     <button type="button" role="menuitem" data-action="reopen">閉じたタブを開き直す</button>
-     <hr data-scope="web">
-     <button type="button" role="menuitem" data-action="display:reader" data-display="reader" data-scope="remote">表示: リーダー</button>
-     <button type="button" role="menuitem" data-action="display:tiles" data-display="tiles" data-scope="remote">表示: 高速（全体表示）</button>
-     <button type="button" role="menuitem" data-action="display:live" data-display="live" data-scope="remote">表示: ライブ</button>
-     <button type="button" role="menuitem" data-action="quality:speed" data-quality="speed" data-scope="remote">画質: 速度優先</button>
-     <button type="button" role="menuitem" data-action="quality:standard" data-quality="standard" data-scope="remote">画質: 標準</button>
-     <button type="button" role="menuitem" data-action="quality:high" data-quality="high" data-scope="remote">画質: 高画質</button>
-     <button type="button" role="menuitem" data-action="perf" data-scope="remote" id="menuPerf">速度表示</button>
-     <button type="button" role="menuitem" data-action="stageUrl" data-scope="web">このURLを追加したリンクへ</button>
-     <button type="button" role="menuitem" data-action="bookmark" data-scope="web">ブックマークに追加</button>
-     <button type="button" role="menuitem" data-action="closeTab" data-scope="web">タブを閉じる</button>
-     <hr>
-     <button type="button" role="menuitem" data-action="bookmarks">ブックマークの管理</button>
-     <button type="button" role="menuitem" data-action="settings">設定</button>
-     <button type="button" role="menuitem" id="logout" data-action="logout">ログアウト</button>
+     <div class="menu-quick">
+      <button type="button" role="menuitem" data-action="newTab">＋ 新しいタブ</button>
+      <button type="button" role="menuitem" data-action="reopen">↺ 閉じたタブ</button>
+     </div>
+     <div class="menu-section" data-scope="web">
+      <div class="menu-head">このページ</div>
+      <div class="menu-label" data-scope="remote">表示</div>
+      <div class="menu-seg" role="group" aria-label="表示方法" data-scope="remote">
+       <button type="button" role="menuitemradio" data-action="display:reader" data-display="reader">リーダー</button>
+       <button type="button" role="menuitemradio" data-action="display:tiles" data-display="tiles">高速</button>
+       <button type="button" role="menuitemradio" data-action="display:live" data-display="live">ライブ</button>
+      </div>
+      <div class="menu-label" data-scope="quality">画質（高速・ライブ）</div>
+      <div class="menu-seg" role="group" aria-label="画質" data-scope="quality">
+       <button type="button" role="menuitemradio" data-action="quality:speed" data-quality="speed">速度優先</button>
+       <button type="button" role="menuitemradio" data-action="quality:standard" data-quality="standard">標準</button>
+       <button type="button" role="menuitemradio" data-action="quality:high" data-quality="high">高画質</button>
+      </div>
+      <button type="button" role="menuitemcheckbox" data-action="perf" data-scope="remote" id="menuPerf" class="menu-toggle">速度表示<span class="menu-check" aria-hidden="true"></span></button>
+      <hr>
+      <button type="button" role="menuitem" data-action="stageUrl">このURLをリンクに追加</button>
+      <button type="button" role="menuitem" data-action="bookmark">ブックマークに追加</button>
+      <button type="button" role="menuitem" data-action="closeTab" class="menu-danger">タブを閉じる</button>
+     </div>
+     <div class="menu-section">
+      <div class="menu-head">アプリ</div>
+      <button type="button" role="menuitem" data-action="bookmarks">ブックマークの管理</button>
+      <button type="button" role="menuitem" data-action="settings">設定</button>
+      <button type="button" role="menuitem" id="logout" data-action="logout">ログアウト</button>
+     </div>
     </div>
    </div>
   </div>
