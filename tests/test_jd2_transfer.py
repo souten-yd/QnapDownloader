@@ -131,5 +131,67 @@ class ContainerMappingTests(unittest.TestCase):
             self.destination(self.mounted)
 
 
+class AutostartTransferTests(unittest.TestCase):
+    """v0.1.24: addLinks(autostart) followed by downloadcontroller/start."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.base = self.root / "Download"
+        self.base.mkdir()
+        self.target = self.base / "Manga"
+        self.target.mkdir()
+        self.api = FakeJD2()
+        self.api._options.update(nas_root=str(self.base), jd2_root="/downloads")
+        self.starts = 0
+        api = self.api
+        original = api.add_link
+        self.flags = []
+
+        def add_link(url, dest, autostart=False):
+            self.flags.append(autostart)
+            return original(url, dest)
+        api.add_link = add_link
+        api.start_downloads = self.start
+
+    def start(self):
+        self.starts += 1
+
+    def test_autostart_passes_the_flag_and_starts_the_controller(self):
+        out = jd2_transfer.transfer(self.api, "https://rapidgator.net/file/123", str(self.target), autostart=True)
+        self.assertEqual(self.flags, [True])
+        self.assertEqual(self.starts, 1)
+        self.assertEqual((out["state"], out["started"]), ("sent", True))
+        self.assertEqual(self.api.records, [("https://rapidgator.net/file/123", "/downloads/Manga")])
+
+    def test_autostart_off_never_touches_the_controller(self):
+        out = jd2_transfer.transfer(self.api, "https://rapidgator.net/file/123", str(self.target))
+        self.assertEqual(self.flags, [False])
+        self.assertEqual(self.starts, 0)
+        self.assertNotIn("started", out)
+
+    def test_autostart_still_requires_the_preflight_with_jd2_auto_start_off(self):
+        self.api.good = False
+        with self.assertRaises(jd2_transfer.TransferBlocked):
+            jd2_transfer.transfer(self.api, "https://rapidgator.net/file/123", str(self.target), autostart=True)
+        self.assertEqual((self.api.records, self.starts), ([], 0))
+
+    def test_autostart_start_failure_still_counts_as_sent_with_a_hint(self):
+        def boom():
+            raise OSError("controller busy")
+        self.api.start_downloads = boom
+        out = jd2_transfer.transfer(self.api, "https://rapidgator.net/file/123", str(self.target), autostart=True)
+        self.assertEqual((out["state"], out["started"]), ("sent", False))
+        self.assertIn("開始", out["note"])
+        self.assertEqual(len(self.api.records), 1)
+
+    def test_autostart_rejected_link_is_not_started(self):
+        self.api.add_link = lambda url, dest, autostart=False: False
+        with self.assertRaises(jd2_transfer.TransferBlocked):
+            jd2_transfer.transfer(self.api, "https://rapidgator.net/file/123", str(self.target), autostart=True)
+        self.assertEqual(self.starts, 0)
+
+
 if __name__ == "__main__":
     unittest.main()

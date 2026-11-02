@@ -64,10 +64,24 @@ def prepare_transfer(adapter, nas_directory):
     return destination
 
 
-def transfer(adapter, url, nas_directory):
+def transfer(adapter, url, nas_directory, autostart=False):
     # Check preflight again in case the real JD2 settings changed.
     destination = prepare_transfer(adapter, nas_directory)
-    result = adapter.add_link(url, destination)
+    if autostart is True:
+        result = adapter.add_link(url, destination, autostart=True)
+    else:
+        result = adapter.add_link(url, destination)
     if result is False:
         raise TransferBlocked("JD2がリンク登録を拒否しました。JD2の状態を確認してください")
-    return {"state": "sent", "note": "JD2 LinkGrabberへ自動開始OFFで送信。保存先を明示し、Packagizerのパッケージ別フォルダは上書きします（ルール自体は変更しません）"}
+    if autostart is not True:
+        return {"state": "sent", "note": "JD2 LinkGrabberへ自動開始OFFで送信。保存先を明示し、Packagizerのパッケージ別フォルダは上書きします（ルール自体は変更しません）"}
+    started = True
+    try:
+        # addLinks(autostart) confirms the link; the controller may still be idle.
+        adapter.start_downloads()
+    except Exception:
+        started = False
+    note = ("JD2へ送信し、ダウンロードを開始しました。保存先を明示し、Packagizerのパッケージ別フォルダは上書きします"
+            if started else
+            "JD2へ送信しました（開始指示は確認できませんでした。ダウンロード画面の「開始」を押してください）")
+    return {"state": "sent", "started": started, "note": note}

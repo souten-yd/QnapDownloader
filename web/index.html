@@ -93,6 +93,10 @@
      <button type="button" role="menuitem" data-action="toggleMode" data-scope="web" id="menuMode">限定操作モードに切り替え</button>
      <button type="button" role="menuitem" data-action="compatMode" data-scope="web" id="menuCompat">互換モードに切り替え</button>
      <button type="button" role="menuitem" data-action="remoteOpen" data-scope="web" id="menuRemote">NASブラウザで開く</button>
+     <button type="button" role="menuitem" data-action="quality:speed" data-quality="speed" data-scope="remote">画質: 速度優先</button>
+     <button type="button" role="menuitem" data-action="quality:standard" data-quality="standard" data-scope="remote">画質: 標準</button>
+     <button type="button" role="menuitem" data-action="quality:high" data-quality="high" data-scope="remote">画質: 高画質</button>
+     <button type="button" role="menuitem" data-action="perf" data-scope="remote" id="menuPerf">速度表示</button>
      <button type="button" role="menuitem" data-action="external" data-scope="web">Safari／外部ブラウザで開く</button>
      <button type="button" role="menuitem" data-action="stageUrl" data-scope="web">このURLを追加したリンクへ</button>
      <button type="button" role="menuitem" data-action="bookmark" data-scope="web">ブックマークに追加</button>
@@ -149,6 +153,7 @@
      <h1>ダウンロード</h1>
      <span class="head-tools">
       <span id="downloadsUpdated" class="muted" role="status"></span>
+      <button type="button" id="downloadsToggle" class="btn small" title="JD2のダウンロードを開始／停止" hidden>開始</button>
       <button type="button" id="downloadsRefresh" class="icon-btn small" aria-label="今すぐ更新" title="今すぐ更新"><svg class="icon" aria-hidden="true"><use href="#i-reload"/></svg></button>
      </span>
     </div>
@@ -159,6 +164,13 @@
     </div>
     <div id="downloadsBody" hidden>
      <p id="downloadsMessage" class="muted" role="status" aria-live="polite"></p>
+     <section id="waitingBox" class="card waiting-box" aria-label="JD2で待機中のリンク" hidden>
+      <div class="section-head">
+       <h2>JD2で待機中のリンク <span id="waitingCount" class="muted"></span></h2>
+       <button type="button" id="waitingStart" class="btn small primary">すべて開始</button>
+      </div>
+      <div id="waitingList" class="waiting-list"></div>
+     </section>
      <div id="downloadsTools" class="toolbar-row" hidden>
       <div class="chips" role="group" aria-label="状態で絞り込み">
        <button type="button" class="chip" data-filter="all" aria-pressed="true">すべて</button>
@@ -336,6 +348,11 @@
       </details>
       <p class="muted">メモリの保護: 空きメモリが2GiB未満、またはブラウザが上限(2GiB)の80%に達しているときはタブを開きません（他のアプリは止めません）。同時に開けるのは3枚までです。</p>
       <p class="muted">自動停止: タブが0枚のまま5分、または10分間操作がないと、コンテナごと停止してメモリを解放します（次回は数秒で再起動）。Webタブを閉じると、対応するNASブラウザのタブも閉じます。</p>
+      <label class="rule-toggle option-row"><input type="checkbox" id="blockAds" checked> 広告をブロック</label>
+      <p class="muted">既知の広告・トラッカー・ポップアンダー配信元（Hub内の固定リスト）への通信をChromiumで止め、表示を軽くします。Rapidgatorなどのホスターは止めません。サイトごとに下の一覧でOFFにできます。</p>
+      <h2 class="sub-h">サイトごとの設定</h2>
+      <p class="muted">NASブラウザのタブで開いているページのホストごとの設定です（最大200件）。</p>
+      <div id="siteRules" class="items"></div>
       <h2 class="sub-h">NASブラウザで開くサイト</h2>
       <div id="remoteHosts" class="items"></div>
      </section>
@@ -351,7 +368,9 @@
        <div id="folderPicker"></div>
        <button type="button" id="folderCancel" class="btn small">閉じる</button>
       </div>
-      <p class="muted">フォルダ作成・自動開始・自動解凍・自動削除はすべてOFF</p>
+      <label class="rule-toggle option-row"><input type="checkbox" id="sendAutostart"> JD2へ送ったらすぐダウンロード開始</label>
+      <p class="muted">ONのとき、Hubから送ったリンクはJD2の待機（LinkGrabber）に残らず、すぐダウンロードが始まります。JD2自体の自動確定・自動開始の設定は変更しません。</p>
+      <p class="muted">フォルダ作成・自動解凍・自動削除はOFF</p>
      </section>
 
      <section class="settings-section" data-section="https" hidden>
@@ -496,6 +515,8 @@
       <button type="button" id="remoteReopen" class="btn primary">NASブラウザで開く</button>
      </div>
      <div id="remoteLoading" class="loading-bar" hidden></div>
+     <div id="remoteRing" class="press-ring" aria-hidden="true" hidden></div>
+     <div id="perfOverlay" class="perf-overlay" role="status" hidden></div>
     </div>
     <div class="remote-tools">
      <button type="button" id="remoteKbdBtn" class="btn small">キーボード</button>
@@ -505,9 +526,25 @@
      <input id="remoteKbd" class="remote-kbd" type="text" inputmode="text" autocapitalize="off" autocomplete="off" autocorrect="off" spellcheck="false" aria-label="NASブラウザへ文字を入力">
     </div>
     <button type="button" id="remoteLinks" class="remote-badge" hidden>リンク 0件</button>
+    <span id="remotePopups" class="remote-popups" role="status" hidden></span>
     <div id="popupToast" class="popup-toast" role="status" hidden>
      <span id="popupToastText" class="popup-toast-text"></span>
      <button type="button" id="popupToastOpen" class="btn small primary">開く</button>
+     <button type="button" id="popupToastAllow" class="btn small">常に許可</button>
+     <button type="button" id="popupToastBlock" class="btn small">常にブロック</button>
+    </div>
+    <div id="probeSheet" class="remote-sheet probe-sheet" role="dialog" aria-label="リンク先を確認しました" hidden>
+     <div class="remote-sheet-head">
+      <strong id="probeTitle">リンク先を確認しています…</strong>
+      <button type="button" id="probeClose" class="btn small">閉じる</button>
+     </div>
+     <p id="probeStatus" class="muted probe-status"></p>
+     <div id="probeList" class="remote-sheet-list"></div>
+     <div class="remote-sheet-actions intercept-actions">
+      <button type="button" id="probeSendAll" class="btn primary" hidden>すべてJD2へ送る</button>
+      <button type="button" id="probeAddAll" class="btn" hidden>リンクに追加</button>
+      <button type="button" id="probeOpen" class="btn" hidden>このタブで開く</button>
+     </div>
     </div>
     <div id="interceptSheet" class="remote-sheet intercept-sheet" role="dialog" aria-label="リンクを検出しました" hidden>
      <div class="remote-sheet-head">
@@ -517,6 +554,7 @@
      <div class="intercept-body">
       <p id="interceptKind" class="muted"></p>
       <p id="interceptUrl" class="intercept-url"></p>
+      <label id="interceptAutoRow" class="rule-toggle" hidden><input type="checkbox" id="interceptAuto"> このサイトでは今後自動で送る</label>
      </div>
      <div class="remote-sheet-actions intercept-actions">
       <button type="button" id="interceptSend" class="btn primary" hidden>JD2へ送る</button>

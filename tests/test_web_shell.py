@@ -422,5 +422,99 @@ if (out !== want) { console.error(JSON.stringify(out)); process.exit(1); }
         self.assertNotIn("innerHTML", self.js)
 
 
+    def test_v0124_every_element_id_used_by_the_script_exists(self):
+        used = set(re.findall(r'\$\("([A-Za-z0-9_-]+)"\)', self.js))
+        have = set(re.findall(r'\sid="([^"]+)"', self.html))
+        self.assertEqual(sorted(used - have), [])
+
+    def test_v0124_send_and_start_ui(self):
+        for ident in ("sendAutostart", "waitingBox", "waitingList", "waitingStart", "downloadsToggle"):
+            self.assertIn('id="%s"' % ident, self.html)
+        for text in ("JD2へ送ったらすぐダウンロード開始", "JD2で待機中のリンク", "すべて開始"):
+            self.assertIn(text, self.html + self.js)
+        for path in ("/api/jd2/linkgrabber", "/api/jd2/linkgrabber/start", "/api/jd2/downloads/start",
+                     "/api/jd2/downloads/stop", "/api/settings/options"):
+            self.assertIn(path, self.js)
+        self.assertRegex(self.js, r"WAITING_MAX\s*=\s*50\b")
+        # start-all and stop are confirmed in the UI as well as on the Hub
+        self.assertRegex(self.js, r"async function startWaiting\(\)[\s\S]*?confirm\(")
+        self.assertRegex(self.js, r"async function toggleDownloads\(\)[\s\S]*?confirm\(")
+        # the old "auto start is OFF" wording only appears when the setting is off
+        self.assertIn("function sendStartText()", self.js)
+
+    def test_v0124_site_rules_and_popup_ui(self):
+        for ident in ("blockAds", "siteRules", "interceptAuto", "interceptAutoRow",
+                      "popupToastAllow", "popupToastBlock", "remotePopups"):
+            self.assertIn('id="%s"' % ident, self.html)
+        for text in ("広告をブロック", "このサイトでは今後自動で送る", "常に許可", "常にブロック",
+                     "JD2へ自動送信しました", "ポップアップ", "件ブロック"):
+            self.assertIn(text, self.html + self.js)
+        self.assertIn("/api/rb/site-rules", self.js)
+        self.assertIn("/api/rb/site-rules/delete", self.js)
+        self.assertRegex(self.js, r'POPUP_LABELS = \{ask: "[^"]+", allow: "[^"]+", block: "[^"]+"\}')
+        self.assertIn('popupRule("allow")', self.js)
+        self.assertIn('popupRule("block")', self.js)
+
+    def test_v0124_long_press_probe_ui(self):
+        self.assertRegex(self.js, r"RB_LONGPRESS_MS\s*=\s*550\b")
+        self.assertRegex(self.js, r"RB_LONGPRESS_MOVE_PX\s*=\s*10\b")
+        for ident in ("probeSheet", "probeList", "probeSendAll", "probeAddAll", "probeOpen", "probeClose",
+                      "remoteRing"):
+            self.assertIn('id="%s"' % ident, self.html)
+        for text in ("リンク先を確認しました", "すべてJD2へ送る", "リンクに追加", "このタブで開く"):
+            self.assertIn(text, self.html + self.js)
+        self.assertIn("/api/rb/probe", self.js)
+        # a long press suppresses the tap, moving cancels it, the OS context menu is off
+        self.assertIn("const longPressed = rbPress.fired;", self.js)
+        self.assertRegex(self.js, r"rbPointer\.moved = true;\s*cancelPress\(\);")
+        self.assertIn('stage.addEventListener("contextmenu"', self.js)
+        # the probe sheet is built from text nodes only
+        self.assertNotIn("innerHTML", self.js)
+
+    def test_v0124_quality_menu_and_perf_overlay(self):
+        for quality in ("speed", "standard", "high"):
+            self.assertIn('data-quality="%s"' % quality, self.html)
+        self.assertIn('id="menuPerf"', self.html)
+        self.assertIn('id="perfOverlay"', self.html)
+        self.assertRegex(self.js, r'RB_QUALITIES\s*=\s*\["speed", "standard", "high"\]')
+        self.assertIn('qnapdl.rbquality.v1', self.js)
+        self.assertIn('return RB_QUALITIES.includes(value) ? value : "speed";', self.js)
+        self.assertIn("quality: state.rbQuality", self.js)
+        # remembered through the guarded storage wrappers only
+        self.assertIn("writeLocal(RB_QUALITY_KEY, mode)", self.js)
+        self.assertNotRegex(self.js, r"localStorage\.\w+Item\([^)]*RB_QUALITY_KEY")
+
+    @unittest.skipUnless(shutil.which("node"), "node not installed")
+    def test_v0124_perf_overlay_math(self):
+        record = re.search(r"function recordPerf\(bytes, latency\) \{.*?\n\}\n", self.js, re.S).group(0)
+        text = re.search(r"function perfText\(\) \{.*?\n\}\n", self.js, re.S).group(0)
+        script = """
+(function (performance) {
+const RB_PERF_WINDOW_MS = 5000;
+const state = {rbPerf: true, rbPerfSamples: [], rbPerfSince: 0};
+""" + record + text + """
+let t = 0;
+const mk = () => ({now: () => t});
+performance = mk();
+for (let i = 0; i < 10; i++) { t = 500 * (i + 1); recordPerf(20480, 100); }
+t = 5000;
+const out = perfText();
+if (out !== "2.0 fps · 20 KB/枚 · 応答 100 ms") { console.error("bad: " + out); process.exit(1); }
+// samples older than 5 s drop out; an idle page reports 0 fps
+t = 20000; state.rbPerfSince = 15000;
+const idle = perfText();
+if (!idle.startsWith("0.0 fps")) { console.error("idle: " + idle); process.exit(1); }
+// 204 responses (no frame) count for latency but not for fps or bytes
+t = 21000; state.rbPerfSamples = []; state.rbPerfSince = 20500;
+recordPerf(0, 300); recordPerf(1024, 100);
+t = 21500;
+const mixed = perfText();
+if (mixed !== "1.0 fps · 1 KB/枚 · 応答 200 ms") { console.error("mixed: " + mixed); process.exit(1); }
+})();
+"""
+        result = subprocess.run(["node", "-e", script], capture_output=True, text=True, timeout=20)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+
 if __name__ == "__main__":
     unittest.main()

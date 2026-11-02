@@ -193,5 +193,162 @@ class ShareTokenStorageTests(unittest.TestCase):
             again.close()
 
 
+class SiteRuleTests(unittest.TestCase):
+    """v0.1.24: site_rules table, options, migration and write-on-change."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.s = storage.Store(self.root)
+        self.addCleanup(self.s.close)
+
+    def revision(self):
+        return self.s.revision()
+
+    def test_defaults_include_the_new_options_on(self):
+        settings = self.s.settings()
+        self.assertIs(settings["send_autostart"], True)
+        self.assertIs(settings["block_ads"], True)
+
+    def test_options_persist_and_are_written_only_on_change(self):
+        before = self.revision()
+        self.s.set_option("send_autostart", True)            # already the default: no write
+        self.assertEqual(self.revision(), before)
+        self.s.set_option("send_autostart", False)
+        self.assertEqual(self.revision(), before + 1)
+        self.s.set_option("send_autostart", False)
+        self.assertEqual(self.revision(), before + 1)
+        again = storage.Store(self.root)
+        try:
+            self.assertIs(again.settings()["send_autostart"], False)
+            self.assertIs(again.settings()["block_ads"], True)
+        finally:
+            again.close()
+
+    def test_options_reject_unknown_keys_and_non_booleans(self):
+        for key, value in (("download_dir", True), ("nope", True), ("send_autostart", "yes"),
+                           ("send_autostart", 1), ("block_ads", None)):
+            with self.subTest(key=key, value=value), self.assertRaises(ValueError):
+                self.s.set_option(key, value)
+
+    def test_rules_roundtrip_with_defaults_and_partial_updates(self):
+        rule = self.s.set_site_rule("Example.COM.", auto_send=True)
+        self.assertEqual(rule, {"host": "example.com", "auto_send": True, "popup": "ask", "block_ads": True})
+        self.s.set_site_rule("example.com", popup="block")
+        self.s.set_site_rule("example.com", block_ads=False)
+        self.assertEqual(self.s.site_rules(), [
+            {"host": "example.com", "auto_send": True, "popup": "block", "block_ads": False}])
+        again = storage.Store(self.root)
+        try:
+            self.assertEqual(again.site_rules()[0]["popup"], "block")
+        finally:
+            again.close()
+
+    def test_unchanged_rule_writes_nothing(self):
+        self.s.set_site_rule("example.com", auto_send=True, popup="allow")
+        before = self.revision()
+        for _ in range(3):
+            self.s.set_site_rule("example.com", auto_send=True, popup="allow", block_ads=True)
+            self.s.set_site_rule("example.com")
+        self.assertEqual(self.revision(), before)
+        self.s.set_site_rule("example.com", popup="ask")
+        self.assertEqual(self.revision(), before + 1)
+
+    def test_host_validation(self):
+        good = ("example.com", "a.b.example.co.jp", "xn--r8jz45g.jp", "EXAMPLE.org")
+        for host in good:
+            with self.subTest(host=host):
+                self.s.valid_host(host)
+        for bad in ("", "localhost", "example", "http://example.com", "example.com/path", "example.com:8080",
+                    "192.168.0.1", "1.2.3.4", "exa mple.com", "-a.example.com", "a..example.com", "ex_ample.com",
+                    "example.c", "example.123", None, 5, "x" * 300 + ".com", "a@b.com"):
+            with self.subTest(host=bad), self.assertRaises(ValueError):
+                self.s.set_site_rule(bad, auto_send=True)
+        self.assertEqual(self.s.site_rules(), [])
+
+    def test_field_validation(self):
+        for kwargs in ({"auto_send": 1}, {"auto_send": "true"}, {"block_ads": 0}, {"popup": "maybe"},
+                       {"popup": ""}, {"popup": None, "auto_send": None, "block_ads": "x"}):
+            with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
+                self.s.set_site_rule("example.com", **kwargs)
+        self.assertEqual(self.s.site_rules(), [])
+
+    def test_popup_check_constraint_in_the_database(self):
+        with self.assertRaises(sqlite3.IntegrityError), self.s.connect() as db:
+            db.execute("INSERT INTO site_rules(host,auto_send,popup,block_ads) VALUES('x.example',0,'maybe',1)")
+
+    def test_at_most_200_rules(self):
+        for i in range(storage.MAX_SITE_RULES):
+            self.s.set_site_rule("h%d.example.com" % i, auto_send=True)
+        with self.assertRaises(ValueError):
+            self.s.set_site_rule("one-too-many.example.com", auto_send=True)
+        before = self.revision()
+        self.s.set_site_rule("h5.example.com", popup="block")       # updating an existing one is fine
+        self.assertEqual(len(self.s.site_rules()), storage.MAX_SITE_RULES)
+        self.assertEqual(self.revision(), before + 1)
+
+    def test_delete(self):
+        self.s.set_site_rule("example.com", auto_send=True)
+        self.s.delete_site_rule("example.com")
+        self.assertEqual(self.s.site_rules(), [])
+        with self.assertRaises(ValueError):
+            self.s.delete_site_rule("example.com")
+        with self.assertRaises(ValueError):
+            self.s.delete_site_rule("not a host")
+
+    def test_lookup_uses_the_host_then_parent_domains_but_never_the_tld(self):
+        self.s.set_site_rule("example.com", auto_send=True)
+        self.s.set_site_rule("deep.example.com", popup="block")
+        self.assertTrue(self.s.site_rule_for("example.com")["auto_send"])
+        self.assertTrue(self.s.site_rule_for("www.example.com")["auto_send"])
+        self.assertEqual(self.s.site_rule_for("a.deep.example.com")["popup"], "block")
+        self.assertIsNone(self.s.site_rule_for("example.org"))
+        self.assertIsNone(self.s.site_rule_for("com"))
+        self.assertIsNone(self.s.site_rule_for(""))
+        self.assertIsNone(self.s.site_rule_for(None))
+        self.assertIsNone(self.s.site_rule_for("notexample.com"))
+
+    def test_cache_follows_writes_from_the_same_store(self):
+        self.assertIsNone(self.s.site_rule_for("example.com"))
+        self.s.set_site_rule("example.com", auto_send=True)
+        self.assertIsNotNone(self.s.site_rule_for("example.com"))
+        self.s.delete_site_rule("example.com")
+        self.assertIsNone(self.s.site_rule_for("example.com"))
+
+    def test_link_state_lookup(self):
+        self.assertIsNone(self.s.link_state("https://example.com/x"))
+        self.s.add_link("https://example.com/x")
+        self.assertEqual(self.s.link_state("https://example.com/x"), "staged")
+
+    def test_upgrade_from_a_database_without_the_table(self):
+        with self.s.connect() as db:
+            db.execute("DROP TABLE site_rules")
+        again = storage.Store(self.root)
+        try:
+            self.assertEqual(again.site_rules(), [])
+            again.set_site_rule("example.com", popup="allow")
+        finally:
+            again.close()
+
+    def test_upgrade_adds_the_block_ads_column_and_keeps_rows(self):
+        with self.s.connect() as db:
+            db.execute("DROP TABLE site_rules")
+            db.execute("CREATE TABLE site_rules(host TEXT PRIMARY KEY, auto_send INTEGER NOT NULL DEFAULT 0, "
+                       "popup TEXT NOT NULL DEFAULT 'ask' CHECK(popup IN ('ask','allow','block')))")
+            db.execute("INSERT INTO site_rules VALUES('old.example.com',1,'block')")
+        again = storage.Store(self.root)
+        try:
+            self.assertEqual(again.site_rules(), [
+                {"host": "old.example.com", "auto_send": True, "popup": "block", "block_ads": True}])
+            again.set_site_rule("old.example.com", block_ads=False)
+            self.assertIs(again.site_rules()[0]["block_ads"], False)
+        finally:
+            again.close()
+        # opening it a third time (column exists) must not fail
+        third = storage.Store(self.root)
+        third.close()
+
+
 if __name__ == "__main__":
     unittest.main()

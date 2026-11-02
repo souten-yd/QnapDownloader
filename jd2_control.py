@@ -44,6 +44,38 @@ class JD2Controller:
         with self.lock:
             return self._require().list_downloads(page)
 
+    def linkgrabber_snapshot(self):
+        """Read-only list of links JD2 holds in the LinkGrabber (max 50)."""
+        with self.lock:
+            return self._require().list_linkgrabber()
+
+    def start_waiting(self, *, confirmed=False):
+        """Move every listed LinkGrabber link to the download list, then start."""
+        if confirmed is not True:
+            raise ValueError("待機中のリンクの開始には確認が必要です")
+        with self.lock:
+            adapter = self._require()
+            waiting = adapter.list_linkgrabber()
+            links = [int(i["id"]) for i in waiting["items"] if i["id"] is not None]
+            packages = sorted({int(i["package_id"]) for i in waiting["items"]
+                               if i["package_id"] is not None})
+            if links or packages:
+                adapter.move_to_downloadlist(links, packages)
+            adapter.start_downloads()
+            return {"moved": len(links), "started": True}
+
+    def start_downloads(self):
+        with self.lock:
+            self._require().start_downloads()
+            return {"started": True}
+
+    def stop_downloads(self, *, confirmed=False):
+        if confirmed is not True:
+            raise ValueError("ダウンロードの停止には確認が必要です")
+        with self.lock:
+            self._require().stop_downloads()
+            return {"stopped": True}
+
     def connection_test(self):
         """Explicit read-only probe; never starts an update/download."""
         with self.lock:

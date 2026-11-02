@@ -82,6 +82,9 @@ chromium \
   --disable-background-networking \
   --disable-features=Translate,MediaRouter,OptimizationHints \
   --renderer-process-limit=2 \
+  --num-raster-threads=4 \
+  --disable-smooth-scrolling \
+  --autoplay-policy=user-gesture-required \
   --disable-extensions \
   --disable-component-update \
   --mute-audio \

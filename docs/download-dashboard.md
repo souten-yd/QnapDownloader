@@ -28,3 +28,8 @@ iPhone/SafariとQNAP App Centerの両方で、QnapDownloaderの画面だけか�
 - QPKG内にjd2_downloads.pyが入ることをbuild/contractで検証。
 - iPhone縦画面で一覧・スクロール・ボタン操作ができ、全行のファイル名がtextContentでXSSとして解釈されないことを確認。
 - 実機TS-253Beで正確な件数・進捗・速度を確認してからstable候補にする。
+
+## v0.1.24 追加: 待機中リンクの開始と全体の開始／停止
+- `GET /api/jd2/linkgrabber`（管理者認証）: `linkgrabberv2/queryLinks` に `name/host/bytesTotal/uuid/packageUUID` と `maxResults=50` だけを渡し、名前・ホスト・サイズ・ID（文字列）のみ返す（URL・保存先・パスワードは返さない）。ダウンロード画面の「JD2で待機中のリンク」に件数と名前を表示する。
+- `POST /api/jd2/linkgrabber/start {confirmed:true}`: 一覧のリンクと所属パッケージを `moveToDownloadlist(linkIds, packageIds)` でダウンロードリストへ移し、`downloadcontroller/start`。`POST /api/jd2/downloads/start`、`POST /api/jd2/downloads/stop {confirmed:true}`。個別の削除・一時停止は引き続き未実装。
+- 設定 `send_autostart`（既定ON）: Hubから送るリンクは `addLinks` を `autostart:true` にして送り、続けて `downloadcontroller/start` を呼ぶ。JD2側の自動確定・自動開始の設定は常にOFFを確認して変更しない。

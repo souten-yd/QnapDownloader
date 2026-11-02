@@ -99,5 +99,35 @@ class DownloadViewTests(unittest.TestCase):
         self.assertNotIn("password", str(calls))
         self.assertNotIn("url", str(calls))
 
+class LinkGrabberViewTests(unittest.TestCase):
+    def test_query_requests_minimal_fields_without_urls_or_paths(self):
+        options = view.linkgrabber_query_options()
+        self.assertEqual(options[0]["maxResults"], 50)
+        self.assertEqual(options[0]["startAt"], 0)
+        self.assertFalse({"url", "password", "downloadPassword", "saveTo", "comment",
+                          "availability"}.intersection(options[0]))
+
+    def test_snapshot_projects_names_ids_and_drops_the_rest(self):
+        out = view.linkgrabber_snapshot([
+            {"uuid": 2 ** 62 + 1, "packageUUID": 9, "name": "x" * 500, "host": "rapidgator.net",
+             "bytesTotal": 5, "url": "https://rapidgator.net/file/abc", "saveTo": "/private"},
+            {"uuid": "bad", "name": None}])
+        self.assertEqual(out["count"], 2)
+        self.assertEqual(out["items"][0]["id"], str(2 ** 62 + 1))      # strings: JS loses 64-bit precision
+        self.assertEqual(len(out["items"][0]["name"]), 240)
+        self.assertIsNone(out["items"][1]["id"])
+        self.assertIn("名称不明", out["items"][1]["name"])
+        self.assertFalse(out["has_more"])
+        self.assertNotIn("/private", str(out))
+        self.assertNotIn("rapidgator.net/file", str(out))
+
+    def test_limit_and_shape_are_enforced(self):
+        full = view.linkgrabber_snapshot([{"uuid": i} for i in range(50)])
+        self.assertTrue(full["has_more"])
+        for bad in ("x", {"a": 1}, [{"uuid": 1}] * 51, [5]):
+            with self.subTest(bad=str(bad)[:20]), self.assertRaises(ValueError):
+                view.linkgrabber_snapshot(bad)
+
+
 if __name__ == "__main__":
     unittest.main()

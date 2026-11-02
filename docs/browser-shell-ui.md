@@ -187,3 +187,25 @@ Cloudflare等で手元のブラウザ（iframe）では開けないサイトを�
 - **タップ**: 座標は、最新フレームのヘッダ（`X-Frame-Width/Height`＝CSSサイズ）と表示中の`<img>`の大きさの比で換算する。
 - **検出ボトムシート**（`#interceptSheet`）: `X-Frame-Intercepts` が増えたら `GET /api/rb/intercepts?tab=&since=` で取得し、キューに積む（最大20件、表示中のタブ分だけ先頭から1件ずつ）。見出し「リンクを検出しました」、URL（1行・末尾省略）、ボタン「JD2へ送る」（主ボタン。`can_send` のときだけ表示。確認ダイアログあり）「リンクに追加」（`can_send` でないときは主ボタン）「ページを開く」（ホスターのみ。Fetch検出を1回だけ素通しにして開く）「閉じる」。他に待機中があれば「ほかN件が待機中」。**ポップアップ（`kind:"popup"`）はシートを出さず**、画面下の小さなトースト「ポップアップ: <ホスト名> を開く」＋「開く」（`POST /api/rb/intercepts/open` でタブを遷移）を表示する。同時に1つだけ（最新が優先）、8秒で自動的に消え、タブ切り替え・閉鎖でも消える。ホスターのポップアップは従来どおりシート。従来の「リンク N件」バッジ（ページ内リンクの一覧）はそのまま。
 - DOMは `textContent` のみ（`innerHTML` 不使用）。
+
+## v0.1.24 送信後すぐ開始・サイトごとの設定・長押し確認・速度（実機未検証）
+
+実機フィードバック（リンクは検出できるがJD2で待機のまま／まだ遅い）への対応。API・CDPの詳細は [container-runtime.md](container-runtime.md) §4。
+
+### 送信後すぐダウンロード開始
+- 設定 › 保存先「JD2へ送ったらすぐダウンロード開始」（`settings.send_autostart`、既定ON、`POST /api/settings/options {send_autostart|block_ads: bool}`、変化したときだけ書き込む）。ONのとき、Hubの送信経路は `addLinks` に `autostart:true` を付け、続けて `downloadcontroller/start` を呼ぶ（開始指示だけ失敗しても送信は成功扱いで、画面の「開始」を案内）。JD2本体の自動確定・自動開始（常にOFFを確認）は変更しない。確認ダイアログとトーストの文言は設定に合わせる。
+- ホワイトリスト追加: `downloadcontroller/start`、`downloadcontroller/stop`、`linkgrabberv2/queryLinks`（`name/host/bytesTotal/uuid/packageUUID` のみ要求、最大50件）、`linkgrabberv2/moveToDownloadlist(linkIds, packageIds)`。
+- ダウンロード画面: 見出しに「開始／停止」（実行中が1件以上なら「停止」。停止は確認ダイアログ）、「JD2で待機中のリンク」（`GET /api/jd2/linkgrabber`：件数と名前、最大50件、50件以上のときは「N件以上」）と「すべて開始」（確認後 `POST /api/jd2/linkgrabber/start {confirmed:true}`＝一覧のリンクと所属パッケージを `moveToDownloadlist`→`start`）。`POST /api/jd2/downloads/start|stop`（stopは `confirmed:true` 必須）。
+
+### サイトごとの設定
+- 設定 › NASブラウザ: 「広告をブロック」（既定ON）、「サイトごとの設定」（ホスト名、自動送信、ポップアップ［確認する／許可（新しいタブ）／ブロック］、広告ブロックの切替と削除）。`GET /api/rb/site-rules`（`{items,block_ads,max}`）、`POST /api/rb/site-rules {host, auto_send?, popup?, block_ads?}`、`POST /api/rb/site-rules/delete {host}`（管理者＋CSRF、ホストはDNS名として検証）。
+- リンク検出シート: 「このサイトでは今後自動で送る」チェック（送信時に保存）。自動送信されたら「JD2へ自動送信しました」のトースト（送信済みのリンクは「すでにJD2へ送信済み」）。
+- ポップアップのトーストに「常に許可」「常にブロック」。許可サイトのポップアップは新しいNASブラウザのタブで（Webタブが上限なら開いた元のタブで）開き、ブロックしたものはタブ下部に「ポップアップ N件ブロック」と表示。
+
+### 長押しでリンク先を確認
+- NASブラウザ画面を550ms以上・10px以内の移動で長押しすると、150ms後から指の位置に輪が広がり、確定で `POST /api/rb/probe`。長押しではタップを送らない（OSのコンテキストメニューも抑止）。
+- シート「リンク先を確認しました」: リダイレクト回数と最終ホスト、見つかったリンク（各「送る」「追加」）、「すべてJD2へ送る」「リンクに追加」。見つからないときは最終URLを示し「このタブで開く」。確認中は最大15秒（閉じても確認用ページはHub側で必ず閉じる）。
+
+### 速度
+- ⋯メニュー（NASブラウザのタブのみ）: 画質「速度優先／標準／高画質」（既定は速度優先＝等倍・JPEG 40。端末の `localStorage` `qnapdl.rbquality.v1`、try/catchで保護）、「速度表示」（画面左上に 直近5秒の fps・1枚あたりKB・フレーム要求の応答時間。クライアントのみで計測）。
+- Chromium引数・広告遮断・`prefers-reduced-motion` は container-runtime.md §4 の v0.1.24 を参照。

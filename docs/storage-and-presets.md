@@ -9,7 +9,7 @@ Status: specification, not yet implemented. This specification overrides contrad
 | Package-name subfolders | OFF | Check both JD2 general folder setting and Packagizer auto rules |
 | Website, date and page-based nested folders | OFF | Keep file layout flat but retain package grouping in the UI |
 | LinkGrabber auto-confirm | OFF | Preview link additions before any commitment |
-| Auto-start after links are detected | OFF | Site-specific explicit opt-in can override with bounded limits |
+| Auto-start after links are detected | OFF | Site-specific explicit opt-in can override with bounded limits. v0.1.24: the Hub setting `send_autostart` (default ON) only affects links the Hub itself sends: `addLinks` with `autostart:true` plus `downloadcontroller/start`; JD2's own auto-confirm/auto-start settings stay OFF |
 | Browser auto-download for all sites | Disallowed | Trusted origin and target host must both match |
 | Auto-extract | OFF | Archives stay in original ZIP, CBZ, RAR or 7z form |
 | Delete original archives or finished downloads | OFF | Never remove files just because an extraction or download ends |

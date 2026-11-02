@@ -96,5 +96,33 @@ def snapshot(packages, links, page):
         "packages": [_normalize(entry, True) for entry in packages],
         "links": [_normalize(entry) for entry in links],
         "has_more": len(packages) == PAGE_SIZE or len(links) == PAGE_SIZE,
-        "notice": "JD2実データの読取専用表示です。開始・停止・削除はまだ実装していません",
+        "notice": "JD2実データの表示です。全体の開始・停止はできますが、個別の削除は未実装です",
     }
+
+
+# ---- LinkGrabber (links JD2 holds but has not started) --------------------
+LINKGRABBER_MAX = 50
+LINKGRABBER_FIELDS = {"name": True, "host": True, "bytesTotal": True, "uuid": True,
+                      "packageUUID": True}
+
+
+def linkgrabber_query_options():
+    return [dict(LINKGRABBER_FIELDS, maxResults=LINKGRABBER_MAX, startAt=0)]
+
+
+def linkgrabber_snapshot(raw):
+    """Names and ids only; URLs, paths and passwords never reach the browser."""
+    if not isinstance(raw, list) or len(raw) > LINKGRABBER_MAX:
+        raise ValueError("JD2のLinkGrabber情報が上限を超えています")
+    items = []
+    for entry in raw:
+        if not isinstance(entry, dict):
+            raise ValueError("JD2のLinkGrabber情報の形式が不正です")
+        items.append({
+            "id": _uuid(entry.get("uuid")),
+            "package_id": _uuid(entry.get("packageUUID")),
+            "name": _string(entry.get("name"), 240) or "ファイル（名称不明）",
+            "host": _string(entry.get("host"), 120),
+            "bytes_total": _nonnegative(entry.get("bytesTotal")),
+        })
+    return {"items": items, "count": len(items), "has_more": len(items) == LINKGRABBER_MAX}

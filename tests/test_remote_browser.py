@@ -178,12 +178,16 @@ class FakeWS:
         self.closed = False
         self.fail = {}                 # method -> error text
         self.eval_value = []
+        self.eval_map = []             # (expression substring, value) overrides for Runtime.evaluate
+        self.hook = None               # called with every command before it is answered
         self.history = {"currentIndex": 1, "entries": [{"id": 5}, {"id": 6}, {"id": 7}]}
 
     def send_text(self, text):
         message = json.loads(text)
         self.sent.append(message)
         method = message["method"]
+        if self.hook is not None:
+            self.hook(message)
         if method in self.fail:
             self.q.put(json.dumps({"id": message["id"], "error": {"message": self.fail[method]}}))
             return
@@ -197,7 +201,12 @@ class FakeWS:
             self.sessions += 1
             result = {"sessionId": "SESSION%d" % self.sessions}
         elif method == "Runtime.evaluate":
-            result = {"result": {"type": "object", "value": self.eval_value}}
+            value = self.eval_value
+            for needle, mapped in self.eval_map:
+                if needle in message["params"]["expression"]:
+                    value = mapped
+                    break
+            result = {"result": {"type": "object", "value": value}}
         elif method == "Page.getNavigationHistory":
             result = self.history
         self.q.put(json.dumps({"id": message["id"], "result": result}))
@@ -565,7 +574,7 @@ class ScreencastTests(BrowserBase):
         result = self.rb.frame("b1", 0, wait=0)
         self.assertIsNone(result["jpeg_base64"])
         self.assertEqual(self.ws.calls("Page.startScreencast")[0]["params"], {
-            "format": "jpeg", "quality": 60, "maxWidth": 1280, "maxHeight": 2000, "everyNthFrame": 1})
+            "format": "jpeg", "quality": 40, "maxWidth": 1280, "maxHeight": 2000, "everyNthFrame": 1})
         self.assertEqual(self.ws.calls("Target.activateTarget")[0]["params"], {"targetId": "TARGET00001"})
         for i, data in enumerate(("QUFB", "QkJC", "Q0ND"), 1):
             self.feed("SESSION1", data, seq_ack=i, width=1000, height=1800)
@@ -719,7 +728,8 @@ class InputTests(BrowserBase):
                    "Page.navigateToHistoryEntry", "Page.reload", "Target.activateTarget",
                    "Page.startScreencast", "Page.stopScreencast", "Page.screencastFrameAck",
                    "Runtime.evaluate", "Target.closeTarget", "Page.handleJavaScriptDialog",
-                   "Fetch.enable"}
+                   "Fetch.enable", "Network.enable", "Network.setBlockedURLs",
+                   "Emulation.setEmulatedMedia"}
         self.assertLessEqual(set(self.ws.methods()), allowed)
 
 
@@ -896,7 +906,7 @@ class ViewportTests(BrowserBase):
         self.open()
 
     def test_mobile_viewport_sets_metrics_touch_and_scaled_screencast(self):
-        self.assertEqual(self.rb.set_viewport("b1", 390, 700, 3), {"ok": True, "changed": True})
+        self.assertEqual(self.rb.set_viewport("b1", 390, 700, 3, "high"), {"ok": True, "changed": True})
         override = self.ws.calls("Emulation.setDeviceMetricsOverride")[0]
         self.assertEqual(override["params"], {"width": 390, "height": 700,
                                               "deviceScaleFactor": 2.0, "mobile": True})
@@ -904,7 +914,7 @@ class ViewportTests(BrowserBase):
         self.assertEqual(self.ws.calls("Emulation.setTouchEmulationEnabled")[0]["params"], {"enabled": True})
         self.rb.frame("b1", 0, wait=0)
         self.assertEqual(self.ws.calls("Page.startScreencast")[-1]["params"], {
-            "format": "jpeg", "quality": 50, "maxWidth": 780, "maxHeight": 1400, "everyNthFrame": 1})
+            "format": "jpeg", "quality": 70, "maxWidth": 780, "maxHeight": 1400, "everyNthFrame": 1})
 
     def test_desktop_viewport_quality_and_no_touch_emulation(self):
         self.rb.set_viewport("b1", 1200, 800, 1)
@@ -913,7 +923,7 @@ class ViewportTests(BrowserBase):
         self.assertEqual(self.ws.calls("Emulation.setTouchEmulationEnabled"), [])
         self.rb.frame("b1", 0, wait=0)
         self.assertEqual(self.ws.calls("Page.startScreencast")[-1]["params"], {
-            "format": "jpeg", "quality": 60, "maxWidth": 1200, "maxHeight": 800, "everyNthFrame": 1})
+            "format": "jpeg", "quality": 40, "maxWidth": 1200, "maxHeight": 800, "everyNthFrame": 1})
 
     def test_boundary_at_760_is_desktop_and_759_is_mobile(self):
         self.rb.set_viewport("b1", 759, 600, 2)
@@ -924,12 +934,12 @@ class ViewportTests(BrowserBase):
                          [True, False])
 
     def test_resize_restarts_a_running_screencast_and_same_size_is_a_noop(self):
-        self.rb.set_viewport("b1", 390, 700, 2)
+        self.rb.set_viewport("b1", 390, 700, 2, "high")
         self.rb.frame("b1", 0, wait=0)
         starts = len(self.ws.calls("Page.startScreencast"))
-        self.assertEqual(self.rb.set_viewport("b1", 390, 700, 2)["changed"], False)
+        self.assertEqual(self.rb.set_viewport("b1", 390, 700, 2, "high")["changed"], False)
         self.assertEqual(len(self.ws.calls("Emulation.setDeviceMetricsOverride")), 1)
-        self.rb.set_viewport("b1", 700, 390, 2)
+        self.rb.set_viewport("b1", 700, 390, 2, "high")
         self.assertEqual(len(self.ws.calls("Page.stopScreencast")), 1)
         self.assertEqual(len(self.ws.calls("Page.startScreencast")), starts + 1)
         self.assertEqual(self.ws.calls("Page.startScreencast")[-1]["params"]["maxWidth"], 1400)
@@ -1171,3 +1181,668 @@ class PopupTests(BrowserBase):
         self.assertIn("POPUP000001", self.closed())
         with self.assertRaises(rb.TabGone):
             self.rb.intercepts("b1")
+
+
+# ======================================================================= v0.1.24
+import rb_blocklist
+import time as _time
+
+
+class FakeRules:
+    """Stands in for storage.Store: settings() and site_rule_for(host)."""
+
+    def __init__(self):
+        self.options = {"block_ads": True}
+        self.rules = {}
+
+    def settings(self):
+        return dict(self.options)
+
+    def site_rule_for(self, host):
+        labels = host.split(".")
+        for start in range(len(labels) - 1):
+            rule = self.rules.get(".".join(labels[start:]))
+            if rule:
+                return dict(rule)
+        return None
+
+
+def rule(host, **fields):
+    base = {"host": host, "auto_send": False, "popup": "ask", "block_ads": True}
+    base.update(fields)
+    return base
+
+
+class TickClock:
+    def __init__(self):
+        self.now = 1000.0
+
+    def __call__(self):
+        self.now += 1.0
+        return self.now
+
+
+class QualityTests(BrowserBase):
+    def setUp(self):
+        super().setUp()
+        self.open()
+
+    def params(self):
+        return self.ws.calls("Page.startScreencast")[-1]["params"]
+
+    def test_default_is_speed_one_x_and_jpeg_40(self):
+        self.rb.set_viewport("b1", 390, 700, 3)
+        self.assertEqual(self.ws.calls("Emulation.setDeviceMetricsOverride")[0]["params"]["deviceScaleFactor"], 1.0)
+        self.rb.frame("b1", 0, wait=0)
+        self.assertEqual(self.params(), {"format": "jpeg", "quality": 40, "maxWidth": 390,
+                                         "maxHeight": 700, "everyNthFrame": 1})
+
+    def test_each_mode_sets_scale_and_quality(self):
+        for mode, scale, quality in (("speed", 1.0, 40), ("standard", 1.5, 55), ("high", 2.0, 70)):
+            with self.subTest(mode=mode):
+                self.rb.set_viewport("b1", 400, 800, 3, mode)
+                override = self.ws.calls("Emulation.setDeviceMetricsOverride")[-1]["params"]
+                self.assertEqual(override["deviceScaleFactor"], scale)
+                self.rb.frame("b1", 0, wait=0)
+                self.assertEqual(self.params()["quality"], quality)
+                self.assertEqual(self.params()["maxWidth"], int(round(400 * scale)))
+                self.assertEqual(self.params()["maxHeight"], int(round(800 * scale)))
+
+    def test_scale_never_exceeds_the_device_pixel_ratio(self):
+        self.rb.set_viewport("b1", 1200, 800, 1, "high")
+        self.assertEqual(self.ws.calls("Emulation.setDeviceMetricsOverride")[-1]["params"]["deviceScaleFactor"], 1.0)
+
+    def test_mode_is_remembered_per_tab_and_changing_it_restarts_the_screencast(self):
+        self.rb.set_viewport("b1", 400, 800, 2, "high")
+        self.rb.frame("b1", 0, wait=0)
+        starts = len(self.ws.calls("Page.startScreencast"))
+        self.rb.set_viewport("b1", 400, 800, 2)          # no quality given: keeps "high"
+        self.assertEqual(len(self.ws.calls("Page.startScreencast")), starts)
+        self.assertEqual(self.rb.set_viewport("b1", 400, 800, 2, "speed")["changed"], True)
+        self.assertEqual(len(self.ws.calls("Page.startScreencast")), starts + 1)
+        self.assertEqual(self.params()["quality"], 40)
+
+    def test_unknown_quality_is_refused_before_anything_is_sent(self):
+        before = len(self.ws.sent)
+        for bad in ("ultra", "", 5, "SPEED", ["high"], {"a": 1}):
+            with self.subTest(q=bad), self.assertRaises(rb.BrowserError):
+                self.rb.set_viewport("b1", 400, 800, 2, bad)
+        self.assertEqual(len(self.ws.sent), before)
+
+
+class PerfSetupTests(BrowserBase):
+    def test_reduced_motion_is_emulated_on_every_tab(self):
+        self.open()
+        call = self.ws.calls("Emulation.setEmulatedMedia")[0]
+        self.assertEqual(call["params"], {"features": [{"name": "prefers-reduced-motion", "value": "reduce"}]})
+        self.assertEqual(call["sessionId"], "SESSION1")
+
+    def test_emulated_media_failure_does_not_break_the_tab(self):
+        self.ws.fail["Emulation.setEmulatedMedia"] = "nope"
+        self.assertEqual(self.open()["id"], "b1")
+
+
+class AdBlockTests(BrowserBase):
+    def setUp(self):
+        super().setUp()
+        self.rules = FakeRules()
+        self.rb.rules = self.rules
+
+    def blocked(self):
+        return [m for m in self.ws.calls("Network.setBlockedURLs")]
+
+    def test_blocked_by_default_with_the_hub_blocklist_patterns(self):
+        self.open()
+        methods = self.ws.methods()
+        self.assertLess(methods.index("Network.enable"), methods.index("Network.setBlockedURLs"))
+        self.assertLess(methods.index("Network.setBlockedURLs"), methods.index("Page.navigate"))
+        call = self.blocked()[0]
+        self.assertEqual(call["sessionId"], "SESSION1")
+        self.assertEqual(call["params"]["urls"], list(rb_blocklist.patterns()))
+        self.assertIn("*://doubleclick.net/*", call["params"]["urls"])
+        self.assertIn("*://*.doubleclick.net/*", call["params"]["urls"])
+
+    def test_global_switch_off_blocks_nothing(self):
+        self.rules.options["block_ads"] = False
+        self.open()
+        self.assertEqual(self.ws.calls("Network.enable"), [])
+        self.assertEqual(self.blocked(), [])
+
+    def test_site_exception_turns_blocking_off_for_that_host_only(self):
+        self.rules.rules["example.com"] = rule("example.com", block_ads=False)
+        self.open("https://example.com/a")
+        self.assertEqual(self.blocked(), [])
+        self.open("https://other.example.org/")
+        self.assertEqual(len(self.blocked()), 1)
+
+    def test_navigating_to_a_host_with_an_exception_clears_the_patterns_and_back(self):
+        self.rules.rules["free.example.net"] = rule("free.example.net", block_ads=False)
+        self.open("https://example.com/a")
+        self.assertEqual(len(self.blocked()), 1)
+        self.ws.emit("Target.targetInfoChanged", {"targetInfo": {
+            "targetId": "TARGET00001", "type": "page", "url": "https://www.free.example.net/x", "title": "t"}})
+        self.barrier()
+        self.assertEqual(self.blocked()[-1]["params"], {"urls": []})
+        self.ws.emit("Target.targetInfoChanged", {"targetInfo": {
+            "targetId": "TARGET00001", "type": "page", "url": "https://example.com/y", "title": "t"}})
+        self.barrier()
+        self.assertEqual(self.blocked()[-1]["params"]["urls"], list(rb_blocklist.patterns()))
+        # the same host again changes nothing
+        count = len(self.blocked())
+        self.ws.emit("Target.targetInfoChanged", {"targetInfo": {
+            "targetId": "TARGET00001", "type": "page", "url": "https://example.com/z", "title": "t"}})
+        self.barrier()
+        self.assertEqual(len(self.blocked()), count)
+
+    def test_blocking_failure_is_logged_not_fatal(self):
+        self.ws.fail["Network.setBlockedURLs"] = "unsupported"
+        self.assertEqual(self.open()["id"], "b1")
+        self.assertTrue(any("ad blocking failed" in line for line in self.rb.log_lines()))
+
+    def test_hoster_domains_are_never_in_the_patterns(self):
+        urls = list(self.blocked() and self.blocked()[0]["params"]["urls"] or rb_blocklist.patterns())
+        for pattern in urls:
+            for hoster in ("rapidgator.net", "rg.to"):
+                self.assertNotIn(hoster, pattern)
+        # and the hoster Fetch patterns still pause only hoster documents
+        self.open()
+        self.assertEqual(self.ws.calls("Fetch.enable")[0]["params"]["patterns"],
+                         [dict(p) for p in rb.FETCH_PATTERNS])
+
+
+class AutoSendTests(BrowserBase):
+    HOSTER = "https://rapidgator.net/file/0123456789abcdef0123456789abcdef"
+
+    def setUp(self):
+        super().setUp()
+        self.rules = FakeRules()
+        self.rb.rules = self.rules
+        self.rb._spawn = lambda fn: fn()
+        self.sent = []
+        self.outcome = "sent"
+        self.rb.auto_send = self.fake_send
+        self.open("https://blog.example.com/post")
+
+    def fake_send(self, url):
+        self.sent.append(url)
+        if isinstance(self.outcome, Exception):
+            raise self.outcome
+        return self.outcome
+
+    def paused(self, url=None):
+        self.ws.emit("Fetch.requestPaused", {"requestId": "r%d" % (len(self.ws.sent)), "resourceType": "Document",
+                                             "request": {"url": url or self.HOSTER + "/a.rar.html"}}, "SESSION1")
+        self.barrier()
+
+    def test_no_rule_means_the_sheet_and_no_send(self):
+        self.paused()
+        self.assertEqual(self.sent, [])
+        self.assertEqual(self.rb.intercepts("b1"), [{"id": 1, "kind": "hoster", "url": self.HOSTER}])
+
+    def test_auto_send_rule_sends_normalized_url_and_reports_auto_sent(self):
+        self.rules.rules["example.com"] = rule("example.com", auto_send=True)      # parent domain matches
+        self.paused()
+        self.assertEqual(self.sent, [self.HOSTER])
+        self.assertEqual(self.rb.intercepts("b1"), [{"id": 1, "kind": "auto_sent", "url": self.HOSTER, "dup": False}])
+        # the page itself was still aborted, never rendered
+        self.assertEqual(len(self.ws.calls("Fetch.failRequest")), 1)
+
+    def test_already_sent_is_reported_as_dup(self):
+        self.rules.rules["blog.example.com"] = rule("blog.example.com", auto_send=True)
+        self.outcome = "dup"
+        self.paused()
+        self.assertEqual(self.rb.intercepts("b1")[0]["dup"], True)
+
+    def test_engine_not_ready_falls_back_to_the_sheet_silently(self):
+        self.rules.rules["blog.example.com"] = rule("blog.example.com", auto_send=True)
+        self.outcome = None
+        self.paused()
+        self.assertEqual(self.rb.intercepts("b1"), [{"id": 1, "kind": "hoster", "url": self.HOSTER}])
+        self.assertIsNone(self.rb.frame("b1", 0, wait=0)["blocked"])
+
+    def test_failure_falls_back_to_the_sheet_and_tells_why(self):
+        self.rules.rules["blog.example.com"] = rule("blog.example.com", auto_send=True)
+        self.outcome = ValueError("保存先を選択してください")
+        self.paused()
+        self.assertEqual(self.rb.intercepts("b1")[0]["kind"], "hoster")
+        self.assertIn("保存先を選択してください", self.rb.frame("b1", 0, wait=0)["blocked"])
+        self.assertEqual(self.rb._auto_inflight, set())
+
+    def test_unexpected_exception_text_is_not_leaked(self):
+        self.rules.rules["blog.example.com"] = rule("blog.example.com", auto_send=True)
+        self.outcome = OSError("secret path /share/x")
+        self.paused()
+        self.assertNotIn("secret", self.rb.frame("b1", 0, wait=0)["blocked"])
+
+    def test_downloads_and_popups_never_auto_send(self):
+        self.rules.rules["blog.example.com"] = rule("blog.example.com", auto_send=True)
+        self.ws.emit("Browser.downloadWillBegin", {"frameId": "TARGET00001", "url": "https://files.example/a.zip"})
+        self.barrier()
+        self.assertEqual(self.sent, [])
+
+    def test_a_rule_for_another_host_does_not_apply(self):
+        self.rules.rules["elsewhere.org"] = rule("elsewhere.org", auto_send=True)
+        self.paused()
+        self.assertEqual(self.sent, [])
+
+    def test_in_flight_send_is_not_started_twice(self):
+        self.rules.rules["blog.example.com"] = rule("blog.example.com", auto_send=True)
+        queued = []
+        self.rb._spawn = queued.append
+        self.paused()
+        self.paused(self.HOSTER + "/other-name.html")
+        self.assertEqual(len(queued), 1)
+        queued[0]()
+        self.assertEqual(self.sent, [self.HOSTER])
+
+
+class PopupPolicyTests(PopupTests):
+    def setUp(self):
+        super().setUp()
+        self.rules = FakeRules()
+        self.rb.rules = self.rules
+
+    def wait_events(self):
+        for _ in range(200):
+            if self.rb.intercepts("b1"):
+                break
+            _time.sleep(0.01)
+        return self.rb.intercepts("b1")
+
+    def test_ask_is_the_default_and_a_rule_for_ask_is_the_same(self):
+        self.rules.rules["example.com"] = rule("example.com", popup="ask")
+        self.popup("https://shop.example/item")
+        self.assertEqual(self.rb.intercepts("b1")[0]["kind"], "popup")
+
+    def test_block_closes_silently_and_counts(self):
+        self.rules.rules["example.com"] = rule("example.com", popup="block")
+        self.popup("https://shop.example/item")
+        self.popup("https://shop.example/other", target="POPUP000002")
+        self.assertEqual(self.closed(), ["POPUP000001", "POPUP000002"])
+        self.assertEqual(self.rb.intercepts("b1"), [])
+        frame = self.rb.frame("b1", 0, wait=0)
+        self.assertEqual(frame["popups"], 2)
+        self.assertIsNone(frame["blocked"])
+        self.assertEqual(len(self.ws.calls("Page.navigate")), 1)
+
+    def test_block_counts_url_less_and_unsafe_popups_too(self):
+        self.rules.rules["example.com"] = rule("example.com", popup="block")
+        self.popup("http://insecure.example/", target="POPUP000001")
+        self.assertEqual(self.rb.frame("b1", 0, wait=0)["popups"], 1)
+
+    def test_hoster_popups_are_still_intercepted_under_block(self):
+        self.rules.rules["example.com"] = rule("example.com", popup="block")
+        self.popup(self.HOSTER + "/x.html")
+        self.assertEqual(self.rb.intercepts("b1"), [{"id": 1, "kind": "hoster", "url": self.HOSTER}])
+        self.assertEqual(self.rb.frame("b1", 0, wait=0)["popups"], 0)
+
+    def test_allow_with_room_asks_the_viewer_to_open_a_new_tab(self):
+        self.rules.rules["example.com"] = rule("example.com", popup="allow")
+        self.popup("https://shop.example/item")
+        self.assertEqual(self.closed(), ["POPUP000001"])
+        self.assertEqual(self.wait_events(), [
+            {"id": 1, "kind": "popup_opened", "url": "https://shop.example/item", "where": "new"}])
+        self.assertEqual(len(self.ws.calls("Page.navigate")), 1)       # the opener did not move
+        # the viewer can still open it in the current tab when a new one is not possible
+        self.rb.open_intercept("b1", 1)
+        self.assertEqual(self.ws.calls("Page.navigate")[-1]["params"], {"url": "https://shop.example/item"})
+
+    def test_allow_at_the_tab_limit_uses_the_current_tab(self):
+        self.rules.rules["example.com"] = rule("example.com", popup="allow")
+        self.open("https://example.com/2")
+        self.open("https://example.com/3")
+        self.popup("https://shop.example/item")
+        events = self.wait_events()
+        self.assertEqual([(e["kind"], e["where"]) for e in events], [("popup_opened", "current")])
+        nav = self.ws.calls("Page.navigate")[-1]
+        self.assertEqual((nav["params"], nav["sessionId"]), ({"url": "https://shop.example/item"}, "SESSION1"))
+
+    def test_allow_under_memory_pressure_uses_the_current_tab(self):
+        self.rules.rules["example.com"] = rule("example.com", popup="allow")
+        self.set_mem(100 * 1024)
+        self.popup("https://shop.example/item")
+        self.assertEqual(self.wait_events()[0]["where"], "current")
+
+    def test_allow_with_unsafe_url_is_never_opened(self):
+        self.rules.rules["example.com"] = rule("example.com", popup="allow")
+        self.popup("http://insecure.example/")
+        _time.sleep(0.1)
+        self.assertEqual(self.rb.intercepts("b1"), [])
+        self.assertEqual(len(self.ws.calls("Page.navigate")), 1)
+
+
+class ProbeTests(BrowserBase):
+    HOSTER = "https://rapidgator.net/file/0123456789abcdef0123456789abcdef"
+    START = "https://blog.example.org/go?id=7"
+
+    def setUp(self):
+        super().setUp()
+        self.open("https://example.com/a")
+        self.ws.eval_map = [("elementFromPoint", self.START)]
+        self.old = (rb.PROBE_SETTLE, rb.PROBE_TIMEOUT)
+        rb.PROBE_SETTLE = 0
+        self.addCleanup(lambda: (setattr(rb, "PROBE_SETTLE", self.old[0]),
+                                 setattr(rb, "PROBE_TIMEOUT", self.old[1])))
+
+    def probe_session(self):
+        return "SESSION2"
+
+    def script(self, on_navigate):
+        """Run `on_navigate(emit)` when the probe page is told to navigate."""
+        def hook(message):
+            if message["method"] == "Page.navigate" and message.get("sessionId") == "SESSION2":
+                on_navigate(lambda method, params=None: self.ws.emit(method, params or {}, "SESSION2"))
+        self.ws.hook = hook
+
+    def closes(self):
+        return [m["params"]["targetId"] for m in self.ws.calls("Target.closeTarget")]
+
+    def test_redirect_chain_to_a_hoster_is_captured_and_the_target_is_closed(self):
+        def navigate(emit):
+            emit("Network.requestWillBeSent", {"type": "Document", "request": {"url": self.START}})
+            emit("Network.requestWillBeSent", {"type": "Document", "redirectResponse": {"status": 302},
+                                               "request": {"url": "https://hop.example.net/r"}})
+            emit("Fetch.requestPaused", {"requestId": "rp1", "resourceType": "Document",
+                                         "request": {"url": self.HOSTER + "/f.rar.html"}})
+        self.script(navigate)
+        result = self.rb.probe("b1", 120.4, 300.2)
+        self.assertEqual(result["start_url"], self.START)
+        self.assertEqual(result["links"], [self.HOSTER])
+        self.assertEqual(result["redirects"], 1)
+        # the hoster document was aborted inside the probe, not rendered
+        fail = self.ws.calls("Fetch.failRequest")[0]
+        self.assertEqual((fail["params"]["requestId"], fail["sessionId"]), ("rp1", "SESSION2"))
+        self.assertEqual(self.closes(), ["TARGET00002"])
+        self.assertEqual(self.rb._probe_targets, {})
+        self.assertEqual(self.rb._probe_sessions, {})
+        self.assertEqual(self.rb._probes, 0)
+        self.assertFalse(self.rb._tabs["b1"].probing)
+
+    def test_probe_target_is_hidden_never_screencast_and_sets_up_hoster_and_ad_rules(self):
+        self.script(lambda emit: emit("Fetch.requestPaused", {
+            "requestId": "rp1", "resourceType": "Document", "request": {"url": self.HOSTER}}))
+        self.rb.probe("b1", 10, 10)
+        create = self.ws.calls("Target.createTarget")[-1]["params"]
+        self.assertEqual(create, {"url": "about:blank", "background": True})
+        probe_calls = [m for m in self.ws.sent if m.get("sessionId") == "SESSION2"]
+        methods = [m["method"] for m in probe_calls]
+        self.assertNotIn("Page.startScreencast", methods)
+        self.assertNotIn("Target.activateTarget", [m["method"] for m in self.ws.sent[-30:]
+                                                   if m.get("params", {}).get("targetId") == "TARGET00002"])
+        for needed in ("Page.enable", "Fetch.enable", "Network.enable", "Network.setBlockedURLs", "Page.navigate"):
+            self.assertIn(needed, methods)
+        fetch = [m for m in probe_calls if m["method"] == "Fetch.enable"][0]
+        self.assertEqual(fetch["params"]["patterns"], [dict(p) for p in rb.FETCH_PATTERNS])
+        self.assertEqual([m for m in probe_calls if m["method"] == "Page.navigate"][0]["params"],
+                         {"url": self.START})
+        # coordinates are CSS pixels of the tab and are formatted as numbers only
+        expression = [m for m in self.ws.calls("Runtime.evaluate") if "elementFromPoint" in m["params"]["expression"]][0]
+        self.assertEqual(expression["sessionId"], "SESSION1")
+        self.assertIn("(10.0,10.0)", expression["params"]["expression"])
+        self.assertIn("closest('a')", expression["params"]["expression"])
+
+    def test_ad_blocking_follows_the_origin_tab_site_exception(self):
+        rules = FakeRules()
+        rules.rules["example.com"] = rule("example.com", block_ads=False)
+        self.rb.rules = rules
+        self.script(lambda emit: emit("Fetch.requestPaused", {
+            "requestId": "rp1", "resourceType": "Document", "request": {"url": self.HOSTER}}))
+        self.rb.probe("b1", 10, 10)
+        probe_methods = [m["method"] for m in self.ws.sent if m.get("sessionId") == "SESSION2"]
+        self.assertNotIn("Network.setBlockedURLs", probe_methods)
+
+    def test_page_without_hoster_redirect_reports_anchors_and_final_url(self):
+        self.ws.eval_map += [("location.href", "https://blog.example.org/final"),
+                             ("querySelectorAll", ["https://x.example/a", self.HOSTER + "/a.html",
+                                                   "https://rapidgator.net/file/ffffffffffffffffffffffffffffffff/b.html",
+                                                   self.HOSTER + "/dupe.html"])]
+
+        def navigate(emit):
+            emit("Page.frameStartedLoading", {"frameId": "F1"})
+            emit("Network.requestWillBeSent", {"type": "Document", "request": {"url": self.START}})
+            emit("Page.frameStoppedLoading", {"frameId": "F1"})
+            emit("Page.loadEventFired", {"timestamp": 1})
+        self.script(navigate)
+        result = self.rb.probe("b1", 5, 5)
+        self.assertEqual(result["links"], [self.HOSTER, "https://rapidgator.net/file/ffffffffffffffffffffffffffffffff"])
+        self.assertEqual(result["final_url"], "https://blog.example.org/final")
+        self.assertEqual(result["redirects"], 0)
+        self.assertEqual(self.closes(), ["TARGET00002"])
+
+    def test_no_links_returns_the_final_url_for_opening_in_the_tab(self):
+        self.ws.eval_map += [("location.href", "https://blog.example.org/landing")]
+
+        def navigate(emit):
+            emit("Page.frameStartedLoading", {"frameId": "F1"})
+            emit("Page.frameStoppedLoading", {"frameId": "F1"})
+            emit("Page.loadEventFired", {})
+        self.script(navigate)
+        result = self.rb.probe("b1", 5, 5)
+        self.assertEqual((result["links"], result["final_url"]), ([], "https://blog.example.org/landing"))
+
+    def test_results_are_capped_at_50_and_deduplicated(self):
+        hrefs = ["https://rapidgator.net/file/%032x/a" % i for i in range(1, 80)]
+        self.ws.eval_map += [("location.href", self.START), ("querySelectorAll", hrefs + hrefs)]
+        self.script(lambda emit: (emit("Page.frameStartedLoading", {"frameId": "F1"}),
+                                  emit("Page.frameStoppedLoading", {"frameId": "F1"}),
+                                  emit("Page.loadEventFired", {})))
+        result = self.rb.probe("b1", 5, 5)
+        self.assertEqual(len(result["links"]), 50)
+        self.assertEqual(len(set(result["links"])), 50)
+
+    def test_timeout_still_reads_the_page_and_closes_the_target(self):
+        rb.PROBE_TIMEOUT = 3
+        self.rb._clock = TickClock()
+        self.ws.eval_map += [("location.href", "https://blog.example.org/slow"), ("querySelectorAll", [])]
+        started = _time.monotonic()
+        result = self.rb.probe("b1", 5, 5)
+        self.assertLess(_time.monotonic() - started, 10)
+        self.assertEqual(result["links"], [])
+        self.assertEqual(result["final_url"], "https://blog.example.org/slow")
+        self.assertEqual(self.closes(), ["TARGET00002"])
+        self.assertEqual(self.rb._probes, 0)
+
+    def test_timeout_when_the_page_no_longer_answers_still_closes(self):
+        rb.PROBE_TIMEOUT = 2
+        self.rb._clock = TickClock()
+        self.ws.fail["Runtime.evaluate"] = "target crashed"
+        # the first evaluate (href) is allowed through, later ones fail
+        calls = []
+
+        def hook(message):
+            if message["method"] == "Runtime.evaluate":
+                calls.append(1)
+                if len(calls) == 1:
+                    self.ws.fail.pop("Runtime.evaluate", None)
+                else:
+                    self.ws.fail["Runtime.evaluate"] = "target crashed"
+        self.ws.hook = hook
+        result = self.rb.probe("b1", 5, 5)
+        self.assertEqual(result["links"], [])
+        self.assertEqual(result["final_url"], self.START)
+        self.assertEqual(self.closes(), ["TARGET00002"])
+
+    def test_navigation_error_raises_and_still_closes_the_target(self):
+        self.ws.fail["Page.navigate"] = "net::ERR"
+        # the tab's own initial navigation already happened; only the probe navigates now
+        with self.assertRaises(rb.BrowserError):
+            self.rb.probe("b1", 5, 5)
+        self.assertEqual(self.closes(), ["TARGET00002"])
+        self.assertEqual((self.rb._probes, self.rb._tabs["b1"].probing), (0, False))
+        self.assertEqual(self.rb._probe_sessions, {})
+
+    def test_attach_failure_closes_the_created_target(self):
+        self.ws.fail["Target.attachToTarget"] = "gone"
+        with self.assertRaises(rb.BrowserError):
+            self.rb.probe("b1", 5, 5)
+        self.assertEqual(self.closes(), ["TARGET00002"])
+        self.assertEqual(self.rb._probe_targets, {})
+
+    def test_close_failure_does_not_mask_the_result(self):
+        self.script(lambda emit: emit("Fetch.requestPaused", {
+            "requestId": "rp1", "resourceType": "Document", "request": {"url": self.HOSTER}}))
+        self.ws.fail["Target.closeTarget"] = "already closed"
+        self.assertEqual(self.rb.probe("b1", 5, 5)["links"], [self.HOSTER])
+
+    def test_direct_hoster_links_need_no_hidden_page(self):
+        self.ws.eval_map = [("elementFromPoint", self.HOSTER + "/file.rar.html")]
+        before = len(self.ws.calls("Target.createTarget"))
+        result = self.rb.probe("b1", 5, 5)
+        self.assertEqual(result["links"], [self.HOSTER])
+        self.assertEqual(len(self.ws.calls("Target.createTarget")), before)
+
+    def test_unsafe_or_missing_links_are_refused_without_creating_a_target(self):
+        before = len(self.ws.calls("Target.createTarget"))
+        for value in (None, "", "http://insecure.example/", "https://192.168.0.2/x", "javascript:alert(1)",
+                      "[object SVGAnimatedString]", 5, ["x"]):
+            with self.subTest(value=value):
+                self.ws.eval_map = [("elementFromPoint", value)]
+                with self.assertRaises(rb.BrowserError):
+                    self.rb.probe("b1", 5, 5)
+        self.assertEqual(len(self.ws.calls("Target.createTarget")), before)
+        self.assertEqual(self.rb._probes, 0)
+
+    def test_hub_origin_check_can_refuse_the_start_url(self):
+        def refuse(url):
+            raise ValueError("hub")
+        with self.assertRaises(rb.BrowserError):
+            self.rb.probe("b1", 5, 5, url_check=refuse)
+        self.assertEqual(len(self.ws.calls("Target.createTarget")), 1)     # only the tab
+
+    def test_coordinates_and_tab_are_validated(self):
+        for x, y in ((-1, 0), (0, -1), ("1", 1), (True, 1), (float("nan"), 1), (1e9, 1), (None, 1)):
+            with self.subTest(x=x, y=y), self.assertRaises(rb.BrowserError):
+                self.rb.probe("b1", x, y)
+        with self.assertRaises(rb.BrowserError):
+            self.rb.probe("../x", 1, 1)
+        with self.assertRaises(rb.TabGone):
+            self.rb.probe("b9", 1, 1)
+
+    def test_one_probe_per_tab_at_a_time_and_flag_is_released(self):
+        gate = threading.Event()
+        release = threading.Event()
+
+        def hook(message):
+            if message["method"] == "Page.navigate" and message.get("sessionId") == "SESSION2":
+                gate.set()
+                release.wait(5)
+        self.ws.hook = hook
+        rb.PROBE_TIMEOUT = 1
+        self.rb._clock = TickClock()
+        out = []
+        thread = threading.Thread(target=lambda: out.append(self.rb.probe("b1", 5, 5)))
+        thread.start()
+        self.assertTrue(gate.wait(5))
+        with self.assertRaises(rb.BrowserError) as error:
+            self.rb.probe("b1", 6, 6)
+        self.assertIn("確認中", str(error.exception))
+        release.set()
+        thread.join(10)
+        self.assertEqual(len(out), 1)
+        self.assertFalse(self.rb._tabs["b1"].probing)
+        self.ws.hook = None
+        self.assertEqual(self.rb.probe("b1", 7, 7)["start_url"], self.START)
+
+    def test_global_probe_cap_counts_against_all_tabs(self):
+        self.open("https://example.com/b")
+        with self.rb._lock:
+            self.rb._probes = rb.MAX_PROBES
+        with self.assertRaises(rb.BrowserError):
+            self.rb.probe("b2", 5, 5)
+        self.assertFalse(self.rb._tabs["b2"].probing)
+        self.assertEqual(self.rb._probes, rb.MAX_PROBES)
+
+    def test_memory_guard_applies_before_a_target_is_created(self):
+        self.set_mem(100 * 1024)
+        before = len(self.ws.calls("Target.createTarget"))
+        with self.assertRaises(rb.BrowserError) as error:
+            self.rb.probe("b1", 5, 5)
+        self.assertIn("メモリ", str(error.exception))
+        self.assertEqual(len(self.ws.calls("Target.createTarget")), before)
+        self.assertEqual(self.rb._probes, 0)
+
+    def test_probe_popups_are_collected_and_closed(self):
+        def navigate(emit):
+            self.ws.emit("Target.targetCreated", {"targetInfo": {
+                "targetId": "POPUPPROBE01", "type": "page", "openerId": "TARGET00002", "url": ""}})
+            self.ws.emit("Target.targetInfoChanged", {"targetInfo": {
+                "targetId": "POPUPPROBE01", "type": "page", "openerId": "TARGET00002",
+                "url": self.HOSTER + "/x.html"}})
+        self.script(navigate)
+        result = self.rb.probe("b1", 5, 5)
+        self.assertEqual(result["links"], [self.HOSTER])
+        self.assertIn("POPUPPROBE01", self.closes())
+        self.assertIn("TARGET00002", self.closes())
+        # nothing was recorded on the origin tab
+        self.assertEqual(self.rb.intercepts("b1"), [])
+
+    def test_unrelated_popups_of_the_probe_are_closed_never_followed(self):
+        def navigate(emit):
+            self.ws.emit("Target.targetCreated", {"targetInfo": {
+                "targetId": "POPUPPROBE02", "type": "page", "openerId": "TARGET00002",
+                "url": "https://ads.example/pop"}})
+            emit("Page.frameStartedLoading", {"frameId": "F1"})
+            emit("Page.frameStoppedLoading", {"frameId": "F1"})
+            emit("Page.loadEventFired", {})
+        self.ws.eval_map += [("location.href", self.START), ("querySelectorAll", [])]
+        self.script(navigate)
+        result = self.rb.probe("b1", 5, 5)
+        self.assertEqual(result["links"], [])
+        self.assertIn("POPUPPROBE02", self.closes())
+        self.assertEqual(len(self.ws.calls("Page.navigate")), 2)      # tab + probe page only
+
+    def test_popup_still_open_when_the_probe_ends_is_closed(self):
+        rb.PROBE_TIMEOUT = 2
+        self.rb._clock = TickClock()
+        self.script(lambda emit: self.ws.emit("Target.targetCreated", {"targetInfo": {
+            "targetId": "POPUPPROBE03", "type": "page", "openerId": "TARGET00002", "url": ""}}))
+        self.rb.probe("b1", 5, 5)
+        self.assertIn("POPUPPROBE03", self.closes())
+        self.assertEqual(self.rb._probe_popups, {})
+
+    def test_dialogs_on_the_probe_page_are_dismissed(self):
+        self.script(lambda emit: emit("Page.javascriptDialogOpening", {"message": "x"}))
+        self.ws.eval_map += [("location.href", self.START), ("querySelectorAll", [])]
+        rb.PROBE_TIMEOUT = 2
+        self.rb._clock = TickClock()
+        self.rb.probe("b1", 5, 5)
+        handled = self.ws.calls("Page.handleJavaScriptDialog")
+        self.assertEqual([(m["params"], m["sessionId"]) for m in handled], [({"accept": False}, "SESSION2")])
+
+    def test_downloads_from_the_probe_never_reach_a_tab(self):
+        self.script(lambda emit: self.ws.emit("Browser.downloadWillBegin", {
+            "frameId": "TARGET00002", "url": "https://files.example/x.zip"}))
+        rb.PROBE_TIMEOUT = 2
+        self.rb._clock = TickClock()
+        self.ws.eval_map += [("location.href", self.START), ("querySelectorAll", [])]
+        self.rb.probe("b1", 5, 5)
+        self.assertEqual(self.rb.intercepts("b1"), [])
+
+    def test_non_document_hoster_requests_pass_in_the_probe(self):
+        self.script(lambda emit: emit("Fetch.requestPaused", {
+            "requestId": "img1", "resourceType": "Image", "request": {"url": self.HOSTER + "/x.png"}}))
+        rb.PROBE_TIMEOUT = 2
+        self.rb._clock = TickClock()
+        self.ws.eval_map += [("location.href", self.START), ("querySelectorAll", [])]
+        self.assertEqual(self.rb.probe("b1", 5, 5)["links"], [])
+        self.assertEqual([m["params"]["requestId"] for m in self.ws.calls("Fetch.continueRequest")], ["img1"])
+
+    def test_probe_only_sends_fixed_cdp_methods(self):
+        self.script(lambda emit: emit("Fetch.requestPaused", {
+            "requestId": "rp1", "resourceType": "Document", "request": {"url": self.HOSTER}}))
+        self.rb.probe("b1", 5, 5)
+        allowed = {"Target.setDiscoverTargets", "Browser.setDownloadBehavior", "Target.getTargets",
+                   "Target.createTarget", "Target.attachToTarget", "Page.enable",
+                   "Emulation.setFocusEmulationEnabled", "Page.navigate", "Runtime.evaluate",
+                   "Target.closeTarget", "Fetch.enable", "Fetch.failRequest", "Fetch.continueRequest",
+                   "Network.enable", "Network.setBlockedURLs", "Emulation.setEmulatedMedia"}
+        self.assertLessEqual(set(self.ws.methods()), allowed)
+
+    def test_stop_clears_probe_state(self):
+        self.script(lambda emit: None)
+        rb.PROBE_TIMEOUT = 1
+        self.rb._clock = TickClock()
+        self.rb.probe("b1", 5, 5)
+        self.rb.stop()
+        self.assertEqual((self.rb._probe_targets, self.rb._probe_sessions, self.rb._probe_popups), ({}, {}, {}))
+

@@ -27,7 +27,7 @@ import engine_supervisor
 import remote_browser
 import updater
 
-VERSION = "0.1.23"
+VERSION = "0.1.24"
 PORT = 17864
 ROOT = Path(__file__).resolve().parent
 FILES = {"/": ("web/index.html", "text/html; charset=utf-8"),
@@ -220,6 +220,69 @@ def credentials_transport_ok(peer, headers):
     Tailscale peer (WireGuard). Plain-HTTP LAN peers are refused.
     """
     return request_is_https(peer, headers) or tailnet_peer(peer)
+
+
+class AlreadySent(ValueError):
+    """The link is already being or has been handed to JD2 (never sent twice)."""
+
+
+def send_link(server, ident=None, url=None, dedupe=False):
+    """Send one staged link to JD2 (the only send path).
+
+    With `url` (remote-browser intercepts) the link is staged first and the
+    engine must be able to send. Serialized with JD2 independent update and
+    preset reapply. The read-only preflight runs before the intent is marked
+    sending; there is no automatic retry after uncertain sends. With `dedupe`
+    a link that was already sent raises AlreadySent instead of ValueError text.
+    The Hub setting send_autostart decides whether JD2 starts it right away.
+    """
+    store = server.store
+    settings = store.settings()
+    chosen = checked_directory(settings.get("download_dir"))
+    autostart = settings.get("send_autostart", True) is True
+    with server.jd2.lock:
+        adapter = server.jd2._require()
+        if url is not None and getattr(adapter, "can_send", False) is not True:
+            raise ValueError("JD2へ送信できる状態ではありません（エンジンの状態を確認してください）")
+        if url is not None and dedupe and store.link_state(url) in ("sending", "sent", "uncertain"):
+            raise AlreadySent("このリンクはすでにJD2へ送信済みです")
+        jd2_transfer.prepare_transfer(adapter, str(chosen))
+        if url is not None:
+            ident = store.add_link(url)["id"]
+        url = store.begin_send(ident)
+        try:
+            if autostart:
+                outcome = jd2_transfer.transfer(adapter, url, str(chosen), autostart=True)
+            else:
+                outcome = jd2_transfer.transfer(adapter, url, str(chosen))
+        except Exception:
+            store.finish_send(ident, "uncertain")
+            raise ValueError("JD2への送信結果が不明です。JD2で確認してください") from None
+        store.finish_send(ident, "sent")
+    return outcome
+
+
+def auto_send_link(server, url):
+    """Site rule "auto_send": "sent", "dup", or None when sending is not possible now
+    (the viewer then gets the normal sheet). Other failures raise."""
+    try:
+        with server.jd2.lock:
+            adapter = server.jd2._require()
+        if getattr(adapter, "can_send", False) is not True:
+            return None
+    except Exception:
+        return None
+    try:
+        send_link(server, url=url, dedupe=True)
+    except AlreadySent:
+        return "dup"
+    return "sent"
+
+
+def wire_remote_browser(server):
+    """Give the NAS browser its site rules (DB) and the existing JD2 send path."""
+    server.rb.rules = server.store
+    server.rb.auto_send = lambda url: auto_send_link(server, url)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -423,6 +486,9 @@ class Handler(BaseHTTPRequestHandler):
                     raise ValueError("表示ページが不正です")
                 page = int(page_text)
                 return self.send_data(200, self.server.jd2.downloads_snapshot(page))
+            if path == "/api/jd2/linkgrabber":
+                # Names and ids of links JD2 holds but has not started (max 50).
+                return self.send_data(200, self.server.jd2.linkgrabber_snapshot())
             if path == "/api/jd2/preset/preview":
                 return self.send_data(200, self.server.jd2.preset_preview())
             if path == "/api/bookmarks":
@@ -492,10 +558,15 @@ class Handler(BaseHTTPRequestHandler):
                     "X-Frame-Intercepts": str(result["intercepts"]),
                     "X-Frame-Rev": str(result["rev"]),
                     "X-Frame-Blocked": quote((result["blocked"] or "")[:200], safe=""),
+                    "X-Frame-Popups": str(result["popups"]),
                 }
                 if result["jpeg"] is None:
                     return self.send_data(204, b"", extra=headers)
                 return self.send_data(200, result["jpeg"], "image/jpeg", extra=headers)
+            if path == "/api/rb/site-rules":
+                return self.send_data(200, {"items": self.store.site_rules(),
+                                            "block_ads": self.store.settings().get("block_ads", True),
+                                            "max": storage.MAX_SITE_RULES})
             if path == "/api/rb/intercepts":
                 query = parse_qs(urlsplit(self.path).query)
                 since_text = query.get("since", ["0"])[0]
@@ -529,29 +600,7 @@ class Handler(BaseHTTPRequestHandler):
         self.reject("APIが存在しません", 404)
 
     def send_staged_link(self, ident=None, url=None):
-        """Send one staged link to JD2 (the only send path).
-
-        With `url` (remote-browser intercepts) the link is staged first and the
-        engine must be able to send. Serialized with JD2 independent update and
-        preset reapply. The read-only preflight runs before the intent is marked
-        sending; there is no automatic retry after uncertain sends.
-        """
-        chosen = checked_directory(self.store.settings().get("download_dir"))
-        with self.server.jd2.lock:
-            adapter = self.server.jd2._require()
-            if url is not None and getattr(adapter, "can_send", False) is not True:
-                raise ValueError("JD2へ送信できる状態ではありません（エンジンの状態を確認してください）")
-            jd2_transfer.prepare_transfer(adapter, str(chosen))
-            if url is not None:
-                ident = self.store.add_link(url)["id"]
-            url = self.store.begin_send(ident)
-            try:
-                outcome = jd2_transfer.transfer(adapter, url, str(chosen))
-            except Exception:
-                self.store.finish_send(ident, "uncertain")
-                raise ValueError("JD2への送信結果が不明です。JD2で確認してください") from None
-            self.store.finish_send(ident, "sent")
-        return outcome
+        return send_link(self.server, ident=ident, url=url)
 
     def share_attempt_failed(self, address):
         with SESSION_LOCK:
@@ -670,6 +719,13 @@ class Handler(BaseHTTPRequestHandler):
                 if not os.access(chosen, os.W_OK):
                     raise ValueError("フォルダに書き込み権限がありません")
                 return self.send_data(200, self.store.set_download_dir(str(chosen)))
+            if path == "/api/settings/options":
+                known = [key for key in storage.BOOL_OPTIONS if key in body]
+                if not known or set(body) - set(storage.BOOL_OPTIONS):
+                    raise ValueError("変更できる設定項目を指定してください")
+                for key in known:
+                    self.store.set_option(key, body[key])
+                return self.send_data(200, self.store.settings())
             if path == "/api/bookmarks":
                 identifier = self.store.add_bookmark(body.get("title"), body.get("url"))
                 return self.send_data(201, {"id": identifier})
@@ -754,7 +810,18 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_data(200, self.server.rb.send_input(body.get("tab"), body))
             if path == "/api/rb/viewport":
                 return self.send_data(200, self.server.rb.set_viewport(
-                    body.get("tab"), body.get("width"), body.get("height"), body.get("dpr")))
+                    body.get("tab"), body.get("width"), body.get("height"), body.get("dpr"),
+                    body.get("quality")))
+            if path == "/api/rb/probe":
+                return self.send_data(200, self.server.rb.probe(
+                    body.get("tab"), body.get("x"), body.get("y"), url_check=self.reject_hub_origin))
+            if path == "/api/rb/site-rules":
+                return self.send_data(200, self.store.set_site_rule(
+                    body.get("host"), auto_send=body.get("auto_send"), popup=body.get("popup"),
+                    block_ads=body.get("block_ads")))
+            if path == "/api/rb/site-rules/delete":
+                self.store.delete_site_rule(body.get("host"))
+                return self.send_data(200, {"deleted": True})
             if path == "/api/rb/intercepts/open":
                 return self.send_data(200, self.server.rb.open_intercept(body.get("tab"), body.get("id")))
             if path == "/api/rb/intercepts/add":
@@ -788,6 +855,14 @@ class Handler(BaseHTTPRequestHandler):
                            "delete": service.delete}[action]
                 # The password is never echoed; the service clears the body dict.
                 return self.send_data(200, handler(self.server.jd2, body))
+            if path == "/api/jd2/linkgrabber/start":
+                return self.send_data(200, self.server.jd2.start_waiting(
+                    confirmed=body.get("confirmed") is True))
+            if path == "/api/jd2/downloads/start":
+                return self.send_data(200, self.server.jd2.start_downloads())
+            if path == "/api/jd2/downloads/stop":
+                return self.send_data(200, self.server.jd2.stop_downloads(
+                    confirmed=body.get("confirmed") is True))
             if path == "/api/jd2/connect/test":
                 return self.send_data(200, self.server.jd2.connection_test())
             if path == "/api/jd2/update/check":
@@ -841,6 +916,7 @@ def main():
     server.accounts = jd2_accounts.AccountService()
     server.rb = remote_browser.RemoteBrowser(
         server.engine.runtime, ROOT / "container" / "browser")
+    wire_remote_browser(server)
     # A labelled browser container surviving a Hub crash would hold memory.
     threading.Thread(target=server.rb.startup_cleanup, daemon=True).start()
     runtime_diagnostics.event("web_started")
