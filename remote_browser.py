@@ -67,7 +67,12 @@ INTERCEPT_DEDUP = 2.0          # an identical event within this many seconds is 
 BYPASS_TTL = 30.0              # a "page open" bypass is valid for one navigation, this long
 POPUP_WAIT = 3.0               # popups: wait this long for the first URL
 # Long-press probe (v0.1.24): a hidden background target follows the link.
-MAX_PROBES = 2                 # at most this many probe targets exist at once (all tabs)
+MAX_PROBES = 4                 # at most this many probe targets exist at once (all tabs)
+MAX_PROBES_PER_TAB = 3         # ... and this many per tab; the rest wait in a FIFO queue
+PROBE_QUEUE_PER_TAB = 10       # waiting probes per tab; more are refused (HTTP 429)
+PROBE_QUEUE_WAIT = 30.0        # a probe waits this long for the memory guard to clear
+PROBE_MIN_AVAILABLE_KIB = 1024 * 1024    # probe guard: MemAvailable >= 1 GiB
+PROBE_MEM_LIMIT_PERCENT = 85.0           # probe guard: container usage < 85%
 PROBE_TIMEOUT = 15.0           # give up waiting for a hoster URL after this long
 PROBE_SETTLE = 4.0             # a loaded page with no navigation for this long is final
 PROBE_LINK_CAP = 50
@@ -77,6 +82,8 @@ PROBE_JS = (
     "var a=e&&e.closest?e.closest('a'):null;"
     "return a&&typeof a.href==='string'?a.href:null;})(%.1f,%.1f)")
 LOCATION_JS = "String(location.href)"
+EDITABLE_JS = ("(()=>{const e=document.activeElement;return !!e&&(e.isContentEditable||"
+               "/^(INPUT|TEXTAREA|SELECT)$/.test(e.tagName))})()")
 EVENT_EXTRAS = ("where", "dup")
 POPUP_BLOCKED = "ポップアップをブロックしました"
 SETUP_CACHE_TTL = 30.0
@@ -127,6 +134,10 @@ class SetupBusy(BrowserError):
 
 
 class TabGone(BrowserError):
+    pass
+
+
+class ProbeQueueFull(BrowserError):
     pass
 
 
@@ -482,7 +493,9 @@ class Tab:
         self.ads = False           # ad blocking currently applied to this tab
         self.popups_blocked = 0    # popups closed silently by a "block" rule
         self.quality = DEFAULT_QUALITY
-        self.probing = False
+        self.probing = 0           # probes running now (<= MAX_PROBES_PER_TAB)
+        self.probe_waiting = 0     # probes queued behind the limits
+        self.editable = False      # the page's focused element accepts text (after the last input)
 
 
 class Probe:
@@ -552,6 +565,7 @@ class RemoteBrowser:
         self._spawn = spawn if spawn is not None else self._spawn_thread
         self._auto_inflight = set()
         self._probes = 0
+        self._probe_queue = []     # FIFO of waiting probe tickets (dicts with the tab)
         self._probe_targets = {}   # probe target id -> Probe
         self._probe_sessions = {}  # CDP session id -> Probe
         self._probe_popups = {}    # popup target id -> Probe
@@ -642,15 +656,17 @@ class RemoteBrowser:
             raise error
         return value
 
-    def memory_reason(self):
-        """Japanese reason a new tab must not be opened now, or None."""
+    def memory_reason(self, min_kib=None, limit_percent=None):
+        """Japanese reason a new tab (or probe) must not be started now, or None."""
+        min_kib = MIN_AVAILABLE_KIB if min_kib is None else min_kib
+        limit_percent = MEM_LIMIT_PERCENT if limit_percent is None else limit_percent
         available = cr.read_mem_available_kib(self._meminfo)
         if available is None:
             return "空きメモリ(MemAvailable)を確認できないため開きません"
-        if available < MIN_AVAILABLE_KIB:
+        if available < min_kib:
             return ("空きメモリが不足しています（MemAvailable %d MiB < 必要 %d MiB）。"
                     "他のアプリを止めずに、開くのを見送りました" % (
-                        available // 1024, MIN_AVAILABLE_KIB // 1024))
+                        available // 1024, min_kib // 1024))
         with self._lock:
             running = self._state == "running"
         if running:
@@ -658,10 +674,13 @@ class RemoteBrowser:
                 stats = self._stats()
             except BrowserError as error:
                 return str(error)
-            if stats["percent"] >= MEM_LIMIT_PERCENT:
+            if stats["percent"] >= limit_percent:
                 return ("NASブラウザのメモリ使用量が上限の%d%%に達しています（%.0f%%）。"
-                        "タブを閉じてから開いてください" % (MEM_LIMIT_PERCENT, stats["percent"]))
+                        "タブを閉じてから開いてください" % (limit_percent, stats["percent"]))
         return None
+
+    def probe_memory_reason(self):
+        return self.memory_reason(PROBE_MIN_AVAILABLE_KIB, PROBE_MEM_LIMIT_PERCENT)
 
     # ------------------------------------------------------------- status
     def status(self):
@@ -1551,7 +1570,7 @@ class RemoteBrowser:
                     "url": tab.url, "title": tab.title,
                     "loading": bool(tab.loading), "blocked": tab.blocked,
                     "intercepts": tab.intercept_seq, "rev": tab.rev,
-                    "popups": tab.popups_blocked,
+                    "popups": tab.popups_blocked, "editable": tab.editable,
                 }
             self._touch()
             return result
@@ -1588,6 +1607,7 @@ class RemoteBrowser:
             self._call("Input.dispatchMouseEvent", {"type": "mouseMoved", "x": x, "y": y}, session)
             self._call("Input.dispatchMouseEvent", dict(base, type="mousePressed", buttons=1), session)
             self._call("Input.dispatchMouseEvent", dict(base, type="mouseReleased", buttons=0), session)
+            self._refresh_editable(tab)
         elif kind == "scroll":
             x = self._number(event.get("x"), 0, MAX_COORD, "x")
             y = self._number(event.get("y"), 0, MAX_COORD, "y")
@@ -1628,7 +1648,16 @@ class RemoteBrowser:
             if not isinstance(entry, int):
                 return {"ok": True, "moved": False}
             self._call("Page.navigateToHistoryEntry", {"entryId": entry}, session=session)
-        return {"ok": True}
+        return {"ok": True, "editable": tab.editable}
+
+    def _refresh_editable(self, tab):
+        try:
+            value = (self._call("Runtime.evaluate", {
+                "expression": EDITABLE_JS, "returnByValue": True, "timeout": 2000},
+                session=tab.session, timeout=PROBE_CDP_TIMEOUT).get("result") or {}).get("value")
+        except BrowserError:
+            value = False
+        tab.editable = value is True
 
     # ---------------------------------------------------------------- links
     @staticmethod
@@ -1863,47 +1892,97 @@ class RemoteBrowser:
     def _probe_popups_of(self, probe):
         return [t for t, p in self._probe_popups.items() if p is probe]
 
+    def _probe_slot_free(self, ticket):
+        """FIFO turn (caller holds the lock): the first queued probe whose tab has room."""
+        if self._probes >= MAX_PROBES:
+            return False
+        for other in self._probe_queue:
+            if other["tab"].probing < MAX_PROBES_PER_TAB:
+                return other is ticket
+        return False
+
+    def _probe_acquire(self, tab):
+        """Reserve a probe slot, waiting FIFO behind the per-tab and overall limits.
+
+        Then the memory guard: while it is not met the probe keeps its slot and waits up
+        to PROBE_QUEUE_WAIT, after which it fails with the guard's message.
+        """
+        ticket = {"tab": tab}
+        with self._cv:
+            if tab.probe_waiting >= PROBE_QUEUE_PER_TAB:
+                raise ProbeQueueFull("確認待ちが多すぎます")
+            tab.probe_waiting += 1
+            self._probe_queue.append(ticket)
+            try:
+                while not self._probe_slot_free(ticket):
+                    if self._state != "running" or self._tabs.get(tab.id) is not tab:
+                        raise TabGone("タブが閉じられたため確認を中止しました")
+                    self._cv.wait(0.25)
+            except BaseException:
+                self._probe_queue.remove(ticket)
+                tab.probe_waiting -= 1
+                self._cv.notify_all()
+                raise
+            self._probe_queue.remove(ticket)
+            tab.probe_waiting -= 1
+            tab.probing += 1
+            self._probes += 1
+            self._cv.notify_all()
+        try:
+            deadline = self._clock() + PROBE_QUEUE_WAIT
+            while True:
+                reason = self.probe_memory_reason()
+                if not reason:
+                    return
+                if self._clock() >= deadline:
+                    raise BrowserError(reason)
+                with self._cv:
+                    if self._state != "running" or self._tabs.get(tab.id) is not tab:
+                        raise TabGone("タブが閉じられたため確認を中止しました")
+                    self._cv.wait(0.5)
+        except BaseException:
+            self._probe_release(tab)
+            raise
+
+    def _probe_release(self, tab):
+        with self._cv:
+            tab.probing -= 1
+            self._probes -= 1
+            self._cv.notify_all()
+
     def probe(self, ident, x, y, url_check=None):
         """Follow the link under (x, y) in a hidden target; see the section comment.
 
         `url_check(url)` may raise ValueError to refuse a start URL (the Hub's own
-        origin). Returns {start_url, final_url, links, redirects}.
+        origin). Several probes run at once (per tab and overall limits, the rest wait
+        in a FIFO queue); each has its own hidden target. Returns
+        {start_url, final_url, links, redirects}.
         """
         x = self._number(x, 0, MAX_COORD, "x")
         y = self._number(y, 0, MAX_COORD, "y")
         tab = self._tab(ident)
         self._touch()
-        with self._lock:
-            if tab.probing:
-                raise BrowserError("このタブではリンク先を確認中です")
-            if self._probes >= MAX_PROBES:
-                raise BrowserError("リンク先の確認が混み合っています。少し待ってください")
-            tab.probing = True
-            self._probes += 1
+        # The link under the finger is resolved right away, before any queueing.
+        result = self._call("Runtime.evaluate", {
+            "expression": PROBE_JS % (x, y), "returnByValue": True, "timeout": 5000},
+            session=tab.session, timeout=PROBE_CDP_TIMEOUT)
+        href = (result.get("result") or {}).get("value")
+        if not isinstance(href, str) or not href:
+            raise BrowserError("この位置にリンクが見つかりません")
         try:
-            reason = self.memory_reason()
-            if reason:
-                raise BrowserError(reason)
-            result = self._call("Runtime.evaluate", {
-                "expression": PROBE_JS % (x, y), "returnByValue": True, "timeout": 5000},
-                session=tab.session, timeout=PROBE_CDP_TIMEOUT)
-            href = (result.get("result") or {}).get("value")
-            if not isinstance(href, str) or not href:
-                raise BrowserError("この位置にリンクが見つかりません")
-            try:
-                start = browser_safety.validate(href)
-                if url_check is not None:
-                    url_check(start)
-            except ValueError:
-                raise BrowserError("リンク先は公開されたhttpsのアドレスだけ確認できます") from None
-            direct = rapidgator_extract.normalize(start)
-            if direct is not None:
-                return {"start_url": start, "final_url": start, "links": [direct], "redirects": 0}
+            start = browser_safety.validate(href)
+            if url_check is not None:
+                url_check(start)
+        except ValueError:
+            raise BrowserError("リンク先は公開されたhttpsのアドレスだけ確認できます") from None
+        direct = rapidgator_extract.normalize(start)
+        if direct is not None:
+            return {"start_url": start, "final_url": start, "links": [direct], "redirects": 0}
+        self._probe_acquire(tab)
+        try:
             return self._run_probe(tab, start)
         finally:
-            with self._lock:
-                tab.probing = False
-                self._probes -= 1
+            self._probe_release(tab)
 
     def _run_probe(self, tab, start):
         probe = Probe(tab.id, self._clock())
