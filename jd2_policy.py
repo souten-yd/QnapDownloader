@@ -21,6 +21,11 @@ KNOWN_KEYS = {
                                "key": "linkgrabberautostartenabled"},
     "extraction.auto_extract": {"kind": "bool", "interface": LINKGRABBER_IFACE,
                                 "key": "autoextractionenabled"},
+    # v0.1.29: with the flat layout JD2 could remove the (now empty) download folder
+    # itself after "delete files"; the per-item delete also guards this at call time.
+    "general.delete_empty_folders": {
+        "kind": "bool", "interface": GENERAL_IFACE,
+        "key": "deleteemptysubfoldersafterdeletingdownloadedfilesenabled"},
     "downloads.auto_start": {"kind": "enum", "interface": GENERAL_IFACE,
                              "key": "autostartdownloadoption",
                              "bad": START_ALWAYS, "target": START_RESUME},
@@ -36,6 +41,7 @@ LABELS = {
     "linkgrabber.auto_confirm": "リンク自動確定",
     "linkgrabber.auto_start": "追加後の自動開始",
     "extraction.auto_extract": "自動解凍",
+    "general.delete_empty_folders": "削除後に空フォルダも削除",
     "downloads.auto_start": "起動時の自動開始（「常に」以外ならOK）",
 }
 

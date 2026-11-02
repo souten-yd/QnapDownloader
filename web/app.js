@@ -1141,7 +1141,8 @@ async function openRemote(tab, value, commit) {
       tab.rb = {id: made.id, seq: 0, url: "", title: "", width: 0, height: 0,
         loading: true, links: [], linksTimer: 0, blocked: null,
         rev: null, icptSeen: 0, present: 0, vp: "", popups: 0,
-        shown: "", autoLive: false, view: null, snap: null, snapKey: "", snapBusy: false,
+        shown: "", autoLive: false, autoSince: 0, autoClean: 0, autoChip: false,
+        autoTimer: 0, autoBusy: false, autoOff: "", view: null, snap: null, snapKey: "", snapBusy: false,
         snapAgain: null, snapTimer: 0, busy: 0, scrollTop: 0, owner: tab};
     }
   } catch (e) {
@@ -1324,6 +1325,7 @@ function applyRemoteMeta(tab, f) {
   const loading = f.loading === true;
   if (url !== rb.url) {
     rb.url = url;
+    rb.autoOff = "";
     changed = true;
     if (url.startsWith("https://") && url.length <= 2048) {
       tab.current = url;
@@ -1350,19 +1352,92 @@ function applyRemoteMeta(tab, f) {
   if (changed) updateChrome();
 }
 
-// Cloudflare checks and logins need the live screencast: switch this tab to ライブ while
-// the page looks like a challenge, and back (to the remembered display) once it is gone.
+// Cloudflare checks and logins need the live screencast. The switch is automatic and
+// temporary (rb.autoLive, never written to the per-host mode map); a dedicated poll of
+// /api/rb/meta brings the tab back to 高速 after two clean checks of a finished page.
+const AUTO_POLL_MS = 1500;
+const AUTO_CLEAN_NEEDED = 2;
+const AUTO_TIMEOUT_MS = 90000;
+
+// Pure state step (unit-tested in node). Returns "enter" | "return" | "chip" | null.
+function challengeStep(rb, challenge, loading, now, userLive) {
+  if (!rb.autoLive) {
+    if (challenge && !userLive) {
+      rb.autoLive = true; rb.autoSince = now; rb.autoClean = 0; rb.autoChip = false;
+      return "enter";
+    }
+    return null;
+  }
+  if (challenge) {
+    rb.autoClean = 0;
+    if (!rb.autoChip && now - rb.autoSince >= AUTO_TIMEOUT_MS) { rb.autoChip = true; return "chip"; }
+    return null;
+  }
+  if (loading) { rb.autoClean = 0; return null; }
+  rb.autoClean++;
+  if (rb.autoClean >= AUTO_CLEAN_NEEDED) {
+    rb.autoLive = false; rb.autoClean = 0; rb.autoChip = false;
+    return "return";
+  }
+  return null;
+}
+
+function userPrefersLive(tab) {
+  return rememberedMode(hostOf(tab.current || "")) === REMOTE_LIVE_MODE;
+}
+
 function syncChallenge(tab, challenge, loading) {
   const rb = tab.rb;
-  if (!rb) return;
-  if (challenge && !rb.autoLive) {
-    rb.autoLive = true;
+  if (!rb || rb.autoLive || rb.autoOff === rb.url) return;   // the poll below owns the way back
+  if (challengeStep(rb, challenge, loading, Date.now(), userPrefersLive(tab)) === "enter") {
     if (rb.shown === "tiles") flash("確認画面のため一時的にライブ表示にしました");
-    applyDisplay(tab);
-  } else if (!challenge && rb.autoLive && !loading) {
-    rb.autoLive = false;
+    startAutoPoll(tab);
     applyDisplay(tab);
   }
+}
+
+function startAutoPoll(tab) {
+  const rb = tab.rb;
+  if (!rb || rb.autoTimer) return;
+  rb.autoTimer = setInterval(() => autoPollTick(tab, rb), AUTO_POLL_MS);
+}
+
+function stopAutoPoll(rb) {
+  if (rb && rb.autoTimer) { clearInterval(rb.autoTimer); rb.autoTimer = 0; }
+}
+
+async function autoPollTick(tab, rb) {
+  if (tab.rb !== rb || !rb.autoLive) { stopAutoPoll(rb); return; }
+  if (document.visibilityState !== "visible" || activeWebTab() !== tab || rb.autoBusy) return;
+  rb.autoBusy = true;
+  try {
+    const res = await fetch("/api/rb/meta?tab=" + encodeURIComponent(rb.id) + "&wait=0",
+      {credentials: "same-origin", cache: "no-store"});
+    if (res.status !== 200 || tab.rb !== rb || !rb.autoLive) return;
+    const meta = await res.json();
+    if (tab.rb !== rb || !rb.autoLive) return;
+    const step = challengeStep(rb, meta.challenge === true, meta.loading === true, Date.now(), false);
+    if (step === "return") {
+      stopAutoPoll(rb);
+      applyDisplay(tab);   // tiles again: the tile loop takes a fresh snapshot on start
+    } else if (step === "chip") {
+      updateRemoteView(tab);
+    }
+  } catch (e) {
+    /* transient: the next tick tries again */
+  } finally {
+    rb.autoBusy = false;
+  }
+}
+
+// 「高速表示に戻す」 after the 90 s safety timeout: back to 高速, and no automatic
+// switch again for this address.
+function returnToFast(tab) {
+  const rb = tab && tab.rb;
+  if (!rb) return;
+  stopAutoPoll(rb);
+  rb.autoLive = false; rb.autoChip = false; rb.autoClean = 0; rb.autoOff = rb.url;
+  applyDisplay(tab);
 }
 
 // The stage is the viewer's CSS viewport for the remote page.
@@ -1487,6 +1562,7 @@ function updateRemoteView(tab) {
     "NASブラウザのタブは開かれていません（メモリ節約のため自動で閉じました）。");
   setShown("remoteReopen", !live);
   setShown("remoteLoading", Boolean(tab.loading));
+  setShown("autoLiveChip", live && tab.rb.autoLive === true && tab.rb.autoChip === true);
   const count = live ? tab.rb.links.length : 0;
   setShown("remoteLinks", count > 0);
   $("remoteLinks").textContent = "リンク " + count + "件";
@@ -1810,7 +1886,8 @@ function setUserDisplay(tab, mode) {
   if (!tab || !tab.rb || !RB_DISPLAY_LABELS[mode]) return;
   const host = hostOf(tab.current || "");
   if (host) rememberHostMode(host, mode === "live" ? REMOTE_LIVE_MODE : REMOTE_MODE);
-  tab.rb.autoLive = false;
+  stopAutoPoll(tab.rb);
+  tab.rb.autoLive = false; tab.rb.autoChip = false;   // a manual choice is respected
   renderRemoteHosts();
   applyDisplay(tab);
   flash("表示: " + RB_DISPLAY_LABELS[mode]);
@@ -2977,12 +3054,13 @@ function fileRow(item) {
   const top = element("div", undefined, "row-top");
   top.appendChild(element("span", item.name, "row-name"));
   top.appendChild(stateChip(item));
+  rowTools("link", item, top);
   row.appendChild(top);
   const bar = progressBar(item);
   if (bar) row.appendChild(bar);
   const meta = metaText(item, item.host);
   if (meta) row.appendChild(element("p", meta, "download-detail"));
-  return row;
+  return itemSwipe("link", item, row);
 }
 
 function packageKey(item) { return item.id ? "id:" + item.id : "n:" + item.name; }
@@ -2991,6 +3069,8 @@ function packageRow(pkg, files) {
   const key = packageKey(pkg);
   const open = state.expanded.has(key);
   const card = element("article", undefined, "download-card pkg " + itemState(pkg));
+  const top = element("div", undefined, "pkg-top");
+  const line = element("div", undefined, "pkg-line");
   const head = element("button", undefined, "pkg-head");
   head.type = "button";
   head.setAttribute("aria-expanded", String(open));
@@ -3002,12 +3082,15 @@ function packageRow(pkg, files) {
     state.downloadsSig = "";
     renderDownloads();
   });
-  card.appendChild(head);
+  line.appendChild(head);
+  rowTools("package", pkg, line);
+  top.appendChild(line);
   const bar = progressBar(pkg);
-  if (bar) card.appendChild(bar);
+  if (bar) top.appendChild(bar);
   const count = typeof pkg.child_count === "number" ? "ファイル " + pkg.child_count + "件" : "";
   const meta = metaText(pkg, count);
-  if (meta) card.appendChild(element("p", meta, "download-detail"));
+  if (meta) top.appendChild(element("p", meta, "download-detail"));
+  card.appendChild(itemSwipe("package", pkg, top));
   if (open) {
     const box = element("div", undefined, "pkg-files");
     if (files.length) for (const f of files) box.appendChild(fileRow(f));
@@ -3015,6 +3098,453 @@ function packageRow(pkg, files) {
     card.appendChild(box);
   }
   return card;
+}
+
+// ---- per-item actions (v0.1.29): swipe rows, action sheet, multi-select ----
+const SWIPE_REVEAL = 88;       // px of the revealed button
+const SWIPE_AXIS_PX = 10;      // movement before the gesture picks an axis
+const SWIPE_FULL = 0.6;        // share of the row width that commits the action
+const LONG_PRESS_MS = 500;
+const BULK_MAX = 100;
+
+function reducedMotion() {
+  return Boolean(window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches);
+}
+
+const swipeState = {open: null, gesture: false, sheet: false, sheetReturn: null,
+  pending: new Set(), select: {on: false, keys: new Set()}, index: new Map()};
+
+// While a row is being dragged or held open, or a sheet is up, the 5 s
+// auto-refresh must not rebuild the rows under the finger.
+function holdRender() { return swipeState.gesture || swipeState.open !== null || swipeState.sheet; }
+
+function flushRender() {
+  if (holdRender()) return;
+  state.downloadsSig = "";
+  renderDownloads();
+  renderWaiting();
+}
+
+function itemKey(kind, item) { return kind + ":" + item.id; }
+
+// Wraps `body` (the visible row) with the buttons that a swipe reveals:
+// swipe left shows 削除 (red), swipe right shows 開始／停止 (cfg.startLabel).
+function swipeRow(body, cfg) {
+  const wrap = element("div", undefined, "swipe");
+  wrap.dataset.key = cfg.key;
+  const left = element("div", undefined, "swipe-under swipe-under-left");
+  const right = element("div", undefined, "swipe-under swipe-under-right");
+  let startButton = null;
+  if (cfg.startLabel) {
+    startButton = element("button", cfg.startLabel, "swipe-btn " + (cfg.startLabel === "停止" ? "stop" : "start"));
+    startButton.type = "button";
+    left.appendChild(startButton);
+  }
+  const deleteButton = element("button", "削除", "swipe-btn delete");
+  deleteButton.type = "button";
+  right.appendChild(deleteButton);
+  body.classList.add("swipe-body");
+  wrap.append(left, right, body);
+  const buttons = [startButton, deleteButton].filter(Boolean);
+  let offset = 0, startX = 0, startY = 0, startOffset = 0, axis = null, pid = null;
+  let width = 320, timer = null, endedAt = 0;
+
+  const setButtons = on => buttons.forEach(b => {
+    b.tabIndex = on ? 0 : -1;
+    if (on) b.removeAttribute("aria-hidden"); else b.setAttribute("aria-hidden", "true");
+  });
+  setButtons(false);
+  const clearTimer = () => { if (timer !== null) { clearTimeout(timer); timer = null; } };
+  const setOffset = (px, animate) => {
+    offset = px;
+    body.style.transition = animate && !reducedMotion() ? "transform .3s cubic-bezier(.22,1,.36,1)" : "none";
+    body.style.transform = px ? "translateX(" + px + "px)" : "";
+  };
+  const handle = {wrap, close() {
+    setOffset(0, true); setButtons(false);
+    if (swipeState.open === handle) { swipeState.open = null; setTimeout(flushRender, 320); }
+  }};
+  const reveal = px => {
+    if (swipeState.open && swipeState.open !== handle) swipeState.open.close();
+    setOffset(px, true); setButtons(true); swipeState.open = handle;
+  };
+  const settle = () => {
+    const ratio = Math.abs(offset) / width;
+    if (ratio > SWIPE_FULL) {
+      const deleting = offset < 0;
+      handle.close();
+      // A full swipe runs the safe default: start/stop, or remove from the list only.
+      if (deleting) cfg.onDelete(); else cfg.onStart();
+    } else if (Math.abs(offset) >= SWIPE_REVEAL / 2) {
+      reveal(offset < 0 ? -SWIPE_REVEAL : SWIPE_REVEAL);
+    } else {
+      handle.close();
+    }
+  };
+  const blocked = () => swipeState.select.on || swipeState.pending.has(cfg.key);
+
+  body.addEventListener("pointerdown", e => {
+    if (e.pointerType === "mouse" && e.button !== 0) return;
+    if (e.target.closest(".row-menu, input")) return;
+    if (swipeState.select.on || pid !== null) return;
+    pid = e.pointerId; startX = e.clientX; startY = e.clientY;
+    startOffset = offset; axis = null; width = body.offsetWidth || 320;
+    if (swipeState.open && swipeState.open !== handle) swipeState.open.close();
+    clearTimer();
+    timer = setTimeout(() => {
+      timer = null;
+      if (axis === null && pid !== null && !blocked()) {
+        pid = null; endedAt = performance.now();
+        cfg.onLongPress();
+      }
+    }, LONG_PRESS_MS);
+  });
+  body.addEventListener("pointermove", e => {
+    if (e.pointerId !== pid || blocked()) return;
+    const dx = e.clientX - startX, dy = e.clientY - startY;
+    if (axis === null) {
+      if (Math.abs(dx) < SWIPE_AXIS_PX && Math.abs(dy) < SWIPE_AXIS_PX) return;
+      clearTimer();
+      if (Math.abs(dy) > Math.abs(dx)) { axis = "y"; pid = null; return; }   // vertical scroll wins
+      axis = "x"; swipeState.gesture = true;
+      try { body.setPointerCapture(e.pointerId); } catch (err) { /* synthetic pointer */ }
+    }
+    if (axis !== "x") return;
+    const max = startLabelAllowed() ? width : 0;
+    setOffset(Math.max(-width, Math.min(max, startOffset + dx)), false);
+  });
+  const startLabelAllowed = () => Boolean(cfg.startLabel);
+  const finish = (e, cancelled) => {
+    if (e.pointerId !== pid && axis !== "x") return;
+    clearTimer();
+    const was = axis;
+    pid = null; axis = null;
+    if (was === "x") {
+      swipeState.gesture = false; endedAt = performance.now();
+      if (cancelled) handle.close(); else settle();
+    }
+  };
+  body.addEventListener("pointerup", e => finish(e, false));
+  body.addEventListener("pointercancel", e => finish(e, true));
+  // A drag or long press must not also count as a tap (expand / toggle).
+  wrap.addEventListener("click", e => {
+    if (performance.now() - endedAt < 450) { e.preventDefault(); e.stopPropagation(); return; }
+    if (swipeState.select.on && !e.target.closest(".row-menu")) {
+      e.preventDefault(); e.stopPropagation(); toggleSelected(cfg.key);
+    }
+  }, true);
+  if (startButton) startButton.addEventListener("click", () => { handle.close(); cfg.onStart(); });
+  deleteButton.addEventListener("click", () => { handle.close(); cfg.onDeleteSheet(); });
+  wrap.addEventListener("keydown", e => {
+    if (e.key === "Escape" && swipeState.open === handle) handle.close();
+  });
+  return wrap;
+}
+
+function menuButton(name, onOpen) {
+  const button = element("button", "⋯", "row-menu");
+  button.type = "button";
+  button.setAttribute("aria-label", name + " の操作メニュー");
+  button.setAttribute("aria-haspopup", "dialog");
+  button.addEventListener("click", e => { e.stopPropagation(); onOpen(button); });
+  return button;
+}
+
+function selectBox(key, name) {
+  const box = element("input", undefined, "sel-box");
+  box.type = "checkbox";
+  box.setAttribute("aria-label", name + " を選択");
+  box.checked = swipeState.select.keys.has(key);
+  box.addEventListener("click", e => { e.stopPropagation(); toggleSelected(key); });
+  return box;
+}
+
+// ---- action sheet (also the ⋯ fallback): every option is a real button ----
+function openSheet(title, options, returnTo) {
+  swipeState.sheet = true;
+  swipeState.sheetReturn = returnTo || document.activeElement;
+  $("sheetTitle").textContent = title;
+  const buttons = options.map(option => {
+    const cls = "btn sheet-btn" + (option.destructive ? " danger" : "") + (option.primary ? " primary" : "");
+    const button = element("button", option.label, cls);
+    button.type = "button";
+    if (option.primary) button.dataset.default = "true";
+    button.addEventListener("click", () => {
+      closeSheet();
+      if (option.run) perform(option.run);
+    });
+    return button;
+  });
+  const cancel = element("button", "キャンセル", "btn sheet-btn");
+  cancel.type = "button";
+  cancel.addEventListener("click", closeSheet);
+  $("sheetOptions").replaceChildren(...buttons, cancel);
+  setShown("actionSheet", true);
+  (buttons.find(b => b.dataset.default) || cancel).focus();
+}
+
+function closeSheet() {
+  if (!swipeState.sheet) return;
+  swipeState.sheet = false;
+  setShown("actionSheet", false);
+  const back = swipeState.sheetReturn;
+  swipeState.sheetReturn = null;
+  if (back && back.isConnected && typeof back.focus === "function") back.focus();
+  flushRender();
+}
+
+function wireSheet() {
+  const sheet = $("actionSheet");
+  sheet.addEventListener("click", e => { if (e.target === sheet) closeSheet(); });
+  sheet.addEventListener("keydown", e => {
+    if (e.key === "Escape") { e.preventDefault(); closeSheet(); return; }
+    if (e.key !== "Tab") return;
+    const items = Array.from(sheet.querySelectorAll("button"));
+    if (!items.length) return;
+    const first = items[0], last = items[items.length - 1];
+    if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }
+    else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
+  });
+  document.addEventListener("pointerdown", e => {
+    const open = swipeState.open;
+    if (open && !open.wrap.contains(e.target)) open.close();
+  }, true);
+  $("selectStart").addEventListener("click", () => perform(() => bulkAction("start")));
+  $("selectStop").addEventListener("click", () => perform(() => bulkAction("stop")));
+  $("selectDelete").addEventListener("click", bulkDeleteSheet);
+  $("selectDone").addEventListener("click", () => exitSelect());
+}
+
+// ---- calls ----
+function setPending(keys, on) {
+  for (const key of keys) if (on) swipeState.pending.add(key); else swipeState.pending.delete(key);
+  document.querySelectorAll(".swipe[data-key]").forEach(node =>
+    node.classList.toggle("pending", swipeState.pending.has(node.dataset.key)));
+}
+
+async function afterItemAction(message) {
+  if (message) flash(message);
+  state.downloadsFails = 0;
+  state.downloadsSig = "";
+  await loadDownloads(state.downloadsPage);
+  flushRender();
+}
+
+// kind: package|link. items: [{id, name}]. Requests are chunked to the server cap.
+async function callItems(action, kind, items, extra) {
+  const keys = items.map(item => itemKey(kind, item));
+  setPending(keys, true);
+  try {
+    for (let i = 0; i < items.length; i += BULK_MAX) {
+      const body = Object.assign({kind, ids: items.slice(i, i + BULK_MAX).map(item => item.id),
+        page: state.downloadsPage}, extra || {});
+      await api("/api/jd2/items/" + action, body);
+    }
+  } finally {
+    setPending(keys, false);
+  }
+}
+
+async function startItems(kind, items) {
+  await callItems("start", kind, items);
+  await afterItemAction(items.length + "件を開始しました");
+}
+
+async function stopItems(kind, items) {
+  await callItems("stop", kind, items);
+  await afterItemAction(items.length + "件を停止しました（「開始」で再開できます）");
+}
+
+// Default delete: only JD2's list; the saved files stay on the NAS.
+async function removeFromList(kind, items) {
+  try {
+    await callItems("remove", kind, items, {delete_files: false});
+  } finally {
+    await afterItemAction("");
+  }
+  flash(items.length + "件を一覧から削除しました（ファイルは残しています）");
+}
+
+async function removeWithFiles(kind, item) {
+  if (!confirm("「" + item.name + "」のファイルをNASから削除します。\n一覧からも消え、元に戻せません。\nよろしいですか？")) return;
+  try {
+    await callItems("remove", kind, [item], {delete_files: true, confirm_name: item.name});
+  } finally {
+    await afterItemAction("");
+  }
+  flash("ファイルも削除しました");
+}
+
+async function waitingCall(action, items) {
+  const keys = items.map(item => "waiting:" + item.id);
+  setPending(keys, true);
+  try {
+    await api("/api/jd2/waiting/" + action, {ids: items.map(item => item.id)});
+  } finally {
+    setPending(keys, false);
+  }
+  await afterItemAction(action === "start" ? "開始しました" : "待機中の一覧から削除しました");
+}
+
+function deleteOptions(kind, item) {
+  return [
+    {label: "一覧から削除（ファイルは残す）", primary: true, run: () => removeFromList(kind, [item])},
+    {label: "ファイルも削除", destructive: true, run: () => removeWithFiles(kind, item)},
+  ];
+}
+
+function canStart(item) { return item.finished !== true; }
+
+function startLabelFor(item) {
+  if (item.finished === true) return null;
+  return item.running === true ? "停止" : "開始";
+}
+
+function itemRun(kind, item) {
+  return item.running === true ? stopItems(kind, [item]) : startItems(kind, [item]);
+}
+
+function itemMenu(kind, item, opener) {
+  const key = itemKey(kind, item);
+  const options = [];
+  const label = startLabelFor(item);
+  if (label) options.push({label, run: () => itemRun(kind, item)});
+  options.push(...deleteOptions(kind, item));
+  options.push({label: "複数選択", run: () => enterSelect(key)});
+  openSheet(item.name, options, opener);
+}
+
+// One swipeable row for a package head or a file; items without an id are plain.
+function itemSwipe(kind, item, body) {
+  if (!item.id) return body;
+  const key = itemKey(kind, item);
+  swipeState.index.set(key, {kind, item});
+  const wrap = swipeRow(body, {
+    key, startLabel: startLabelFor(item),
+    onStart: () => perform(() => itemRun(kind, item)),
+    onDelete: () => perform(() => removeFromList(kind, [item])),
+    onDeleteSheet: () => openSheet(item.name, deleteOptions(kind, item)),
+    onLongPress: () => enterSelect(key),
+  });
+  wrap.classList.toggle("pending", swipeState.pending.has(key));
+  wrap.classList.toggle("selected", swipeState.select.keys.has(key));
+  return wrap;
+}
+
+function rowTools(kind, item, line) {
+  if (!item.id) return;
+  const key = itemKey(kind, item);
+  line.prepend(selectBox(key, item.name));
+  line.appendChild(menuButton(item.name, opener => itemMenu(kind, item, opener)));
+}
+
+// ---- waiting (LinkGrabber) rows ----
+function waitingMenu(item, opener) {
+  openSheet(item.name, [
+    {label: "開始", run: () => waitingCall("start", [item])},
+    {label: "一覧から削除", primary: true, run: () => waitingCall("remove", [item])},
+  ], opener);
+}
+
+function waitingRow(item) {
+  const body = element("div", undefined, "waiting-item");
+  body.appendChild(element("span", item.name, "waiting-name"));
+  if (item.host) body.appendChild(element("span", item.host, "muted"));
+  if (!item.id) return body;
+  body.appendChild(menuButton(item.name, opener => waitingMenu(item, opener)));
+  const wrap = swipeRow(body, {
+    key: "waiting:" + item.id, startLabel: "開始",
+    onStart: () => perform(() => waitingCall("start", [item])),
+    onDelete: () => perform(() => waitingCall("remove", [item])),
+    onDeleteSheet: () => openSheet(item.name, [
+      {label: "一覧から削除", primary: true, run: () => waitingCall("remove", [item])}]),
+    onLongPress: () => {},
+  });
+  wrap.classList.toggle("pending", swipeState.pending.has("waiting:" + item.id));
+  return wrap;
+}
+
+// ---- multi-select ----
+function updateSelectBar() {
+  const sel = swipeState.select;
+  setShown("selectBar", sel.on);
+  $("view-downloads").classList.toggle("selecting", sel.on);
+  $("selectCount").textContent = sel.keys.size + "件選択";
+  for (const id of ["selectStart", "selectStop", "selectDelete"]) $(id).disabled = sel.keys.size === 0;
+}
+
+function refreshSelection() {
+  document.querySelectorAll(".swipe[data-key]").forEach(node => {
+    const on = swipeState.select.keys.has(node.dataset.key);
+    node.classList.toggle("selected", on);
+    const box = node.querySelector(".sel-box");
+    if (box) box.checked = on;
+  });
+  updateSelectBar();
+}
+
+function enterSelect(key) {
+  if (swipeState.open) swipeState.open.close();
+  swipeState.select.on = true;
+  if (key) swipeState.select.keys.add(key);
+  refreshSelection();
+}
+
+function exitSelect() {
+  swipeState.select.on = false;
+  swipeState.select.keys.clear();
+  refreshSelection();
+}
+
+function toggleSelected(key) {
+  const keys = swipeState.select.keys;
+  if (keys.has(key)) keys.delete(key); else keys.add(key);
+  refreshSelection();
+}
+
+function selectedGroups() {
+  const groups = {package: [], link: []};
+  for (const key of swipeState.select.keys) {
+    const entry = swipeState.index.get(key);
+    if (entry) groups[entry.kind].push(entry.item);
+  }
+  return groups;
+}
+
+async function bulkAction(action) {
+  const groups = selectedGroups();
+  let count = 0;
+  try {
+    for (const kind of ["package", "link"]) {
+      if (!groups[kind].length) continue;
+      await callItems(action, kind, groups[kind]);
+      count += groups[kind].length;
+    }
+  } finally {
+    await afterItemAction("");
+  }
+  flash(count + "件を" + (action === "start" ? "開始" : "停止") + "しました");
+  exitSelect();
+}
+
+function bulkDeleteSheet() {
+  const groups = selectedGroups();
+  const total = groups.package.length + groups.link.length;
+  if (!total) return;
+  openSheet(total + "件を削除（ファイルを消すには1件ずつ操作してください）", [{
+    label: "一覧から削除（ファイルは残す）", primary: true,
+    run: async () => {
+      try {
+        for (const kind of ["package", "link"]) {
+          if (groups[kind].length) await callItems("remove", kind, groups[kind], {delete_files: false});
+        }
+      } finally {
+        await afterItemAction("");
+      }
+      flash(total + "件を一覧から削除しました（ファイルは残しています）");
+      exitSelect();
+    },
+  }]);
 }
 
 function matchesFilter(item) {
@@ -3058,7 +3588,9 @@ function renderDownloads() {
   const sig = snap ? state.snapshotJson + "|" + state.filter + "|" + state.query + "|" +
     Array.from(state.expanded).join(",") : "";
   if (sig === state.downloadsSig) return;
+  if (holdRender()) return;   // keep the row under the finger; flushRender() catches up
   state.downloadsSig = sig;
+  swipeState.index.clear();
   const list = $("downloadList"), orphans = $("downloadOrphans");
   if (!snap) {
     list.replaceChildren(); orphans.replaceChildren();
@@ -3102,6 +3634,10 @@ function renderDownloads() {
   for (const item of rows) counts[itemState(item)]++;
   $("downloadsSummary").textContent = hasItems ? "実行中 " + counts.running + " · 待機 " +
     counts.waiting + " · 完了 " + counts.finished : "";
+  for (const key of Array.from(swipeState.select.keys)) {
+    if (!swipeState.index.has(key)) swipeState.select.keys.delete(key);
+  }
+  updateSelectBar();
 }
 
 // Links JD2 holds in the LinkGrabber (names only, max 50) with a one-click start.
@@ -3121,12 +3657,8 @@ function renderWaiting() {
   $("downloadsToggle").textContent = state.dlRunning > 0 ? "停止" : "開始";
   if (!count) { $("waitingList").replaceChildren(); return; }
   $("waitingCount").textContent = (w.has_more ? count + "件以上" : count + "件");
-  $("waitingList").replaceChildren(...w.items.slice(0, WAITING_MAX).map(item => {
-    const row = element("div", undefined, "waiting-item");
-    row.appendChild(element("span", item.name, "waiting-name"));
-    if (item.host) row.appendChild(element("span", item.host, "muted"));
-    return row;
-  }));
+  if (holdRender()) return;
+  $("waitingList").replaceChildren(...w.items.slice(0, WAITING_MAX).map(waitingRow));
 }
 
 async function startWaiting() {
@@ -3999,6 +4531,8 @@ function wireDownloads() {
     state.downloadsFails = 0;
     loadDownloads(state.downloadsPage);
   });
+  wireSheet();
+  $("autoLiveChip").addEventListener("click", () => returnToFast(activeWebTab()));
   $("waitingStart").addEventListener("click", () => perform(startWaiting));
   $("downloadsToggle").addEventListener("click", () => perform(toggleDownloads));
   $("downloadsClear").addEventListener("click", () => perform(clearFinished));

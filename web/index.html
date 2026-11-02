@@ -525,6 +525,7 @@
       <button type="button" id="remoteReopen" class="btn primary">NASブラウザで開く</button>
      </div>
      <div id="remoteLoading" class="loading-bar" hidden></div>
+     <button type="button" id="autoLiveChip" class="auto-live-chip" hidden>高速表示に戻す</button>
      <div id="snapProgress" class="loading-bar snap-progress" role="progressbar" aria-label="ページを取得中" hidden></div>
      <button type="button" id="tileRefresh" class="tile-refresh" aria-label="再取得" title="再取得" hidden>⟳</button>
      <div id="remoteRing" class="press-ring" aria-hidden="true" hidden></div>
@@ -607,6 +608,19 @@
  </div>
 </div>
 
+<div id="selectBar" class="select-bar" hidden>
+ <span id="selectCount" role="status">0件選択</span>
+ <button type="button" id="selectStart" class="btn small">開始</button>
+ <button type="button" id="selectStop" class="btn small">停止</button>
+ <button type="button" id="selectDelete" class="btn small danger">削除</button>
+ <button type="button" id="selectDone" class="btn small">完了</button>
+</div>
+<div id="actionSheet" class="sheet-backdrop" hidden>
+ <div class="sheet-panel" role="dialog" aria-modal="true" aria-labelledby="sheetTitle">
+  <h2 id="sheetTitle"></h2>
+  <div id="sheetOptions" class="sheet-options"></div>
+ </div>
+</div>
 <div id="notice" class="toasts" role="status" aria-live="polite"></div>
 </body>
 </html>

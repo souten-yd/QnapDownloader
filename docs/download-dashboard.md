@@ -33,3 +33,14 @@ iPhone/SafariとQNAP App Centerの両方で、QnapDownloaderの画面だけか�
 - `GET /api/jd2/linkgrabber`（管理者認証）: `linkgrabberv2/queryLinks` に `name/host/bytesTotal/uuid/packageUUID` と `maxResults=50` だけを渡し、名前・ホスト・サイズ・ID（文字列）のみ返す（URL・保存先・パスワードは返さない）。ダウンロード画面の「JD2で待機中のリンク」に件数と名前を表示する。
 - `POST /api/jd2/linkgrabber/start {confirmed:true}`: 一覧のリンクと所属パッケージを `moveToDownloadlist(linkIds, packageIds)` でダウンロードリストへ移し、`downloadcontroller/start`。`POST /api/jd2/downloads/start`、`POST /api/jd2/downloads/stop {confirmed:true}`。個別の削除・一時停止は引き続き未実装。
 - 設定 `send_autostart`（既定ON）: Hubから送るリンクは `addLinks` を `autostart:true` にして送り、続けて `downloadcontroller/start` を呼ぶ。JD2側の自動確定・自動開始の設定は常にOFFを確認して変更しない。
+
+## v0.1.29 追加: 項目ごとの開始・停止・削除（実機未検証）
+- JD2呼び出し（許可リスト）: `downloadsV2/setEnabled(enabled, linkIds, packageIds)`、`downloadsV2/removeLinks(linkIds, packageIds)`（一覧からのみ削除）、`downloadcontroller/forceDownload(linkIds, packageIds)`、`linkgrabberv2/removeLinks`、ファイルも消す `downloadsV2/cleanup(linkIds, packageIds, "DELETE_ALL", "REMOVE_LINKS_AND_DELETE_FILES", "SELECTED")`（`delete_with_files` からのみ）。IDは64bit。ブラウザへは10進数の文字列（19桁以内・2^63-1以下）で渡し、Hubが整数のまま（浮動小数にせず）JD2へ送る。
+- Hub API（管理者・CSRF・Origin必須、`kind`=`package|link`、`id` または `ids`（最大100件））: `POST /api/jd2/items/start`（setEnabled(true)＋forceDownload）、`/items/stop`（setEnabled(false)。再開は開始）、`/items/remove {delete_files, confirm_name}`、`POST /api/jd2/waiting/remove`（待機中の一覧から削除）、`/waiting/start`（ダウンロードリストへ移して開始）。操作の直前にHubがその `page` の一覧をJD2から取り直し、含まれないIDは拒否する。
+- `delete_files: true` は1件のみ。`confirm_name` が項目名と完全一致し、かつ項目（ファイルは所属パッケージ）の保存先が、選択中のNAS保存先フォルダ（コンテナ時は `/downloads` へ読み替え）の内側にあるときだけ実行する（`..`・外側・取得不能は拒否）。既定は `delete_files: false`（ファイルは残す）。
+- UI: パッケージ行・ファイル行・待機中リンク行を左スワイプで「削除」、右スワイプで「開始」／「停止」（実行中→停止、完了済みは右スワイプなし）。10px動いたところで横方向に固定し縦スクロールは妨げない（`touch-action: pan-y`）。幅の60%超の全スワイプは安全側の既定動作（開始／停止、またはファイルを残す一覧削除）を即実行。「削除」タップで「一覧から削除（ファイルは残す）」（既定）／「ファイルも削除」（名前を表示する確認ダイアログ、元に戻せない）／キャンセルのシート。各行の「⋯」ボタンに同じ操作（キーボード・VoiceOver用）。行の長押しで複数選択（下部バーの開始・停止・削除。複数選択の削除は一覧からのみ）。処理中の行は薄く表示し、完了後に一覧を更新。操作中は5秒ごとの自動更新で行を作り直さない。`prefers-reduced-motion` ではアニメーションなし。
+
+## v0.1.29 追加: 確認画面からの自動復帰
+- チャレンジ判定: タイトル／URLに加え、ページ内で `window._cf_chl_opt` や `#challenge-form` 等の有無を評価（読み込みイベントごとに無効化、要求時は最大1秒に1回）。`GET /api/rb/meta` とフレームヘッダの `challenge` に反映。
+- クライアント: 自動でライブにしたタブ（`autoLive`）は、1.5秒ごとに `/api/rb/meta`（表示中のみ）を確認し、チャレンジなし＆読み込み完了が2回続いたら高速表示へ戻して再取得する。ホスト別の記憶には書かない。90秒たってもチャレンジなら「高速表示に戻す」チップを表示。⋯からの手動ライブは自動では戻さない。
+- ファイルも削除する前の安全確認: JD2の `GeneralSettings` の「削除後に空フォルダも削除」（`DeleteEmptySubFoldersAfterDeletingDownloadedFilesEnabled`）を推奨設定（OFF）に追加。`delete_with_files` は実行前にこの値を読み、OFFでなければOFFへ設定して読み戻し、確認できなければ `cleanup` を呼ばずに中止する（保存先フォルダ自体が消えるのを防ぐ）。

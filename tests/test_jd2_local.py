@@ -430,9 +430,11 @@ class ControllerCallTests(unittest.TestCase):
         for call in (("downloadcontroller", "start"), ("downloadcontroller", "stop"),
                      ("linkgrabberv2", "queryLinks"), ("linkgrabberv2", "moveToDownloadlist")):
             self.assertIn(call, jl.ALLOWED_CALLS)
-        for call in (("downloadcontroller", "pause"), ("downloadcontroller", "forceDownload"),
-                     ("linkgrabberv2", "removeLinks"), ("linkgrabberv2", "clearList"),
-                     ("downloadsV2", "removeLinks")):
+        for call in (("downloadsV2", "setEnabled"), ("downloadsV2", "removeLinks"),
+                     ("downloadcontroller", "forceDownload"), ("linkgrabberv2", "removeLinks")):
+            self.assertIn(call, jl.ALLOWED_CALLS)
+        for call in (("downloadcontroller", "pause"), ("linkgrabberv2", "clearList"),
+                     ("downloadsV2", "cleanupAll")):
             self.assertNotIn(call, jl.ALLOWED_CALLS)
             with self.assertRaises(jl.LocalUnavailable):
                 jl.encode_call(call[0], call[1], ())
@@ -444,10 +446,103 @@ class ControllerCallTests(unittest.TestCase):
                          [[], [], "DELETE_FINISHED", "REMOVE_LINKS_ONLY", "ALL"]))
         self.assertEqual(jl.CLEANUP_MODE, "REMOVE_LINKS_ONLY")
         source = open(jl.__file__, encoding="utf-8").read()
-        self.assertNotIn("DELETE_ALL", source)
+        # v0.1.29: the file-deleting triple exists only behind delete_with_files.
+        self.assertEqual(source.count('"REMOVE_LINKS_AND_DELETE_FILES"'), 1)
         self.assertNotIn("DELETE_DISABLED", source)
-        self.assertNotIn("REMOVE_LINKS_AND_DELETE_FILES", source)
         self.assertNotIn("REMOVE_LINKS_AND_RECYCLE_FILES", source)
+
+    def test_item_calls_have_exact_arguments_and_keep_64bit_ids_exact(self):
+        big = 2 ** 63 - 1
+        self.adapter.set_enabled(True, [5], [big])
+        self.assertEqual(self.decoded(), ("/downloadsV2/setEnabled", [True, [5], [big]]))
+        self.assertIn("9223372036854775807", self.server.paths[-1])   # an int, never 9.22e18
+        self.adapter.force_download([], [7])
+        self.assertEqual(self.decoded(), ("/downloadcontroller/forceDownload", [[], [7]]))
+        self.adapter.remove_links([1], [])
+        self.assertEqual(self.decoded(), ("/downloadsV2/removeLinks", [[1], []]))
+        self.adapter.remove_waiting([9])
+        self.assertEqual(self.decoded(), ("/linkgrabberv2/removeLinks", [[9], []]))
+        key = jd2_policy.KNOWN_KEYS["general.delete_empty_folders"]
+        self.server.responses["/config/list"] = {"data": [{
+            "interfaceName": key["interface"], "storage": "s", "key": key["key"]}]}
+        self.server.responses["/config/get"] = {"data": False}
+        self.adapter.delete_with_files([], [3])
+        self.assertEqual(self.decoded(), ("/downloadsV2/cleanup", [[], [3], "DELETE_ALL",
+                                                                  "REMOVE_LINKS_AND_DELETE_FILES", "SELECTED"]))
+
+    def test_item_calls_reject_floats_negatives_bools_oversize_and_empty(self):
+        before = len(self.server.paths)
+        for bad in ([1.0], [-1], [True], [2 ** 63], ["1"], None, list(range(101))):
+            with self.subTest(bad=bad), self.assertRaises(jl.LocalUnavailable):
+                self.adapter.remove_links(bad, [])
+        with self.assertRaises(jl.LocalUnavailable):
+            self.adapter.remove_links([], [])
+        with self.assertRaises(jl.LocalUnavailable):
+            self.adapter.set_enabled(1, [1], [])
+        self.assertEqual(len(self.server.paths), before)
+
+    def _guarded(self, initial, accepts_set=True, listed=True):
+        """Adapter whose _call is a small stateful JD2 fake for the empty-folder key."""
+        key = jd2_policy.KNOWN_KEYS["general.delete_empty_folders"]
+        state = {"value": initial, "calls": []}
+        entries = [{"interfaceName": key["interface"], "storage": "s", "key": "DeleteEmptySubFoldersAfterDeletingDownloadedFilesEnabled"}] if listed else []
+
+        def fake(namespace, method, *args):
+            state["calls"].append((namespace, method) + args)
+            if (namespace, method) == ("config", "list"):
+                return entries
+            if (namespace, method) == ("config", "get"):
+                return state["value"]
+            if (namespace, method) == ("config", "set"):
+                if accepts_set:
+                    state["value"] = args[-1]
+                return accepts_set
+            return None
+        self.adapter._call = fake
+        return state
+
+    def cleanups(self, state):
+        return [c for c in state["calls"] if c[:2] == ("downloadsV2", "cleanup")]
+
+    def test_preset_requires_the_empty_folder_key(self):
+        spec = jd2_policy.KNOWN_KEYS["general.delete_empty_folders"]
+        self.assertEqual(spec["interface"], "org.jdownloader.settings.GeneralSettings")
+        self.assertEqual(spec["kind"], "bool")
+        self.assertIn("general.delete_empty_folders", jd2_policy.REQUIRED)
+        self.assertEqual(jd2_policy.LABELS["general.delete_empty_folders"], "削除後に空フォルダも削除")
+        self.assertFalse(jd2_policy.compliant("general.delete_empty_folders", True))
+        self.assertIs(jd2_policy.target_for("general.delete_empty_folders", True), False)
+
+    def test_delete_with_files_runs_when_the_key_is_already_false(self):
+        state = self._guarded(False)
+        self.adapter.delete_with_files([], [3])
+        self.assertEqual(len(self.cleanups(state)), 1)
+        self.assertFalse([c for c in state["calls"] if c[1] == "set"])
+
+    def test_delete_with_files_turns_the_key_off_and_reads_it_back(self):
+        state = self._guarded(True)
+        self.adapter.delete_with_files([], [3])
+        calls = [c[:2] for c in state["calls"]]
+        self.assertLess(calls.index(("config", "set")), calls.index(("downloadsV2", "cleanup")))
+        self.assertEqual(calls[-1], ("downloadsV2", "cleanup"))
+        self.assertEqual(calls[calls.index(("config", "set")) + 1], ("config", "get"))
+        self.assertIs(state["value"], False)
+
+    def test_delete_with_files_refuses_when_the_key_stays_on_or_is_unreadable(self):
+        for kwargs in ({"initial": True, "accepts_set": False}, {"initial": True, "listed": False},
+                       {"initial": "yes", "accepts_set": False}):
+            with self.subTest(kwargs=kwargs):
+                state = self._guarded(**kwargs)
+                with self.assertRaises(jl.LocalUnavailable) as ctx:
+                    self.adapter.delete_with_files([], [3])
+                self.assertIn("空フォルダ削除", str(ctx.exception))
+                self.assertEqual(self.cleanups(state), [])
+
+    def test_package_save_path_queries_one_package_and_checks_the_uuid(self):
+        self.server.responses["/downloadsV2/queryPackages"] = {"data": [{"uuid": 12, "saveTo": "/downloads/x"}]}
+        self.assertEqual(self.adapter.package_save_path(12), "/downloads/x")
+        self.assertEqual(self.decoded()[1][0]["packageUUIDs"], [12])
+        self.assertIsNone(self.adapter.package_save_path(13))
 
     def test_start_and_stop_take_no_arguments(self):
         self.adapter.start_downloads()
