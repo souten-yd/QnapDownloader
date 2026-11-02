@@ -52,6 +52,8 @@
 > - **原因対策（推定）**: `--tmpfs /profile:rw,nosuid,nodev,size=512m,uid=1000,gid=1000,mode=0700`（非rootのChromiumが書けるように所有者を指定）、`--tmpfs /tmp:rw,nosuid,nodev,size=256m,mode=1777`。Chromiumに `--disable-gpu --password-store=basic` を追加。`HOME=/tmp` と `/tmp/.config`・`/tmp/.cache` を起動前に作成。サンドボックスは無効にしない。
 > - **イメージ更新**: `entrypoint.sh` が変わるためタグ（内容ハッシュ）が変わる。新タグが無く、古いHub製イメージだけがある場合、`/api/rb/status` は `update_needed: true`、理由「NASブラウザの更新が必要です（初期設定を再実行）」を返し、タブを開こうとしても同文言で拒否する（存在しないタグでの `docker run` は行わない）。設定画面のボタンは「初期設定を再実行」になる。
 
+> **v0.1.19 実機修正メモ**: 実機で `docker: ... failed to initialize logging driver: compression cannot be enabled when max file count is 1` となった。`local` ドライバは既定で圧縮が有効なため、ブラウザのログ引数に `--log-opt compress=false` を追加（`--log-driver local --log-opt max-size=256k --log-opt max-file=1 --log-opt compress=false`）。また `docker run -d` 自体が失敗して「created」状態のコンテナが残る場合に備え、`run_browser` は失敗時にHubラベルを確認したうえで `qnapdl-browser` を削除する（次回の名前衝突を防ぐ。Hub管理外の同名コンテナは削除しない）。UIの同一エラートーストは5秒以内の重複を1つにまとめる。
+
 （以下は元の設計）
 - イメージ: 初期設定時に `debian:bookworm-slim@…` から `chromium`・`xvfb`・`socat`・日本語フォントを入れたイメージを `docker build` で作る（Debianのセキュリティ更新付きChromium。ビルドは利用者のボタン操作時のみ）。「更新」で再ビルド。
 - 起動: 非root、Chromiumサンドボックス有効（`--no-sandbox` 禁止）、Xvfb上のヘッドフル（Cloudflareに通常のブラウザとして扱われやすい。UA偽装はしない）。プロフィールは `--tmpfs`（RAM、512MB）で毎回使い捨て、`--disk-cache-size=1`、クラッシュレポート無効。CDPは内部で `socat` によりコンテナIP:9223 に中継（ポート公開なし）。

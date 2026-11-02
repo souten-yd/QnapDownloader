@@ -303,8 +303,18 @@ function pruneToasts(box) {
   while (normal.length > 4) normal.shift().remove();
 }
 
+const recentErrorToasts = new Map();
 function toast(message, kind = "success") {
   const box = $("notice");
+  if (kind === "error") {
+    // The same failure can surface from more than one handler for one click:
+    // show it once per 5 s.
+    const now = Date.now();
+    const last = recentErrorToasts.get(message);
+    if (last !== undefined && now - last < 5000) return;
+    recentErrorToasts.set(message, now);
+    for (const [key, at] of recentErrorToasts) if (now - at >= 5000) recentErrorToasts.delete(key);
+  }
   for (const old of Array.from(box.children)) {
     if (old.dataset.message === message) old.remove();
   }

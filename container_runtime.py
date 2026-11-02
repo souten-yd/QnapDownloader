@@ -576,8 +576,12 @@ class Runtime:
         # entrypoint prints the tail of those files. `local` with a 256k cap and
         # one file bounds that to a tiny, rotated file (JD2 keeps `none`), and
         # lets the Hub read the failure reason via `docker logs` before removal.
+        # The local driver compresses rotated files by default, which Docker
+        # rejects together with max-file=1 ("compression cannot be enabled when
+        # max file count is 1"), so compression is turned off explicitly.
         log_args = ("--log-driver", "local", "--log-opt", "max-size=256k",
-                    "--log-opt", "max-file=1")
+                    "--log-opt", "max-file=1",
+                    "--log-opt", "compress=false")
         return (["run", "-d", "--name", BROWSER_NAME, "--label", LABEL,
                  "--network", BROWSER_NET, "--restart", "no"] +
                 self._browser_hardening(log_args) + [tag])
@@ -607,7 +611,14 @@ class Runtime:
         check_memory(self._meminfo, BROWSER_MIN_AVAILABLE_KIB)
         result = self._docker(args, 120)
         if result.returncode != 0:
-            raise ContainerError("コンテナを起動できません: " + self._tail(result))
+            message = "コンテナを起動できません: " + self._tail(result)
+            # A failed `docker run -d` can leave a container in "created" state;
+            # remove it (label-checked) so the next attempt has no name conflict.
+            try:
+                self.remove(BROWSER_NAME)
+            except ContainerError:
+                pass
+            raise ContainerError(message)
         return (result.stdout or "").strip()[:80]
 
     def logs_tail(self, name):
