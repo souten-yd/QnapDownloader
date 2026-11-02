@@ -773,6 +773,113 @@ if (o !== "リーダー · ブロック 3 · 画像 1/2 · 取得 600 ms · 画�
         self.assertIn("AUTO_CLEAN_NEEDED = 2", self.js)
         self.assertIn("if (rb.autoLive) return \"live\";", self.js)
 
+    def test_v0131_node_behaviour_of_early_read_errors_and_fallback(self):
+        if shutil.which("node") is None:
+            self.skipTest("node missing")
+        display = self.js[self.js.index("// The display the user chose"):self.js.index("// 「表示: リーダー / 高速 / ライブ」 from the menu")]
+        logic = self.js[self.js.index("// A page that is still \"loading\" after this long"):
+                        self.js.index("// Metadata long-poll like the fast display")]
+        loop = self.js[self.js.index("async function readerLoop("):self.js.index("// Tap on a link: the NAS browser goes there")]
+        self.assertIn('readerAction(rb, meta, Date.now()) === "run"', loop)
+        script = """
+const state = {settings: {rb_default_mode: "reader"}};
+const REMOTE_MODE = "remote", REMOTE_FAST_MODE = "remote-fast", REMOTE_LIVE_MODE = "remote-live",
+  REMOTE_READER_MODE = "remote-reader";
+const DISPLAY_OF_MODE = {[REMOTE_FAST_MODE]: "tiles", [REMOTE_LIVE_MODE]: "live", [REMOTE_READER_MODE]: "reader"};
+const DISPLAY_OF_SETTING = {reader: "reader", fast: "tiles", live: "live"};
+const hostOf = u => u ? new URL(u).hostname : "";
+const rememberedMode = h => null;
+const toasts = [], logs = [];
+console.error = (...a) => logs.push(a.join(" "));
+const toast = (m, k) => toasts.push([m, k || "success"]);
+let applied = 0, apiResult = null, apiError = null;
+const applyDisplay = () => { applied++; };
+const updateRemoteView = () => {};
+const remoteLost = () => {};
+const snapBusy = () => {};
+const $ = () => ({scrollTop: 0});
+const readerHost = {owner: null};
+const renderReaderBody = () => {};
+const cleanReaderData = raw => raw && Array.isArray(raw.blocks) ? raw : null;
+const api = async () => { if (apiError) throw apiError; return apiResult; };
+const performance = {now: () => 0};
+%s
+%s
+const eq = (a, b, m) => { if (a !== b) { process.stdout.write(m + ": " + a + " != " + b + "\\n"); process.exit(1); } };
+const mk = () => ({id: "b1", url: "https://e.com/a", reader: null, readerPending: false, readerEarly: "", readerFail: null,
+  readerErr: false, tilesFor: "", snapEarly: "", loadUrl: "", loadSince: 0, snap: null, snapKey: "", perf: {},
+  readerBusy: false, readerAgain: false});
+const A = "https://e.com/a", B = "https://e.com/b";
+// --- 3 s rule: not before 3 s, then once, then again when loading turns false
+let rb = mk();
+eq(readerAction(rb, {url: A, loading: true}, 1000), "", "loading, 0 s");
+eq(readerAction(rb, {url: A, loading: true}, 3999), "", "loading, 2.999 s");
+eq(readerAction(rb, {url: A, loading: true}, 4000), "run", "loading, 3 s");
+eq(readerAction(rb, {url: A, loading: true}, 9000), "", "only once while loading");
+rb.reader = {url: A};
+rb.readerPending = false;
+eq(readerAction(rb, {url: A, loading: false}, 9500), "run", "re-run once loading is false");
+eq(readerAction(rb, {url: A, loading: false}, 9600), "", "...and only once");
+// a new URL restarts the 3 s clock; a finished page is read at once
+rb = mk(); rb.reader = {url: A};
+eq(readerAction(rb, {url: B, loading: true}, 100), "", "new URL starts the clock");
+eq(readerAction(rb, {url: B, loading: true}, 3100), "run", "3 s after the URL change");
+rb = mk();
+eq(readerAction(rb, {url: A, loading: false}, 0), "run", "not loading: run at once");
+// --- fast display uses the same rule
+rb = mk(); rb.snap = {}; rb.snapKey = A + "\\nT";
+eq(tilesAction(rb, {url: A, title: "T", loading: true}, false, 0), "", "tiles: loading 0 s");
+eq(tilesAction(rb, {url: A, title: "T", loading: true}, false, 3000), "snap", "tiles: loading 3 s");
+eq(tilesAction(rb, {url: A, title: "T", loading: true}, false, 6000), "", "tiles: once while loading");
+eq(tilesAction(rb, {url: A, title: "T", loading: false}, false, 7000), "snap-force", "tiles: again when loaded");
+eq(tilesAction(rb, {url: A, title: "T", loading: false}, true, 8000), "snap-changed", "tiles: usual if-changed");
+eq(tilesAction(rb, {url: A, title: "T2", loading: false}, false, 9000), "snap", "tiles: title change");
+// --- errors are surfaced; the second failure falls back to the fast display
+(async () => {
+  const tab = {rb: mk(), error: ""};
+  tab.rb.id = "b1";
+  tab.rb.url = A;
+  apiError = new Error("ブラウザの操作に失敗しました");
+  await runReader(tab, {quiet: true});
+  eq(tab.error, "リーダー表示を作れませんでした: ブラウザの操作に失敗しました", "error text");
+  eq(logs.length, 1, "logged");
+  eq(tabDisplay(tab), "reader", "one failure keeps the reader");
+  eq(toasts.length, 0, "quiet: no toast for the first failure");
+  await runReader(tab, {quiet: true});
+  eq(tabDisplay(tab), "tiles", "second failure -> fast");
+  eq(tab.error, "", "error cleared on fallback");
+  eq(toasts.length, 1, "one fallback toast");
+  eq(toasts[0][0], "このページはリーダー表示に対応していないため高速表示にしました", "toast text");
+  // only for this page
+  tab.rb.url = B;
+  eq(tabDisplay(tab), "reader", "other page: reader again");
+  // 0 blocks -> fast at once
+  apiError = null; apiResult = {blocks: [], url: B};
+  await runReader(tab, {quiet: true});
+  eq(tabDisplay(tab), "tiles", "0 blocks -> fast");
+  eq(toasts.length, 2, "toast for 0 blocks");
+  // a success resets the failure count and the error
+  const t2 = {rb: mk(), error: ""};
+  t2.rb.url = A;
+  apiError = new Error("x");
+  await runReader(t2, {quiet: true});
+  apiError = null; apiResult = {blocks: [{t: "p"}], url: A};
+  await runReader(t2, {quiet: true});
+  eq(t2.error, "", "error cleared on success");
+  apiError = new Error("y");
+  await runReader(t2, {quiet: true});
+  eq(tabDisplay(t2), "reader", "failures must be consecutive");
+  // a non-quiet failure also toasts the message
+  const t3 = {rb: mk(), error: ""};
+  t3.rb.url = A;
+  const before = toasts.length;
+  await runReader(t3, {});
+  eq(toasts.length, before + 1, "loud failure toasts");
+})().catch(e => { process.stdout.write("EXC " + e.stack + "\\n"); process.exit(1); });
+""" % (display, logic)
+        result = subprocess.run(["node", "-e", script], capture_output=True, text=True, timeout=20)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
     def test_v0128_node_behaviour_of_display_choice_and_hit_testing(self):
         if shutil.which("node") is None:
             self.skipTest("node missing")
