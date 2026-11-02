@@ -1791,14 +1791,14 @@ function renderProbe(view, tab) {
   $("probeAddAll").textContent = "リンクに追加（" + links.length + "件）";
   setShown("probeSendAll", !busy && canSend && links.length > 0);
   setShown("probeAddAll", !busy && links.length > 0);
-  setShown("probeOpen", !busy && Boolean(result) && links.length === 0 && Boolean(result.final_url));
   state.probeResult = result;
 }
 
 let probeError = "";
 
 // Long press found hoster links: hand them to JD2 without a dialog (setting probe_autosend).
-// Returns true when handled (toast shown, sheet closed); false opens the sheet as before.
+// Returns true when handled (toast shown, sheet closed); false keeps the sheet with its buttons
+// (the only case it stays: autosend off or the engine cannot send).
 async function autoSendProbe(result, rb, seq) {
   probeError = "";
   if (!result.links.length || !result.probe_id) return false;
@@ -1809,18 +1809,23 @@ async function autoSendProbe(result, rb, seq) {
     const r = await api("/api/rb/probe/send", {tab: rb.id, probe_id: result.probe_id});
     swrDrop("links");
     loadQueue(true).catch(() => {});
-    if (r.error) {
-      probeError = (r.sent ? r.sent + "件送信後に停止: " : "") + r.error;
-      return false;
-    }
+    if (seq !== state.probeSeq) return true;
     setShown("probeSheet", false);
-    if (r.sent === 0) flash("送信済みのためスキップしました（" + r.skipped + "件）");
-    else if (r.skipped) flash(r.sent + "件送信・" + r.skipped + "件は重複のためスキップ");
-    else flash("JD2へ送信しました（" + r.sent + "件・" + (r.autostart ? "開始" : "待機中") + "）");
+    if (r.error) {
+      toast((r.sent ? r.sent + "件送信後に停止: " : "") + "JD2へ送信できませんでした: " + r.error, "error");
+    } else if (r.sent === 0) {
+      flash("送信済みのためスキップしました（" + r.skipped + "件）");
+    } else {
+      flash("JD2へ送信しました（" + r.sent + "件）" +
+            (r.skipped ? "・" + r.skipped + "件は重複のためスキップ" : ""));
+    }
     return true;
   } catch (e) {
-    probeError = e.message;
-    return false;
+    if (seq === state.probeSeq) {
+      setShown("probeSheet", false);
+      toast("JD2へ送信できませんでした: " + e.message, "error");
+    }
+    return true;
   }
 }
 
@@ -1835,6 +1840,13 @@ async function startProbe(tab, point) {
   try {
     const result = await api("/api/rb/probe", {tab: rb.id, x: point.x, y: point.y});
     if (seq !== state.probeSeq || tab.rb !== rb) return;
+    if (!result.links.length) {
+      // Nothing found: the sheet was only a progress indicator, so say so and close it.
+      setShown("probeSheet", false);
+      const host = hostLabel(result.final_url);
+      flash("リンクは見つかりませんでした" + (host ? "（最終: " + host + "）" : ""));
+      return;
+    }
     if (await autoSendProbe(result, rb, seq)) return;
     if (seq !== state.probeSeq || tab.rb !== rb) return;
     renderProbe({result, error: probeError}, tab);
@@ -1980,13 +1992,6 @@ function wireRemote() {
     const links = state.probeResult ? state.probeResult.links.slice() : [];
     await stageLinks(links);
     flash(links.length + "件を追加したリンクに入れました（JD2へは未送信）");
-  }));
-  $("probeOpen").addEventListener("click", () => perform(async () => {
-    const tab = remoteTab();
-    const result = state.probeResult;
-    if (!tab || !result) return;
-    closeProbeSheet();
-    await api("/api/rb/navigate", {tab: tab.rb.id, url: result.final_url});
   }));
   $("interceptSend").addEventListener("click", () => perform(() => interceptAction("send")));
   $("interceptAdd").addEventListener("click", () => perform(() => interceptAction("add")));
