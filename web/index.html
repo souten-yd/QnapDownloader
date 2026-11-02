@@ -23,6 +23,8 @@
  <symbol id="i-gear" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/></symbol>
  <symbol id="i-globe" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3a14 14 0 0 1 0 18 14 14 0 0 1 0-18"/></symbol>
  <symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></symbol>
+ <symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="6.5"/><path d="M16 16l5 5M8.5 11h5M11 8.5v5"/></symbol>
+ <symbol id="i-image" viewBox="0 0 24 24"><rect x="3" y="5" width="18" height="14" rx="2"/><circle cx="9" cy="10" r="1.5"/><path d="M4 18l5-5 4 4 3-3 4 4"/></symbol>
  <symbol id="i-x" viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></symbol>
  <symbol id="i-back" viewBox="0 0 24 24"><path d="M19 12H5M11 6l-6 6 6 6"/></symbol>
  <symbol id="i-forward" viewBox="0 0 24 24"><path d="M5 12h14M13 6l6 6-6 6"/></symbol>
@@ -578,12 +580,13 @@
     <div id="remoteStage" class="remote-stage">
      <img id="remoteImg" class="remote-img" alt="NASブラウザの画面" draggable="false" hidden>
      <div id="tileScroll" class="tile-scroll" aria-label="NASブラウザのページ（全体表示）" hidden></div>
+     <div id="readerProgress" class="reader-progress" role="progressbar" aria-label="読み進み" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" hidden><div id="readerProgressFill" class="reader-progress-fill"></div></div>
      <div id="readerScroll" class="reader-scroll" aria-label="NASブラウザのページ（リーダー表示）" hidden>
       <div class="reader-head">
        <div id="readerTitle" class="reader-title" role="heading" aria-level="1"></div>
        <div class="reader-sub">
         <span id="readerHost" class="reader-host"></span>
-        <button type="button" id="readerSize" class="btn small">文字 標準</button>
+        <button type="button" id="readerAppearance" class="btn small aa" aria-haspopup="dialog" aria-label="表示設定（文字・テーマ・画像など）">Aa</button>
         <button type="button" id="readerOriginal" class="btn small">元のページ表示に切替</button>
        </div>
       </div>
@@ -694,6 +697,29 @@
   <h2 id="sheetTitle"></h2>
   <div id="sheetOptions" class="sheet-options"></div>
  </div>
+</div>
+<div id="readerSheet" class="sheet-backdrop reader-sheet" hidden>
+ <div class="sheet-panel" role="dialog" aria-modal="true" aria-labelledby="readerSheetTitle">
+  <div class="rs-head">
+   <h2 id="readerSheetTitle">リーダーの表示設定（この端末だけ）</h2>
+   <button type="button" id="readerSheetClose" class="btn small">完了</button>
+  </div>
+  <div id="readerSheetBody"></div>
+ </div>
+</div>
+<div id="gestureHint" class="gesture-hint" aria-hidden="true" hidden></div>
+<div id="readerViewer" class="reader-viewer" role="dialog" aria-modal="true" aria-label="画像ビューア" hidden>
+ <div id="rvStage" class="rv-stage">
+  <img id="rvImg" class="rv-img is-loading" alt="" draggable="false">
+  <div id="rvMsg" class="rv-msg" role="status"></div>
+ </div>
+ <div class="rv-bar">
+  <span id="rvCount" class="rv-count"></span>
+  <button type="button" id="rvClose" class="rv-btn" aria-label="閉じる"><svg class="icon" aria-hidden="true"><use href="#i-x"/></svg></button>
+ </div>
+ <button type="button" id="rvPrev" class="rv-btn rv-nav rv-prev" aria-label="前の画像"><svg class="icon" aria-hidden="true"><use href="#i-back"/></svg></button>
+ <button type="button" id="rvNext" class="rv-btn rv-nav rv-next" aria-label="次の画像"><svg class="icon" aria-hidden="true"><use href="#i-forward"/></svg></button>
+ <div id="rvCaption" class="rv-caption"></div>
 </div>
 <div id="folderSheet" class="sheet-backdrop" hidden>
  <div class="sheet-panel" role="dialog" aria-modal="true" aria-labelledby="folderSheetTitle">

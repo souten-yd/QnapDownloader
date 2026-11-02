@@ -154,8 +154,11 @@ CHALLENGE_TITLES = ("just a moment", "しばらくお待ちください")
 CHALLENGE_URL = "/cdn-cgi/challenge"
 # Page-side check (v0.1.29): Cloudflare's interstitial keeps its normal title on some
 # sites, so the DOM is asked too. Re-evaluated after every load event, at most once per second.
-CHALLENGE_JS = ("!!(window._cf_chl_opt||document.querySelector('#challenge-form,#challenge-stage,"
-                ".cf-turnstile,iframe[src*=\"challenges.cloudflare.com\"]'))")
+# v0.1.37: a Turnstile widget inside an ordinary page (comment or login form) is not an
+# interstitial: it only counts when the page has almost no text of its own.
+CHALLENGE_JS = ("!!(window._cf_chl_opt||document.querySelector('#challenge-form,#challenge-stage')||"
+                "(document.querySelector('.cf-turnstile,iframe[src*=\"challenges.cloudflare.com\"]')&&"
+                "((document.body&&document.body.innerText)||'').length<400))")
 CHALLENGE_CHECK_INTERVAL = 1.0
 SNAP_JS = (
     "(function(){try{if(!window.__qdlMut){var m=new MutationObserver(function(){window.__qdlDirty=true});"
@@ -230,6 +233,7 @@ READER_TIMEOUT = 20.0
 READER_HOSTS = ("rapidgator.net", "www.rapidgator.net", "rg.to", "www.rg.to")
 READER_HOSTER_TITLE = "ダウンロードリンク"
 IMAGE_MAX_BYTES = 4 * 1024 * 1024
+READER_IMAGE_TARGET = 1280      # v0.1.36: the smallest srcset candidate at least this wide is used
 IMAGE_CDP_TIMEOUT = 12.0
 CONTROL_CHARS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 # Fixed extractor, run in the NAS browser's page (Runtime.evaluate, returnByValue). It only reads the
@@ -242,7 +246,7 @@ var SKIP={SCRIPT:1,STYLE:1,NOSCRIPT:1,TEMPLATE:1,NAV:1,ASIDE:1,SVG:1,
 IFRAME:1,OBJECT:1,EMBED:1,CANVAS:1,SELECT:1,BUTTON:1,INPUT:1,TEXTAREA:1,AUDIO:1,VIDEO:1,MAP:1,DIALOG:1};
 var INLINE={'inline':1,'inline-block':1,'inline-flex':1,'inline-grid':1,'inline-table':1,
 'contents':1,'ruby':1,'table-cell':1};
-var blocks=[],images=[],imgIndex={},size=0,trunc=false,visited=0,depth=0,inA=0,anchorImgs=[];
+var blocks=[],images=[],fallbacks=[],imgIndex={},qd=0,size=0,trunc=false,visited=0,depth=0,inA=0,anchorImgs=[];
 var hid=false,root=null,pseudoLeft=8000;
 var buf=[],ctx={kind:'p',depth:0,level:0};
 function norm(s){return s.replace(/[ \t\r\n\f ]+/g,' ');}
@@ -281,7 +285,7 @@ function flush(){
   var text='';for(var n=0;n<out.length;n++)text+=out[n].text;
   push({t:'h',level:ctx.level,text:text.replace(/\s+/g,' ').trim()},len);
  }else if(ctx.kind==='li'){push({t:'li',runs:out,depth:ctx.depth},len);}
- else push({t:'p',runs:out},len);
+ else{var pb={t:'p',runs:out};if(qd>0)pb.q=true;push(pb,len);}
 }
 function adMatch(el){
  var id=el.id;if(typeof id==='string'&&id&&AD.test(id))return true;
@@ -313,20 +317,83 @@ function pseudo(node,which){
 function absUrl(v){
  try{var u=new URL(v,document.baseURI).href;return /^https?:/i.test(u)&&u.length<=2048?u:null;}catch(e){return null;}
 }
-function image(el,href){
+/*PICK*/
+function parseSrcset(str,baseW){
+ var out=[],s=String(str||''),i=0,n=s.length;
+ while(i<n){
+  while(i<n&&/[\s,]/.test(s.charAt(i)))i++;
+  if(i>=n)break;
+  var st=i;while(i<n&&!/\s/.test(s.charAt(i)))i++;
+  var url=s.slice(st,i),desc='';
+  if(/,+$/.test(url)){url=url.replace(/,+$/,'');}
+  else{var ds=i;while(i<n&&s.charAt(i)!==',')i++;desc=s.slice(ds,i).replace(/^\s+|\s+$/g,'');}
+  if(!url)continue;
+  var w=0,m=/^(\d+(?:\.\d+)?)([wx])$/i.exec(desc);
+  if(m){w=parseFloat(m[1]);if(m[2].toLowerCase()==='x')w=baseW>0?w*baseW:0;}
+  else if(!desc&&baseW>0)w=baseW;
+  out.push({u:url,w:Math.round(w)});
+ }
+ return out;
+}
+function pickBest(list,target){
+ var known=[],all=[],i;
+ for(i=0;i<list.length;i++){if(!list[i]||!list[i].u)continue;all.push(list[i]);if(list[i].w>0)known.push(list[i]);}
+ if(!all.length)return null;
+ if(!known.length)return all[all.length-1];
+ var best=null;
+ for(i=0;i<known.length;i++){if(known[i].w>=target&&(!best||known[i].w<best.w))best=known[i];}
+ if(best)return best;
+ for(i=0;i<known.length;i++){if(!best||known[i].w>best.w)best=known[i];}
+ return best;
+}
+/*ENDPICK*/
+function lazySrc(el){
  var src=el.currentSrc||el.getAttribute('src')||'';
  if(!src||/^data:/i.test(src)){
   src=el.getAttribute('data-src')||el.getAttribute('data-original')||el.getAttribute('data-lazy-src')||
   el.getAttribute('data-lazy')||(/^data:/i.test(src)?'':src);
  }
- if(!src)return;
- var abs=absUrl(src);if(!abs)return;
+ return src;
+}
+function pictureSets(el,baseW,list){
+ var pic=el.parentElement;
+ if(!pic||pic.tagName!=='PICTURE')return;
+ for(var c=pic.firstElementChild;c;c=c.nextElementSibling){
+  if(c.tagName!=='SOURCE')continue;
+  var ty=(c.getAttribute('type')||'').toLowerCase();
+  if(ty&&!/^image\/(jpeg|png|webp|avif|gif)$/.test(ty))continue;
+  var md=c.getAttribute('media');
+  if(md){try{if(!window.matchMedia(md).matches)continue;}catch(e){continue;}}
+  var set=parseSrcset(c.getAttribute('srcset')||c.getAttribute('data-srcset'),baseW);
+  for(var k=0;k<set.length;k++)list.push(set[k]);
+ }
+}
+function image(el,href){
  var r=el.getBoundingClientRect(),rw=Math.round(r.width),rh=Math.round(r.height);
- var w=el.naturalWidth||rw,h=el.naturalHeight||rh;
+ var nw=el.naturalWidth||0,nh=el.naturalHeight||0;
+ var w=nw||rw,h=nh||rh;
  if((rw>0&&rw<24)||(rh>0&&rh<24)||(w===1&&h===1))return;
+ var base=rw>0?rw:nw,cands=[];
+ pictureSets(el,base,cands);
+ var a1=parseSrcset(el.getAttribute('srcset'),base),a2=parseSrcset(el.getAttribute('data-srcset'),base),q;
+ for(q=0;q<a1.length;q++)cands.push(a1[q]);
+ for(q=0;q<a2.length;q++)cands.push(a2[q]);
+ var src0=lazySrc(el),abs0=src0?absUrl(src0):null;
+ if(abs0)cands.push({u:src0,w:el.currentSrc&&nw>0?nw:0});
+ var pick=pickBest(cands,__TARGET__);
+ if(!pick)return;
+ var abs=absUrl(pick.u);if(!abs)return;
+ var fb=abs0&&abs0!==abs?abs0:null;
+ var cw=pick.w>0?pick.w:w;
+ var ch=h;
+ if(nw>0&&nh>0)ch=Math.round(cw*nh/nw);
+ else if(rw>0&&rh>0)ch=Math.round(cw*rh/rw);
  var idx=imgIndex[abs];
- if(idx===undefined){if(images.length>=IMGCAP)return;idx=images.length;images.push(abs);imgIndex[abs]=idx;}
- var b={t:'img',i:idx,alt:(el.getAttribute('alt')||'').slice(0,300),w:Math.min(w,20000),h:Math.min(h,20000)};
+ if(idx===undefined){
+  if(images.length>=IMGCAP)return;
+  idx=images.length;images.push(abs);fallbacks.push(fb);imgIndex[abs]=idx;
+ }
+ var b={t:'img',i:idx,alt:(el.getAttribute('alt')||'').slice(0,300),w:Math.min(cw,20000),h:Math.min(ch,20000)};
  if(href)b.href=href;
  push(b,60+(href?href.length:0));
 }
@@ -389,6 +456,7 @@ function walkEl(node){
   else for(var q=0;q<imgs.length;q++)anchorImgs.push(imgs[q]);
   return;
  }
+ if(tag==='BLOCKQUOTE'){flush();qd++;try{walkChildren(node);}finally{flush();qd--;}return;}
  var hm=/^H([1-6])$/.exec(tag);
  if(hm){
   flush();var sh=ctx;ctx={kind:'h',level:parseInt(hm[1],10),depth:0};
@@ -406,7 +474,7 @@ function walkEl(node){
  if(inA){addText(' ');walkChildren(node);addText(' ');return;}
  flush();walkChildren(node);flush();
 }
-var out={title:'',blocks:[],images:[],hosters:[],truncated:false};
+var out={title:'',blocks:[],images:[],fallbacks:[],hosters:[],truncated:false};
 try{
  var body=document.body||document.documentElement;
  root=document.querySelector('main,[role=main]');
@@ -429,13 +497,14 @@ try{
  }
 }catch(e){}
 out.title=String(document.title||'').slice(0,300);
-out.blocks=blocks;out.images=images;out.truncated=trunc;
+out.blocks=blocks;out.images=images;out.fallbacks=fallbacks;out.truncated=trunc;
 return out;
 })()
 """.replace("__CAP__", str(READER_BLOCK_CAP)).replace(
     "__TMAX__", str(READER_TEXT_MAX)).replace(
     "__BUDGET__", str(READER_MAX_JSON - 256 * 1024)).replace(
-    "__IMGCAP__", str(READER_IMAGE_CAP)).replace("__RUNCAP__", str(READER_RUNS_CAP))
+    "__IMGCAP__", str(READER_IMAGE_CAP)).replace("__RUNCAP__", str(READER_RUNS_CAP)).replace(
+    "__TARGET__", str(READER_IMAGE_TARGET))
 IMAGE_FETCH_JS = (
     "(function(u,cap){return fetch(u,{credentials:'include'}).then(function(r){"
     "if(!r.ok)return {err:'status'};var ct=(r.headers.get('content-type')||'').toLowerCase();"
@@ -871,6 +940,7 @@ class Tab:
         self.vp_cache = None       # {"token": vp_rev + rev, "map": viewport link map}
         self.vp_lock = threading.Lock()
         self.reader_images = []    # reader image index -> absolute http(s) URL (None = refused); Hub only
+        self.reader_fallbacks = [] # v0.1.36: index -> smaller alternative URL (or None); Hub only
 
 
 class Snapshot:
@@ -2682,7 +2752,10 @@ class RemoteBrowser:
             if runs is None:
                 return None
             if kind == "p":
-                return {"t": "p", "runs": runs}
+                block = {"t": "p", "runs": runs}
+                if item.get("q") is True:      # v0.1.36: block quote (a boolean only)
+                    block["q"] = True
+                return block
             depth = self._small_int(item.get("depth", 0), 0, 8)
             return {"t": "li", "runs": runs, "depth": depth if depth is not None else 0}
         if kind == "pre":
@@ -2763,6 +2836,13 @@ class RemoteBrowser:
         return {"title": title, "blocks": blocks, "count": len(blocks), "truncated": truncated,
                 "hoster_links": len(hosters)}, images
 
+    def _reader_fallbacks(self, value, count):
+        """Smaller alternative URL per image index (None when absent or invalid); Hub only."""
+        raw = value.get("fallbacks") if isinstance(value, dict) else None
+        raw = raw if isinstance(raw, list) else []
+        out = [self._http_url(u) for u in raw[:count]]
+        return out + [None] * (count - len(out))
+
     def reader(self, ident):
         """Reader data of the page: validated blocks (see the section comment)."""
         tab = self._tab(ident)
@@ -2780,10 +2860,12 @@ class RemoteBrowser:
             raise
         value = (result.get("result") or {}).get("value")
         data, images = self._reader_clean(value)
+        fallbacks = self._reader_fallbacks(value, len(images))
         with self._lock:
             if self._tabs.get(tab.id) is not tab:
                 raise TabGone("このタブはすでに閉じられています")
             tab.reader_images = images
+            tab.reader_fallbacks = fallbacks
             data.update({"url": tab.url, "host": self._host_of(tab.url)})
             if not data["title"]:
                 data["title"] = tab.title[:READER_TITLE_MAX]
@@ -2867,17 +2949,7 @@ class RemoteBrowser:
             return None
         return self._decode_image(value.get("d"))
 
-    def reader_image(self, ident, index):
-        """(bytes, mime type) of reader image `index`, read through the NAS browser."""
-        tab = self._tab(ident)
-        if isinstance(index, bool) or not isinstance(index, int) or index < 0:
-            raise BrowserError("画像の番号が不正です")
-        with self._lock:
-            images = tab.reader_images
-            url = images[index] if index < len(images) else None
-        if url is None:
-            raise ReaderImageGone("この画像は見つかりません。読み込み直してください")
-        self._touch()
+    def _fetch_reader_image(self, tab, url):
         data = self._image_from_resources(tab, url)
         if data is None:
             data = self._image_from_page(tab, url)
@@ -2887,6 +2959,28 @@ class RemoteBrowser:
         if kind is None:
             raise ImageRefused("対応していない画像形式です")
         return data, kind
+
+    def reader_image(self, ident, index):
+        """(bytes, mime type) of reader image `index`, read through the NAS browser."""
+        tab = self._tab(ident)
+        if isinstance(index, bool) or not isinstance(index, int) or index < 0:
+            raise BrowserError("画像の番号が不正です")
+        with self._lock:
+            images = tab.reader_images
+            url = images[index] if index < len(images) else None
+            fallbacks = tab.reader_fallbacks
+            fallback = fallbacks[index] if index < len(fallbacks) else None
+        if url is None:
+            raise ReaderImageGone("この画像は見つかりません。読み込み直してください")
+        self._touch()
+        try:
+            return self._fetch_reader_image(tab, url)
+        except (ImageRefused, ImageUnavailable):
+            # v0.1.36: the large srcset candidate was too big / unsupported / failed: use the
+            # smaller one the page itself showed (same 4 MB cap and magic-byte check).
+            if fallback is None or fallback == url:
+                raise
+            return self._fetch_reader_image(tab, fallback)
 
     # ------------------------------------------------------------ intercepts
     @staticmethod
