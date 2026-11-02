@@ -14,7 +14,7 @@
   - `eclipse-temurin:21-jre@sha256:0b99b3376fbb50dbf9c0af8535fdd5b8eb0d3fdfc8b1e4967f383b6919f6901a`
   - `debian:bookworm-slim@sha256:7ff6ba31527b9e336162fa061746c366c4b2032f4d2cff2078bea43f78efe3f8`
 - **ポートは一切公開しない（`-p` なし）。** 各コンテナ専用のユーザー定義ブリッジネットワーク（`qnapdl-jd2-net`, `qnapdl-browser-net`）に1台ずつ置き、HubはホストからコンテナIPへ直接接続する。LANからは経路がなく、ブラウザコンテナからJD2 APIにも届かない（別ネットワーク）。接続前に毎回 `docker inspect` で、宛先IPがラベル付きの自コンテナのものであることを確認する。
-- **ディスク書込を最小化**: `--log-driver none`、`--read-only` ルートFS、書込が必要な一時領域は `--tmpfs`（サイズ上限付き）。永続化するのはJD2のデータ（設定・キュー・アカウント・部分ファイル）とダウンロード成果物だけ。
+- **ディスク書込を最小化**: JD2は `--log-driver none`（ブラウザは出力をtmpfsに書き、失敗時のみ末尾を出す小さな `local` ログ。v0.1.18）、`--read-only` ルートFS、書込が必要な一時領域は `--tmpfs`（サイズ上限付き）。永続化するのはJD2のデータ（設定・キュー・アカウント・部分ファイル）とダウンロード成果物だけ。
 - **メモリ**: 各コンテナに `--memory` と `--memory-swap`（同値＝swap不使用）を設定。起動前に `/proc/meminfo` の `MemAvailable` を確認し、閾値未満なら起動しない（他アプリを止めない）。
 - 非root利用者（`--user 1000:1000`）、`--cap-drop ALL`、`--security-opt no-new-privileges`、`--pids-limit`。
 
@@ -31,7 +31,7 @@
 > **v0.1.16 実装メモ（設計からの差分・判断）**
 > - 実装: `remote_browser.py`（stdlib製の最小RFC 6455クライアント＋CDPセッション管理）、`container_runtime.py` の `browser_*`/`run_browser`/`stats`、`container/browser/{Dockerfile,entrypoint.sh}`（QPKGに同梱、`scripts/build-qpkg.sh` が `container/` をコピー）。APIは `/api/rb/*`（status/setup/stop/tabs/tabs/close/frame/input/links/navigate）。CDPの生の中継は無く、固定のメソッドだけをHubが送る。
 > - イメージ: `qnapdl-browser:<Dockerfile+entrypoint.sh のSHA-256先頭12桁>`。ビルド文脈は同梱の固定フォルダのみ（2ファイル以外が混じると拒否）。内容が変われば別タグになり、古いHub製イメージは再ビルド時に削除。
-> - 起動引数（完全一致をテスト）: `--read-only --log-driver none --memory 2g --memory-swap 2g --shm-size 512m --pids-limit 1024 --cap-drop ALL --cap-add SYS_ADMIN --security-opt no-new-privileges --user 1000:1000 --tmpfs /profile:size=512m --tmpfs /tmp:size=256m`、`-p`・マウントなし、専用ネットワーク `qnapdl-browser-net`。seccompは既定のまま。
+> - 起動引数（v0.1.16時点。v0.1.18で下記の通り変更）: `--read-only --log-driver none --memory 2g --memory-swap 2g --shm-size 512m --pids-limit 1024 --cap-drop ALL --cap-add SYS_ADMIN --security-opt no-new-privileges --user 1000:1000 --tmpfs /profile:size=512m --tmpfs /tmp:size=256m`、`-p`・マウントなし、専用ネットワーク `qnapdl-browser-net`。seccompは既定のまま。
 > - **サンドボックスと `--cap-add SYS_ADMIN`（最大の未検証事項、ブラウザのみ・JD2には付けない）**: サンドボックス無効化オプションは使わない。DebianのChromiumはユーザー名前空間のサンドボックスを使う。Dockerの既定seccompは、名前空間フラグ付きの `clone`/`unshare` を、コンテナ作成時のcapabilityセットに `CAP_SYS_ADMIN` が含まれる場合にだけ許可する。そこで `--cap-drop ALL` のあとに `--cap-add SYS_ADMIN` だけを足す（seccompは既定のまま）。
 >   - **なぜ実権限にならないか**: プロセスは `--user 1000:1000`（非root）＋`no-new-privileges` で動く。非rootユーザーではSYS_ADMINはbounding setにだけ入り、effective/permitted/ambientは空のまま、`no-new-privileges` により後から引き上げることもできない。作れるのは**非特権のユーザー名前空間**だけで、これがChromiumの名前空間サンドボックスの必要条件。
 >   - **実行時の自己検査**: `entrypoint.sh` は最初に `/proc/self/status` の `CapEff` が `0000000000000000` であることを確認し、違えば終了コード79で終了する（selftestも同じ）。Dockerの挙動が想定と違ってもChromiumが実権限で動くことはない。続いて `unshare --user …` で名前空間を試し、使えなければ78で終了。初期設定の「サンドボックスの確認」段階（`docker run --rm … selftest`）は78・79を区別せず、どちらも設定を中止し、カーネルのユーザー名前空間とこの検査の両方に触れた日本語メッセージを出す（サンドボックスは無効にしない）。
@@ -43,6 +43,14 @@
 > - 自動停止: タブ0で5分、または閲覧者の操作が10分ない、またはCDP接続が切れた、いずれかで全ターゲットを閉じて `docker stop -t 5` → `rm`。`/api/rb/status` のポーリングは操作に数えない。Hub終了時も停止。Hub起動時に残っていたHub製コンテナは削除（クラッシュ後のメモリ解放）。
 > - メモリ: タブを開く前に `MemAvailable ≥ 2GiB`（読めなければ開かない）と、稼働中なら `docker stats --no-stream`（自コンテナのみ、5秒キャッシュ）で使用率80%未満を確認。確認できないときも開かない。
 > - リンク: `Runtime.evaluate` で `a[href]` を最大5000件取得し、60KB以下に分割して `rapidgator_extract` へ。結果は最大100件（既存の抽出commitの上限）。
+
+> **v0.1.18 実機修正メモ（起動直後に終了する問題の調査性と原因対策）**
+> - 実機で初期設定のselftestは通るのにタブを開くと「ブラウザコンテナが起動直後に終了しました（終了コード 1）」となり、`--log-driver none` のため理由が不明だった。
+> - **診断性**: `entrypoint.sh` はXvfbの出力を `/tmp/xvfb.log`、Chromiumの出力を `/tmp/chromium.log`（どちらもtmpfs）へ書く。通常運転では何も出力しない（ディスク書込は最小）。子プロセスが落ちたときだけ、`qnapdl-browser: <xvfb|chromium|socat> exited` の見出しと該当ログの `tail -n 60` をstderrへ出す。終了コード: 70 Xvfbのソケット待ち時間切れ、71 Xvfb終了、72 Chromium終了、73 socat終了、78 ユーザー名前空間なし、79 実効capabilityあり。
+> - **ログドライバ**: ブラウザのみ `--log-driver local --log-opt max-size=256k --log-opt max-file=1`（上限付き・1ファイル）。JD2は従来どおり `none`、selftest（`--rm`）も `none`。
+> - **Hub側**: 起動直後の終了を検出すると、コンテナを削除する前に固定操作 `logs_tail("qnapdl-browser")`（`docker logs --tail 80`。名前固定・Hubラベル確認・制御文字除去・末尾2000文字）で末尾を読み、RAMログ（設定 › NASブラウザ › ログ、`GET /api/rb/log`）へ全文、エラー表示（トースト）へ先頭300文字相当（末尾300文字）を載せる。終了コードは日本語に変換（70 画面サーバーの起動待ちが時間切れ／71 画面サーバー(Xvfb)が終了／72 Chromiumが終了／73 中継(socat)が終了／78・79 従来文言）。ログ取得に失敗しても元のメッセージだけで続行する。
+> - **原因対策（推定）**: `--tmpfs /profile:rw,nosuid,nodev,size=512m,uid=1000,gid=1000,mode=0700`（非rootのChromiumが書けるように所有者を指定）、`--tmpfs /tmp:rw,nosuid,nodev,size=256m,mode=1777`。Chromiumに `--disable-gpu --password-store=basic` を追加。`HOME=/tmp` と `/tmp/.config`・`/tmp/.cache` を起動前に作成。サンドボックスは無効にしない。
+> - **イメージ更新**: `entrypoint.sh` が変わるためタグ（内容ハッシュ）が変わる。新タグが無く、古いHub製イメージだけがある場合、`/api/rb/status` は `update_needed: true`、理由「NASブラウザの更新が必要です（初期設定を再実行）」を返し、タブを開こうとしても同文言で拒否する（存在しないタグでの `docker run` は行わない）。設定画面のボタンは「初期設定を再実行」になる。
 
 （以下は元の設計）
 - イメージ: 初期設定時に `debian:bookworm-slim@…` から `chromium`・`xvfb`・`socat`・日本語フォントを入れたイメージを `docker build` で作る（Debianのセキュリティ更新付きChromium。ビルドは利用者のボタン操作時のみ）。「更新」で再ビルド。

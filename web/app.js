@@ -3062,20 +3062,21 @@ function renderBrowserStatus(r) {
   state.rbStatus = r;
   const cs = r.container_station || {};
   const setup = r.phase === "setup";
-  $("rbState").textContent = !r.image_ready && !setup ? "未設定" : RB_PHASE_LABELS[r.phase] || r.phase;
+  $("rbState").textContent = r.update_needed && !setup ? "更新が必要" : !r.image_ready && !setup ? "未設定" : RB_PHASE_LABELS[r.phase] || r.phase;
   $("rbState").classList.toggle("is-ok", r.phase === "running");
   setShown("rbNoContainer", cs.available === false);
   $("rbSetup").hidden = setup || cs.available === false || r.phase !== "stopped";
-  $("rbSetup").textContent = r.image_ready ? "イメージを再作成" : "初期設定（イメージ作成）";
+  $("rbSetup").textContent = r.image_ready ? "イメージを再作成" :
+    r.update_needed ? "初期設定を再実行" : "初期設定（イメージ作成）";
   $("rbStop").hidden = !(r.phase === "running" || r.phase === "starting");
   const parts = [];
   if (r.memory) parts.push("ブラウザのメモリ " + r.memory.used_mib + " / " + r.memory.limit_mib + " MiB（" + r.memory.percent + "%）");
   if (typeof r.available_mib === "number") parts.push("NAS空きメモリ " + r.available_mib + " MiB");
   parts.push("タブ " + (r.tabs || []).length + " / " + r.max_tabs);
   $("rbMemory").textContent = parts.join(" · ");
-  const reason = r.image_ready && r.reason ? r.reason : "";
+  const reason = (r.image_ready || r.update_needed) && r.reason ? r.reason : "";
   $("rbReason").hidden = !reason;
-  $("rbReason").textContent = reason ? "いまは開けません: " + reason : "";
+  $("rbReason").textContent = reason ? (r.update_needed ? reason : "いまは開けません: " + reason) : "";
   $("rbError").hidden = !r.error;
   $("rbError").textContent = r.error || "";
   const steps = r.steps || [];
@@ -3093,6 +3094,11 @@ function renderBrowserStatus(r) {
     return li;
   }));
   syncBrowserPoll();
+}
+
+async function loadBrowserLog() {
+  const data = await api("/api/rb/log");
+  $("rbLog").textContent = (data.lines || []).join("\n") || "まだログはありません";
 }
 
 async function loadBrowserStatus(force = false) {
@@ -3181,6 +3187,9 @@ function wireEngine() {
   });
   $("engineLogBox").addEventListener("toggle", () => {
     if ($("engineLogBox").open) perform(loadEngineLog);
+  });
+  $("rbLogBox").addEventListener("toggle", () => {
+    if ($("rbLogBox").open) perform(loadBrowserLog);
   });
   document.addEventListener("visibilitychange", syncEnginePoll);
 }

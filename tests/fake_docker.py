@@ -20,6 +20,8 @@ class FakeDocker:
         self.build_fail = False
         self.stats_out = "512MiB / 2GiB|25.00%"
         self.stats_fail = False
+        self.container_logs = ""
+        self.logs_fail = False
         self.run_exits = None     # exit code: the started container is already exited
 
     def isfile(self, path):
@@ -74,6 +76,10 @@ class FakeDocker:
         if a[0] == "rmi":
             self.images.discard(a[1])
             return self.result(0, a[1])
+        if a[0] == "logs":
+            if self.logs_fail or a[-1] not in self.containers:
+                return self.result(1, "", "no such container")
+            return self.result(0, "", self.container_logs)
         if a[0] == "stats":
             if self.stats_fail or a[-1] not in self.containers:
                 return self.result(1, "", "no such container")

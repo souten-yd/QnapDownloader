@@ -114,7 +114,7 @@ class HttpTests(unittest.TestCase):
         self.assertEqual(code, 200)
         self.csrf = body["csrf"]
 
-    RB_GET = ("/api/rb/status", "/api/rb/frame?tab=b1&since=0", "/api/rb/links?tab=b1")
+    RB_GET = ("/api/rb/status", "/api/rb/log", "/api/rb/frame?tab=b1&since=0", "/api/rb/links?tab=b1")
     RB_POST = (("/api/rb/setup", {"confirmed": True}), ("/api/rb/stop", {"confirmed": True}),
                ("/api/rb/tabs", {"url": "https://example.com/"}), ("/api/rb/tabs/close", {"id": "b1"}),
                ("/api/rb/navigate", {"tab": "b1", "url": "https://example.com/"}),
@@ -230,7 +230,7 @@ class HttpTests(unittest.TestCase):
                                          headers={"Host": "192.168.68.57:17864"})
         with self.client.open(request, timeout=4) as response:
             self.assertEqual(response.status, 200)
-            self.assertEqual(json.load(response)["version"], "0.1.17")
+            self.assertEqual(json.load(response)["version"], "0.1.18")
         with self.client.open(self.url + "/icon.svg", timeout=4) as response:
             self.assertEqual(response.status, 200)
             self.assertEqual(response.headers.get_content_type(), "image/svg+xml")
@@ -860,7 +860,7 @@ class HttpTests(unittest.TestCase):
         self.assertFalse(info["supported"])
         code, _ = self.req("/api/update/apply", {"version": "v0.1.8"})
         self.assertEqual(code, 400)
-        self.assertEqual(self.req("/api/health")[1]["version"], "0.1.17")
+        self.assertEqual(self.req("/api/health")[1]["version"], "0.1.18")
         self.assertFalse(self.req("/api/jd2/status")[1]["connected"])
         self.assertEqual(self.req("/api/jd2/update/apply", {"confirmed": True})[0], 400)
         self.assertEqual(self.req("/api/jd2/preset/apply", {"confirmed": True})[0], 400)

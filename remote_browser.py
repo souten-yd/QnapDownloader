@@ -20,6 +20,7 @@ import socket
 import struct
 import threading
 import time
+from collections import deque
 from urllib.parse import urlsplit
 
 import browser_safety
@@ -52,6 +53,10 @@ WS_PATH = re.compile(r"/devtools/browser/[A-Za-z0-9-]{1,100}\Z")
 TARGET_ID = re.compile(r"[A-Za-z0-9]{8,64}\Z")
 TAB_ID = re.compile(r"b[0-9]{1,6}\Z")
 BASE64 = re.compile(r"[A-Za-z0-9+/]+={0,2}\Z")
+
+LOG_LINES = 200
+TOAST_TAIL_CHARS = 300
+UPDATE_NEEDED = "NASブラウザの更新が必要です（初期設定を再実行）"
 
 STEP_DEFS = (
     ("precheck", "Container Stationの検出と事前確認"),
@@ -476,6 +481,20 @@ class RemoteBrowser:
         self._setup_active = False
         self._steps = self._fresh_steps()
         self._error = None
+        self._stale = False
+        self._ring = deque(maxlen=LOG_LINES)
+        self._ring_lock = threading.Lock()
+
+    # ------------------------------------------------------------- RAM log
+    def log(self, text):
+        with self._ring_lock:
+            for line in str(text).splitlines() or [""]:
+                for start in range(0, max(len(line), 1), 500):
+                    self._ring.append(line[start:start + 500])
+
+    def log_lines(self):
+        with self._ring_lock:
+            return list(self._ring)
 
     # ------------------------------------------------------------- basics
     @staticmethod
@@ -515,12 +534,18 @@ class RemoteBrowser:
             cached = self._image_cache
         if cached is not None and not refresh and now - cached[0] < SETUP_CACHE_TTL:
             return cached[1]
+        stale = False
         try:
             ready = self.runtime.browser_image_present(tag)
+            if not ready:
+                # An older Hub-built image exists: the shipped files changed, so
+                # the tag no longer matches and setup must be re-run.
+                stale = bool(self.runtime.browser_image_tags())
         except cr.ContainerError:
             ready = False
         with self._lock:
             self._image_cache = (now, ready)
+            self._stale = stale and not ready
         return ready
 
     def _stats(self):
@@ -568,6 +593,7 @@ class RemoteBrowser:
         station = self.container_station()
         ready = bool(station) and self.image_ready()
         with self._lock:
+            stale = self._stale
             state = self._state
             setup = self._setup_active
             tabs = [{"id": t.id, "url": t.url, "title": t.title} for t in self._tabs.values()]
@@ -589,9 +615,12 @@ class RemoteBrowser:
             reason = self.memory_reason()
             if reason is None and len(tabs) >= MAX_TABS:
                 reason = "NASブラウザのタブは最大%d枚です" % MAX_TABS
+        if bool(station) and not ready and stale and not setup:
+            reason = UPDATE_NEEDED
         return {
             "container_station": {"available": bool(station), "version": station},
             "image_ready": ready,
+            "update_needed": bool(station) and not ready and stale,
             "phase": "setup" if setup else state,
             "setup_running": setup,
             "steps": steps,
@@ -699,17 +728,33 @@ class RemoteBrowser:
         self.runtime.stop(cr.BROWSER_NAME, grace=cr.BROWSER_STOP_GRACE)
         self.runtime.remove(cr.BROWSER_NAME)
 
+    def _early_exit_message(self, code):
+        """Message for a container that exited early; reads its logs before removal."""
+        base = cr.BROWSER_EXIT_MESSAGES.get(code)
+        base = ("%s（終了コード %s）" % (base, code) if base else
+                "ブラウザコンテナが起動直後に終了しました（終了コード %s）" % code)
+        try:
+            tail = self.runtime.logs_tail(cr.BROWSER_NAME)
+        except cr.ContainerError:
+            tail = ""
+        self.log(base)
+        if not tail:
+            return base
+        self.log(tail)
+        flat = " ".join(tail.split())[-TOAST_TAIL_CHARS:]
+        return "%s: %s" % (base, flat)
+
     def _wait_connect(self):
         deadline = self._clock() + self._start_timeout
         while True:
             info = self.runtime.container_state(cr.BROWSER_NAME)
             if not info["running"]:
-                if info.get("exit_code") == cr.BROWSER_EXIT_NO_USERNS:
+                code = info.get("exit_code")
+                if code == cr.BROWSER_EXIT_NO_USERNS:
                     raise BrowserError(cr.NO_USERNS_MESSAGE)
-                if info.get("exit_code") == cr.BROWSER_EXIT_CAPS:
+                if code == cr.BROWSER_EXIT_CAPS:
                     raise BrowserError(cr.CAPS_MESSAGE)
-                raise BrowserError("ブラウザコンテナが起動直後に終了しました（終了コード %s）" %
-                                   info.get("exit_code"))
+                raise BrowserError(self._early_exit_message(code))
             try:
                 ip = self.runtime.inspect_ip(cr.BROWSER_NAME, cr.BROWSER_NET)
                 return self._connect(ip)
@@ -866,7 +911,10 @@ class RemoteBrowser:
                 running = self._state == "running"
             if not running:
                 if not self.image_ready(refresh=True):
-                    raise BrowserError("NASブラウザの初期設定（イメージ作成）が必要です")
+                    with self._lock:
+                        stale = self._stale
+                    raise BrowserError(UPDATE_NEEDED if stale else
+                                       "NASブラウザの初期設定（イメージ作成）が必要です")
             reason = self.memory_reason()
             if reason:
                 raise BrowserError(reason)

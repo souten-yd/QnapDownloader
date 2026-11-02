@@ -59,10 +59,23 @@ BROWSER_CDP_PORT = 9223
 BROWSER_UID = 1000
 BROWSER_MIN_AVAILABLE_KIB = 2 * 1024 * 1024   # MemAvailable >= 2 GiB to open a tab
 BROWSER_CONTEXT_FILES = frozenset(("Dockerfile", "entrypoint.sh"))
+BROWSER_EXIT_XVFB_TIMEOUT = 70  # entrypoint exit code: Xvfb socket never appeared
+BROWSER_EXIT_XVFB = 71         # entrypoint exit code: Xvfb died
+BROWSER_EXIT_CHROMIUM = 72     # entrypoint exit code: Chromium died
+BROWSER_EXIT_SOCAT = 73        # entrypoint exit code: socat relay died
 BROWSER_EXIT_NO_USERNS = 78    # entrypoint exit code: user namespaces unavailable
 BROWSER_EXIT_CAPS = 79         # entrypoint exit code: process has effective capabilities
 BROWSER_TAG = re.compile(r"qnapdl-browser:[0-9a-f]{12}\Z")
 BROWSER_BUILD_TIMEOUT = 3600
+BROWSER_LOG_LINES = 80          # `docker logs --tail` after an early exit
+BROWSER_LOG_CHARS = 2000        # sanitized tail kept for the RAM log / message
+BROWSER_EXIT_MESSAGES = {
+    BROWSER_EXIT_XVFB_TIMEOUT: "画面サーバーの起動待ちが時間切れになりました",
+    BROWSER_EXIT_XVFB: "画面サーバー(Xvfb)が終了しました",
+    BROWSER_EXIT_CHROMIUM: "Chromiumが終了しました",
+    BROWSER_EXIT_SOCAT: "中継(socat)が終了しました",
+}
+_CONTROL_CHARS = re.compile(r"[\x00-\x09\x0b-\x1f\x7f-\x9f]")
 
 MAX_OUTPUT = 1024 * 1024
 _BAD_PATH_CHARS = set(',"\'\n\r\0')
@@ -471,6 +484,15 @@ class Runtime:
         self._check_browser_tag(tag)
         return self._docker(["image", "inspect", "--format", "{{.Id}}", tag], 20).returncode == 0
 
+    def browser_image_tags(self):
+        """Hub-built browser image tags present locally (label + repository checked)."""
+        result = self._docker(["images", "--filter", "label=" + LABEL,
+                               "--filter", "reference=" + BROWSER_REPO + ":*",
+                               "--format", "{{.Repository}}:{{.Tag}}"], 30)
+        if result.returncode != 0:
+            return []
+        return [line for line in (result.stdout or "").split() if BROWSER_TAG.match(line)]
+
     def browser_build_args(self, tag, context_dir):
         self._check_browser_tag(tag)
         _safe_path(context_dir, "ビルド用フォルダ")
@@ -502,7 +524,7 @@ class Runtime:
         return removed
 
     @staticmethod
-    def _browser_hardening():
+    def _browser_hardening(log_args=("--log-driver", "none")):
         """Shared hardening for the browser container and its selftest.
 
         WHY `--cap-drop ALL` IS FOLLOWED BY `--cap-add SYS_ADMIN` (browser only,
@@ -533,7 +555,7 @@ class Runtime:
         """
         return [
             "--read-only",
-            "--log-driver", "none",
+        ] + list(log_args) + [
             "--memory", BROWSER_MEMORY, "--memory-swap", BROWSER_MEMORY,
             "--shm-size", BROWSER_SHM,
             "--pids-limit", BROWSER_PIDS,
@@ -541,16 +563,24 @@ class Runtime:
             "--cap-add", "SYS_ADMIN",
             "--security-opt", "no-new-privileges",
             "--user", "%d:%d" % (BROWSER_UID, BROWSER_UID),
-            "--tmpfs", "/profile:size=512m",
-            "--tmpfs", "/tmp:size=256m",
+            "--tmpfs", "/profile:rw,nosuid,nodev,size=512m,uid=%d,gid=%d,mode=0700" %
+            (BROWSER_UID, BROWSER_UID),
+            "--tmpfs", "/tmp:rw,nosuid,nodev,size=256m,mode=1777",
         ]
 
     def browser_run_args(self, tag):
         """Exact `docker run` list: no -p, no mounts, default seccomp."""
         self._check_browser_tag(tag)
+        # Minimal disk writes: Chromium/Xvfb output goes to tmpfs files inside
+        # the container, so normal operation logs nothing. Only a dying
+        # entrypoint prints the tail of those files. `local` with a 256k cap and
+        # one file bounds that to a tiny, rotated file (JD2 keeps `none`), and
+        # lets the Hub read the failure reason via `docker logs` before removal.
+        log_args = ("--log-driver", "local", "--log-opt", "max-size=256k",
+                    "--log-opt", "max-file=1")
         return (["run", "-d", "--name", BROWSER_NAME, "--label", LABEL,
                  "--network", BROWSER_NET, "--restart", "no"] +
-                self._browser_hardening() + [tag])
+                self._browser_hardening(log_args) + [tag])
 
     def browser_selftest_args(self, tag):
         self._check_browser_tag(tag)
@@ -579,6 +609,28 @@ class Runtime:
         if result.returncode != 0:
             raise ContainerError("コンテナを起動できません: " + self._tail(result))
         return (result.stdout or "").strip()[:80]
+
+    def logs_tail(self, name):
+        """Sanitized last lines of our own labelled browser container's logs.
+
+        Fixed operation: only the browser container name, only when the
+        container carries the Hub label. Control characters are removed and the
+        result is capped at BROWSER_LOG_CHARS (the end is kept).
+        """
+        if name != BROWSER_NAME:
+            raise ContainerError("許可されていないコンテナ名です")
+        info = self._inspect(name)
+        if info is None:
+            raise ContainerError("コンテナがありません")
+        if not info["managed"]:
+            raise ContainerError("Hub管理外のコンテナのログは読みません")
+        result = self._docker(["logs", "--tail", str(BROWSER_LOG_LINES), name], 20)
+        if result.returncode != 0:
+            raise ContainerError("コンテナのログを取得できません")
+        text = (result.stdout or "") + (result.stderr or "")
+        text = text.replace("\r\n", "\n").replace("\r", "\n").replace("\t", " ")
+        text = _CONTROL_CHARS.sub("", text).strip()
+        return text[-BROWSER_LOG_CHARS:]
 
     def stats(self, name):
         """Memory use of our own named container: {used_bytes, limit_bytes, percent}."""
