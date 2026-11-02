@@ -688,3 +688,7 @@ h5.reader-h,h6.reader-h{font-size:1em}
 .menu-toggle[aria-checked="true"] .menu-check{background:var(--accent)}
 .menu-toggle[aria-checked="true"] .menu-check::after{left:16px}
 .menu .menu-danger{color:var(--danger)}
+/* v0.1.37: gesture hint */
+.gesture-hint{position:fixed;left:50%;top:calc(env(safe-area-inset-top) + 64px);transform:translateX(-50%);z-index:80;padding:8px 16px;
+  border-radius:999px;background:rgba(0,0,0,.75);color:#fff;font-size:14px;font-weight:600;pointer-events:none}
+.gesture-hint[hidden]{display:none}

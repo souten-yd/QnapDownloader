@@ -1305,3 +1305,17 @@ eq(readerSavedTop(rb, "u99"), 99, "newest kept");
                        ".reader-quote", "rdShimmer"):
             self.assertIn(needle, self.css)
         self.assertNotRegex(self.css, r"\.rd-justify[^{]*\.reader-(h|card)")         # never justify headings or cards
+
+
+class GestureAndAutoLiveTest(unittest.TestCase):
+    """v0.1.37: flick back/forward, drag down from the toolbar to close, auto-live returns on busy pages."""
+
+    def test_gestures_and_auto_live(self):
+        app = (Path(__file__).resolve().parents[1] / "web" / "app.js").read_text(encoding="utf-8")
+        self.assertIn("function wireGestures()", app)
+        self.assertIn("stepHistory(tab, dx > 0 ? -1 : 1)", app)
+        self.assertIn("GESTURE_EDGE_PX", app)             # screen edges stay with iOS
+        self.assertIn("離すとタブを閉じます", app)
+        self.assertIn("now - rb.autoQuiet < AUTO_SETTLE_MS", app)
+        rb = (Path(__file__).resolve().parents[1] / "remote_browser.py").read_text(encoding="utf-8")
+        self.assertIn("innerText)||'').length<400", rb)

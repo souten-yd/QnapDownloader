@@ -1209,22 +1209,25 @@ function applyRemoteMeta(tab, f) {
 const AUTO_POLL_MS = 1500;
 const AUTO_CLEAN_NEEDED = 2;
 const AUTO_TIMEOUT_MS = 90000;
+const AUTO_SETTLE_MS = 3000;
 
 // Pure state step (unit-tested in node). Returns "enter" | "return" | "chip" | null.
 function challengeStep(rb, challenge, loading, now, userLive) {
   if (!rb.autoLive) {
     if (challenge && !userLive) {
-      rb.autoLive = true; rb.autoSince = now; rb.autoClean = 0; rb.autoChip = false;
+      rb.autoLive = true; rb.autoSince = now; rb.autoClean = 0; rb.autoChip = false; rb.autoQuiet = 0;
       return "enter";
     }
     return null;
   }
   if (challenge) {
-    rb.autoClean = 0;
+    rb.autoClean = 0; rb.autoQuiet = 0;
     if (!rb.autoChip && now - rb.autoSince >= AUTO_TIMEOUT_MS) { rb.autoChip = true; return "chip"; }
     return null;
   }
-  if (loading) { rb.autoClean = 0; return null; }
+  // Ad-heavy pages never finish "loading": 3 s after the check page is gone counts as settled (v0.1.37).
+  if (!rb.autoQuiet) rb.autoQuiet = now;
+  if (loading && now - rb.autoQuiet < AUTO_SETTLE_MS) { rb.autoClean = 0; return null; }
   rb.autoClean++;
   if (rb.autoClean >= AUTO_CLEAN_NEEDED) {
     rb.autoLive = false; rb.autoClean = 0; rb.autoChip = false;
@@ -3991,6 +3994,75 @@ function ensureRemote() {
   wireRemote();
 }
 
+// v0.1.37 gestures on the NAS browser:
+// - a quick horizontal flick over the page goes back (finger to the right) / forward;
+//   flicks starting at the screen edges are left to iOS.
+// - dragging down from the toolbar closes the tab (a hint shows while armed).
+const GESTURE_FLICK_PX = 90;
+const GESTURE_FLICK_MS = 450;
+const GESTURE_EDGE_PX = 24;
+const GESTURE_CLOSE_PX = 110;
+
+function gestureHint(text) {
+  const hint = $("gestureHint");
+  hint.textContent = text || "";
+  hint.hidden = !text;
+}
+
+function wireGestures() {
+  const view = $("remoteView");
+  let flick = null;
+  view.addEventListener("touchstart", event => {
+    flick = null;
+    if (event.touches.length !== 1) return;
+    const t = event.touches[0];
+    if (t.clientX < GESTURE_EDGE_PX || t.clientX > window.innerWidth - GESTURE_EDGE_PX) return;
+    flick = {x: t.clientX, y: t.clientY, at: performance.now()};
+  }, {passive: true});
+  view.addEventListener("touchmove", event => { if (event.touches.length !== 1) flick = null; }, {passive: true});
+  view.addEventListener("touchend", event => {
+    const f = flick;
+    flick = null;
+    if (!f || event.changedTouches.length !== 1) return;
+    const t = event.changedTouches[0];
+    const dx = t.clientX - f.x, dy = t.clientY - f.y;
+    if (performance.now() - f.at > GESTURE_FLICK_MS || Math.abs(dx) < GESTURE_FLICK_PX || Math.abs(dx) < 2.5 * Math.abs(dy)) return;
+    if (!$("readerViewer").hidden) return;                 // the image viewer swipes between images
+    const tab = activeWebTab();
+    if (!tab || !tab.rb) return;
+    state.gestureAt = Date.now();
+    dlog("ui", "info", "gesture", {kind: dx > 0 ? "back" : "forward"});
+    gestureHint(dx > 0 ? "← 戻る" : "進む →");
+    setTimeout(() => gestureHint(""), 600);
+    perform(() => stepHistory(tab, dx > 0 ? -1 : 1));
+  }, {passive: true});
+
+  const bar = document.querySelector(".toolbar");
+  let pull = null;
+  bar.addEventListener("touchstart", event => {
+    pull = null;
+    const tab = activeWebTab();
+    if (!tab || event.touches.length !== 1 || event.target.closest("input,textarea,.menu")) return;
+    pull = {x: event.touches[0].clientX, y: event.touches[0].clientY, armed: false, id: tab.id};
+  }, {passive: true});
+  bar.addEventListener("touchmove", event => {
+    if (!pull || event.touches.length !== 1) return;
+    const t = event.touches[0];
+    const armed = t.clientY - pull.y > GESTURE_CLOSE_PX && Math.abs(t.clientX - pull.x) < 80;
+    if (armed !== pull.armed) { pull.armed = armed; gestureHint(armed ? "離すとタブを閉じます" : ""); }
+  }, {passive: true});
+  const end = () => {
+    const p = pull;
+    pull = null;
+    gestureHint("");
+    if (!p || !p.armed) return;
+    const tab = activeWebTab();
+    if (tab && tab.id === p.id) { dlog("ui", "info", "gesture", {kind: "close"}); closeTab(tab.id); }
+  };
+  bar.addEventListener("touchend", end, {passive: true});
+  bar.addEventListener("touchcancel", () => { pull = null; gestureHint(""); }, {passive: true});
+}
+
 function wireRemote() {
   const stage = $("remoteStage");
   stage.addEventListener("pointerdown", event => {
@@ -4119,6 +4191,7 @@ function wireRemote() {
   document.addEventListener("visibilitychange", syncRemotePoll);
   wireTiles();
   wireReader();
+  wireGestures();
 }
 
 function refreshAfterTabChange() {

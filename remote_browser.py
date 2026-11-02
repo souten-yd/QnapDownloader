@@ -154,8 +154,11 @@ CHALLENGE_TITLES = ("just a moment", "しばらくお待ちください")
 CHALLENGE_URL = "/cdn-cgi/challenge"
 # Page-side check (v0.1.29): Cloudflare's interstitial keeps its normal title on some
 # sites, so the DOM is asked too. Re-evaluated after every load event, at most once per second.
-CHALLENGE_JS = ("!!(window._cf_chl_opt||document.querySelector('#challenge-form,#challenge-stage,"
-                ".cf-turnstile,iframe[src*=\"challenges.cloudflare.com\"]'))")
+# v0.1.37: a Turnstile widget inside an ordinary page (comment or login form) is not an
+# interstitial: it only counts when the page has almost no text of its own.
+CHALLENGE_JS = ("!!(window._cf_chl_opt||document.querySelector('#challenge-form,#challenge-stage')||"
+                "(document.querySelector('.cf-turnstile,iframe[src*=\"challenges.cloudflare.com\"]')&&"
+                "((document.body&&document.body.innerText)||'').length<400))")
 CHALLENGE_CHECK_INTERVAL = 1.0
 SNAP_JS = (
     "(function(){try{if(!window.__qdlMut){var m=new MutationObserver(function(){window.__qdlDirty=true});"
