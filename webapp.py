@@ -26,7 +26,7 @@ import engine_supervisor
 import remote_browser
 import updater
 
-VERSION = "0.1.20"
+VERSION = "0.1.21"
 PORT = 17864
 ROOT = Path(__file__).resolve().parent
 FILES = {"/": ("web/index.html", "text/html; charset=utf-8"),
@@ -429,7 +429,7 @@ class Handler(BaseHTTPRequestHandler):
                 since_text = query.get("since", ["0"])[0]
                 if not since_text.isdecimal() or len(since_text) > 12:
                     raise ValueError("sinceが不正です")
-                wait_text = query.get("wait", [str(remote_browser.FRAME_WAIT_MAX)])[0]
+                wait_text = query.get("wait", [str(int(remote_browser.FRAME_WAIT_MAX))])[0]
                 if not wait_text.isdecimal() or len(wait_text) > 2 or int(wait_text) > 10:
                     raise ValueError("waitが不正です")
                 return self.send_data(200, self.server.rb.frame(
