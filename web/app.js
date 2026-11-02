@@ -487,6 +487,8 @@ function applyRoute() {
   if (route.redirect) { replaceRoute(route.redirect); return; }
   if (route.view === "tab" && !findTab(route.tabId)) { replaceRoute("#/home"); return; }
   state.route = route;
+  // The folder sheet belongs to Settings › JD2 › 保存先: leaving it closes the sheet.
+  if (state.pickerOpen && !(route.view === "settings" && route.section === "jd2")) setPicker(false);
   if (route.view === "links" && route.paste) {
     // Drop the pasted text from the address bar and history state at once.
     history.replaceState(null, "", "#/links");

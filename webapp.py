@@ -807,6 +807,9 @@ class Handler(BaseHTTPRequestHandler):
             return self.reject(str(exc), 415)
         except remote_browser.ImageUnavailable as exc:
             return self.reject(str(exc), 502)
+        except (BrokenPipeError, ConnectionResetError):
+            self.close_connection = True     # the viewer left (e.g. a held long-poll): nothing to answer
+            return None
         except (OSError, ValueError, RuntimeError, KeyError, sqlite3.Error) as exc:
             return self.reject(str(exc))
         self.reject("APIが存在しません", 404)
@@ -866,6 +869,9 @@ class Handler(BaseHTTPRequestHandler):
                     # A lone https URL (Safari's share of the page itself).
                     found = [self.store.validate_url(single)]
             added = self.store.add_links(found) if found else 0
+        except (BrokenPipeError, ConnectionResetError):
+            self.close_connection = True     # the viewer left (e.g. a held long-poll): nothing to answer
+            return None
         except (OSError, ValueError, KeyError, RuntimeError, json.JSONDecodeError, sqlite3.Error) as exc:
             return self.reject(str(exc))
         return self.send_data(200, {"added": added, "found": len(found)})
@@ -1137,6 +1143,9 @@ class Handler(BaseHTTPRequestHandler):
             return self.reject(str(exc), 404)
         except remote_browser.ProbeQueueFull as exc:
             return self.reject(str(exc), 429)
+        except (BrokenPipeError, ConnectionResetError):
+            self.close_connection = True     # the viewer left (e.g. a held long-poll): nothing to answer
+            return None
         except (OSError, ValueError, KeyError, RuntimeError, json.JSONDecodeError, sqlite3.Error) as exc:
             return self.reject(str(exc))
         self.reject("APIが存在しません", 404)
