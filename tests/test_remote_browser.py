@@ -1842,9 +1842,9 @@ class ProbeTests(BrowserBase):
         t1, o1, e1 = self.run_probes(3, "b1")
         t2, o2, e2 = self.run_probes(2, "b2")
         self.assertTrue(self.wait_for(lambda: len(seen) == 4))
-        time.sleep(0.4)
+        # the fifth probe queues behind the overall cap (wait instead of a fixed sleep: slow CI)
+        self.assertTrue(self.wait_for(lambda: self.rb._tabs["b2"].probe_waiting == 1))
         self.assertEqual((len(seen), self.rb._probes), (4, 4))
-        self.assertEqual(self.rb._tabs["b2"].probe_waiting, 1)
         release.set()
         for t in t1 + t2:
             t.join(10)
