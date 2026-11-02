@@ -1,5 +1,9 @@
 """Local-only adapter for the Hub-managed JDownloader 2 engine.
 
+Native mode: loopback 127.0.0.1 only (see below). Container mode: the
+unpublished bridge-network IP of the Hub's own labelled container, verified by
+docker inspect on every connection (engine_supervisor / container_runtime).
+
 JD2's deprecated RemoteAPI has no authentication. It is therefore only used
 when (1) every LISTEN socket on the API port is loopback and (2) the socket
 inode is owned by the Java process the Hub itself started (see
@@ -175,9 +179,11 @@ def filter_config_keys(entries):
 class LocalAdapter:
     """Same interface the old remote adapter had; talks to 127.0.0.1 only.
 
-    `engine` must provide connection_target() -> port (raising LocalUnavailable
-    unless the engine is ours, running and the listener is verified),
-    is_ours_running() and preset_applied.
+    `engine` must provide connection_target() -> port, or (host, port) in
+    container mode (raising LocalUnavailable unless the engine is ours,
+    running and the listener/container is verified), is_ours_running() and
+    preset_applied. Optional path_mapping() -> {"nas_root", "jd2_root"} in
+    container mode.
     """
 
     def __init__(self, engine, host="127.0.0.1", timeout=TIMEOUT):
@@ -203,15 +209,27 @@ class LocalAdapter:
 
     @property
     def _options(self):
-        # Same-host engine: no NAS/container path mapping. Link submission is
-        # an explicit admin click and only allowed after the preset was applied.
+        # Link submission is an explicit admin click and only allowed after
+        # the preset was applied.
+        mapping = getattr(self._engine, "path_mapping", None)
+        mapping = mapping() if callable(mapping) else None
+        if mapping:
+            # Container mode: only the mounted download folder is visible to
+            # JD2, as /downloads. jd2_transfer refuses anything outside it.
+            return {"allow_link_submit": self.can_send,
+                    "allow_unverified_packagizer": True,
+                    "nas_root": mapping.get("nas_root"),
+                    "jd2_root": mapping.get("jd2_root")}
+        # Native engine on the same host: no path mapping.
         return {"allow_link_submit": self.can_send,
                 "allow_unverified_packagizer": True, "same_host": True}
 
     def _call(self, namespace, method, *args):
         path = encode_call(namespace, method, args)
-        port = self._engine.connection_target()
-        connection = http.client.HTTPConnection(self._host, port, timeout=self._timeout)
+        target = self._engine.connection_target()
+        # Native: a port on 127.0.0.1. Container: (verified container IP, port).
+        host, port = (self._host, target) if isinstance(target, int) else target
+        connection = http.client.HTTPConnection(host, port, timeout=self._timeout)
         try:
             connection.request("GET", path, headers={"Accept": "application/json"})
             response = connection.getresponse()

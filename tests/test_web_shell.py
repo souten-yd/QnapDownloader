@@ -23,6 +23,18 @@ class WebShellStaticTests(unittest.TestCase):
         cls.js = (WEB / "app.js").read_text(encoding="utf-8")
         cls.html = (WEB / "index.html").read_text(encoding="utf-8")
 
+    def test_engine_section_shows_mode_migration_and_container_station_hint(self):
+        for ident in ("engineMode", "engineMigrate", "engineNoContainer", "engineSetupNative"):
+            self.assertIn('id="%s"' % ident, self.html)
+        self.assertIn("QTSのApp CenterでContainer Stationをインストールしてください", self.html)
+        self.assertNotIn("engineNoContainerLink", self.html + self.js)
+        self.assertNotIn(":8080", self.js)
+        for text in ("コンテナ (Container Station)", "QTS直接実行", "コンテナへ移行",
+                     "初期設定を開始"):
+            self.assertIn(text, self.js + self.html)
+        self.assertIn('mode: "container"', self.js)
+        self.assertIn("startEngineSetup(\"native\")", self.js)
+
     def test_forbidden_sandbox_tokens_absent_everywhere(self):
         for path in text_files():
             body = path.read_text(encoding="utf-8")

@@ -81,7 +81,7 @@ class QpkgContractTests(unittest.TestCase):
         script = (ROOT / "scripts/build-qpkg.sh").read_text()
         for name in ("webapp.py", "storage.py", "durability.py",
                      "updater.py", "self_update.py", "jd2_policy.py",
-                     "jd2_control.py", "jd2_local.py", "engine_components.py", "engine_supervisor.py", "jd2_transfer.py", "jd2_downloads.py", "runtime_diagnostics.py", "rapidgator_extract.py", "browser_safety.py", "downloader_pid.py", "python3-path", "downloader-diagnose"):
+                     "jd2_control.py", "jd2_local.py", "engine_components.py", "engine_supervisor.py", "container_runtime.py", "jd2_transfer.py", "jd2_downloads.py", "runtime_diagnostics.py", "rapidgator_extract.py", "browser_safety.py", "downloader_pid.py", "python3-path", "downloader-diagnose"):
             with self.subTest(name=name):
                 self.assertIn(name, script)
         self.assertIn('cp -R "$ROOT/web"', script)

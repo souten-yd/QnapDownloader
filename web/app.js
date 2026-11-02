@@ -1,6 +1,6 @@
 "use strict";
 /*
- * QnapDownloader browser-style shell (v0.1.14).
+ * QnapDownloader browser-style shell (v0.1.15).
  * Spec: docs/browser-shell-ui.md. Single file, no build step.
  *
  * Security notes (see "Security invariants" in the spec):
@@ -638,7 +638,9 @@ function renderHome() {
     $("obEngineText").textContent = engineDone ? "準備できました" :
       busy ? setupProgressText(e) :
       e.error ? "失敗しました: " + e.error :
-      folderDone ? "JDownloader 2を導入します" : "先に保存先を選んでください";
+      folderDone ? ((e.container || {}).available === false ?
+        "Container Stationが必要です（設定 › エンジン）" : "JDownloader 2を導入します") :
+      "先に保存先を選んでください";
     return;
   }
   const phase = e.phase;
@@ -2371,8 +2373,17 @@ function renderEngine(e) {
   stateText.textContent = phase === "failed" && e.installed ? "起動できません" : PHASE_LABELS[phase] || phase;
   stateText.classList.toggle("is-ok", running);
   // One primary action per state; unusable buttons are hidden, not disabled.
-  $("engineSetup").hidden = e.installed || busy;
+  const noCs = !e.installed && !busy && (e.container || {}).available === false;
+  $("engineSetup").hidden = e.installed || busy || noCs;
   $("engineSetup").textContent = failedSetup ? "初期設定をやり直す" : "初期設定を開始";
+  // Execution mode: container (Container Station) is the default; native is the fallback.
+  const cs = e.container || {};
+  const modeText = e.mode === "container" ? "コンテナ (Container Station)" : "QTS直接実行";
+  $("engineMode").textContent = "実行方式: " + modeText +
+    (e.mode === "container" && cs.state === "running" ? "（" + cs.name + "）" : "");
+  setShown("engineMigrate", Boolean(e.can_migrate) && !busy);
+  setShown("engineNoContainer", noCs);
+  setShown("engineSetupNative", noCs);
   $("engineStart").hidden = !(e.installed && !running && !busy);
   $("engineStop").hidden = !running || phase === "setup";
   setShown("engineResetup", e.installed && !running && !busy);
@@ -2398,8 +2409,8 @@ function renderEngine(e) {
     const box = element("div", undefined, "item");
     box.appendChild(element("b", c.label));
     box.appendChild(element("span", (c.installed ? "導入済み" : "未導入") +
-      " · 版 " + (c.version || c.pinned_version || "不明") + " · SHA-256 " + c.sha256 + "… · " +
-      readableSize(c.size)));
+      " · 版 " + (c.version || c.pinned_version || "不明") + " · SHA-256 " + c.sha256 + "…" +
+      (c.size ? " · " + readableSize(c.size) : "")));
     return box;
   });
   $("engineComponents").replaceChildren(...comps);
@@ -2485,8 +2496,17 @@ async function loadEngineLog() {
   $("engineLog").textContent = (data.lines || []).join("\n") || "まだログはありません";
 }
 
-function engineSetupConfirm() {
-  return confirm("JD2エンジンの初期設定を開始します。\n\n" +
+function engineSetupConfirm(mode) {
+  if (mode === "container") {
+    return confirm("JD2エンジンの初期設定を開始します（コンテナ方式）。\n\n" +
+      "・Container Station上に、Hub専用のコンテナ qnapdl-jd2 を作ります（公式イメージ eclipse-temurin:21-jre をダイジェスト固定で取得）\n" +
+      "・ポートは公開せず、専用ネットワークのみ。非rootで読み取り専用、メモリ上限1GB、空きメモリ1.5GB未満では起動しません\n" +
+      "・JDownloader.jar（公式インストーラ、SHA-256検証）を engine/jd2 に置きます\n" +
+      "・コンテナに見えるのは engine/jd2 と選択済みの保存先だけです\n" +
+      "取得後、JD2が公式アップデートを自己適用するため時間がかかります。\n" +
+      "ダウンロードは自動開始しません。既存のDocker版JD2・他のコンテナには触れません。\n\nよろしいですか？");
+  }
+  return confirm("JD2エンジンの初期設定を開始します（QTS直接実行）。\n\n" +
     "取得元（公式の固定URL・SHA-256検証つき）:\n" +
     "・Java 21 JRE（Eclipse Temurin 21.0.13+9）github.com/adoptium 約52MB\n" +
     "・JDownloader.jar（公式インストーラ）installer.jdownloader.org 約5MB\n\n" +
@@ -2495,11 +2515,27 @@ function engineSetupConfirm() {
     "ダウンロードは自動開始しません。既存のDocker版JD2には触れません。\n\nよろしいですか？");
 }
 
-async function startEngineSetup() {
-  if (!engineSetupConfirm()) return;
-  await api("/api/engine/setup", {confirmed: true});
+// mode: "container" | "native" | undefined (the Hub picks: container when available).
+async function startEngineSetup(mode) {
+  const e = state.engine || {};
+  const chosen = mode || (e.installed ? e.mode : e.preferred_mode) || "native";
+  if (!engineSetupConfirm(chosen)) return;
+  const body = {confirmed: true};
+  if (mode) body.mode = mode;
+  await api("/api/engine/setup", body);
   swrDrop("engine", "status");
   flash("初期設定を開始しました");
+  applyEngine(await api("/api/engine/status"));
+}
+
+async function migrateEngine() {
+  if (!confirm("JD2をコンテナ方式へ移行します。\n\n" +
+      "・いまのJD2（QTS直接実行）を停止し、Container Stationのコンテナとして再起動します（実行中のダウンロードは中断されます）\n" +
+      "・設定・キュー・アカウント・部分ファイルは engine/jd2 のまま引き継ぎます（データは消えません）\n" +
+      "・保存先と推奨設定は移行後に再確認されます\n\nよろしいですか？")) return;
+  await api("/api/engine/setup", {confirmed: true, mode: "container"});
+  swrDrop("engine", "status");
+  flash("コンテナへの移行を開始しました");
   applyEngine(await api("/api/engine/status"));
 }
 
@@ -2510,9 +2546,11 @@ async function startEngine() {
 }
 
 function wireEngine() {
-  $("engineSetup").addEventListener("click", () => perform(startEngineSetup));
-  $("engineResetup").addEventListener("click", () => perform(startEngineSetup));
-  $("homeEngineSetup").addEventListener("click", () => perform(startEngineSetup));
+  $("engineSetup").addEventListener("click", () => perform(() => startEngineSetup()));
+  $("engineResetup").addEventListener("click", () => perform(() => startEngineSetup()));
+  $("homeEngineSetup").addEventListener("click", () => perform(() => startEngineSetup()));
+  $("engineSetupNative").addEventListener("click", () => perform(() => startEngineSetup("native")));
+  $("engineMigrate").addEventListener("click", () => perform(migrateEngine));
   $("engineStart").addEventListener("click", () => perform(startEngine));
   $("homeEngineStart").addEventListener("click", () => perform(startEngine));
   $("downloadsEngineAction").addEventListener("click", () => {

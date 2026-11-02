@@ -91,5 +91,45 @@ class TransferTests(unittest.TestCase):
             store.begin_send(record["id"])
 
 
+class ContainerMappingTests(unittest.TestCase):
+    """Container mode: the selected NAS folder is /downloads inside the container."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.mounted = (self.root / "Download").resolve()
+        (self.mounted / "Manga" / "Vol1").mkdir(parents=True)
+        self.api = FakeJD2()
+        self.api._options.update(nas_root=str(self.mounted), jd2_root="/downloads")
+
+    def destination(self, path):
+        return jd2_transfer.jd2_destination(str(path), self.api._options)
+
+    def test_mounted_folder_and_subpaths_map_under_downloads(self):
+        self.assertEqual(self.destination(self.mounted), "/downloads")
+        self.assertEqual(self.destination(self.mounted / "Manga"), "/downloads/Manga")
+        self.assertEqual(self.destination(self.mounted / "Manga" / "Vol1"), "/downloads/Manga/Vol1")
+        out = jd2_transfer.transfer(self.api, "https://rapidgator.net/file/1", str(self.mounted))
+        self.assertEqual(out["state"], "sent")
+        self.assertEqual(self.api.records, [("https://rapidgator.net/file/1", "/downloads")])
+
+    def test_paths_outside_the_mount_are_refused(self):
+        sibling = self.root / "Download2"
+        sibling.mkdir()
+        other = self.root / "Private"
+        other.mkdir()
+        (self.mounted / "escape").symlink_to(other, target_is_directory=True)
+        for value in (sibling, other, self.root, self.mounted / "escape", self.mounted / "missing",
+                      "relative/path"):
+            with self.subTest(path=str(value)), self.assertRaises(jd2_transfer.TransferBlocked):
+                self.destination(value)
+
+    def test_unmounted_state_refuses(self):
+        self.api._options["nas_root"] = None
+        with self.assertRaises(jd2_transfer.TransferBlocked):
+            self.destination(self.mounted)
+
+
 if __name__ == "__main__":
     unittest.main()
