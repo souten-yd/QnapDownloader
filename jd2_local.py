@@ -24,6 +24,11 @@ API_PORT = 3128
 TIMEOUT = 5.0
 MAX_RESPONSE = 4 * 1024 * 1024
 
+# v0.1.25: "remove finished from the list". REMOVE_LINKS_ONLY never deletes files.
+CLEANUP_ACTION = "DELETE_FINISHED"
+CLEANUP_MODE = "REMOVE_LINKS_ONLY"
+CLEANUP_SELECTION = "ALL"
+
 ALLOWED_CALLS = frozenset((
     ("jd", "getCoreRevision"),
     ("update", "isUpdateAvailable"),
@@ -37,6 +42,8 @@ ALLOWED_CALLS = frozenset((
     ("linkgrabberv2", "addLinks"),
     # v0.1.24: start/stop the download controller and move LinkGrabber links.
     ("downloadcontroller", "start"),
+    # v0.1.25: remove finished entries from the list only (never deletes files).
+    ("downloadsV2", "cleanup"),
     ("downloadcontroller", "stop"),
     ("linkgrabberv2", "queryLinks"),
     ("linkgrabberv2", "moveToDownloadlist"),
@@ -451,6 +458,11 @@ class LocalAdapter:
 
     def stop_downloads(self):
         self._call("downloadcontroller", "stop")
+
+    def cleanup_finished(self):
+        """Remove finished downloads from JD2's list. The mode is a constant: files stay."""
+        assert CLEANUP_MODE == "REMOVE_LINKS_ONLY"
+        self._call("downloadsV2", "cleanup", [], [], CLEANUP_ACTION, CLEANUP_MODE, CLEANUP_SELECTION)
 
     def list_linkgrabber(self):
         from jd2_downloads import linkgrabber_query_options, linkgrabber_snapshot

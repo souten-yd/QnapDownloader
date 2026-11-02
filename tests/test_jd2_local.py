@@ -437,6 +437,18 @@ class ControllerCallTests(unittest.TestCase):
             with self.assertRaises(jl.LocalUnavailable):
                 jl.encode_call(call[0], call[1], ())
 
+    def test_cleanup_finished_args_are_exact_and_never_delete_files(self):
+        self.assertIn(("downloadsV2", "cleanup"), jl.ALLOWED_CALLS)
+        self.adapter.cleanup_finished()
+        self.assertEqual(self.decoded(), ("/downloadsV2/cleanup",
+                         [[], [], "DELETE_FINISHED", "REMOVE_LINKS_ONLY", "ALL"]))
+        self.assertEqual(jl.CLEANUP_MODE, "REMOVE_LINKS_ONLY")
+        source = open(jl.__file__, encoding="utf-8").read()
+        self.assertNotIn("DELETE_ALL", source)
+        self.assertNotIn("DELETE_DISABLED", source)
+        self.assertNotIn("REMOVE_LINKS_AND_DELETE_FILES", source)
+        self.assertNotIn("REMOVE_LINKS_AND_RECYCLE_FILES", source)
+
     def test_start_and_stop_take_no_arguments(self):
         self.adapter.start_downloads()
         self.assertEqual(self.decoded(), ("/downloadcontroller/start", []))

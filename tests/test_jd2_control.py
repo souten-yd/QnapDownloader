@@ -114,8 +114,20 @@ class LinkGrabberAdapter(Adapter):
     def stop_downloads(self):
         self.calls.append("stop")
 
+    def cleanup_finished(self):
+        self.calls.append("cleanup")
+
 
 class DownloadControlTests(unittest.TestCase):
+    def test_clear_finished_needs_confirmation(self):
+        adapter = LinkGrabberAdapter()
+        ctrl = jd2_control.JD2Controller(adapter)
+        with self.assertRaises(ValueError):
+            ctrl.clear_finished()
+        self.assertEqual(adapter.calls, [])
+        self.assertEqual(ctrl.clear_finished(confirmed=True), {"cleared": True})
+        self.assertEqual(adapter.calls, ["cleanup"])
+
     def setUp(self):
         self.adapter = LinkGrabberAdapter()
         self.ctrl = jd2_control.JD2Controller(self.adapter)

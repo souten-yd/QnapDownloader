@@ -9,6 +9,25 @@ import storage
 import webapp
 
 
+class ClearLinksTests(unittest.TestCase):
+    def test_clear_removes_only_sent_and_uncertain_unless_staged_requested(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            s = storage.Store(Path(tmp))
+            ids = {}
+            for name in ("a", "b", "c", "d"):
+                ids[name] = s.add_link("https://example.com/" + name)["id"]
+            s.begin_send(ids["a"]); s.finish_send(ids["a"], "sent")
+            s.begin_send(ids["b"]); s.finish_send(ids["b"], "uncertain")
+            s.begin_send(ids["c"])                               # in flight: kept
+            self.assertEqual(s.clear_links(), 2)
+            self.assertEqual(sorted(l["state"] for l in s.links()), ["sending", "staged"])
+            self.assertEqual(s.clear_links(), 0)
+            self.assertEqual(s.clear_links(True), 1)
+            self.assertEqual([l["state"] for l in s.links()], ["sending"])
+            with self.assertRaises(ValueError):
+                s.clear_links("yes")
+
+
 class StorageTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -209,6 +228,7 @@ class SiteRuleTests(unittest.TestCase):
     def test_defaults_include_the_new_options_on(self):
         settings = self.s.settings()
         self.assertIs(settings["send_autostart"], True)
+        self.assertIs(settings["probe_autosend"], True)
         self.assertIs(settings["block_ads"], True)
 
     def test_options_persist_and_are_written_only_on_change(self):

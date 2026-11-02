@@ -209,3 +209,11 @@ Cloudflare等で手元のブラウザ（iframe）では開けないサイトを�
 ### 速度
 - ⋯メニュー（NASブラウザのタブのみ）: 画質「速度優先／標準／高画質」（既定は速度優先＝等倍・JPEG 40。端末の `localStorage` `qnapdl.rbquality.v1`、try/catchで保護）、「速度表示」（画面左上に 直近5秒の fps・1枚あたりKB・フレーム要求の応答時間。クライアントのみで計測）。
 - Chromium引数・広告遮断・`prefers-reduced-motion` は container-runtime.md §4 の v0.1.24 を参照。
+
+## v0.1.25 長押しの自動送信・重複スキップ・履歴削除（実機未検証）
+
+- 設定 › NASブラウザ「長押しで見つかったリンクを自動でJD2へ送る」（`probe_autosend`、既定ON）。長押しでホスターのリンクが見つかりエンジンが送信可能なとき、`POST /api/rb/probe/send {tab, probe_id}` がサーバ側に保持した直近の結果（タブごと・最大50件・5分）だけを送ります（クライアントのURLは受け付けません）。重複はスキップし、`send_autostart` に従い、確認ダイアログなしでトーストのみ表示します。失敗時・送信不可時・リンクなしのときは従来のシートを開きます。
+- 単発のJD2送信（NASブラウザの検出シート、長押しシート）は確認なし。リンク画面の「すべてJD2へ送る」は5件以上のときだけ確認します。Packagizerに関する文言は削除しました（Hub管理のエンジンは `overwritePackagizerRules:true`）。
+- 重複リンクは常に確認なしでスキップし、件数だけ表示します。
+- リンク画面「履歴を削除」: `POST /api/links/clear {include_staged}` が送信済み・要確認の記録（任意で未送信も）を削除します。JD2・ファイルには触れません。
+- ダウンロード画面「完了したものを一覧から消す」: `downloadsV2/cleanup`（`DELETE_FINISHED` / `REMOVE_LINKS_ONLY` / `ALL`、固定値）。保存ファイルは削除されません。

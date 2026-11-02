@@ -76,6 +76,14 @@ class JD2Controller:
             self._require().stop_downloads()
             return {"stopped": True}
 
+    def clear_finished(self, *, confirmed=False):
+        """Drop finished entries from JD2's list; saved files are never touched."""
+        if confirmed is not True:
+            raise ValueError("一覧から消すには確認が必要です")
+        with self.lock:
+            self._require().cleanup_finished()
+            return {"cleared": True}
+
     def connection_test(self):
         """Explicit read-only probe; never starts an update/download."""
         with self.lock:

@@ -185,7 +185,7 @@ if (bad.length) { console.error("mismatch: " + bad.join(",")); process.exit(1); 
         # Delete APIs are wired, and sending to JD2 still asks for confirmation.
         self.assertIn("/api/links/delete", self.js)
         self.assertIn("/api/bookmarks/delete", self.js)
-        self.assertIn("confirm(many", self.js)
+        self.assertIn("confirmMany", self.js)
 
     def test_v0113_https_and_share_sections(self):
         for ident in ("httpsState", "httpsCmd", "httpsCmdCopy", "shareDevices", "shareForm", "shareName",
@@ -470,6 +470,37 @@ if (out !== want) { console.error(JSON.stringify(out)); process.exit(1); }
         self.assertIn('stage.addEventListener("contextmenu"', self.js)
         # the probe sheet is built from text nodes only
         self.assertNotIn("innerHTML", self.js)
+
+    def test_v0125_probe_autosend_has_no_confirm_and_packagizer_text_is_gone(self):
+        self.assertNotIn("Packagizer", self.js)
+        self.assertIn('id="probeAutosend"', self.html)
+        self.assertIn("長押しで見つかったリンクを自動でJD2へ送る", self.html)
+        self.assertIn("/api/rb/probe/send", self.js)
+        start = self.js.index("async function autoSendProbe")
+        auto = self.js[start:self.js.index("async function startProbe")]
+        self.assertNotIn("confirm(", auto)
+        self.assertIn("JD2へ送信しました", auto)
+        # no confirm on the NAS-browser intercept send; the Links page asks only for 5+ links
+        send = self.js[self.js.index('if (action === "send")'):self.js.index('} else if (action === "add")')]
+        self.assertNotIn("confirm(", send)
+        self.assertIn("opts.confirmMany && links.length >= 5", self.js)
+
+    def test_v0125_history_clear_and_duplicate_skips(self):
+        for ident in ("clearHistory", "clearStaged", "downloadsClear"):
+            self.assertIn('id="%s"' % ident, self.html)
+        self.assertIn("履歴を削除", self.html)
+        self.assertIn("未送信のリンクも削除", self.html)
+        self.assertIn("完了したものを一覧から消す", self.html)
+        self.assertIn("/api/links/clear", self.js)
+        self.assertIn("/api/jd2/downloads/cleanup", self.js)
+        self.assertIn("保存されたファイルは削除されません", self.js)
+        self.assertIn("ダウンロード済みファイルやJD2のダウンロードは削除しません", self.js)
+        # duplicates are skipped and counted, never confirmed
+        self.assertIn("件は重複のためスキップ", self.js)
+        for fn in ("async function sendUrls", "async function autoSendProbe", "async function stageLinks"):
+            start = self.js.index(fn)
+            body = self.js[start:self.js.index("\n}\n", start)]
+            self.assertNotIn("confirm(", body)
 
     def test_v0124_quality_menu_and_perf_overlay(self):
         for quality in ("speed", "standard", "high"):
