@@ -7029,12 +7029,9 @@ async function loadBrowserStatus(force = false) {
   await swr("rb-status", "/api/rb/status", renderBrowserStatus, {force});
 }
 
+// v0.1.38: the 常駐 switch sits right under the status (one control, no duplicate button).
 function renderResidentQuick(on) {
-  const button = $("rbResidentQuick");
-  button.textContent = on ? "常駐: オン" : "常駐: オフ";
-  button.setAttribute("aria-pressed", on ? "true" : "false");
-  button.classList.toggle("primary", on);
-  button.classList.toggle("quiet", !on);
+  $("rbResident").checked = on;
 }
 
 async function setResident(on, revert) {
@@ -7071,10 +7068,6 @@ function residentLines(r) {
 function wireBrowser() {
   $("rbResident").addEventListener("change", () => perform(() =>
     setResident($("rbResident").checked, () => { $("rbResident").checked = !$("rbResident").checked; })));
-  $("rbResidentQuick").addEventListener("click", () => perform(() => {
-    const next = !(state.settings && state.settings.rb_resident === true);
-    return setResident(next, () => renderResidentQuick(!next));
-  }));
   $("rbRetry").addEventListener("click", () => perform(async () => {
     $("rbRetry").disabled = true;
     try { await api("/api/rb/retry", {}); } finally { $("rbRetry").disabled = false; }

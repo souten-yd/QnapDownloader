@@ -543,7 +543,7 @@ class ClientStaticTests(unittest.TestCase):
         cls.html = (ROOT / "web/index.html").read_text()
 
     def test_switch_quick_button_and_retry_exist(self):
-        for ident in ("rbResident", "rbResidentQuick", "rbRetry", "rbResidentLine", "rbWatchdog", "rbWdLog"):
+        for ident in ("rbResident", "rbRetry", "rbResidentLine", "rbWatchdog", "rbWdLog"):
             self.assertIn('id="%s"' % ident, self.html)
         self.assertIn("NASブラウザを常駐", self.html)
         row = self.html[self.html.index("NASブラウザを常駐"):][:900]
