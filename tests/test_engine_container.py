@@ -384,7 +384,7 @@ class ApiConfigSwitchTests(ContainerBase):
         (manager.jd2_dir / "cfg" / "other.json").write_text("{}")
         manager.switch_api_config("container")
         self.assertEqual(sorted(p.name for p in (manager.jd2_dir / "cfg").iterdir()),
-                         ["org.jdownloader.api.RemoteAPIConfig.json", "other.json"])
+                         sorted([es.MYJD_CONFIG_NAME, "org.jdownloader.api.RemoteAPIConfig.json", "other.json"]))
         self.assertEqual((manager.jd2_dir / "cfg" / "other.json").read_text(), "{}")
 
     def test_container_launch_refuses_wrong_port_and_logs_reason(self):

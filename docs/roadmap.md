@@ -32,7 +32,7 @@
 ### M1.5 — JD2のコンテナ化（v0.1.15で実装、実機検証は未実施）
 - `docs/container-runtime.md` §2〜3 の実装。Container Stationが使える場合、JD2を Hub 専用コンテナ `qnapdl-jd2`（非root・読み取り専用・メモリ1GB・ポート非公開・専用ブリッジネットワーク）で動かす。`container_runtime.py`（固定操作のみのDocker CLIラッパ）、`engine_supervisor.py`（mode: container / native）、`jd2_local.py`（コンテナIPへ接続、毎回inspect検証）。
 - ネイティブ方式はContainer Stationが無い環境のフォールバックとして残す。既存のネイティブ導入は「コンテナへ移行」で同じ `engine/jd2` のデータのまま移せる。
-- リモートブラウザ（`container-runtime.md` §4）は v0.1.16 の予定（未実装）。
+- リモートブラウザ（`container-runtime.md` §4）は v0.1.16 で実装（実機未検証。Chromiumのサンドボックスがこのコンテナ設定で起動できるかが最大の確認事項）。
 - 受入れ（実機で未確認）: コンテナ起動とJD2初回アップデートの完了、LANから3128に届かないこと、`/jd2/logs` tmpfsでJD2が動くこと、`/tmp` の noexec で問題が出ないこと、保存先の書込権限（uid 1000）。
 
 ### M2 — ダウンロード操作（開始/一時停止/再開/削除）

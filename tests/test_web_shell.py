@@ -109,8 +109,11 @@ if (bad.length) { console.error("mismatch: " + bad.join(",")); process.exit(1); 
 
     def test_iframe_src_comes_from_validation(self):
         self.assertIn("/api/browser/validate", self.js)
-        self.assertEqual(len(re.findall(r"\.src\s*=", self.js)), 1)
+        # Exactly two assignments: the validated iframe URL and the remote-browser
+        # screencast image (data:image/jpeg;base64 built from /api/rb/frame).
+        self.assertEqual(len(re.findall(r"\.src\s*=", self.js)), 2)
         self.assertIn("frame.src = validatedUrl", self.js)
+        self.assertIn("img.src = RB_JPEG_PREFIX + f.jpeg_base64", self.js)
 
     def test_routes_and_limits(self):
         for route in ("#/downloads", "#/links", "#/settings/"):
@@ -174,7 +177,7 @@ if (bad.length) { console.error("mismatch: " + bad.join(",")); process.exit(1); 
 
     def test_settings_order_and_auto_refresh_interval(self):
         order = re.findall(r'<a href="#/settings/(\w+)" data-section', self.html)
-        self.assertEqual(order, ["engine", "storage", "https", "share", "bookmarks", "updates", "diagnostics", "about"])
+        self.assertEqual(order, ["engine", "browser", "storage", "https", "share", "bookmarks", "updates", "diagnostics", "about"])
         self.assertRegex(self.js, r"AUTO_REFRESH_MS\s*=\s*5000\b")
         self.assertRegex(self.js, r"BADGE_REFRESH_MS\s*=\s*30000\b")
         self.assertRegex(self.js, r"PASTE_DEBOUNCE_MS\s*=\s*400\b")
@@ -270,6 +273,66 @@ if (out !== want) { console.error(JSON.stringify(out)); process.exit(1); }
         self.assertIn("表示されない場合", view_web)
         self.assertIn("Safariで開く（次回から自動）", view_web)
         self.assertIn("互換で再読み込み", view_web)
+
+    def test_v0116_remote_mode_is_a_host_preference_not_a_sandbox_mode(self):
+        self.assertIn('REMOTE_MODE = "remote"', self.js)
+        modes = re.search(r"const MODES = \[(.*?)\];", self.js).group(1)
+        self.assertNotIn("remote", modes)
+        for ident in ("remoteView", "remoteImg", "remoteStage", "remoteKbd", "remoteKbdBtn", "remoteLinks",
+                      "remoteSheet", "remoteAdd", "remoteSend", "cfRemote", "menuRemote", "remoteHosts"):
+            self.assertIn('id="%s"' % ident, self.html)
+        for text in ("NASブラウザで開く", "リンク", "件を追加", "JD2へ送る"):
+            self.assertIn(text, self.html + self.js)
+        for route in ("/api/rb/frame", "/api/rb/input", "/api/rb/tabs", "/api/rb/tabs/close",
+                      "/api/rb/links", "/api/rb/navigate", "/api/rb/status", "/api/rb/setup"):
+            self.assertIn(route, self.js)
+        self.assertIn('"/api/rapidgator/extract"', self.js)
+
+    def test_v0116_image_source_is_only_a_jpeg_data_url_from_the_api(self):
+        self.assertIn('RB_JPEG_PREFIX = "data:image/jpeg;base64,"', self.js)
+        assignments = re.findall(r"(\w+)\.src\s*=\s*(.+?);", self.js)
+        self.assertEqual(sorted(a[0] for a in assignments), ["frame", "img"])
+        self.assertEqual(dict(assignments)["img"], "RB_JPEG_PREFIX + f.jpeg_base64")
+        self.assertIn("function validJpeg", self.js)
+        self.assertIn("/^[A-Za-z0-9+/]+={0,2}$/", self.js)
+        self.assertNotRegex(self.js, r"setAttribute\(\"src\"")
+        # still no remote-controlled markup and no forbidden sandbox tokens
+        for token in ("innerHTML", "outerHTML", "insertAdjacentHTML"):
+            self.assertNotIn(token, self.js)
+        for token in FORBIDDEN_SANDBOX:
+            self.assertNotIn(token, self.js + self.html)
+
+    def test_v0116_remote_tab_lifecycle_and_input_wiring(self):
+        # closing the web tab frees the NAS tab; polling only for the visible tab
+        self.assertRegex(self.js, r"releaseRemote\(tab\);\s*//[^\n]*frees memory")
+        self.assertIn('document.visibilityState === "visible" && currentViewName() === "web"', self.js)
+        self.assertIn('"pointerdown"', self.js)
+        self.assertIn('"wheel"', self.js)
+        self.assertIn('$("remoteKbd")', self.js)
+        for key in ("Enter", "Backspace", "Tab"):
+            self.assertIn('"%s"' % key, self.js)
+        self.assertIn("compositionend", self.js)
+        # restored remote tabs are never opened automatically
+        self.assertIn("remote tabs are opened on request only", self.js)
+        self.assertIn("rb.width", self.js)    # taps are scaled to the reported frame size
+
+    def test_v0116_settings_browser_section(self):
+        section = re.search(r'<section class="settings-section" data-section="browser".*?</section>',
+                            self.html, re.S).group(0)
+        for ident in ("rbState", "rbSetup", "rbStop", "rbMemory", "rbSteps", "rbNoContainer"):
+            self.assertIn('id="%s"' % ident, section)
+        for text in ("初期設定（イメージ作成）", "停止", "2GiB", "80%", "5分", "10分", "Container Station"):
+            self.assertIn(text, section)
+        self.assertIn('SETTINGS_SECTIONS = ["engine", "browser"', self.js)
+
+    def test_v0116_native_leftover_row(self):
+        self.assertRegex(self.html, r'<div id="engineNativeRow"[^>]*hidden')
+        self.assertIn('id="engineNativeRemove"', self.html)
+        self.assertIn("native_leftovers", self.js)
+        self.assertIn('setShown("engineNativeRow", canClean)', self.js)
+        self.assertIn("/api/engine/native/remove", self.js)
+        self.assertIn("JD2の設定・キュー・ダウンロード途中のファイル", self.js)
+        self.assertIn("QTS直接実行には戻せなくなります", self.js)
 
     def test_icons_use_symbol_sprite(self):
         self.assertIn("<symbol", self.html)

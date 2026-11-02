@@ -16,7 +16,11 @@ import storage
 import engine_supervisor
 import jd2_control
 import jd2_local
+import container_runtime
+import remote_browser
 import webapp
+from fake_docker import FakeDocker
+from test_remote_browser import FakeWS
 
 
 class HttpTests(unittest.TestCase):
@@ -36,6 +40,21 @@ class HttpTests(unittest.TestCase):
         self.server.engine = engine_supervisor.EngineManager(self.root, self.store)
         self.server.jd2 = jd2_control.JD2Controller(self.server.engine.adapter)
         self.server.secure_cookies = False
+        ctx = self.root / "browser-ctx"
+        ctx.mkdir()
+        (ctx / "Dockerfile").write_text("FROM x\n")
+        (ctx / "entrypoint.sh").write_text("#!/bin/sh\n")
+        meminfo = self.root / "meminfo"
+        meminfo.write_text("MemTotal: 16000000 kB\nMemAvailable: 9000000 kB\n")
+        self.rb_fake = FakeDocker()
+        self.rb_ws = FakeWS()
+        runtime = container_runtime.Runtime(self.rb_fake, isfile=self.rb_fake.isfile,
+                                            access=lambda p, m: True, meminfo_path=str(meminfo))
+        self.rb_fake.images.add(runtime.browser_tag(str(ctx)))
+        self.server.rb = remote_browser.RemoteBrowser(
+            runtime, ctx, meminfo_path=str(meminfo), connect=lambda ip: self.rb_ws,
+            monitor=False, frame_interval=0.0, start_timeout=2.0)
+        self.addCleanup(self.server.rb.shutdown)
         self.server.updates = self_update.UpdateManager(self.root, webapp.ROOT,
                                                        webapp.VERSION, "x86_64", self.server.server_port)
         self.port = self.server.server_port
@@ -95,6 +114,95 @@ class HttpTests(unittest.TestCase):
         self.assertEqual(code, 200)
         self.csrf = body["csrf"]
 
+    RB_GET = ("/api/rb/status", "/api/rb/frame?tab=b1&since=0", "/api/rb/links?tab=b1")
+    RB_POST = (("/api/rb/setup", {"confirmed": True}), ("/api/rb/stop", {"confirmed": True}),
+               ("/api/rb/tabs", {"url": "https://example.com/"}), ("/api/rb/tabs/close", {"id": "b1"}),
+               ("/api/rb/navigate", {"tab": "b1", "url": "https://example.com/"}),
+               ("/api/rb/input", {"tab": "b1", "type": "reload"}),
+               ("/api/engine/native/remove", {"confirmed": True}))
+
+    def test_rb_endpoints_require_login_csrf_and_origin(self):
+        for path in self.RB_GET:
+            with self.subTest(path=path):
+                self.assertEqual(self.req(path)[0], 401)
+        for path, body in self.RB_POST:
+            with self.subTest(path=path):
+                self.assertIn(self.req(path, body)[0], (401, 403))
+        self.login()
+        for path, body in self.RB_POST:
+            with self.subTest(path=path, case="no csrf"):
+                self.assertEqual(self.req(path, body, csrf=False)[0], 403)
+            with self.subTest(path=path, case="no origin"):
+                self.assertEqual(self.req(path, body, origin=False)[0], 403)
+        self.assertEqual([c for c in self.rb_fake.docker_calls() if c[0] in ("run", "build")], [])
+
+    def test_rb_status_and_confirmations(self):
+        self.login()
+        code, body = self.req("/api/rb/status")
+        self.assertEqual(code, 200)
+        self.assertEqual(body["phase"], "stopped")
+        self.assertTrue(body["image_ready"])
+        self.assertEqual(body["max_tabs"], 3)
+        self.assertEqual(self.req("/api/rb/setup", {})[0], 400)
+        self.assertEqual(self.req("/api/rb/stop", {"confirmed": "yes"})[0], 400)
+        self.assertEqual(self.req("/api/engine/native/remove", {})[0], 400)
+
+    def test_rb_open_validates_urls_and_hub_origin(self):
+        self.login()
+        for url in ("http://example.com/", "https://127.0.0.1/", "file:///etc/passwd", "", None, 5,
+                    "https://nas.tail1234.ts.net/"):
+            with self.subTest(url=url):
+                self.assertEqual(self.req("/api/rb/tabs", {"url": url})[0], 400)
+        self.assertEqual([c for c in self.rb_fake.docker_calls() if c[0] == "run"], [])
+
+    def test_rb_tab_frame_input_links_close_flow(self):
+        self.login()
+        code, tab = self.req("/api/rb/tabs", {"url": "https://example.com/a"})
+        self.assertEqual((code, tab["id"]), (201, "b1"))
+        code, frame = self.req("/api/rb/frame?tab=b1&since=0&wait=0")
+        self.assertEqual(code, 200)
+        self.assertEqual(set(frame), {"seq", "jpeg_base64", "width", "height", "url", "title",
+                                      "loading", "blocked"})
+        self.assertIsNone(frame["jpeg_base64"])
+        self.rb_ws.emit("Page.screencastFrame", {"data": "QUJD", "sessionId": 1, "metadata": {
+            "deviceWidth": 1280, "deviceHeight": 2000}}, "SESSION1")
+        for _ in range(100):
+            code, frame = self.req("/api/rb/frame?tab=b1&since=0&wait=0")
+            if frame["jpeg_base64"]:
+                break
+        self.assertEqual(frame["jpeg_base64"], "QUJD")
+        self.assertEqual(self.req("/api/rb/input", {"tab": "b1", "type": "tap", "x": 5, "y": 6})[0], 200)
+        for bad in ({"tab": "b1", "type": "eval"}, {"tab": "b1", "type": "tap", "x": -5, "y": 1},
+                    {"tab": "b1", "type": "key", "key": "F5"}, {"tab": "../x", "type": "reload"}):
+            with self.subTest(bad=bad):
+                self.assertEqual(self.req("/api/rb/input", bad)[0], 400)
+        self.rb_ws.eval_value = ["https://rapidgator.net/file/12345"]
+        self.assertEqual(self.req("/api/rb/links?tab=b1")[1]["items"], ["https://rapidgator.net/file/12345"])
+        self.assertEqual(self.req("/api/rb/navigate", {"tab": "b1", "url": "http://x.example/"})[0], 400)
+        self.assertEqual(self.req("/api/rb/navigate", {"tab": "b1", "url": "https://example.org/"})[0], 200)
+        self.assertEqual(self.req("/api/rb/tabs/close", {"id": "b1"})[1], {"closed": True})
+        self.assertEqual(self.req("/api/rb/frame?tab=b1&since=0&wait=0")[0], 404)
+        self.assertEqual(self.req("/api/rb/tabs/close", {"id": "b1"})[0], 404)
+        self.assertEqual(self.req("/api/rb/frame?tab=b1&since=abc")[0], 400)
+        code, body = self.req("/api/rb/stop", {"confirmed": True})
+        self.assertEqual(code, 200)
+        self.assertNotIn("qnapdl-browser", self.rb_fake.containers)
+
+    def test_rb_tab_limit_and_memory_refusals_are_japanese_400s(self):
+        self.login()
+        for i in range(3):
+            self.assertEqual(self.req("/api/rb/tabs", {"url": "https://example.com/%d" % i})[0], 201)
+        code, body = self.req("/api/rb/tabs", {"url": "https://example.com/x"})
+        self.assertEqual(code, 400)
+        self.assertIn("最大3枚", body["error"])
+
+    def test_engine_native_remove_refused_in_native_mode(self):
+        self.login()
+        code, body = self.req("/api/engine/native/remove", {"confirmed": True})
+        self.assertEqual(code, 400)
+        self.assertIn("コンテナ方式", body["error"])
+        self.assertIn("native_leftovers", self.req("/api/engine/status")[1])
+
     def test_host_filter_allows_private_and_tailscale_not_public(self):
         self.assertTrue(webapp.public_host_allowed("192.168.0.5:17864"))
         self.assertTrue(webapp.public_host_allowed("100.64.1.2:17864"))
@@ -122,7 +230,7 @@ class HttpTests(unittest.TestCase):
                                          headers={"Host": "192.168.68.57:17864"})
         with self.client.open(request, timeout=4) as response:
             self.assertEqual(response.status, 200)
-            self.assertEqual(json.load(response)["version"], "0.1.15")
+            self.assertEqual(json.load(response)["version"], "0.1.16")
         with self.client.open(self.url + "/icon.svg", timeout=4) as response:
             self.assertEqual(response.status, 200)
             self.assertEqual(response.headers.get_content_type(), "image/svg+xml")
@@ -204,7 +312,9 @@ class HttpTests(unittest.TestCase):
         req = urllib.request.Request(self.url + "/icon.svg")
         with self.client.open(req, timeout=4) as response:
             csp = response.headers.get("Content-Security-Policy")
-            self.assertIn("img-src 'self'", csp)
+            self.assertIn("img-src 'self' data:;", csp)
+            self.assertNotIn("blob:", csp)
+            self.assertIn("default-src 'none'", csp)
             self.assertIn("frame-ancestors 'none'", csp)
             self.assertEqual(response.headers.get("X-Frame-Options"), "DENY")
 
@@ -750,7 +860,7 @@ class HttpTests(unittest.TestCase):
         self.assertFalse(info["supported"])
         code, _ = self.req("/api/update/apply", {"version": "v0.1.8"})
         self.assertEqual(code, 400)
-        self.assertEqual(self.req("/api/health")[1]["version"], "0.1.15")
+        self.assertEqual(self.req("/api/health")[1]["version"], "0.1.16")
         self.assertFalse(self.req("/api/jd2/status")[1]["connected"])
         self.assertEqual(self.req("/api/jd2/update/apply", {"confirmed": True})[0], 400)
         self.assertEqual(self.req("/api/jd2/preset/apply", {"confirmed": True})[0], 400)

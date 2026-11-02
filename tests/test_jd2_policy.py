@@ -7,7 +7,9 @@ import jd2_policy as p
 class FakeJD2:
     def __init__(self):
         self.version = "core-1"
-        self.values = {key: True for key in p.REQUIRED}
+        self.values = {key: ("ALWAYS" if key == "downloads.auto_start" else True)
+                       for key in p.REQUIRED}
+        self.initial = dict(self.values)
         self.calls = []
 
     def inspect_preset(self):
@@ -31,7 +33,9 @@ class Jd2PolicyTests(unittest.TestCase):
         self.assertEqual(len(engine.calls), 0)
         self.assertEqual(len(preview["entries"]), len(p.REQUIRED))
         post = p.apply_preset(engine, preview)
-        self.assertTrue(all(x["current"] is False for x in post["entries"]))
+        self.assertTrue(all(x["compliant"] for x in post["entries"]))
+        self.assertEqual(engine.values["downloads.auto_start"], "ONLY_IF_EXIT_WITH_RUNNING_DOWNLOADS")
+        self.assertIs(engine.values["linkgrabber.auto_start"], False)
         self.assertEqual(len(engine.calls), len(p.REQUIRED))
         self.assertEqual(len(p.apply_preset(engine, p.build_preview(engine))["entries"]),
                          len(p.REQUIRED))
@@ -78,7 +82,7 @@ class Jd2PolicyTests(unittest.TestCase):
         engine.update_preset = partially_write_then_fail
         with self.assertRaises(RuntimeError):
             p.apply_preset(engine, p.build_preview(engine))
-        self.assertTrue(all(value is True for value in engine.values.values()))
+        self.assertEqual(engine.values, engine.initial)
 
     def test_unverified_rollback_reports_failure(self):
         engine = FakeJD2()
@@ -103,7 +107,44 @@ class Jd2PolicyTests(unittest.TestCase):
         engine.update_preset = fail
         with self.assertRaises(RuntimeError):
             p.apply_preset(engine, p.build_preview(engine))
-        self.assertTrue(all(v is True for v in engine.values.values()))
+        self.assertEqual(engine.values, engine.initial)
+
+    def test_enum_entry_compliance_and_target(self):
+        for current, change in (("ALWAYS", True), ("NEVER", False),
+                                ("ONLY_IF_EXIT_WITH_RUNNING_DOWNLOADS", False)):
+            with self.subTest(current=current):
+                engine = FakeJD2()
+                engine.values["downloads.auto_start"] = current
+                entry = [e for e in p.build_preview(engine)["entries"]
+                         if e["key"] == "downloads.auto_start"][0]
+                self.assertEqual(entry["change"], change)
+                self.assertEqual(entry["compliant"], not change)
+                self.assertEqual(entry["target"],
+                                 "ONLY_IF_EXIT_WITH_RUNNING_DOWNLOADS" if change else current)
+
+    def test_compliant_enum_is_not_written(self):
+        engine = FakeJD2()
+        engine.values["downloads.auto_start"] = "NEVER"
+        p.apply_preset(engine, p.build_preview(engine))
+        self.assertNotIn("downloads.auto_start", [k for k, _ in engine.calls])
+        self.assertEqual(engine.values["downloads.auto_start"], "NEVER")
+
+    def test_invalid_enum_value_is_unsupported(self):
+        engine = FakeJD2()
+        engine.values["downloads.auto_start"] = "SOMETIMES"
+        self.assertIn("downloads.auto_start", p.build_preview(engine)["missing"])
+        engine.values["downloads.auto_start"] = True
+        self.assertIn("downloads.auto_start", p.build_preview(engine)["missing"])
+
+    def test_exact_interfaces_labels_and_no_subfolder_keys(self):
+        self.assertEqual(p.LABELS["linkgrabber.auto_confirm"], "リンク自動確定")
+        self.assertEqual(p.LABELS["linkgrabber.auto_start"], "追加後の自動開始")
+        self.assertEqual(p.LABELS["extraction.auto_extract"], "自動解凍")
+        self.assertIn("「常に」以外ならOK", p.LABELS["downloads.auto_start"])
+        self.assertNotIn("packagizer.package_subfolders", p.REQUIRED)
+        self.assertNotIn("general.package_subfolders", p.REQUIRED)
+        self.assertEqual(p.KNOWN_KEYS["downloads.auto_start"]["interface"],
+                         "org.jdownloader.settings.GeneralSettings")
 
 
 if __name__ == "__main__":

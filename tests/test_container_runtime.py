@@ -111,7 +111,7 @@ class ImageNetworkTests(RuntimeBase):
         self.assertFalse(self.rt.network_ensure(cr.JD2_NET))
 
     def test_network_names_and_foreign_network_refused(self):
-        for name in ("bridge", "host", "qnapdl-other", "qnapdl-browser-net"):
+        for name in ("bridge", "host", "qnapdl-other", "qnapdl-evil-net"):
             with self.subTest(name=name), self.assertRaises(cr.ContainerError):
                 self.rt.network_ensure(name)
         self.fake.networks[cr.JD2_NET] = {"Driver": "bridge", "Labels": {}, "Internal": False}
@@ -334,3 +334,210 @@ class StaticTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class BrowserRuntimeTests(RuntimeBase):
+    def context(self, dockerfile="FROM x\n", entry="#!/bin/sh\n"):
+        ctx = Path(self.temp.name) / "ctx"
+        ctx.mkdir(exist_ok=True)
+        (ctx / "Dockerfile").write_text(dockerfile)
+        (ctx / "entrypoint.sh").write_text(entry)
+        return str(ctx)
+
+    def test_tag_is_hash_of_dockerfile_and_entrypoint(self):
+        import hashlib
+        ctx = self.context("A", "B")
+        self.assertEqual(self.rt.browser_tag(ctx),
+                         "qnapdl-browser:" + hashlib.sha256(b"AB").hexdigest()[:12])
+        (Path(ctx) / "entrypoint.sh").write_text("C")
+        self.assertNotEqual(self.rt.browser_tag(ctx), "qnapdl-browser:" + hashlib.sha256(b"AB").hexdigest()[:12])
+
+    def test_context_must_hold_exactly_the_shipped_files(self):
+        ctx = self.context()
+        (Path(ctx) / "extra").write_text("x")
+        with self.assertRaises(cr.ContainerError):
+            self.rt.browser_tag(ctx)
+        (Path(ctx) / "extra").unlink()
+        (Path(ctx) / "entrypoint.sh").unlink()
+        (Path(ctx) / "entrypoint.sh").symlink_to(Path(ctx) / "Dockerfile")
+        with self.assertRaises(cr.ContainerError):
+            self.rt.browser_tag(ctx)
+
+    def test_build_command_label_and_fixed_context(self):
+        ctx = self.context()
+        tag = self.rt.browser_build(ctx)
+        build = [c for c in self.fake.docker_calls() if c[0] == "build"][0]
+        self.assertEqual(build, ["build", "--label", "org.qnapdownloader.managed=1", "--tag", tag, ctx])
+        self.assertTrue(self.rt.browser_image_present(tag))
+
+    def test_only_own_tag_shapes_are_accepted(self):
+        for bad in ("alpine", "qnapdl-browser:latest", "qnapdl-browser:" + "g" * 12,
+                    "evil/qnapdl-browser:" + "a" * 12, "qnapdl-browser:" + "a" * 13):
+            with self.subTest(tag=bad), self.assertRaises(cr.ContainerError):
+                self.rt.browser_image_present(bad)
+            with self.assertRaises(cr.ContainerError):
+                self.rt.browser_run_args(bad)
+
+    def test_exact_run_arguments(self):
+        tag = "qnapdl-browser:0123456789ab"
+        self.assertEqual(self.rt.browser_run_args(tag), [
+            "run", "-d", "--name", "qnapdl-browser", "--label", "org.qnapdownloader.managed=1",
+            "--network", "qnapdl-browser-net", "--restart", "no", "--read-only",
+            "--log-driver", "none", "--memory", "2g", "--memory-swap", "2g",
+            "--shm-size", "512m", "--pids-limit", "1024", "--cap-drop", "ALL",
+            "--cap-add", "SYS_ADMIN",
+            "--security-opt", "no-new-privileges", "--user", "1000:1000",
+            "--tmpfs", "/profile:size=512m", "--tmpfs", "/tmp:size=256m", tag])
+
+    def test_run_args_have_no_ports_mounts_privileges_or_sandbox_flags(self):
+        args = self.rt.browser_run_args("qnapdl-browser:0123456789ab")
+        joined = " ".join(args)
+        for forbidden in ("-p", "-P", "--publish", "--mount", "-v", "--volume", "--privileged",
+                          "--network=host", "seccomp", "apparmor", "--device",
+                          "--pid", "--ipc"):
+            self.assertNotIn(forbidden, args)
+        for forbidden in ("no-sandbox", "disable-web-security", "user-agent"):
+            self.assertNotIn(forbidden, joined)
+        # SYS_ADMIN only, after ALL is dropped, on a non-root user with no-new-privileges.
+        caps = [args[i + 1] for i, a in enumerate(args) if a == "--cap-add"]
+        self.assertEqual(caps, ["SYS_ADMIN"])
+        self.assertLess(args.index("--cap-drop"), args.index("--cap-add"))
+        self.assertIn("no-new-privileges", args)
+        self.assertEqual(args[args.index("--user") + 1], "1000:1000")
+
+    def test_jd2_container_gets_no_cap_add(self):
+        self.rt.run_jd2(str(self.jd2), str(self.dl), 1000, 1000)
+        run = [c for c in self.fake.docker_calls() if c[0] == "run"][0]
+        self.assertNotIn("--cap-add", run)
+
+    def test_run_checks_image_and_two_gib_memory(self):
+        tag = self.rt.browser_build(self.context())
+        self.set_mem(1900 * 1024)
+        with self.assertRaises(cr.ContainerError) as ctx:
+            self.rt.run_browser(tag)
+        self.assertIn("空きメモリ", str(ctx.exception))
+        self.assertEqual([c for c in self.fake.docker_calls() if c[0] == "run"], [])
+        self.set_mem(2200 * 1024)
+        self.rt.run_browser(tag)
+        self.assertIn("qnapdl-browser", self.fake.containers)
+        self.assertEqual(self.rt.inspect_ip(cr.BROWSER_NAME, cr.BROWSER_NET), "172.30.0.2")
+        with self.assertRaises(cr.ContainerError):
+            self.rt.inspect_ip(cr.BROWSER_NAME, cr.JD2_NET)   # name/network must pair up
+        with self.assertRaises(cr.ContainerError):
+            self.rt.run_browser(tag)    # leftover with the same name
+
+    def test_run_without_image_is_refused(self):
+        with self.assertRaises(cr.ContainerError):
+            self.rt.run_browser("qnapdl-browser:0123456789ab")
+
+    def test_selftest_uses_same_hardening_and_maps_userns_failure(self):
+        tag = "qnapdl-browser:0123456789ab"
+        self.assertTrue(self.rt.browser_selftest(tag))
+        run = [c for c in self.fake.docker_calls() if c[0] == "run"][0]
+        self.assertEqual(run[-2:], [tag, "selftest"])
+        self.assertIn("--rm", run)
+        self.assertIn("--read-only", run)
+        self.assertEqual(run[run.index("--network") + 1], "none")
+        self.fake.selftest_code = cr.BROWSER_EXIT_NO_USERNS
+        with self.assertRaises(cr.ContainerError) as err:
+            self.rt.browser_selftest(tag)
+        self.assertIn("ユーザー名前空間", str(err.exception))
+        self.assertIn("サンドボックスを無効にする方法へは切り替えません", str(err.exception))
+        self.assertIn("カーネル", str(err.exception))
+        self.fake.selftest_code = cr.BROWSER_EXIT_CAPS
+        with self.assertRaises(cr.ContainerError) as err:
+            self.rt.browser_selftest(tag)
+        self.assertIn("CapEff", str(err.exception))
+        self.assertIn("ユーザー名前空間", str(err.exception))
+        self.assertEqual(self.rt.browser_selftest_args(tag).count("--cap-add"), 1)
+
+    def test_stats_for_own_container_only_and_parsing(self):
+        self.fake.containers["qnapdl-browser"] = {
+            "labels": {cr.LABEL_KEY: "1"}, "running": True, "net": cr.BROWSER_NET,
+            "ip": "172.30.0.2", "ports": {}, "extra_nets": []}
+        stats = self.rt.stats(cr.BROWSER_NAME)
+        self.assertEqual(stats["limit_bytes"], 2 * 1024 ** 3)
+        self.assertEqual(stats["percent"], 25.0)
+        call = [c for c in self.fake.docker_calls() if c[0] == "stats"][0]
+        self.assertEqual(call, ["stats", "--no-stream", "--format", "{{.MemUsage}}|{{.MemPerc}}",
+                                "qnapdl-browser"])
+        with self.assertRaises(cr.ContainerError):
+            self.rt.stats("other-container")
+        self.assertEqual(cr.parse_stats("1.5GiB / 2GiB|75.00%")["percent"], 75.0)
+        with self.assertRaises(cr.ContainerError):
+            cr.parse_stats("garbage")
+
+    def test_prune_removes_only_older_hub_built_browser_images(self):
+        self.fake.images.update({"qnapdl-browser:aaaaaaaaaaaa", "qnapdl-browser:bbbbbbbbbbbb"})
+        self.assertEqual(self.rt.browser_prune_old("qnapdl-browser:bbbbbbbbbbbb"), 1)
+        self.assertNotIn("qnapdl-browser:aaaaaaaaaaaa", self.fake.images)
+        self.assertIn("qnapdl-browser:bbbbbbbbbbbb", self.fake.images)
+
+    def test_stop_with_short_grace_and_foreign_container_refused(self):
+        self.fake.containers["qnapdl-browser"] = {
+            "labels": {cr.LABEL_KEY: "1"}, "running": True, "net": cr.BROWSER_NET,
+            "ip": "172.30.0.2", "ports": {}, "extra_nets": []}
+        self.assertTrue(self.rt.stop(cr.BROWSER_NAME, grace=cr.BROWSER_STOP_GRACE))
+        self.assertIn(["stop", "-t", "5", "qnapdl-browser"], self.fake.docker_calls())
+        self.fake.containers["qnapdl-browser"]["labels"] = {}
+        with self.assertRaises(cr.ContainerError):
+            self.rt.stop(cr.BROWSER_NAME)
+
+
+class BrowserDockerfileStaticTests(unittest.TestCase):
+    ROOT = Path(__file__).resolve().parents[1] / "container" / "browser"
+
+    def setUp(self):
+        self.dockerfile = (self.ROOT / "Dockerfile").read_text()
+        self.entry = (self.ROOT / "entrypoint.sh").read_text()
+
+    def test_only_the_two_shipped_files(self):
+        self.assertEqual({p.name for p in self.ROOT.iterdir()}, {"Dockerfile", "entrypoint.sh"})
+
+    def test_base_image_is_the_pinned_digest(self):
+        self.assertIn("FROM " + cr.IMAGE_DEBIAN + "\n", self.dockerfile)
+        self.assertTrue(cr.IMAGE_DEBIAN.endswith(
+            "7ff6ba31527b9e336162fa061746c366c4b2032f4d2cff2078bea43f78efe3f8"))
+
+    def test_packages_user_and_entrypoint(self):
+        self.assertIn("apt-get install -y --no-install-recommends", self.dockerfile)
+        for pkg in ("chromium", "xvfb", "socat", "fonts-noto-cjk", "ca-certificates", "dumb-init"):
+            self.assertIn(pkg, self.dockerfile)
+        self.assertIn("useradd -u 1000", self.dockerfile)
+        self.assertIn("USER 1000:1000", self.dockerfile)
+        self.assertIn('ENTRYPOINT ["dumb-init", "--"', self.dockerfile)
+
+    def test_chromium_flags_exact_set_and_sandbox_kept(self):
+        for flag in ("--remote-debugging-port=9222", "--user-data-dir=/profile", "--disk-cache-size=1",
+                     "--media-cache-size=1", "--disable-breakpad", "--disable-crash-reporter",
+                     "--no-first-run", "--no-default-browser-check", "--disable-sync",
+                     "--disable-background-networking", "--lang=ja", "--window-size=1280,2000",
+                     "about:blank"):
+            self.assertIn(flag, self.entry)
+        self.assertIn("Xvfb :99 -screen 0 1280x2000x24", self.entry)
+        self.assertIn("socat TCP-LISTEN:9223,fork,reuseaddr,bind=0.0.0.0 TCP:127.0.0.1:9222", self.entry)
+        self.assertIn("exit 78", self.entry)
+
+    def test_entrypoint_refuses_to_run_with_effective_capabilities(self):
+        guard = "grep -q '^CapEff:[[:space:]]*0000000000000000$' /proc/self/status"
+        self.assertIn(guard, self.entry)
+        self.assertIn("exit 79", self.entry)
+        # the guard runs before the userns probe, the selftest exit and any process start
+        for later in ("unshare --user", '= "selftest"', "Xvfb :99", "chromium \\"):
+            self.assertLess(self.entry.index(guard), self.entry.index(later), later)
+
+    def test_runtime_source_has_the_reasoning_comment_and_no_sandbox_off_switch(self):
+        source = (Path(__file__).resolve().parents[1] / "container_runtime.py").read_text()
+        self.assertIn("CAP_SYS_ADMIN", source)
+        self.assertIn("bounding", source)
+        self.assertNotIn("no-sandbox", source.lower())
+
+    def test_no_sandbox_off_switch_ua_spoofing_or_web_security_flags(self):
+        import re
+        for text in (self.dockerfile, self.entry):
+            low = text.lower()
+            for forbidden in ("no-sandbox", "disable-web-security", "user-agent", "useragent",
+                              "disable-setuid-sandbox", "disable-site-isolation", "ignore-certificate",
+                              "--single-process", "remote-allow-origins"):
+                self.assertNotIn(forbidden, low)
+        self.assertIsNone(re.search(r"--remote-debugging-address", self.entry))

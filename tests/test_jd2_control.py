@@ -7,7 +7,8 @@ import jd2_policy
 class Adapter:
     def __init__(self):
         self.revision = "jd2-core-2026"
-        self.values = {k: True for k in jd2_policy.REQUIRED}
+        self.values = {k: ("ALWAYS" if k == "downloads.auto_start" else True)
+                       for k in jd2_policy.REQUIRED}
         self.available = True
         self.update_count = 0
 
@@ -53,7 +54,7 @@ class ControllerTests(unittest.TestCase):
         self.assertTrue(status["connected"])
         self.assertTrue(status["update_available"])
         self.assertEqual(adapter.update_count, 0)
-        self.assertTrue(all(adapter.values.values()))
+        self.assertEqual(adapter.values["linkgrabber.auto_confirm"], True)
 
     def test_jd_update_does_not_call_hub_updater(self):
         jd = Adapter()
@@ -78,7 +79,8 @@ class ControllerTests(unittest.TestCase):
         preview = ctl.preset_preview()
         self.assertTrue(preview["applicable"])
         self.assertTrue(ctl.preset_reapply(confirmed=True)["applicable"])
-        self.assertTrue(all(v is False for v in jd.values.values()))
+        self.assertTrue(all(v is False for k, v in jd.values.items() if k != "downloads.auto_start"))
+        self.assertEqual(jd.values["downloads.auto_start"], "ONLY_IF_EXIT_WITH_RUNNING_DOWNLOADS")
         with self.assertRaises(jd2_policy.PresetUnavailable):
             ctl.preset_reapply(confirmed=True)
 
