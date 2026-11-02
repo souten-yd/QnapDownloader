@@ -380,6 +380,56 @@ class LifecycleTests(BrowserBase):
         self.assertIn("CapEff", str(ctx.exception))
         self.assertNotIn("qnapdl-browser", self.fake.containers)
 
+    def test_early_exit_reads_logs_tail_and_surfaces_it(self):
+        self.fake.run_exits = cr.BROWSER_EXIT_CHROMIUM
+        self.fake.container_logs = ("qnapdl-browser: chromium exited\n" +
+                                    "Failed to move to new namespace " * 30 + "TAILEND")
+        with self.assertRaises(rb.BrowserError) as ctx:
+            self.open()
+        message = str(ctx.exception)
+        self.assertIn("Chromiumが終了しました", message)
+        self.assertIn("終了コード 72", message)
+        self.assertIn("TAILEND", message)
+        self.assertLessEqual(len(message.split(": ", 1)[1]), 300)
+        lines = "\n".join(self.rb.log_lines())
+        self.assertIn("qnapdl-browser: chromium exited", lines)
+        self.assertIn("TAILEND", lines)
+        calls = self.fake.docker_calls()
+        logs = [i for i, c in enumerate(calls) if c[0] == "logs"]
+        removes = [i for i, c in enumerate(calls) if c[:2] == ["rm", "-f"]]
+        self.assertEqual([calls[i] for i in logs], [["logs", "--tail", "80", "qnapdl-browser"]])
+        self.assertLess(logs[0], removes[0])
+        self.assertNotIn("qnapdl-browser", self.fake.containers)
+
+    def test_each_exit_code_has_its_message_and_missing_logs_are_tolerated(self):
+        for code, word in ((70, "時間切れ"), (71, "Xvfb"), (72, "Chromium"), (73, "socat")):
+            self.fake.run_exits = code
+            self.fake.logs_fail = True
+            with self.assertRaises(rb.BrowserError) as ctx:
+                self.open()
+            self.assertIn(word, str(ctx.exception))
+            self.assertIn("終了コード %d" % code, str(ctx.exception))
+        self.fake.run_exits = 5
+        with self.assertRaises(rb.BrowserError) as ctx:
+            self.open()
+        self.assertIn("起動直後に終了しました（終了コード 5）", str(ctx.exception))
+
+    def test_image_tag_mismatch_asks_for_setup_again(self):
+        self.fake.images.clear()
+        self.fake.images.add("qnapdl-browser:aaaaaaaaaaaa")   # older Hub-built image
+        status = self.rb.status()
+        self.assertFalse(status["image_ready"])
+        self.assertTrue(status["update_needed"])
+        self.assertEqual(status["reason"], "NASブラウザの更新が必要です（初期設定を再実行）")
+        with self.assertRaises(rb.BrowserError) as ctx:
+            self.open()
+        self.assertEqual(str(ctx.exception), "NASブラウザの更新が必要です（初期設定を再実行）")
+        self.assertFalse([c for c in self.fake.docker_calls() if c[0] == "run"])
+
+    def test_no_image_at_all_is_plain_setup_not_update(self):
+        self.fake.images.clear()
+        self.assertFalse(self.rb.status()["update_needed"])
+
     def test_connect_failure_stops_and_removes_container(self):
         def broken(ip):
             raise OSError("refused")

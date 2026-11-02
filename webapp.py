@@ -26,7 +26,7 @@ import engine_supervisor
 import remote_browser
 import updater
 
-VERSION = "0.1.17"
+VERSION = "0.1.18"
 PORT = 17864
 ROOT = Path(__file__).resolve().parent
 FILES = {"/": ("web/index.html", "text/html; charset=utf-8"),
@@ -421,6 +421,9 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_data(200, {"log": self.server.updates.log_tail()})
             if path == "/api/rb/status":
                 return self.send_data(200, self.server.rb.status())
+            if path == "/api/rb/log":
+                # RAM ring only (early-exit reasons from the browser container).
+                return self.send_data(200, {"lines": self.server.rb.log_lines()})
             if path == "/api/rb/frame":
                 query = parse_qs(urlsplit(self.path).query)
                 since_text = query.get("since", ["0"])[0]

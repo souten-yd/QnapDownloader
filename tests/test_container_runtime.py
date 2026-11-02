@@ -431,11 +431,50 @@ class BrowserRuntimeTests(RuntimeBase):
         self.assertEqual(self.rt.browser_run_args(tag), [
             "run", "-d", "--name", "qnapdl-browser", "--label", "org.qnapdownloader.managed=1",
             "--network", "qnapdl-browser-net", "--restart", "no", "--read-only",
-            "--log-driver", "none", "--memory", "2g", "--memory-swap", "2g",
+            "--log-driver", "local", "--log-opt", "max-size=256k", "--log-opt", "max-file=1",
+            "--memory", "2g", "--memory-swap", "2g",
             "--shm-size", "512m", "--pids-limit", "1024", "--cap-drop", "ALL",
             "--cap-add", "SYS_ADMIN",
             "--security-opt", "no-new-privileges", "--user", "1000:1000",
-            "--tmpfs", "/profile:size=512m", "--tmpfs", "/tmp:size=256m", tag])
+            "--tmpfs", "/profile:rw,nosuid,nodev,size=512m,uid=1000,gid=1000,mode=0700",
+            "--tmpfs", "/tmp:rw,nosuid,nodev,size=256m,mode=1777", tag])
+
+    def test_selftest_keeps_log_driver_none_and_jd2_is_unchanged(self):
+        args = self.rt.browser_selftest_args("qnapdl-browser:0123456789ab")
+        self.assertEqual(args[args.index("--log-driver") + 1], "none")
+        self.assertNotIn("--log-opt", args)
+        jd2 = self.rt.jd2_run_args("/a/jd2", "/a/dl", 1000, 1000)
+        self.assertEqual(jd2[jd2.index("--log-driver") + 1], "none")
+        self.assertNotIn("--log-opt", jd2)
+
+    def test_exit_code_messages(self):
+        self.assertEqual(set(cr.BROWSER_EXIT_MESSAGES), {70, 71, 72, 73})
+        self.assertIn("時間切れ", cr.BROWSER_EXIT_MESSAGES[70])
+        self.assertIn("Xvfb", cr.BROWSER_EXIT_MESSAGES[71])
+        self.assertIn("Chromium", cr.BROWSER_EXIT_MESSAGES[72])
+        self.assertIn("socat", cr.BROWSER_EXIT_MESSAGES[73])
+
+    def test_logs_tail_is_label_checked_fixed_name_and_sanitized(self):
+        self.fake.containers["qnapdl-browser"] = {
+            "labels": {cr.LABEL_KEY: cr.LABEL_VALUE}, "running": False, "net": "n", "ip": "172.30.0.2",
+            "ports": {}, "extra_nets": [], "exit": 72}
+        self.fake.container_logs = "boom\x1b[31m red\x00\r\n" + "x" * 3000 + "END"
+        text = self.rt.logs_tail("qnapdl-browser")
+        self.assertLessEqual(len(text), cr.BROWSER_LOG_CHARS)
+        self.assertTrue(text.endswith("END"))
+        self.assertNotIn("\x1b", text)
+        self.assertNotIn("\x00", text)
+        self.assertEqual(self.fake.docker_calls()[-1], ["logs", "--tail", "80", "qnapdl-browser"])
+        with self.assertRaises(cr.ContainerError):
+            self.rt.logs_tail("qnapdl-jd2")
+        with self.assertRaises(cr.ContainerError):
+            self.rt.logs_tail("other")
+
+    def test_logs_tail_refuses_unlabelled_container_without_reading(self):
+        self.fake.add_foreign("qnapdl-browser")
+        with self.assertRaises(cr.ContainerError):
+            self.rt.logs_tail("qnapdl-browser")
+        self.assertFalse([c for c in self.fake.docker_calls() if c[0] == "logs"])
 
     def test_run_args_have_no_ports_mounts_privileges_or_sandbox_flags(self):
         args = self.rt.browser_run_args("qnapdl-browser:0123456789ab")
@@ -565,6 +604,17 @@ class BrowserDockerfileStaticTests(unittest.TestCase):
         self.assertIn("Xvfb :99 -screen 0 1280x2000x24", self.entry)
         self.assertIn("socat TCP-LISTEN:9223,fork,reuseaddr,bind=0.0.0.0 TCP:127.0.0.1:9222", self.entry)
         self.assertIn("exit 78", self.entry)
+
+    def test_entrypoint_logs_to_tmpfs_and_distinct_exit_codes_with_tail(self):
+        for text in ('>"$XVFB_LOG" 2>&1', '>"$CHROMIUM_LOG" 2>&1', "XVFB_LOG=/tmp/xvfb.log",
+                     "CHROMIUM_LOG=/tmp/chromium.log", "tail -n 60", "qnapdl-browser: $1 exited",
+                     "fail xvfb", "fail chromium", "fail socat", " 71", " 72", " 73", " 70",
+                     "mkdir -p", "/tmp/.config", "/tmp/.cache", "--disable-gpu",
+                     "--password-store=basic", "--no-default-browser-check"):
+            self.assertIn(text, self.entry)
+        self.assertNotIn("--disable-dev-shm-usage", self.entry)
+        self.assertNotIn("no" + "-sandbox", self.entry)
+        self.assertLess(self.entry.index("/tmp/.cache"), self.entry.index("chromium \\"))
 
     def test_entrypoint_refuses_to_run_with_effective_capabilities(self):
         guard = "grep -q '^CapEff:[[:space:]]*0000000000000000$' /proc/self/status"
