@@ -285,7 +285,7 @@
        </li>
        <li><code>https://&lt;NAS名&gt;.&lt;tailnet名&gt;.ts.net/</code> を開き、ホーム画面に追加し直します。</li>
       </ol>
-      <p class="muted">Cloudflare確認は、HTTPS＋互換モード＋サイトが埋め込みを許可している場合に通過できる見込みです。iPhoneでは失敗することがあり、その場合は「iPhoneから送る」の共有メニュー方式（Safariで開いてリンクを送る）を使ってください。</p>
+      <p id="cfHttps" class="muted">HTTPSで開くと通過しやすくなります。Cloudflare確認は、HTTPS＋互換モード＋サイトが埋め込みを許可している場合に通過できる見込みです。iPhoneでは失敗することがあり、その場合は「iPhoneから送る」の共有メニュー方式（Safariで開いてリンクを送る）を使ってください。</p>
      </section>
 
      <section class="settings-section" data-section="share" hidden>
@@ -327,6 +327,9 @@
        <button type="submit" id="bookmarkAdd" class="btn primary">追加</button>
       </form>
       <div id="bookmarkItems" class="items"></div>
+      <h2>常にSafariで開くサイト</h2>
+      <p class="muted">Webタブで表示できないサイトを、次回からタブを作らずSafariで開く設定です。</p>
+      <div id="externalHosts" class="items"></div>
      </section>
 
      <section class="settings-section" data-section="updates" hidden>
@@ -369,7 +372,9 @@
        <li>初期開発版です。実機（TS-253Be）でのJD2の動作は未検証です。</li>
        <li>自動ダウンロードとサイトの自動巡回はありません。追加したリンクは手動でJD2へ送ります。</li>
        <li>Rapidgatorのリンクは、貼り付けたテキストやHTMLから抽出できます。</li>
-       <li>Webの閲覧は端末側の隔離表示です。表示できないサイトはSafariで開いてください。</li>
+       <li>Webの閲覧は端末側の隔離表示です。表示できないサイトはSafariで開いてください（「Safariで開く（次回から自動）」でサイトごとに記憶できます）。</li>
+       <li>枠内で遷移した先のURLは読み取れません。サイトが埋め込みを禁止している場合は空白になります。</li>
+       <li>互換モードでは、そのサイト自身のCookie・ストレージを枠内で使えます（Hub自体のものではありません）。</li>
       </ul>
       <details class="fold">
        <summary>詳細</summary>
@@ -391,10 +396,9 @@
    <div id="webLoading" class="loading-bar" hidden></div>
    <div id="webStatus" class="web-status"></div>
    <div id="cfHint" class="cf-hint" role="note" hidden>
-    <span class="cf-hint-text">Cloudflareの確認が進まない場合 →</span>
-    <a id="cfHttps" class="btn small" href="#/settings/https" hidden>HTTPSで開くと通過しやすくなります</a>
-    <button type="button" id="cfCompat" class="btn small">互換モードで再読み込み</button>
-    <button type="button" id="cfSafari" class="btn small">Safariで開く</button>
+    <span class="cf-hint-text">表示されない場合:</span>
+    <button type="button" id="cfSafari" class="btn small">Safariで開く（次回から自動）</button>
+    <button type="button" id="cfCompat" class="btn small">互換で再読み込み</button>
     <button type="button" id="cfDismiss" class="icon-btn small" aria-label="このヒントを閉じる" title="閉じる"><svg class="icon" aria-hidden="true"><use href="#i-x"/></svg></button>
    </div>
    <div id="frames" class="frames"></div>

@@ -222,6 +222,43 @@ if (out !== want) { console.error(JSON.stringify(out)); process.exit(1); }
         result = subprocess.run(["node", "-e", script], capture_output=True, text=True, timeout=20)
         self.assertEqual(result.returncode, 0, result.stderr)
 
+    def test_v0114_external_mode_storage(self):
+        self.assertIn('EXTERNAL_MODE = "external"', self.js)
+        self.assertRegex(self.js, r"e\[1\] === EXTERNAL_MODE")
+        self.assertIn("rememberHostMode(host, EXTERNAL_MODE)", self.js)
+        # external is a host preference, never a tab mode / sandbox value.
+        modes = re.search(r"const MODES = \[(.*?)\];", self.js).group(1)
+        self.assertNotIn("external", modes)
+        # Reads/writes of the map stay guarded and capped.
+        for fn in ("readLocal", "writeLocal", "removeLocal"):
+            body = re.search(r"function %s\(.*?\n\}\n" % fn, self.js, re.S).group(0)
+            self.assertIn("try", body)
+            self.assertIn("catch", body)
+        self.assertRegex(self.js, r"\.slice\(-MAX_HOST_MODES\)")
+        # Opens externally with noopener, synchronously, then validates.
+        self.assertIn('window.open(href, "_blank", "noopener,noreferrer")', self.js)
+        self.assertIn("externalSanityUrl", self.js)
+        self.assertIn("renderExternalHosts", self.js)
+        self.assertIn('id="externalHosts"', self.html)
+        self.assertIn("常にSafariで開くサイト", self.html)
+        self.assertRegex(self.js, r"HINT_DELAY_MS\s*=\s*6000\b")
+        self.assertIn("Safariで開きました（このサイトは常に外部で開きます）", self.js)
+
+    def test_v0114_long_tab_copy_removed(self):
+        for gone in ("隔離表示中", "枠内の遷移先URLは", "Cloudflareの確認が進まない場合",
+                     "互換モードで再読み込み"):
+            for path in text_files():
+                with self.subTest(file=path.name, text=gone):
+                    self.assertNotIn(gone, path.read_text(encoding="utf-8"))
+        # The HTTPS hint now lives only in the HTTPS settings section.
+        https = re.search(r'<section class="settings-section" data-section="https".*?</section>', self.html, re.S).group(0)
+        self.assertIn("HTTPSで開くと通過しやすくなります", https)
+        view_web = re.search(r'<section id="view-web".*?</section>', self.html, re.S).group(0)
+        self.assertNotIn("HTTPSで開くと", view_web)
+        self.assertIn("表示されない場合", view_web)
+        self.assertIn("Safariで開く（次回から自動）", view_web)
+        self.assertIn("互換で再読み込み", view_web)
+
     def test_icons_use_symbol_sprite(self):
         self.assertIn("<symbol", self.html)
         self.assertIn('id="notice"', self.html)
