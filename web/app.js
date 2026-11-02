@@ -1,25 +1,19 @@
 "use strict";
 /*
- * QnapDownloader browser-style shell (v0.1.33).
+ * QnapDownloader browser-style shell (v0.1.35).
  * Spec: docs/browser-shell-ui.md. Single file, no build step.
  *
  * Security notes (see "Security invariants" in the spec):
  *  - DOM is built only with createElement/createElementNS + textContent.
- *  - External pages live in per-tab iframes whose sandbox is one of exactly
- *    three constants (SANDBOX_STRICT / _INTERACTIVE / _COMPAT, see below). The
- *    src is only ever set to a URL that /api/browser/validate returned
- *    (see mountFrame).
- *  - Storage keeps only {id, url history, index, mode} and the last route
- *    (session), one boolean preference and hostname->mode pairs (local).
- *    Never tokens, passwords or cookies.
+ *  - There are no iframes: since v0.1.35 every http(s) web tab is shown by the NAS browser
+ *    (Chromium in a NAS container); this page only displays JPEG frames / reader data the Hub
+ *    produced. The URL is validated by /api/browser/validate before it is handed to the Hub.
+ *  - Storage keeps only {id, url history, index} and the last route (session), one boolean
+ *    preference and hostname->display pairs (local). Never tokens, passwords or cookies.
  */
 
 // ---------------------------------------------------------------- constants
 const MAX_WEB_TABS = 6;
-// iOS kills the WebContent process (and reloads the home-screen app) under
-// memory pressure, so keep few live external iframes. Others re-load lazily.
-const MAX_LIVE_FRAMES_NARROW = 1;
-const MAX_LIVE_FRAMES_WIDE = 3;
 const SWR_TTL_MS = 10000;
 const MAX_HOST_MODES = 100;
 const UPDATE_POLL_MS = 2000;
@@ -30,35 +24,17 @@ const UPDATE_WATCH_MS = 5 * 60 * 1000;
 const MAX_CLOSED_TABS = 10;
 const MAX_HISTORY = 50;
 const AUTO_REFRESH_MS = 5000;     // downloads view: local data, refreshed while visible
-const FRAME_LOAD_TIMEOUT_MS = 12000;
-const HINT_DELAY_MS = 6000;         // offer the "not showing?" bar after this long
 const PAGE_SIZE = 30;
 const WAITING_MAX = 50;
-// Remote pages never get popups, downloads, modals or top navigation.
-const SANDBOX_STRICT = "";
-const SANDBOX_INTERACTIVE = "allow-scripts allow-forms";
-// Compatibility mode (per tab, explicit confirm). SAFETY ARGUMENT: a sandboxed
-// frame without the origin-sharing flag gets an opaque origin, so it has no
-// cookies/storage and e.g. a Cloudflare check cannot complete. With the flag,
-// the page keeps its OWN origin. External pages are always https on a public
-// DNS name (browser_safety.validate), and the Hub is served from an http
-// LAN/VPN address or a reverse-proxy host, so the two origins can never be
-// equal; the backend (/api/browser/validate) additionally rejects the Hub's own
-// hostname and *.ts.net. The page therefore gets only its own origin's
-// cookies/storage and cannot reach the Hub's session or storage.
-const SANDBOX_COMPAT = "allow-scripts allow-forms allow-same-origin";
-const MODES = ["strict", "interactive", "compat"];
-// NAS remote browser (v0.1.16): a host preference and a per-tab flag, never a
-// sandbox value. The page is rendered by Chromium in a NAS container; this
+// NAS remote browser (v0.1.16): the page is rendered by Chromium in a NAS container; this
 // page only shows JPEG frames from /api/rb/frame.jpg (binary, shown through a
 // blob: object URL) and posts validated input.
-// NAS browser modes in the per-host map. "remote" = use the NAS browser with the display chosen in
-// Settings (rb_default_mode); the other three are an explicit per-site display choice (v0.1.30).
-const REMOTE_MODE = "remote";
+// Per-host map (localStorage): only an explicit per-site display choice is stored (v0.1.30);
+// without an entry the display chosen in Settings (rb_default_mode) applies.
 const REMOTE_FAST_MODE = "remote-fast";      // fast full-page display (JPEG tiles)
 const REMOTE_LIVE_MODE = "remote-live";      // live screencast (Cloudflare checks, logins)
 const REMOTE_READER_MODE = "remote-reader";  // reader: text rebuilt from validated data
-const REMOTE_MODES = [REMOTE_MODE, REMOTE_FAST_MODE, REMOTE_LIVE_MODE, REMOTE_READER_MODE];
+const REMOTE_MODES = [REMOTE_FAST_MODE, REMOTE_LIVE_MODE, REMOTE_READER_MODE];
 const DISPLAY_OF_MODE = {[REMOTE_FAST_MODE]: "tiles", [REMOTE_LIVE_MODE]: "live", [REMOTE_READER_MODE]: "reader"};
 const MODE_OF_DISPLAY = {tiles: REMOTE_FAST_MODE, live: REMOTE_LIVE_MODE, reader: REMOTE_READER_MODE};
 const DISPLAY_OF_SETTING = {reader: "reader", fast: "tiles", live: "live"};
@@ -97,15 +73,24 @@ const RB_STREAM_STALL_MS = 6000;
 const RB_POPUP_NEW_TAB = "new";
 const RB_KEYS = ["Enter", "Backspace", "Tab", "Escape", "Delete",
   "ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown"];
-const MODE_LABELS = {strict: "強い制限", interactive: "限定操作", compat: "互換"};
-// v0.1.30: the old per-host "external" (always open in Safari) mode was removed; a stored entry
-// is converted to the NAS browser default mode on load.
-const LEGACY_EXTERNAL_MODE = "external";
 const SHELL_KEY = "qnapdl.shell.v1";
 const HOST_MODE_KEY = "qnapdl.hostmodes.v1";
 const TAB_STORAGE_KEY = "qnapdl.webtabs.v1";
 const LEGACY_AUTO_KEY = "qnapdl.downloads.auto";   // v0.1.11 switch; removed silently
 // v0.1.33: four sections, each with in-page subsections (#/settings/jd2/accounts scrolls to one).
+// v0.1.35 debug log (server ring, RAM only). The page batches entries while the server says it is on.
+const DEBUG_CATEGORIES = ["ui", "render", "net", "rb", "jd2", "engine", "disk", "http", "app"];
+const DEBUG_CATEGORY_LABELS = {ui: "画面", render: "描画", net: "通信", rb: "NASブラウザ", jd2: "JD2",
+  engine: "エンジン", disk: "ディスク", http: "HTTP", app: "アプリ"};
+const DEBUG_LEVELS = ["debug", "info", "warn", "error"];
+const DEBUG_LEVEL_LABELS = {debug: "詳細", info: "情報", warn: "警告", error: "エラー"};
+const DEBUG_FLUSH_MS = 2000;       // at most one POST per this long
+const DEBUG_BATCH = 100;           // entries per POST (the server also enforces this)
+const DEBUG_QUEUE_MAX = 300;       // entries waiting for the next POST; the oldest are dropped
+const DEBUG_RATE_MS = 1000;        // the same key is logged at most this often
+const DEBUG_VIEW_MS = 2000;        // the log sheet follows the server this often
+const DEBUG_VIEW_MAX = 1000;
+const DISK_REFRESH_MS = 10000;     // disk write table (the Hub samples every 10 s)
 const SETTINGS_SECTIONS = ["jd2", "browser", "connection", "system"];
 const SETTINGS_SUBS = {jd2: ["engine", "accounts", "storage", "send"], browser: ["nas", "rules", "bookmarks"],
   connection: ["https", "share"], system: ["updates", "diagnostics", "about"]};
@@ -139,7 +124,8 @@ const state = {
   bootVersion: "", updateWatching: false,
   engine: null,
   https: false, tailnet: false,
-  rbPolling: "", rbPollMode: "", rbGen: 0, rbStatus: null,
+  rbPolling: "", rbPollMode: "", rbGen: 0, rbStatus: null, rbReady: null,
+  debug: {enabled: false, level: "debug", categories: [], until: 0, endsAt: 0},
   rbIntercepts: [],
   rbQuality: loadRbQuality(), rbStream: null, rbPerf: false, rbPerfSamples: [],
   rbPerfSince: 0, probeResult: null, probeResults: [], siteRules: null, waiting: null,
@@ -225,38 +211,32 @@ function removeLocal(key) {
   try { localStorage.removeItem(key); } catch (e) { /* ignore */ }
 }
 
-function normalizeMode(mode) { return MODES.includes(mode) ? mode : "strict"; }
-
-function sandboxFor(mode) {
-  if (mode === "compat") return SANDBOX_COMPAT;
-  return mode === "interactive" ? SANDBOX_INTERACTIVE : SANDBOX_STRICT;
-}
-
-// Remembered mode per hostname: [[host, mode], ...] only, newest last, capped.
+// Remembered display per hostname: [[host, mode], ...] only, newest last, capped. v0.1.35: the
+// iframe modes (strict / interactive / compat), the old "external" mode and the plain "remote"
+// entry no longer exist; such stored entries are dropped so the default display applies.
 function readHostModes() {
   try {
     const data = JSON.parse(readLocal(HOST_MODE_KEY) || "[]");
     if (!Array.isArray(data)) return [];
-    return data.map(e => (Array.isArray(e) && e[1] === LEGACY_EXTERNAL_MODE) ? [e[0], REMOTE_MODE] : e)
-      .filter(e => Array.isArray(e) && typeof e[0] === "string" && e[0].length <= 253 &&
-        ((MODES.includes(e[1]) && e[1] !== "strict") || REMOTE_MODES.includes(e[1]))).slice(-MAX_HOST_MODES);
+    return data.filter(e => Array.isArray(e) && typeof e[0] === "string" && e[0].length <= 253 &&
+      REMOTE_MODES.includes(e[1])).map(e => [e[0], e[1]]).slice(-MAX_HOST_MODES);
   } catch (e) { return []; }
 }
 
-// One-time rewrite of stored "external" entries (readHostModes already maps them when reading).
+// One-time silent rewrite of the stored map (readHostModes already ignores the old values).
 function migrateHostModes() {
   try {
     const raw = readLocal(HOST_MODE_KEY);
-    if (raw && raw.includes('"' + LEGACY_EXTERNAL_MODE + '"')) {
-      writeLocal(HOST_MODE_KEY, JSON.stringify(readHostModes()));
-    }
-  } catch (e) { /* ignore: reads still map the old value */ }
+    if (raw === null) return;
+    const clean = JSON.stringify(readHostModes());
+    if (clean !== raw) writeLocal(HOST_MODE_KEY, clean);
+  } catch (e) { /* ignore: reads still skip the old values */ }
 }
 
 function rememberHostMode(host, mode) {
   if (!host) return;
   const list = readHostModes().filter(e => e[0] !== host);
-  if (mode !== "strict") list.push([host, mode]);   // strict is the default: store nothing
+  if (REMOTE_MODES.includes(mode)) list.push([host, mode]);   // no entry = the default display
   writeLocal(HOST_MODE_KEY, JSON.stringify(list.slice(-MAX_HOST_MODES)));
 }
 
@@ -265,13 +245,8 @@ function rememberedMode(host) {
   return hit ? hit[1] : null;
 }
 
-function isRemoteHost(host) {
-  const mode = host ? rememberedMode(host) : null;
-  return REMOTE_MODES.includes(mode);
-}
-
-function remoteHosts() {
-  return readHostModes().filter(e => REMOTE_MODES.includes(e[1])).map(e => e[0]);
+function displayHosts() {
+  return readHostModes().map(e => e[0]);
 }
 
 migrateHostModes();
@@ -355,6 +330,78 @@ async function perform(fn) {
   try { await fn(); } catch (e) { toast(e.message, "error"); }
 }
 
+// ------------------------------------------------------------------ debug log
+// dlog(category, level, message, data): does nothing unless the Hub says the debug log is on.
+// Entries are queued and POSTed to /api/debug/log at most every DEBUG_FLUSH_MS (<= DEBUG_BATCH each);
+// the Hub applies its own size limits and redaction. Nothing is stored on this device.
+const dbgQueue = [];
+const dbgGate = new Map();
+let dbgTimer = 0;
+
+function dlogWanted(category, level) {
+  const d = state.debug;
+  if (!d.enabled || !DEBUG_CATEGORIES.includes(category)) return false;
+  if (d.categories.length && !d.categories.includes(category)) return false;
+  return DEBUG_LEVELS.indexOf(level) >= Math.max(0, DEBUG_LEVELS.indexOf(d.level));
+}
+
+function dlog(category, level, message, data) {
+  if (!dlogWanted(category, level)) return;
+  dbgQueue.push({category, level, message: String(message).slice(0, 500), data: data === undefined ? null : data});
+  while (dbgQueue.length > DEBUG_QUEUE_MAX) dbgQueue.shift();
+  if (!dbgTimer) dbgTimer = setTimeout(flushDebug, DEBUG_FLUSH_MS);
+}
+
+// Rate-limited dlog: the same key is logged at most once per `every` ms.
+function dlogRate(key, category, level, message, data, every = DEBUG_RATE_MS) {
+  if (!state.debug.enabled) return;
+  const now = Date.now();
+  if (now - (dbgGate.get(key) || 0) < every) return;
+  if (dbgGate.size > 200) dbgGate.clear();
+  dbgGate.set(key, now);
+  dlog(category, level, message, data);
+}
+
+async function flushDebug() {
+  dbgTimer = 0;
+  if (!state.authed || !state.debug.enabled || !dbgQueue.length) { dbgQueue.length = 0; return; }
+  const entries = dbgQueue.splice(0, DEBUG_BATCH);
+  try {
+    await fetch("/api/debug/log", {method: "POST", credentials: "same-origin",
+      headers: {"Content-Type": "application/json", "X-CSRF-Token": state.csrf},
+      body: JSON.stringify({entries})});
+  } catch (e) { /* the log is best effort */ }
+  if (dbgQueue.length && !dbgTimer) dbgTimer = setTimeout(flushDebug, DEBUG_FLUSH_MS);
+}
+
+function setDebugState(d) {
+  const next = d && typeof d === "object" ? d : {};
+  const was = state.debug.enabled;
+  state.debug = {
+    enabled: next.enabled === true,
+    level: DEBUG_LEVELS.includes(next.level) ? next.level : "debug",
+    categories: Array.isArray(next.categories) ? next.categories.filter(c => DEBUG_CATEGORIES.includes(c)) : [],
+    until: Number.isFinite(next.until) ? next.until : 0,
+    endsAt: next.enabled === true && Number.isFinite(next.remaining) ? Date.now() + next.remaining * 1000 : 0,
+  };
+  if (!state.debug.enabled) { dbgQueue.length = 0; clearTimeout(dbgTimer); dbgTimer = 0; }
+  if (state.debug.enabled !== was) {
+    if (state.debug.enabled) dlog("app", "info", "client debug on");
+    renderDebugCard();
+    sched.kick();
+  }
+}
+
+window.addEventListener("error", event => {
+  const where = String(event.filename || "").split("/").pop();
+  dlogRate("err:" + event.message, "app", "error", "JS error: " + event.message,
+    {at: where + ":" + event.lineno}, 5000);
+});
+window.addEventListener("unhandledrejection", event => {
+  const reason = event.reason && event.reason.message ? event.reason.message : String(event.reason);
+  dlogRate("rej:" + reason, "app", "error", "unhandled rejection: " + reason, null, 5000);
+});
+
 // ------------------------------------------------------------------- toasts
 // One transient toast at a time (v0.1.33). Toasts of the same group and kind merge into one with
 // a running count ("JD2へ送信しました（3件）"). An error stays until it is dismissed and replaces an
@@ -377,6 +424,7 @@ function clearToast() {
 }
 
 function toast(message, kind = "success", opts = {}) {
+  dlogRate("toast:" + message, "ui", kind === "error" ? "warn" : "info", "toast", {kind, text: String(message).slice(0, 200)});
   if (kind !== "error" && toastSlot.cur && toastSlot.cur.kind === "error") return;
   const next = planToast(toastSlot.cur, {kind, message, group: opts.group || "", count: opts.count || 1,
     format: opts.format || null});
@@ -501,10 +549,10 @@ function applyRoute() {
   closeMenu(false);
   closeSwitcher(false);
   const shown = currentViewName();
+  dlog("ui", "info", "route", {view: route.view, shown, section: route.section || null, sub: route.sub || null});
   for (const name of ["home", "downloads", "links", "settings", "web"]) {
     $("view-" + name).hidden = name !== shown;
   }
-  syncFrameVisibility();
   renderWebTabs();
   updateChrome();
   syncRemotePoll();
@@ -524,8 +572,6 @@ async function enterView(route, force = false) {
     await loadQueue(force);
   } else if (route.view === "settings") {
     await enterSettings(route, force);
-  } else if (route.view === "tab") {
-    await ensureLoaded(findTab(route.tabId));
   }
 }
 
@@ -548,8 +594,8 @@ function updateChrome() {
       display = tab.current || tab.history[tab.index] || "";
       iconName = tab.current ? "lock" : "globe";
     }
-    back = tab.remote ? Boolean(tab.rb) : tab.index > 0;
-    forward = tab.remote ? Boolean(tab.rb) : (tab.index >= 0 && tab.index < tab.history.length - 1);
+    back = Boolean(tab.rb);       // history lives in the NAS browser tab
+    forward = Boolean(tab.rb);
   } else if (route.view === "downloads") {
     display = "qnap://downloads"; iconName = "download";
   } else if (route.view === "links") {
@@ -578,7 +624,6 @@ function updateChrome() {
   setShown("bookmarkBar", bar);
   $("webLoading").hidden = !(tab && tab.loading);
   updateWebStatus(tab);
-  updateCfHint(tab);
   updateRemoteView(tab);
   updatePinnedTabs();
   updateMobileBar();
@@ -632,27 +677,16 @@ function renderWebTabs() {
   updateMobileBar();
 }
 
-// One compact row per web tab (single line, ellipsis): [mode chip] host ... [...]
+// One compact row per web tab (single line, ellipsis): [NASブラウザ] host ... [...]
 function updateWebStatus(tab) {
   const box = $("webStatus");
   box.replaceChildren();
   if (!tab || !tab.history.length) return;
-  const remote = Boolean(tab.remote);
-  const chip = element("button", remote ? "NASブラウザ" : (MODE_LABELS[tab.mode] || MODE_LABELS.strict),
-    "mode-badge " + (remote ? "remote" : tab.mode));
-  chip.type = "button";
-  chip.title = "表示されない場合のヒントを表示";
-  chip.addEventListener("click", () => {
-    tab.showHint = true;
-    tab.hintDismissed = false;
-    updateChrome();
-  });
-  box.appendChild(chip);
+  box.appendChild(element("span", "NASブラウザ", "mode-badge remote"));
   const host = hostOf(tab.history[tab.index]);
   let text = host;
-  if (tab.remote && tab.rb && tab.rb.title) text = tab.rb.title;
+  if (tab.rb && tab.rb.title) text = tab.rb.title;
   if (tab.error) text = host + " — 読み込めませんでした: " + tab.error;
-  else if (!tab.current && !tab.remote) text = host + " — 読み込み中…";
   const label = element("span", text, "web-status-text");
   label.title = tab.current || text;
   box.appendChild(label);
@@ -663,14 +697,6 @@ function updateWebStatus(tab) {
   more.appendChild(icon("more"));
   more.addEventListener("click", event => { event.stopPropagation(); openMenu(); });
   box.appendChild(more);
-}
-
-// Slim one-line bar: shown 6 s after a load starts (or when the chip is tapped).
-// Cross-origin load failure cannot be detected, so this is a timing heuristic.
-function updateCfHint(tab) {
-  const show = Boolean(tab && tab.current && !tab.remote && tab.showHint && !tab.hintDismissed);
-  $("cfHint").hidden = !show;
-  $("cfCompat").hidden = !tab || tab.mode === "compat";
 }
 
 // ------------------------------------------------------------- status/home
@@ -837,18 +863,16 @@ async function addBookmark(title, url) {
 }
 
 // -------------------------------------------------------------- web tabs
+// Every web tab is a NAS browser tab (v0.1.35): there is no in-phone iframe any more.
 function newTabRecord(id) {
-  return {id, history: [], index: -1, mode: "strict", current: "",
-    loaded: false, loading: false, token: 0, frame: null, error: "",
-    lastUsed: 0, hintDismissed: false, showHint: false, hintTimer: 0,
-    remote: false, rb: null};
+  return {id, history: [], index: -1, current: "", loading: false, token: 0, error: "",
+    notReady: false, rb: null};
 }
 
 function saveTabs() {
-  // Only id / url history / index / mode. No tokens, cookies or page data.
+  // Only id / url history / index. No tokens, cookies or page data.
   const data = {v: 1, next: state.nextTabId, tabs: state.tabs.map(t => ({
-    id: t.id, history: t.history.slice(), index: t.index, mode: t.mode,
-    remote: t.remote === true}))};
+    id: t.id, history: t.history.slice(), index: t.index}))};
   writeSession(TAB_STORAGE_KEY, JSON.stringify(data));
 }
 
@@ -865,9 +889,7 @@ function restoreTabs() {
       u.startsWith("https://")).slice(-MAX_HISTORY);
     const idx = Number.isInteger(raw.index) ? raw.index : tab.history.length - 1;
     tab.index = tab.history.length ? Math.min(Math.max(idx, 0), tab.history.length - 1) : -1;
-    tab.mode = normalizeMode(raw.mode);
-    tab.remote = raw.remote === true;   // the remote tab itself is NOT reopened automatically
-    state.tabs.push(tab);   // loaded=false: validated and loaded lazily on selection
+    state.tabs.push(tab);   // the NAS browser tab is opened when the tab is shown (autoReopen)
     maxId = Math.max(maxId, Number(raw.id.slice(1)));
   }
   const next = Number.isInteger(data.next) ? data.next : 1;
@@ -883,7 +905,7 @@ function createTab() {
 
 function tabLimitReached() {
   if (state.tabs.length < MAX_WEB_TABS) return false;
-  toast("Webタブは最大" + MAX_WEB_TABS + "枚です。端末のメモリと隔離iframeの負荷を考慮した上限です。不要なタブを閉じてください。", "error");
+  toast("Webタブは最大" + MAX_WEB_TABS + "枚です。端末とNASのメモリを考慮した上限です。不要なタブを閉じてください。", "error");
   return true;
 }
 
@@ -898,12 +920,10 @@ function closeTab(id) {
   if (idx < 0) return;
   const tab = state.tabs[idx];
   if (tab.history.length) {
-    state.closed.push({history: tab.history.slice(), index: tab.index, mode: tab.mode});
+    state.closed.push({history: tab.history.slice(), index: tab.index});
     while (state.closed.length > MAX_CLOSED_TABS) state.closed.shift();
   }
   tab.token++;
-  clearTimeout(tab.hintTimer);
-  if (tab.frame) tab.frame.remove();
   releaseRemote(tab);   // closing the web tab closes the NAS browser tab (frees memory)
   state.tabs.splice(idx, 1);
   saveTabs();
@@ -925,149 +945,42 @@ function reopenClosedTab() {
   const tab = createTab();
   tab.history = saved.history;
   tab.index = saved.index;
-  tab.mode = saved.mode;
   saveTabs();
-  navigate("#/tab/" + tab.id);   // loaded lazily (and re-validated) on selection
+  navigate("#/tab/" + tab.id);   // the NAS browser tab is opened when the tab is shown
 }
 
-// Ask the Hub to validate; the returned URL is the only value used for iframes.
+// Ask the Hub to validate; the returned URL is the only value handed to the NAS browser.
 async function validateUrl(value) {
   const result = await api("/api/browser/validate?url=" + encodeURIComponent(value));
   return result.url;
-}
-
-// Defense in depth for compat mode (the backend enforces the same rule): the
-// page's origin must differ from the Hub's and must not be a tailnet name.
-function compatAllowedFor(url) {
-  let host;
-  try {
-    const parsed = new URL(url);
-    if (parsed.protocol !== "https:") return false;
-    host = parsed.hostname.toLowerCase();
-  } catch (e) { return false; }
-  const hub = location.hostname.toLowerCase().replace(/^\[|\]$/g, "");
-  return host !== hub && host !== "ts.net" && !host.endsWith(".ts.net");
-}
-
-function unloadTab(tab) {
-  tab.token++;
-  if (tab.frame) tab.frame.remove();
-  tab.frame = null;
-  tab.loaded = false;
-  tab.loading = false;
-  tab.current = "";   // history is kept; selecting the tab re-validates and reloads
-}
-
-function liveFrameLimit() {
-  let narrow = false;
-  try { narrow = window.matchMedia("(max-width: 759px)").matches; } catch (e) { narrow = false; }
-  return narrow ? MAX_LIVE_FRAMES_NARROW : MAX_LIVE_FRAMES_WIDE;
-}
-
-// LRU: unload the least recently used frames beyond the limit (never `keep`).
-function enforceLiveLimit(keep) {
-  const limit = liveFrameLimit();
-  const live = state.tabs.filter(t => t.frame);
-  if (live.length <= limit) return;
-  live.filter(t => t !== keep).sort((a, b) => a.lastUsed - b.lastUsed)
-    .slice(0, live.length - limit).forEach(unloadTab);
-}
-
-function mountFrame(tab, validatedUrl) {
-  // SECURITY: validatedUrl must come from validateUrl(). The iframe is rebuilt
-  // each time so the sandbox attribute is in force before navigation starts.
-  if (tab.frame) tab.frame.remove();
-  if (tab.mode === "compat" && !compatAllowedFor(validatedUrl)) {
-    tab.mode = "strict";
-    toast("このアドレスでは互換モードを使えません。強い制限モードで表示します。", "error");
-  }
-  const frame = document.createElement("iframe");
-  frame.setAttribute("sandbox", sandboxFor(tab.mode));
-  frame.setAttribute("referrerpolicy", "no-referrer");
-  frame.title = "外部サイトの隔離プレビュー（" + hostOf(validatedUrl) + "）";
-  frame.className = "web-frame";
-  frame.hidden = !(state.route.view === "tab" && state.route.tabId === tab.id);
-  const done = () => {
-    if (tab.frame === frame && tab.loading) { tab.loading = false; updateChrome(); }
-  };
-  frame.addEventListener("load", done);
-  setTimeout(done, FRAME_LOAD_TIMEOUT_MS);
-  // Heuristic only: whether or not 'load' fired, offer the bar after HINT_DELAY_MS.
-  clearTimeout(tab.hintTimer);
-  tab.showHint = false;
-  tab.hintDismissed = false;
-  tab.hintTimer = setTimeout(() => {
-    if (tab.frame === frame && state.tabs.includes(tab)) { tab.showHint = true; updateChrome(); }
-  }, HINT_DELAY_MS);
-  $("frames").appendChild(frame);
-  tab.frame = frame;
-  tab.loading = true;
-  tab.lastUsed = Date.now();
-  frame.src = validatedUrl;
-  enforceLiveLimit(tab);
-}
-
-function syncFrameVisibility() {
-  for (const tab of state.tabs) {
-    if (!tab.frame) continue;
-    const active = state.route.view === "tab" && state.route.tabId === tab.id;
-    tab.frame.hidden = !active;
-    if (active) tab.lastUsed = Date.now();
-  }
-}
-
-// The mode follows the hostname: a remembered mode applies when a tab opens
-// that host; compat never carries over to a host the user did not choose it for.
-function applyHostMode(tab, url) {
-  const remembered = rememberedMode(hostOf(url));
-  if (remembered && MODES.includes(remembered)) tab.mode = remembered;
-  else if (tab.mode === "compat") tab.mode = "strict";
-}
-
-// Validate `value`, let `commit` update the history, then (re)load the iframe.
-// opts.restore: lazy load of a restored tab (a remote tab is never opened automatically).
-async function openInTab(tab, value, commit, opts = {}) {
-  if (tab.remote || (!opts.restore && isRemoteHost(hostOf(value)))) {
-    if (opts.restore) { tab.loaded = true; refreshAfterTabChange(); return; }   // never auto-open on restore
-    await openRemote(tab, value, commit);
-    return;
-  }
-  const token = ++tab.token;
-  tab.error = "";
-  tab.loading = true;
-  updateChrome();
-  let url;
-  try {
-    url = await validateUrl(value);
-  } catch (e) {
-    if (token === tab.token) { tab.loading = false; tab.error = e.message; updateChrome(); }
-    throw e;
-  }
-  if (token !== tab.token || !state.tabs.includes(tab)) return;
-  const previous = tab.history.length ? tab.history[tab.index] : "";
-  commit(url);
-  if (!previous || hostOf(previous) !== hostOf(url)) applyHostMode(tab, url);
-  tab.current = url;
-  tab.loaded = true;
-  mountFrame(tab, url);
-  saveTabs();
-  refreshAfterTabChange();
 }
 
 // ---------------------------------------------------------- NAS remote browser
 // The Hub validates every URL (/api/browser/validate rules) and forwards a fixed
 // set of inputs. The only image source is a blob: object URL made from
 // the Hub's /api/rb/frame.jpg bytes; it is never a remote URL.
-async function openRemote(tab, value, commit) {
+// opts.validated: `value` already came from validateUrl().
+async function openRemote(tab, value, commit, opts = {}) {
   ensureRemote();
   const token = ++tab.token;
   tab.error = "";
+  tab.notReady = false;
   tab.loading = true;
   updateChrome();
   let url;
   try {
-    url = await validateUrl(value);
+    url = opts.validated ? value : await validateUrl(value);
     if (token !== tab.token || !state.tabs.includes(tab)) return;
+    if (state.rbReady === false) {
+      // Not set up (or the image is outdated): one clear state in the tab, nothing is started.
+      commit(url);
+      tab.current = url;
+      tab.notReady = true;
+      tab.loading = false;
+      saveTabs();
+      refreshAfterTabChange();
+      return;
+    }
     if (!state.settings) await loadSettings().catch(() => {});   // the default display comes from Settings
     if (token !== tab.token || !state.tabs.includes(tab)) return;
     if (tab.rb) {
@@ -1099,11 +1012,8 @@ async function openRemote(tab, value, commit) {
     if (token === tab.token) { tab.loading = false; tab.error = e.message; updateChrome(); }
     throw e;
   }
-  if (tab.frame) { tab.frame.remove(); tab.frame = null; }
   commit(url);
-  tab.remote = true;
   tab.current = url;
-  tab.loaded = true;
   tab.loading = false;
   tab.rb.seq = 0;
   tab.rb.rev = null;
@@ -1131,31 +1041,16 @@ function releaseRemote(tab) {
   api("/api/rb/tabs/close", {id: rb.id}).catch(() => {});
 }
 
+// (Re)open the current URL of the tab in the NAS browser.
 async function openInRemote(tab) {
   const url = tab.current || (tab.history.length ? tab.history[tab.index] : "");
   if (!url) return;
-  if (!isRemoteHost(hostOf(url))) rememberHostMode(hostOf(url), REMOTE_MODE);   // default: fast display
-  renderRemoteHosts();
-  unloadTab(tab);
-  tab.remote = true;
   await openRemote(tab, url, u => { tab.history[tab.index] = u; });
-}
-
-async function leaveRemote(tab) {
-  const url = tab.current || (tab.history.length ? tab.history[tab.index] : "");
-  const host = hostOf(url);
-  if (isRemoteHost(host)) rememberHostMode(host, "strict");
-  releaseRemote(tab);
-  tab.remote = false;
-  tab.loaded = false;
-  renderRemoteHosts();
-  if (url) await reloadTab(tab);
-  else refreshAfterTabChange();
 }
 
 function remoteTab() {
   const tab = activeWebTab();
-  return tab && tab.remote && tab.rb ? tab : null;
+  return tab && tab.rb ? tab : null;
 }
 
 // The key bar (キーボード/Enter/⌫/Tab) is shown only while the remote page's focused element
@@ -1470,6 +1365,7 @@ function closeStream() {
 }
 
 function streamFallback(tab, rb) {
+  dlog("net", "warn", "stream fallback to polling", {reason: rb.perf.fallback || ""});
   rb.streamFailed = true;
   closeStream();
   state.rbPollMode = "";             // make syncRemotePoll restart this tab with frame.jpg polling
@@ -1491,6 +1387,7 @@ function openStream(tab, rb) {
       s.loaded = true;
       clearTimeout(s.timer);
       rb.perf.streamMs = performance.now() - s.opened;
+      dlog("net", "info", "stream first frame", {ms: Math.round(rb.perf.streamMs)});
     }
     img.hidden = false;
     $("remoteIdle").hidden = true;
@@ -1515,12 +1412,14 @@ function openStream(tab, rb) {
     const now = performance.now();
     s.errors = s.errors.filter(t => now - t < RB_STREAM_ERR_WINDOW_MS);
     s.errors.push(now);
+    dlog("net", "warn", "stream error", {count: s.errors.length});
     if (s.errors.length >= 2) { rb.perf.fallback = "ストリームのエラー"; streamFallback(tab, rb); return; }
     s.loaded = false;
     s.opened = now;
     arm();
     s.retry = setTimeout(() => { if (state.rbStream === s) img.src = streamUrl(rb); }, 500);
   };
+  dlog("net", "info", "stream open", {});
   arm();
   img.src = streamUrl(rb);
 }
@@ -1626,11 +1525,12 @@ async function remoteLoop(tab, gen) {
 // Stopping the loop lets the Hub stop the screencast (5 s) and later the container.
 function syncRemotePoll() {
   const tab = activeWebTab();
-  const want = Boolean(state.authed && tab && tab.remote && tab.rb &&
+  const want = Boolean(state.authed && tab && tab.rb &&
     document.visibilityState === "visible" && currentViewName() === "web");
   const id = want ? tab.rb.id : "";
   const mode = want ? tabDisplay(tab) : "";
   if (id === state.rbPolling && mode === state.rbPollMode) return;
+  if (want) dlog("render", "info", "display mode", {mode, why: displayReason(tab)});
   closeStream();
   state.rbPolling = id;
   state.rbPollMode = mode;
@@ -1651,10 +1551,9 @@ function syncRemotePoll() {
 }
 
 function updateRemoteView(tab) {
-  const remote = Boolean(tab && tab.remote && tab.history.length);
+  const remote = Boolean(tab && tab.history.length);
   if (remote) ensureRemote();
   setShown("remoteView", remote);
-  $("frames").hidden = remote;
   if (!remote) { closeRemoteSheet(); setShown("interceptSheet", false); return; }
   const live = Boolean(tab.rb);
   const display = live ? tabDisplay(tab) : "tiles";
@@ -1673,9 +1572,15 @@ function updateRemoteView(tab) {
   // A tab closed to save memory reopens by itself when it is shown again (v0.1.32);
   // the button only appears when that automatic reopen failed.
   const reopening = !live && autoReopen(tab);
-  $("remoteIdleText").textContent = tab.error || (live || reopening ? "画面を待っています…" :
-    "NASブラウザのタブを開けませんでした。");
-  setShown("remoteReopen", !live && !reopening);
+  // v0.1.35: one clear state when the NAS browser cannot show the page (not set up, or it failed).
+  const blocked = !live && !reopening && Boolean(tab.notReady || tab.error || state.rbReady === false);
+  setShown("rbNotReady", blocked);
+  if (blocked) {
+    $("rbNotReadyText").textContent = tab.error ||
+      "初期設定（イメージの作成）が済んでいません。設定 › ブラウザで準備してください。";
+  }
+  if (!live) $("remoteIdle").hidden = blocked;
+  $("remoteIdleText").textContent = "画面を待っています…";
   setShown("remoteLoading", Boolean(tab.loading));
   setShown("autoLiveChip", live && tab.rb.autoLive === true && tab.rb.autoChip === true);
   const count = live ? tab.rb.links.length : 0;
@@ -1691,6 +1596,7 @@ const RB_AUTO_REOPEN_MS = 30000;
 function autoReopen(tab) {
   if (tab.reopening) return true;
   if (document.hidden || activeWebTab() !== tab) return false;
+  if (tab.notReady || tab.error || state.rbReady === false) return false;   // the tab shows why; reload retries
   const now = Date.now();
   if (tab.reopenAt && now - tab.reopenAt < RB_AUTO_REOPEN_MS) return false;   // failed recently: show the button
   tab.reopenAt = now;
@@ -1944,7 +1850,9 @@ async function interceptAction(action) {
 
 // ---- speed overlay (client side only): frames/s and bytes over the last 5 s,
 // and request-to-response time of the frame poll.
+let dbgFrames = 0, dbgFramesAt = performance.now();
 function recordPerf(bytes, latency) {
+  if (state.debug && state.debug.enabled && bytes > 0) dbgFrames++;
   if (!state.rbPerf) return;
   const now = performance.now();
   state.rbPerfSamples.push({t: now, bytes, latency});
@@ -2030,6 +1938,16 @@ function userDisplay(tab) {
   if (remembered) return remembered;
   const setting = state.settings && state.settings.rb_default_mode;
   return DISPLAY_OF_SETTING[setting] || "tiles";
+}
+
+// Why the display is what it is (debug log only).
+function displayReason(tab) {
+  const rb = tab && tab.rb;
+  if (!rb) return "no-rb";
+  if (rb.autoLive) return "auto-live(challenge)";
+  if (rb.tilesFor && rb.tilesFor === rb.url) return "reader-failed->tiles";
+  if (DISPLAY_OF_MODE[rememberedMode(hostOf(tab.current || ""))]) return "site-choice";
+  return "setting";
 }
 
 // What is shown now: "tiles" (fast), "live" or "reader". A Cloudflare check forces "live" meanwhile.
@@ -2181,6 +2099,7 @@ function mountTiles(tab) {
   if (!rb || tileHost.owner === rb) return;
   if (tileHost.owner) tileHost.owner.scrollTop = scroller.scrollTop;
   tileHost.owner = rb;
+  dlog("render", "info", "tile mount", {tiles: rb.view ? rb.view.tiles.length : 0});
   scroller.replaceChildren(...(rb.view ? [rb.view.canvas] : []));
   scroller.scrollTop = rb.scrollTop || 0;
   if (rb.view) { layoutView(rb.view); observeView(rb.view); }
@@ -2276,6 +2195,7 @@ async function takeSnapshot(tab, opts = {}) {
     const meta = await api("/api/rb/snapshot", {tab: rb.id, force: opts.force === true,
       if_changed: opts.ifChanged === true});
     rb.perf.snapMs = performance.now() - started;
+    dlog("render", "debug", "tile snapshot (client)", {ms: Math.round(rb.perf.snapMs)});
     if (tab.rb !== rb || tabDisplay(tab) !== "tiles") return;
     if (rb.view && rb.view.meta.snap_id === meta.snap_id) { rb.view.meta = meta; rb.snap = meta; return; }
     await swapView(tab, rb, meta, opts);
@@ -2983,8 +2903,10 @@ function renderReaderBody(rb) {
     body.appendChild(element("p", "本文を取り出せませんでした。「元のページ表示に切替」をお試しください。", "reader-empty"));
     return;
   }
+  const renderStart = performance.now();
   const frag = document.createDocumentFragment();
   for (const block of data.blocks) frag.appendChild(readerNode(rb, block));
+  dlog("render", "info", "reader render", {ms: Math.round(performance.now() - renderStart), blocks: data.blocks.length});
   if (data.truncated) frag.appendChild(element("p", "長いページのため、途中までを表示しています。", "reader-empty"));
   body.appendChild(frag);
 }
@@ -3079,6 +3001,7 @@ async function runReader(tab, opts = {}) {
     const started = performance.now();
     const raw = await api("/api/rb/reader", {tab: rb.id});
     rb.perf.extractMs = performance.now() - started;
+    dlog("render", "debug", "reader fetched", {ms: Math.round(rb.perf.extractMs)});
     rb.perf.imgs = 0; rb.perf.imgMs = 0;
     const data = cleanReaderData(raw);
     if (tab.rb !== rb || tabDisplay(tab) !== "reader") return;
@@ -3570,14 +3493,7 @@ function wireRemote() {
   $("remoteSheetClose").addEventListener("click", closeRemoteSheet);
   $("remoteAdd").addEventListener("click", () => perform(remoteAdd));
   $("remoteSend").addEventListener("click", () => perform(remoteSend));
-  $("remoteReopen").addEventListener("click", () => {
-    const tab = activeWebTab();
-    if (tab) perform(() => openInRemote(tab));
-  });
-  $("cfRemote").addEventListener("click", () => {
-    const tab = activeWebTab();
-    if (tab) perform(() => openInRemote(tab));
-  });
+  $("rbNotReadyBtn").addEventListener("click", () => navigate("#/settings/browser/nas"));
   $("autoLiveChip").addEventListener("click", () => returnToFast(activeWebTab()));
   document.addEventListener("visibilitychange", syncRemotePoll);
   wireTiles();
@@ -3589,7 +3505,6 @@ function refreshAfterTabChange() {
     const shown = currentViewName();
     for (const name of ["home", "web"]) $("view-" + name).hidden = name !== shown;
   }
-  syncFrameVisibility();
   renderWebTabs();
   updateChrome();
   syncRemotePoll();
@@ -3602,10 +3517,8 @@ function pushHistory(tab, url) {
   tab.index = tab.history.length - 1;
 }
 
-const navigateTab = (tab, value) => openInTab(tab, value, url => pushHistory(tab, url));
-const reloadTab = tab => (tab.remote && tab.rb) ?
-  rbInputFor(tab, {type: "reload"}) :
-  openInTab(tab, tab.history[tab.index], url => { tab.history[tab.index] = url; });
+const navigateTab = (tab, value) => openRemote(tab, value, url => pushHistory(tab, url));
+const reloadTab = tab => tab.rb ? rbInputFor(tab, {type: "reload"}) : openInRemote(tab);
 
 async function rbInputFor(tab, event) {
   try {
@@ -3616,26 +3529,11 @@ async function rbInputFor(tab, event) {
   }
 }
 
-function ensureLoaded(tab) {
-  if (!tab || !tab.history.length || tab.loaded || tab.loading) return Promise.resolve();
-  if (tab.remote) { tab.loaded = true; return Promise.resolve(); }   // remote tabs are opened on request only
-  return openInTab(tab, tab.history[tab.index], url => { tab.history[tab.index] = url; }, {restore: true});
-}
-
 async function stepHistory(tab, delta) {
-  if (tab.remote) {
-    if (tab.rb) await rbInputFor(tab, {type: delta < 0 ? "back" : "forward"});
-    return;
-  }
-  const target = tab.index + delta;
-  if (target < 0 || target >= tab.history.length) return;
-  await openInTab(tab, tab.history[target], url => {
-    tab.index = target;
-    tab.history[target] = url;
-  });
+  if (tab.rb) await rbInputFor(tab, {type: delta < 0 ? "back" : "forward"});
 }
 
-// Open a URL typed/clicked by the user: in the active web tab, else a new tab.
+// Open a URL typed/clicked by the user: in the active web tab, else a new tab. Always the NAS browser.
 async function openWebUrl(value) {
   const tab = activeWebTab();
   if (tab) { await navigateTab(tab, value); return; }
@@ -3643,31 +3541,9 @@ async function openWebUrl(value) {
   const url = await validateUrl(value);
   const fresh = createTab();
   pushHistory(fresh, url);
-  applyHostMode(fresh, url);
-  fresh.current = url;
-  fresh.loaded = true;
-  mountFrame(fresh, url);
   saveTabs();
   navigate("#/tab/" + fresh.id);
-}
-
-const COMPAT_CONFIRM = "互換モードに切り替えます。\n\n" +
-  "・このサイト自身のCookie・ストレージを枠内で使えるようにします（Hub自体のものではありません）。\n" +
-  "・Cloudflareの確認を回避する機能ではありません。\n" +
-  "・iPhoneのSafariではサードパーティCookieのブロックにより動作しない場合があります。その場合は「NASブラウザ」を使ってください。\n\n" +
-  "続けますか？";
-
-async function setMode(tab, target) {
-  target = normalizeMode(target);
-  if (tab.mode === target) return;
-  if (target === "interactive" && tab.mode === "strict" &&
-      !confirm("外部サイトのスクリプトとフォームを隔離枠内で実行します。ログインやCloudflareの動作保証はありません。続けますか？")) return;
-  if (target === "compat" && !confirm(COMPAT_CONFIRM)) return;
-  tab.mode = target;
-  if (tab.history.length) rememberHostMode(hostOf(tab.history[tab.index]), target);
-  saveTabs();
-  if (tab.history.length) await reloadTab(tab);   // re-validates and rebuilds the iframe
-  updateChrome();
+  await openRemote(fresh, url, u => { fresh.history[fresh.index] = u; }, {validated: true});
 }
 
 // -------------------------------------------------------------- omnibox
@@ -3736,14 +3612,11 @@ function configureMenu() {
   const web = Boolean(tab && tab.history.length);
   $("menu").querySelectorAll("[data-scope='web']").forEach(n => { n.hidden = !web; });
   const usable = Boolean(tab && tab.current);
-  for (const action of ["remoteOpen", "stageUrl", "bookmark"]) {
+  for (const action of ["stageUrl", "bookmark"]) {
     $("menu").querySelector("[data-action='" + action + "']").disabled = !usable;
   }
   $("menu").querySelector("[data-action='reopen']").disabled = state.closed.length === 0;
-  $("menuMode").textContent = tab && tab.mode === "interactive" ?
-    "強い制限モードに戻す" : "限定操作モードに切り替え";
-  $("menuRemote").textContent = tab && tab.remote ? "NASブラウザをやめる（通常表示へ）" : "NASブラウザで開く";
-  const remoteMenu = Boolean(tab && tab.remote && tab.history.length);
+  const remoteMenu = Boolean(tab && tab.history.length);
   $("menu").querySelectorAll("[data-scope='remote']").forEach(n => { n.hidden = !remoteMenu; });
   $("menu").querySelectorAll("[data-quality]").forEach(n => {
     const on = n.dataset.quality === state.rbQuality;
@@ -3757,10 +3630,6 @@ function configureMenu() {
     n.setAttribute("aria-checked", String(on));
   });
   $("menuPerf").textContent = state.rbPerf ? "速度表示をやめる" : "速度表示";
-  $("menuMode").hidden = Boolean(tab && tab.remote) || !web;
-  $("menuCompat").hidden = Boolean(tab && tab.remote) || !web;
-  $("menuCompat").textContent = tab && tab.mode === "compat" ?
-    "互換モードをやめる（強い制限へ）" : "互換モードに切り替え";
 }
 
 function openMenu() {
@@ -3776,9 +3645,6 @@ async function menuAction(action) {
   const tab = activeWebTab();
   if (action === "newTab") createBlankTab();
   else if (action === "reopen") reopenClosedTab();
-  else if (action === "toggleMode" && tab) await setMode(tab, tab.mode === "interactive" ? "strict" : "interactive");
-  else if (action === "compatMode" && tab) await setMode(tab, tab.mode === "compat" ? "strict" : "compat");
-  else if (action === "remoteOpen" && tab) await (tab.remote ? leaveRemote(tab) : openInRemote(tab));
   else if (action.startsWith("quality:")) setRbQuality(action.slice(8));
   else if (action.startsWith("display:")) setUserDisplay(tab, action.slice(8));
   else if (action === "perf") setPerf(!state.rbPerf);
@@ -4882,6 +4748,8 @@ async function enterSettings(route, force = false) {
     renderShareStatic();
     await swr("share-tokens", "/api/share/tokens", renderShareDevices, {force});
   } else if (section === "system") {
+    renderDebugCard();
+    loadDisk().catch(() => {});
     await updateStatus(force);
   }
   scrollToSub(route);
@@ -5135,6 +5003,8 @@ function teardownSession() {
   state.rbPolling = "";
   state.rbGen++;
   state.rbStatus = null;
+  state.rbReady = null;
+  setDebugState(null);
   setPerf(false);
   closeProbeSheet();
   hidePopupToast();
@@ -5143,7 +5013,6 @@ function teardownSession() {
   cancelPress();
   closeStream();
   $("remoteImg").removeAttribute("src");
-  $("frames").replaceChildren();   // unload every external page
   state.tabs = [];
   state.closed = [];
   state.lastWebTabId = null;
@@ -5285,14 +5154,6 @@ function wireShell() {
   document.addEventListener("visibilitychange", () => {
     syncStateLoop();
     sched.kick();
-  });
-  $("cfCompat").addEventListener("click", () => {
-    const tab = activeWebTab();
-    if (tab) perform(() => setMode(tab, "compat"));
-  });
-  $("cfDismiss").addEventListener("click", () => {
-    const tab = activeWebTab();
-    if (tab) { tab.hintDismissed = true; updateChrome(); }
   });
   document.addEventListener("keydown", onKeydown);
   document.addEventListener("click", event => {
@@ -5442,6 +5303,10 @@ function registerTasks() {
     const tab = activeWebTab();
     return Boolean(tab && tab.rb && tab.rb.autoLive);
   }, () => { const tab = activeWebTab(); return tab && tab.rb ? autoPollTick(tab, tab.rb) : null; });
+  sched.add("disk", DISK_REFRESH_MS, diagVisible, loadDisk);
+  sched.add("debug-view", DEBUG_VIEW_MS, () => dbgView.open && !dbgView.paused, () => pollDebugView(false));
+  sched.add("debug-fps", 10000, () => state.debug.enabled, debugFps);
+  sched.add("debug-remaining", 5000, () => state.debug.enabled && diagVisible(), renderDebugCard);
   sched.add("rb-perf", 1000, () => state.rbPerf, renderPerf);
   sched.add("probe-flight", 1000, () => probeFlight.size > 0 && probeFlightOpen, renderProbeFlight);
 }
@@ -5527,6 +5392,8 @@ function applyState(d) {
   }
   if (state.queueData && state.route.view === "links") renderQueue(state.queueData);
   // NAS browser: refetch the status only while its settings are on screen
+  if (typeof d.rb.ready === "boolean") setRbReady(d.rb.ready);
+  if (d.debug) setDebugState(d.debug);
   if (d.rb.sig !== state.rbSig) {
     state.rbSig = d.rb.sig;
     if (browserSectionVisible()) { swrDrop("rb-status"); loadBrowserStatus(true).catch(() => {}); }
@@ -6034,6 +5901,233 @@ function wireAccounts() {
   $("accountHost").addEventListener("focus", () => { if (engineRunning()) loadAccountHosts().catch(() => {}); });
 }
 
+// ---- Settings › システム › 診断: disk writes and the debug log (v0.1.35)
+function diagVisible() {
+  return state.route.view === "settings" && state.route.section === "system";
+}
+
+function rateText(value) {
+  return typeof value === "number" && Number.isFinite(value) ? readableSize(value) + "/s" : "—";
+}
+
+function renderDisk(data) {
+  const rows = [];
+  const measuring = data.measuring === true;
+  $("diskToggle").textContent = measuring ? "計測を停止" : "計測を開始";
+  $("diskToggle").classList.toggle("primary", !measuring);
+  $("diskState").textContent = measuring ? "計測中" : data.stopped_at ? "停止しました（合計は停止時点）" : "未開始（平均は表示中だけ記録）";
+  for (const source of data.sources || []) {
+    const row = document.createElement("tr");
+    const name = element("td", source.label + (source.kind === "array" ? "（RAID）" : source.kind === "disk" ? "（ディスク）" : ""));
+    if (source.how) name.title = source.how;
+    row.appendChild(name);
+    if (!source.available) {
+      const na = element("td", "取得できません", "na");
+      na.colSpan = 3;
+      if (source.reason) na.title = source.reason;
+      row.appendChild(na);
+    } else {
+      const w = source.write || {};
+      row.appendChild(element("td", rateText(w.rate_1m)));
+      row.appendChild(element("td", rateText(w.rate_10m)));
+      row.appendChild(element("td", typeof w.total === "number" ? readableSize(w.total) : "—"));
+    }
+    rows.push(row);
+  }
+  if (!rows.length) {
+    const row = document.createElement("tr");
+    const cell = element("td", "計測中…（最初の記録まで10秒ほどかかります）", "muted");
+    cell.colSpan = 4;
+    row.appendChild(cell);
+    rows.push(row);
+  }
+  $("diskRows").replaceChildren(...rows);
+}
+
+async function loadDisk() {
+  if (!diagVisible()) return;
+  renderDisk(await api("/api/diag/diskio"));
+}
+
+function remainingText() {
+  const left = Math.max(0, Math.round((state.debug.endsAt - Date.now()) / 1000));
+  return "オン・残り " + Math.floor(left / 60) + "分" + String(left % 60).padStart(2, "0") + "秒で自動オフ";
+}
+
+function renderDebugCard() {
+  if (!$("debugEnabled")) return;
+  const d = state.debug;
+  $("debugEnabled").checked = d.enabled;
+  $("debugNote").textContent = d.enabled ? remainingText() : "オフ（RAMのみ・60分で自動オフ）";
+  if (document.activeElement !== $("debugLevel")) $("debugLevel").value = d.level;
+  const chosen = d.enabled ? d.categories : null;
+  $("debugCats").querySelectorAll("input").forEach(box => {
+    if (document.activeElement !== box && chosen) box.checked = chosen.includes(box.dataset.cat);
+  });
+  $("debugLevel").disabled = d.enabled;
+  $("debugCats").querySelectorAll("input").forEach(box => { box.disabled = d.enabled; });
+}
+
+function buildDebugControls() {
+  const levelOptions = DEBUG_LEVELS.map(l => {
+    const o = element("option", DEBUG_LEVEL_LABELS[l]);
+    o.value = l;
+    return o;
+  });
+  $("debugLevel").replaceChildren(...levelOptions);
+  $("debugLevel").value = "debug";
+  const fl = [element("option", "すべてのレベル")].concat(DEBUG_LEVELS.map(l => {
+    const o = element("option", DEBUG_LEVEL_LABELS[l] + "以上");
+    o.value = l;
+    return o;
+  }));
+  fl[0].value = "";
+  $("debugFilterLevel").replaceChildren(...fl);
+  const fc = [element("option", "すべてのカテゴリ")].concat(DEBUG_CATEGORIES.map(c => {
+    const o = element("option", c + "（" + DEBUG_CATEGORY_LABELS[c] + "）");
+    o.value = c;
+    return o;
+  }));
+  fc[0].value = "";
+  $("debugFilterCat").replaceChildren(...fc);
+  $("debugCats").replaceChildren(...DEBUG_CATEGORIES.map(c => {
+    const label = element("label", undefined, "switch compact");
+    const input = document.createElement("input");
+    input.type = "checkbox";
+    input.setAttribute("role", "switch");
+    input.dataset.cat = c;
+    input.checked = true;
+    label.appendChild(input);
+    label.appendChild(element("span", undefined, "switch-track"));
+    label.appendChild(element("span", c + " " + DEBUG_CATEGORY_LABELS[c]));
+    return label;
+  }));
+}
+
+const dbgView = {open: false, paused: false, entries: [], seq: 0, busy: false};
+
+function debugFiltered() {
+  const level = $("debugFilterLevel").value, cat = $("debugFilterCat").value;
+  const needle = $("debugSearch").value.trim().toLowerCase();
+  const min = level ? DEBUG_LEVELS.indexOf(level) : 0;
+  return dbgView.entries.filter(e => DEBUG_LEVELS.indexOf(e.level) >= min && (!cat || e.category === cat) &&
+    (!needle || (e.message + " " + (e.data ? JSON.stringify(e.data) : "")).toLowerCase().includes(needle)));
+}
+
+function pad(n, width = 2) { return String(n).padStart(width, "0"); }
+
+function debugLine(e) {
+  const t = new Date(e.ts * 1000);
+  return pad(t.getHours()) + ":" + pad(t.getMinutes()) + ":" + pad(t.getSeconds()) + "." + pad(t.getMilliseconds(), 3);
+}
+
+function renderDebugView() {
+  const shown = debugFiltered();
+  const rows = shown.slice(-300).reverse().map(e => {
+    const row = element("div", undefined, "debug-row " + e.level);
+    row.appendChild(element("span", debugLine(e) + " " + e.src.slice(0, 1) + " " + e.category + " " + e.level + " ", "dbg-meta"));
+    row.appendChild(element("span", e.message + (e.data ? " " + JSON.stringify(e.data) : "")));
+    return row;
+  });
+  $("debugList").replaceChildren(...rows);
+  $("debugMeta").textContent = shown.length + "件を表示（保持 " + dbgView.entries.length + "件）" +
+    (state.debug.enabled ? "" : " · ログはオフです");
+  $("debugFollow").textContent = dbgView.paused ? "一時停止中" : "追従中";
+}
+
+async function pollDebugView(initial = false) {
+  if (dbgView.busy) return;
+  dbgView.busy = true;
+  try {
+    const r = await api("/api/debug/log?since=" + (initial ? 0 : dbgView.seq) + "&limit=" + (initial ? 500 : 200));
+    const list = Array.isArray(r.entries) ? r.entries : [];
+    dbgView.entries = (initial ? list : dbgView.entries.concat(list)).slice(-DEBUG_VIEW_MAX);
+    dbgView.seq = list.length ? list[list.length - 1].seq : (initial ? r.seq || 0 : dbgView.seq);
+    renderDebugView();
+  } finally { dbgView.busy = false; }
+}
+
+function debugJsonl() {
+  return debugFiltered().map(e => JSON.stringify(e)).join("\n") + "\n";
+}
+
+function openDebugView() {
+  dbgView.open = true;
+  dbgView.paused = false;
+  setShown("debugSheet", true);
+  perform(() => pollDebugView(true));
+  sched.kick();
+}
+
+function closeDebugView() {
+  dbgView.open = false;
+  setShown("debugSheet", false);
+  sched.kick();
+}
+
+async function saveDebugConfig(enabled) {
+  const body = {enabled};
+  if (enabled) {
+    body.level = $("debugLevel").value;
+    body.categories = Array.from($("debugCats").querySelectorAll("input")).filter(b => b.checked).map(b => b.dataset.cat);
+    if (!body.categories.length) throw new Error("カテゴリを1つ以上選んでください");
+  }
+  const status = await api("/api/debug/config", body);
+  setDebugState(Object.assign({}, status, {remaining: status.remaining}));
+  renderDebugCard();
+}
+
+function debugFps() {
+  const now = performance.now();
+  const frames = dbgFrames;
+  const seconds = (now - dbgFramesAt) / 1000;
+  dbgFrames = 0;
+  dbgFramesAt = now;
+  const tab = remoteTab();
+  if (tab && seconds > 0 && tabDisplay(tab) === "live") {
+    dlog("render", "debug", "polling frame rate", {fps: Math.round(frames / seconds * 10) / 10, seconds: Math.round(seconds)});
+  }
+}
+
+function wireDiagnostics() {
+  buildDebugControls();
+  renderDebugCard();
+  $("diskToggle").addEventListener("click", () => perform(async () => {
+    const measuring = $("diskToggle").textContent === "計測を停止";
+    renderDisk(await api("/api/diag/diskio/" + (measuring ? "stop" : "start"), {}));
+  }));
+  $("debugEnabled").addEventListener("change", () => perform(async () => {
+    const want = $("debugEnabled").checked;
+    try { await saveDebugConfig(want); } catch (e) { $("debugEnabled").checked = !want; throw e; }
+  }));
+  $("debugView").addEventListener("click", openDebugView);
+  $("debugClose").addEventListener("click", closeDebugView);
+  $("debugSheet").addEventListener("click", e => { if (e.target === $("debugSheet")) closeDebugView(); });
+  $("debugSheet").addEventListener("keydown", e => { if (e.key === "Escape") closeDebugView(); });
+  for (const id of ["debugFilterLevel", "debugFilterCat"]) $(id).addEventListener("change", renderDebugView);
+  $("debugSearch").addEventListener("input", renderDebugView);
+  $("debugFollow").addEventListener("click", () => { dbgView.paused = !dbgView.paused; renderDebugView(); sched.kick(); });
+  $("debugCopy").addEventListener("click", () => copyText(debugJsonl()));
+  $("debugDownload").addEventListener("click", () => {
+    // Client-side file: JSON Lines from the entries already on this page; the Hub writes nothing.
+    const url = URL.createObjectURL(new Blob([debugJsonl()], {type: "application/x-ndjson"}));
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = "qnapdl-debug-" + new Date().toISOString().replace(/[:.]/g, "-") + ".jsonl";
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  });
+  $("debugClear").addEventListener("click", () => perform(async () => {
+    if (!confirm("HubのRAM上のデバッグログをすべて消去します。よろしいですか？")) return;
+    await api("/api/debug/clear", {});
+    dbgView.entries = [];
+    dbgView.seq = 0;
+    await pollDebugView(true);
+  }));
+}
+
 // ---- Settings › NASブラウザ (v0.1.16)
 const RB_PHASE_LABELS = {stopped: "停止中", starting: "起動中…", running: "稼働中",
   stopping: "停止処理中…", setup: "初期設定中"};
@@ -6045,9 +6139,9 @@ function browserSectionVisible() {
 function renderRemoteHosts() {
   const box = $("remoteHosts");
   if (!box) return;
-  const hosts = remoteHosts();
+  const hosts = displayHosts();
   if (!hosts.length) {
-    box.replaceChildren(element("p", "設定されたサイトはありません", "empty-state"));
+    box.replaceChildren(element("p", "設定されたサイトはありません（すべて既定の表示）", "empty-state"));
     return;
   }
   const nodes = [];
@@ -6057,7 +6151,7 @@ function renderRemoteHosts() {
     row.appendChild(element("span", host + "（" + (shown ? RB_DISPLAY_LABELS[shown] : "既定の表示") + "）"));
     const off = element("button", "解除", "btn small");
     off.type = "button";
-    off.addEventListener("click", () => { rememberHostMode(host, "strict"); renderRemoteHosts(); });
+    off.addEventListener("click", () => { rememberHostMode(host, ""); renderRemoteHosts(); });
     row.appendChild(off);
     nodes.push(row);
   }
@@ -6132,8 +6226,20 @@ async function saveOption(key, value) {
   return saved;
 }
 
+// Whether the NAS browser image exists (null = not known yet). A change updates the shown tab:
+// "not ready" appears, or the tab opens by itself once the setup is done.
+function setRbReady(ready) {
+  if (state.rbReady === ready) return;
+  state.rbReady = ready;
+  for (const tab of state.tabs) {
+    if (ready !== false && tab.notReady) { tab.notReady = false; tab.reopenAt = 0; }
+  }
+  if (state.authed) updateChrome();
+}
+
 function renderBrowserStatus(r) {
   state.rbStatus = r;
+  if (typeof r.image_ready === "boolean") setRbReady(r.image_ready);
   const cs = r.container_station || {};
   const setup = r.phase === "setup";
   $("rbState").textContent = r.update_needed && !setup ? "更新が必要" : !r.image_ready && !setup ? "未設定" : RB_PHASE_LABELS[r.phase] || r.phase;
@@ -6318,6 +6424,7 @@ function wireSettings() {
       "（累積値。JD2や他アプリのI/Oは含みません）" :
       "この環境では/proc/self/ioを読み取れません。";
   }));
+  wireDiagnostics();
   wireEngine();
   wireAccounts();
   $("httpsCmdCopy").addEventListener("click", () => copyText(HTTPS_SERVE_COMMAND));

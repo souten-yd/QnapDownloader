@@ -25,6 +25,7 @@ from urllib.parse import urlsplit
 
 import browser_safety
 import container_runtime as cr
+import debuglog
 import rapidgator_extract
 import rb_blocklist
 
@@ -864,6 +865,8 @@ class Tab:
         self.streams = 0           # MJPEG streams being written now
         self.stream_times = deque(maxlen=128)    # monotonic send times (fps for the viewer's overlay)
         self.stream_bytes = 0      # size of the last part sent
+        self.dbg_frames = 0        # debug log only: screencast frames in the current 10 s window
+        self.dbg_t = 0.0
         self.vp_rev = 0            # bumped by every screencast frame (the live picture changed)
         self.vp_cache = None       # {"token": vp_rev + rev, "map": viewport link map}
         self.vp_lock = threading.Lock()
@@ -1419,7 +1422,9 @@ class RemoteBrowser:
                 raise BrowserError(reason)
             if not running:
                 self._start()
-            return self._create_tab(checked)
+            created = self._create_tab(checked)
+            debuglog.log("rb", "info", "tab open", {"tab": created.get("id"), "host": self._host_of(checked)})
+            return created
 
     def _create_tab(self, checked):
         created = self._call("Target.createTarget", {
@@ -1525,6 +1530,7 @@ class RemoteBrowser:
         tab = self._tab(ident)
         self._touch()
         self._drop_tab(tab, close=True)
+        debuglog.log("rb", "info", "tab close", {"tab": ident})
         return True
 
     def navigate(self, ident, url):
@@ -1658,6 +1664,8 @@ class RemoteBrowser:
                 # Only the newest frame is kept; older ones are simply replaced.
                 tab.frame = data
                 tab.seq += 1
+                if debuglog.LOG._enabled:
+                    self._debug_frame_rate(tab)
                 tab.vp_rev += 1      # the picture changed: the viewport link map may be stale
                 meta = params.get("metadata") if isinstance(params.get("metadata"), dict) else {}
                 width, height = meta.get("deviceWidth"), meta.get("deviceHeight")
@@ -1673,6 +1681,17 @@ class RemoteBrowser:
                 conn.send_nowait("Page.screencastFrameAck", {"sessionId": ack}, session=session)
             except CDPError:
                 pass
+
+    @staticmethod
+    def _debug_frame_rate(tab):
+        now = time.monotonic()
+        tab.dbg_frames += 1
+        if tab.dbg_t == 0.0:
+            tab.dbg_t = now
+        elif now - tab.dbg_t >= 10.0:
+            debuglog.log("render", "debug", "screencast frames", {
+                "tab": tab.id, "fps": round(tab.dbg_frames / (now - tab.dbg_t), 1)})
+            tab.dbg_frames, tab.dbg_t = 0, now
 
     # ------------------------------------------------- intercepts (RAM only)
     def _record_event(self, tab, kind, url, **extra):
@@ -1927,6 +1946,7 @@ class RemoteBrowser:
 
     # ----------------------------------------------------------- screencast
     def _start_screencast(self, tab):
+        debuglog.log("render", "info", "screencast start", {"tab": tab.id})
         self._call("Target.activateTarget", {"targetId": tab.target_id})
         self._call("Page.startScreencast", self._screencast_params(tab), session=tab.session)
 
@@ -1935,6 +1955,7 @@ class RemoteBrowser:
             if not tab.screencast:
                 return
             tab.screencast = False
+        debuglog.log("render", "info", "screencast stop", {"tab": tab.id})
         try:
             self._call("Page.stopScreencast", session=tab.session, timeout=5.0)
         except BrowserError:
@@ -2009,6 +2030,9 @@ class RemoteBrowser:
             tab.last_poll = self._clock()
             starting = not tab.screencast
             tab.screencast = True
+        stream_started = stream_logged = time.monotonic()
+        stream_parts = 0
+        debuglog.log("net", "info", "stream connect", {"tab": ident})
         try:
             self._touch()
             if starting:
@@ -2046,11 +2070,18 @@ class RemoteBrowser:
                         % (STREAM_BOUNDARY, len(last))).encode("ascii") + last + b"\r\n"
                 write(part)
                 last_sent = time.monotonic()
+                stream_parts += 1
+                if debuglog.LOG._enabled and last_sent - stream_logged >= 10.0:
+                    stream_logged = last_sent
+                    debuglog.log("render", "debug", "stream frames", {
+                        "tab": ident, "fps": self.stream_fps(tab), "bytes": len(last)})
                 with self._lock:
                     tab.stream_times.append(last_sent)
                     tab.stream_bytes = len(last)
                     tab.last_poll = self._last_activity = self._clock()
         finally:
+            debuglog.log("net", "info", "stream disconnect", {
+                "tab": ident, "seconds": int(time.monotonic() - stream_started), "parts": stream_parts})
             with self._lock:
                 tab.streams -= 1
                 self._streams -= 1
@@ -2258,6 +2289,7 @@ class RemoteBrowser:
                     return self._snap_public(tab, newest, True)
                 if if_changed and self._dom_quiet(tab):
                     return self._snap_public(tab, newest, True)
+            snap_started = time.monotonic()
             reason = self.probe_memory_reason()
             if reason:
                 raise BrowserError(reason)
@@ -2307,6 +2339,9 @@ class RemoteBrowser:
                 # The previous snapshot stays (until the new one renders a tile); older ones go.
                 while len(tab.snaps) > SNAP_KEEP:
                     self._snap_drop(tab, next(iter(tab.snaps)))
+            debuglog.log("render", "debug", "tile snapshot", {
+                "tab": tab.id, "ms": int((time.monotonic() - snap_started) * 1000),
+                "tiles": snap.tiles, "height": height})
             return self._snap_public(tab, snap, False)
 
     def _dom_quiet(self, tab):
@@ -2732,6 +2767,7 @@ class RemoteBrowser:
         """Reader data of the page: validated blocks (see the section comment)."""
         tab = self._tab(ident)
         self._touch()
+        reader_started = time.monotonic()
         try:
             result = self._call("Runtime.evaluate", {
                 "expression": READER_JS, "returnByValue": True, "timeout": 15000},
@@ -2752,6 +2788,9 @@ class RemoteBrowser:
             if not data["title"]:
                 data["title"] = tab.title[:READER_TITLE_MAX]
         self._touch()
+        debuglog.log("render", "debug", "reader extract", {
+            "tab": tab.id, "ms": int((time.monotonic() - reader_started) * 1000),
+            "blocks": data.get("count")})
         return data
 
     @staticmethod

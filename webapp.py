@@ -22,6 +22,9 @@ import jd2_control
 import jd2_transfer
 import rapidgator_extract
 import browser_safety
+import container_runtime
+import debuglog
+import diskio
 import runtime_diagnostics
 import engine_supervisor
 import remote_browser
@@ -29,7 +32,7 @@ import state_hub
 import ttlcache
 import updater
 
-VERSION = "0.1.34"
+VERSION = "0.1.35"
 PORT = 17864
 ROOT = Path(__file__).resolve().parent
 FILES = {"/": ("web/index.html", "text/html; charset=utf-8"),
@@ -38,6 +41,9 @@ FILES = {"/": ("web/index.html", "text/html; charset=utf-8"),
          "/icon.svg": ("web/icon.svg", "image/svg+xml"),
          "/apple-touch-icon.png": ("web/apple-touch-icon.png", "image/png"),
          "/icon-192.png": ("web/icon-192.png", "image/png")}
+# No frame-src https: since v0.1.35 (the in-phone iframe browser is gone): the page embeds nothing.
+CSP = ("default-src 'none'; img-src 'self' data: blob:; script-src 'self'; style-src 'self'; "
+       "connect-src 'self'; frame-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'")
 SESSIONS = {}
 FAILED = {}
 SHARE_FAILED = {}    # per-address failed share-token attempts (RAM only)
@@ -48,6 +54,9 @@ SHARE_LINK_LIMIT = 50
 SESSION_LOCK = threading.RLock()
 CREDENTIALS_TRANSPORT_ERROR = "パスワードはHTTPSまたはTailscale経由でのみ送信できます"
 ACCOUNT_BODY_MAX = 4096
+DEBUG_BODY_MAX = 320000     # 100 entries of at most ~3 KB each
+DEBUG_SKIP_HTTP = ("/api/debug/",)
+HTTP_LOG_GATE = 1.0         # seconds between debug entries of the same method+path
 
 
 def allowed_roots():
@@ -361,6 +370,21 @@ def server_cache(server):
     return cache
 
 
+def server_diskio(server):
+    """Per-server disk write meter (v0.1.35); created on first use, samples only while asked."""
+    meter = getattr(server, "diskio", None)
+    if meter is None:
+        with SESSION_LOCK:
+            meter = getattr(server, "diskio", None)
+            if meter is None:
+                engine = getattr(server, "engine", None)
+                runtime = getattr(engine, "runtime", None)
+                meter = server.diskio = diskio.DiskIO(runtime, (
+                    ("jd2", "JD2コンテナ", container_runtime.JD2_NAME),
+                    ("browser", "NASブラウザコンテナ", container_runtime.BROWSER_NAME)))
+    return meter
+
+
 def server_state_hub(server):
     hub = getattr(server, "state_hub", None)
     if hub is None:
@@ -372,7 +396,7 @@ def server_state_hub(server):
 
 
 # Writes under these prefixes change nothing the cached reads show (screen input only).
-RB_QUIET_POSTS = ("/api/rb/input", "/api/rb/viewport", "/api/rb/snapshot", "/api/rb/snapshot/release",
+RB_QUIET_POSTS = ("/api/debug/log", "/api/diag/diskio/start", "/api/diag/diskio/stop", "/api/rb/input", "/api/rb/viewport", "/api/rb/snapshot", "/api/rb/snapshot/release",
                   "/api/rb/tap-page", "/api/rb/reader", "/api/rb/probe", "/api/rb/intercepts/open")
 
 
@@ -396,7 +420,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("X-Frame-Options", "DENY")
         self.send_header("Referrer-Policy", "no-referrer")
         self.send_header("Permissions-Policy", "geolocation=(),camera=(),microphone=(),payment=()")
-        self.send_header("Content-Security-Policy", "default-src 'none'; img-src 'self' data: blob:; script-src 'self'; style-src 'self'; connect-src 'self'; frame-src https:; base-uri 'none'; frame-ancestors 'none'; form-action 'self'")
+        self.send_header("Content-Security-Policy", CSP)
 
     def stream_mjpeg(self, tab_id):
         """Live display push stream (multipart/x-mixed-replace). Runs until the viewer leaves."""
@@ -445,7 +469,7 @@ class Handler(BaseHTTPRequestHandler):
         # cannot display a blob: URL. data: is kept unchanged (security invariant); the
         # JSON frame endpoint that used it was removed in v0.1.33. No other directive
         # changes (default-src 'none', no inline).
-        self.send_header("Content-Security-Policy", "default-src 'none'; img-src 'self' data: blob:; script-src 'self'; style-src 'self'; connect-src 'self'; frame-src https:; base-uri 'none'; frame-ancestors 'none'; form-action 'self'")
+        self.send_header("Content-Security-Policy", CSP)
         if getattr(self, "_cookie", None):
             self.send_header("Set-Cookie", self._cookie)
         self.end_headers()
@@ -460,12 +484,10 @@ class Handler(BaseHTTPRequestHandler):
                 bool(host) and public_host_allowed(host, self.client_address[0]))
 
     def reject_hub_origin(self, checked_url):
-        """Never allow an embedded page to share the Hub's own origin.
+        """Never let the NAS browser be pointed at the Hub itself or at a tailnet name.
 
-        The UI's compatibility mode lets a framed page keep its own origin
-        (cookies/storage). That is only safe while the page can never be the
-        Hub itself, so the Hub's own hostname (from the Host header, any port)
-        and Tailscale MagicDNS names are refused for every mode.
+        The Hub's own hostname (from the Host header, any port) and Tailscale MagicDNS
+        names are refused (SSRF guard; the NAS browser container could otherwise reach them).
         """
         target = (urlsplit(checked_url).hostname or "").lower().rstrip(".")
         try:
@@ -473,7 +495,7 @@ class Handler(BaseHTTPRequestHandler):
         except ValueError:
             own = ""
         if target == "ts.net" or target.endswith(".ts.net") or (own and target == own):
-            raise ValueError("このHub自身またはTailscaleのアドレスは埋め込み表示できません")
+            raise ValueError("このHub自身またはTailscaleのアドレスはNASブラウザで開けません")
 
     def origin_ok(self):
         origin = self.headers.get("Origin")
@@ -525,6 +547,8 @@ class Handler(BaseHTTPRequestHandler):
         maximum = 72000 if path in ("/api/rapidgator/extract", "/api/share") else 16384
         if path.startswith("/api/accounts/"):
             maximum = ACCOUNT_BODY_MAX
+        if path == "/api/debug/log":
+            maximum = DEBUG_BODY_MAX
         if not 0 <= size <= maximum:
             raise ValueError("リクエストが大きすぎます")
         value = json.loads(self.rfile.read(size))
@@ -576,6 +600,10 @@ class Handler(BaseHTTPRequestHandler):
             None if rev_text is None else int(rev_text), int(wait_text))
         data = dict(state, rev=rev, https=request_is_https(self.client_address[0], self.headers),
                     tailnet=tailnet_peer(self.client_address[0]))
+        debug = dict(data.get("debug") or {})
+        if debug.get("enabled"):
+            debug["remaining"] = max(0, int((debug.get("until") or 0) - time.time()))
+        data["debug"] = debug
         if query.get("full", ["0"])[0] == "1":
             # First load only: the data the home view needs, in the same round trip.
             data["settings"] = self.store.settings()
@@ -585,7 +613,40 @@ class Handler(BaseHTTPRequestHandler):
     def cached(self, key, ttl, loader):
         return server_cache(self.server).get(key, ttl, loader)
 
+    def send_response(self, code, message=None):
+        self._status = code
+        super().send_response(code, message)
+
+    def _log_http(self, method, started):
+        path = urlsplit(self.path).path
+        if not path.startswith("/api/") or path.startswith(DEBUG_SKIP_HTTP) or not debuglog.enabled("http"):
+            return
+        now = time.monotonic()
+        gate = self.server.__dict__.setdefault("http_log_gate", {})
+        key = method + path
+        last, skipped = gate.get(key, (0.0, 0))
+        if now - last < HTTP_LOG_GATE:
+            gate[key] = (last, skipped + 1)
+            return
+        if len(gate) > 200:
+            gate.clear()
+        gate[key] = (now, 0)
+        data = {"method": method, "path": path, "status": getattr(self, "_status", 0),
+                "ms": int((now - started) * 1000)}
+        if skipped:
+            data["skipped"] = skipped
+        debuglog.log("http", "debug", "%s %s %s" % (method, path, data["status"]), data)
+
     def do_GET(self):
+        if not debuglog.LOG._enabled:
+            return self.handle_get()
+        started = time.monotonic()
+        try:
+            return self.handle_get()
+        finally:
+            self._log_http("GET", started)
+
+    def handle_get(self):
         if not self.check_host():
             return self.reject("アクセス元Hostが許可されていません", 403)
         path = urlsplit(self.path).path
@@ -616,6 +677,18 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_state()
             if path == "/api/settings":
                 return self.send_data(200, self.store.settings())
+            if path == "/api/diag/diskio":
+                return self.send_data(200, server_diskio(self.server).snapshot())
+            if path == "/api/debug/log":
+                query = parse_qs(urlsplit(self.path).query)
+                since_text = query.get("since", ["0"])[0]
+                limit_text = query.get("limit", ["200"])[0]
+                if (not since_text.isdecimal() or len(since_text) > 12 or
+                        not limit_text.isdecimal() or len(limit_text) > 4 or not 1 <= int(limit_text) <= 1000):
+                    raise ValueError("sinceまたはlimitが不正です")
+                result = debuglog.LOG.entries(int(since_text), int(limit_text))
+                result["status"] = debuglog.LOG.status()
+                return self.send_data(200, result)
             if path == "/api/diagnostics/io":
                 # Reads /proc/self/io only; no writes or background polling.
                 return self.send_data(200, runtime_diagnostics.snapshot())
@@ -788,8 +861,7 @@ class Handler(BaseHTTPRequestHandler):
                 value = query.get("url", [""])[0]
                 checked = browser_safety.validate(value)
                 self.reject_hub_origin(checked)
-                return self.send_data(200, {"url": checked,
-                  "mode": "sandboxed-client-only", "server_fetched": False})
+                return self.send_data(200, {"url": checked})
             if path == "/api/update/check":
                 query = parse_qs(urlsplit(self.path).query)
                 channel = query.get("channel", ["rc"])[0]
@@ -877,6 +949,15 @@ class Handler(BaseHTTPRequestHandler):
         return self.send_data(200, {"added": added, "found": len(found)})
 
     def do_POST(self):
+        if not debuglog.LOG._enabled:
+            return self.post_and_refresh()
+        started = time.monotonic()
+        try:
+            return self.post_and_refresh()
+        finally:
+            self._log_http("POST", started)
+
+    def post_and_refresh(self):
         path = urlsplit(self.path).path
         if path == "/api/share" or path in RB_QUIET_POSTS:
             return self.handle_post()
@@ -1085,6 +1166,25 @@ class Handler(BaseHTTPRequestHandler):
                     return self.send_data(200, send_link(self.server, url=item["url"], dedupe=True))
                 except AlreadySent:
                     return self.send_data(200, {"state": "dup"})
+            if path == "/api/diag/diskio/start":
+                return self.send_data(200, server_diskio(self.server).start())
+            if path == "/api/diag/diskio/stop":
+                return self.send_data(200, server_diskio(self.server).stop())
+            if path == "/api/debug/log":
+                stored = debuglog.LOG.log_client(body.get("entries"))
+                return self.send_data(200, {"accepted": stored})
+            if path == "/api/debug/config":
+                if body.get("enabled") is True:
+                    debuglog.LOG.enable(body.get("level", "debug"), body.get("categories"))
+                    debuglog.log("app", "info", "debug log enabled")
+                elif body.get("enabled") is False:
+                    debuglog.LOG.disable()
+                else:
+                    raise ValueError("enabledを指定してください")
+                return self.send_data(200, debuglog.LOG.status())
+            if path == "/api/debug/clear":
+                debuglog.LOG.clear()
+                return self.send_data(200, debuglog.LOG.status())
             if path == "/api/engine/start":
                 self.server.engine.start()
                 return self.send_data(202, {"started": True})

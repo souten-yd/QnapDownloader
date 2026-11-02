@@ -12,6 +12,8 @@ import json
 import threading
 import time
 
+import debuglog
+
 ENGINE_TTL = 2.0
 COUNTS_TTL = 5.0
 RB_TTL = 2.0
@@ -84,15 +86,17 @@ class StateHub:
         try:
             status = self._cache.get("rb:status", RB_TTL, self._server.rb.status)
         except Exception:
-            return {"state": "unknown", "tabs": 0, "mem": None, "sig": ""}
+            return {"state": "unknown", "tabs": 0, "mem": None, "ready": None, "sig": ""}
         memory = status.get("memory") or {}
         return {"state": status.get("phase"), "tabs": len(status.get("tabs") or []),
-                "mem": memory.get("percent"), "sig": _digest(status)}
+                "mem": memory.get("percent"), "ready": status.get("image_ready") is True,
+                "sig": _digest(status)}
 
     def _build(self):
         engine, running = self._engine()
         return {"engine": engine, "downloads": self._downloads(running), "rb": self._rb(),
-                "settings_rev": self._server.store.revision(), "version": self._version}
+                "settings_rev": self._server.store.revision(), "version": self._version,
+                "debug": debuglog.LOG.client_status()}
 
     # ---- revision handling -------------------------------------------------------------------
     def _refresh(self, force=False):
