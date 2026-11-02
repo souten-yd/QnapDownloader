@@ -1485,14 +1485,7 @@ function openStream(tab, rb) {
   rb.stream = s;
   rbShown.owner = rb;
   rbShown.url = "";
-  const arm = () => {
-    clearTimeout(s.timer);
-    s.timer = setTimeout(() => {
-      if (state.rbStream === s && !s.loaded) streamFallback(tab, rb);
-    }, RB_STREAM_FIRST_MS);
-  };
-  s.arm = arm;
-  img.onload = () => {
+  const shown = () => {
     if (state.rbStream !== s) return;
     if (!s.loaded) {
       s.loaded = true;
@@ -1502,12 +1495,27 @@ function openStream(tab, rb) {
     img.hidden = false;
     $("remoteIdle").hidden = true;
   };
+  // iOS Safari draws each part of a multipart stream but may never fire "load" (the response
+  // never ends), so the first frame is also detected by the decoded size (v0.1.34).
+  const arm = () => {
+    clearTimeout(s.timer);
+    const deadline = performance.now() + RB_STREAM_FIRST_MS;
+    const check = () => {
+      if (state.rbStream !== s || s.loaded) return;
+      if (img.naturalWidth > 0 && img.currentSrc.indexOf("/api/rb/stream.mjpg") >= 0) { shown(); return; }
+      if (performance.now() >= deadline) { rb.perf.fallback = "最初の画面が届かない"; streamFallback(tab, rb); return; }
+      s.timer = setTimeout(check, 250);
+    };
+    s.timer = setTimeout(check, 250);
+  };
+  s.arm = arm;
+  img.onload = shown;
   img.onerror = () => {
     if (state.rbStream !== s) return;
     const now = performance.now();
     s.errors = s.errors.filter(t => now - t < RB_STREAM_ERR_WINDOW_MS);
     s.errors.push(now);
-    if (s.errors.length >= 2) { streamFallback(tab, rb); return; }
+    if (s.errors.length >= 2) { rb.perf.fallback = "ストリームのエラー"; streamFallback(tab, rb); return; }
     s.loaded = false;
     s.opened = now;
     arm();
@@ -1975,7 +1983,7 @@ function perfText(tab = remoteTab()) {
   const fps = frames.length / elapsed;
   const bytes = frames.length ? frames.reduce((sum, x) => sum + x.bytes, 0) / frames.length : 0;
   const wait = recent.length ? recent.reduce((sum, x) => sum + x.latency, 0) / recent.length : 0;
-  return "ライブ(ポーリング)・" + quality + " · " + fps.toFixed(1) + " fps · " + kb(bytes) +
+  return "ライブ(ポーリング" + (p.fallback ? ": " + p.fallback : "") + ")・" + quality + " · " + fps.toFixed(1) + " fps · " + kb(bytes) +
     "/枚 · 応答 " + Math.round(wait) + " ms";
 }
 
@@ -2815,10 +2823,65 @@ function readerImage(rb, block) {
   return figure;
 }
 
+// Rows made almost only of short links (page numbers « 1 2 3 … », tags) are hard to tap as
+// inline text: they are shown as large buttons instead (v0.1.34).
+const READER_ROW_PUNCT = /[\s\u00a0…·|,.、。\/«»<>‹›\-–—:;()（）\[\]［］]+/g;
+function readerLinkRow(runs) {
+  let links = 0, plain = "";
+  for (const r of runs) {
+    if (r.href) {
+      if (r.text.trim().length > 12) return false;
+      links++;
+    } else plain += r.text;
+  }
+  return links >= 3 && plain.replace(READER_ROW_PUNCT, "").length <= 8;
+}
+
+function readerChips(runs) {
+  const row = element("div", undefined, "reader-chips");
+  for (const r of runs) {
+    if (r.href) {
+      const a = readerLink(r.text.trim() || r.href, r.href);
+      a.classList.add("reader-chip");
+      row.appendChild(a);
+      continue;
+    }
+    for (const token of r.text.split(/\s+/)) {
+      if (token) row.appendChild(element("span", token, "reader-chip is-plain"));
+    }
+  }
+  return row;
+}
+
+// Reader text size, per device (a convenience: falls back to the default when storage fails).
+const READER_SIZES = [["小", 14], ["標準", 16], ["大", 19], ["特大", 23]];
+const READER_SIZE_KEY = "qd.readerSize";
+function readerSizeIndex() {
+  try {
+    const v = Number(localStorage.getItem(READER_SIZE_KEY));
+    if (Number.isInteger(v) && v >= 0 && v < READER_SIZES.length) return v;
+  } catch (e) { /* storage unavailable */ }
+  return 1;
+}
+
+function applyReaderSize(index) {
+  const [label, px] = READER_SIZES[index];
+  $("readerScroll").style.fontSize = px + "px";
+  $("readerSize").textContent = "文字 " + label;
+  $("readerSize").setAttribute("aria-label", "文字の大きさ: " + label + "（押すと切替）");
+}
+
+function cycleReaderSize() {
+  const next = (readerSizeIndex() + 1) % READER_SIZES.length;
+  try { localStorage.setItem(READER_SIZE_KEY, String(next)); } catch (e) { /* keep for this page only */ }
+  applyReaderSize(next);
+}
+
 function readerNode(rb, block) {
   if (block.t === "h") {
     return element("h" + Math.min(6, Math.max(2, block.level + 1)), block.text, "reader-h");
   }
+  if ((block.t === "p" || block.t === "li") && readerLinkRow(block.runs)) return readerChips(block.runs);
   if (block.t === "p") {
     const p = element("p", undefined, "reader-p");
     readerRuns(p, block.runs);
@@ -3041,6 +3104,8 @@ async function readerNavigate(tab, href) {
 
 function wireReader() {
   const body = $("readerBody");
+  applyReaderSize(readerSizeIndex());
+  $("readerSize").addEventListener("click", cycleReaderSize);
   const press = {timer: 0, a: null, x: 0, y: 0, id: null, fired: false};
   const stop = () => { clearTimeout(press.timer); press.timer = 0; };
   const anchor = event => (event.target && event.target.closest) ? event.target.closest("a[data-href]") : null;

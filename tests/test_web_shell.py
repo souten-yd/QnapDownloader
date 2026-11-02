@@ -1056,3 +1056,19 @@ assert.strictEqual(challengeStep(rb, false, false, 97500, false), "return");
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ReaderTapTargetsTest(unittest.TestCase):
+    """v0.1.34: reader text size switch and large buttons for rows of short links."""
+
+    def test_reader_size_and_chips(self):
+        root = Path(__file__).resolve().parents[1] / "web"
+        app = (root / "app.js").read_text(encoding="utf-8")
+        html = (root / "index.html").read_text(encoding="utf-8")
+        css = (root / "style.css").read_text(encoding="utf-8")
+        self.assertIn('id="readerSize"', html)
+        for name in ("function readerLinkRow", "function readerChips", "function cycleReaderSize"):
+            self.assertIn(name, app)
+        # storage is optional: every access is guarded
+        self.assertIn("try { localStorage.setItem(READER_SIZE_KEY", app)
+        self.assertIn("min-height:44px", css.split(".reader-chip{", 1)[1].split("}", 1)[0])
