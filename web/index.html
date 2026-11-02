@@ -218,6 +218,9 @@
         <button type="button" id="engineStop" class="btn quiet" hidden>停止</button>
        </div>
       </div>
+      <p id="engineMode" class="muted"></p>
+      <button type="button" id="engineMigrate" class="btn small" hidden>コンテナへ移行</button>
+      <p id="engineNoContainer" class="engine-error" hidden>QTSのApp CenterでContainer Stationをインストールしてください（JD2を隔離して動かすために使います。入れない場合は「詳細」からQTS直接実行も選べます）</p>
       <p id="engineProgressText" class="muted" hidden></p>
       <progress id="engineProgress" max="100" class="wide-progress" hidden></progress>
       <p id="engineError" class="engine-error" hidden></p>
@@ -241,7 +244,8 @@
        <summary>詳細</summary>
        <div id="engineComponents" class="items"></div>
        <p id="engineMeta" class="muted"></p>
-       <p class="muted">JD2とJavaはQPKGに同梱されません。公式の固定URLから取得し、SHA-256で検証して永続データ領域に置きます。</p>
+       <p class="muted">JD2とJavaはQPKGに同梱されません。公式の固定URLから取得し、SHA-256で検証して永続データ領域に置きます。コンテナ方式ではJavaはダイジェスト固定の公式イメージに含まれます。</p>
+       <button type="button" id="engineSetupNative" class="btn small" hidden>QTS直接実行で初期設定（非推奨・Container Stationなし用）</button>
        <button type="button" id="engineResetup" class="btn small" hidden>初期設定をやり直す</button>
        <div id="engineKeysRow" hidden>
         <button type="button" id="engineKeys" class="btn small">推奨設定の項目を調べる</button>

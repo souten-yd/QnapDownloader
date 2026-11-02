@@ -1,5 +1,8 @@
 """Hub-managed JDownloader 2 engine: setup, supervised start, stop.
 
+Two modes (docs/container-runtime.md): "container" (default when Container
+Station is available; JD2 runs in the Hub's own labelled Docker container) and
+"native" (fallback; Java process on QTS). Only one of them may run at a time.
 Setup follows docs/engine-setup.md steps 1-9 and resumes by skipping already
 verified artifacts. The java/jar paths come only from the pinned manifest and
 engine/state.json, never from a request. State is RAM-only except
@@ -19,6 +22,7 @@ import sys
 import threading
 import time
 
+import container_runtime
 import durability
 import engine_components as components
 import jd2_local
@@ -35,6 +39,19 @@ BACKOFF = (5.0, 15.0, 30.0, 60.0, 60.0)
 READY_TIMEOUT = 180.0
 API_CONFIG = {"deprecatedapienabled": True, "deprecatedapiport": 3128,
               "deprecatedapilocalhostonly": True}
+# Container mode: JD2 must listen on the container's own interface so the Hub
+# (host) can reach it. This is acceptable only because the container sits alone
+# on the dedicated, unpublished bridge network (no -p, no LAN route) and the
+# Hub re-verifies the target with docker inspect before every connection.
+API_CONFIG_CONTAINER = {"deprecatedapienabled": True, "deprecatedapiport": 3128,
+                        "deprecatedapilocalhostonly": False}
+MODE_NATIVE = "native"
+MODE_CONTAINER = "container"
+CONTAINER_STATE_TTL = 2.0
+CONTAINER_IP_TTL = 10.0
+AVAILABLE_TTL = 60.0
+NO_CONTAINER_STATION = ("Container Stationが見つかりません。"
+                        "App CenterでContainer Stationをインストールしてください")
 API_CONFIG_NAME = "org.jdownloader.api.RemoteAPIConfig.json"
 
 STEP_DEFS = (
@@ -46,6 +63,20 @@ STEP_DEFS = (
     ("first_run", "初回起動・公式アップデート"),
     ("resident", "常駐起動"),
     ("verify", "ローカル接続の安全確認"),
+    ("preset", "保存先と推奨設定"),
+    ("done", "完了"),
+)
+STEP_DEFS_CONTAINER = (
+    ("precheck", "Container Stationの検出と事前確認"),
+    ("migrate", "内蔵エンジンの停止（移行時のみ）"),
+    ("memory", "メモリの確認"),
+    ("image", "JD2イメージの取得"),
+    ("network", "専用ネットワークの作成"),
+    ("jd2_fetch", "JD2の取得・検証・配置"),
+    ("api_config", "ローカル接続設定の作成"),
+    ("first_run", "初回起動・公式アップデート"),
+    ("resident", "常駐起動"),
+    ("verify", "接続確認（コンテナの検証）"),
     ("preset", "保存先と推奨設定"),
     ("done", "完了"),
 )
@@ -98,7 +129,8 @@ def read_mem_total_kib(path="/proc/meminfo"):
 def _default_state():
     return {"schema": 1, "autostart": False, "setup_complete": False,
             "java": None, "jd2": {"placed": False, "initialized": False},
-            "preset_applied": False, "process": None}
+            "preset_applied": False, "process": None,
+            "mode": None, "container": None}
 
 
 class EngineManager:
@@ -106,7 +138,8 @@ class EngineManager:
                  popen=subprocess.Popen, run=subprocess.run, kill=os.kill,
                  proc_root="/proc", api_port=jd2_local.API_PORT,
                  meminfo_path="/proc/meminfo", sleep=time.sleep,
-                 monotonic=time.monotonic, machine=None, disk_usage=shutil.disk_usage):
+                 monotonic=time.monotonic, machine=None, disk_usage=shutil.disk_usage,
+                 runtime=None):
         self.store = store
         self.manifest = manifest if manifest is not None else components.COMPONENTS
         self.engine_dir = Path(data_dir) / "engine"
@@ -146,6 +179,14 @@ class EngineManager:
         self._restart_times = deque()
         self._restart_count = 0
         self._heap_mb = None
+        self.runtime = runtime if runtime is not None else container_runtime.Runtime(
+            meminfo_path=meminfo_path, config_dir=str(self.engine_dir / "docker-config"))
+        self._setup_mode = None
+        self._c_alive = False
+        self._c_status = None
+        self._c_checked = None
+        self._ip_cache = None
+        self._avail = None
         self.adapter = jd2_local.LocalAdapter(self)
         self._saved = None
         self._state = self._load_state()
@@ -207,6 +248,31 @@ class EngineManager:
     def note_preset_stale(self):
         self._update_state(preset_applied=False)
 
+    # ------------------------------------------------------------------ mode
+    @property
+    def mode(self):
+        """Mode in effect: the one being set up, else the installed one."""
+        return self._setup_mode or self._state.get("mode") or MODE_NATIVE
+
+    def container_available(self, refresh=False):
+        """Container Station usable? Cached so status polling stays cheap."""
+        now = self._now()
+        with self._lock:
+            cached = self._avail
+        if cached is not None and not refresh and now - cached[0] < AVAILABLE_TTL:
+            return cached[1]
+        version = self.runtime.version()
+        with self._lock:
+            self._avail = (now, version)
+        return version
+
+    def path_mapping(self):
+        """Container mode: the NAS folder mounted as /downloads, else None."""
+        if self.mode != MODE_CONTAINER:
+            return None
+        mounted = (self._state.get("container") or {}).get("mounted_dir")
+        return {"nas_root": mounted, "jd2_root": container_runtime.CONTAINER_DOWNLOADS}
+
     def _step(self, sid, status, detail=None, progress=None):
         with self._lock:
             for item in self._steps:
@@ -217,26 +283,49 @@ class EngineManager:
                     item["progress"] = progress
                     return
 
-    def _reset_steps(self):
+    def _reset_steps(self, mode=MODE_NATIVE):
+        defs = STEP_DEFS_CONTAINER if mode == MODE_CONTAINER else STEP_DEFS
         with self._lock:
-            for item in self._steps:
-                item.update(status="pending", detail="", progress=None)
+            self._steps = [{"id": i, "label": l, "status": "pending", "detail": "", "progress": None}
+                           for i, l in defs]
+
+    def _steps_view(self, mode):
+        """Step list for the UI; before any run it matches the mode that would run."""
+        if all(step["status"] == "pending" for step in self._steps) and not self._setup_active:
+            defs = STEP_DEFS_CONTAINER if mode == MODE_CONTAINER else STEP_DEFS
+            return [{"id": i, "label": l, "status": "pending", "detail": "", "progress": None}
+                    for i, l in defs]
+        return [dict(step) for step in self._steps]
 
     def phase(self):
         with self._lock:
             if self._setup_active:
                 return "setup"
-            if self._pid is not None and self._alive():
-                return "running" if self._ready else "starting"
+        if self._alive():
+            return "running" if self._ready else "starting"
+        with self._lock:
             if self._error:
                 return "failed"
             return "stopped" if self.installed else "not_installed"
 
     def status(self):
+        phase = self.phase()
+        cs_version = self.container_available()
+        mode = self._setup_mode or self._state.get("mode") or (
+            MODE_CONTAINER if cs_version else MODE_NATIVE)
         with self._lock:
             java = self._state.get("java") or {}
             comps = []
-            for name in ("java", "jd2"):
+            if mode == MODE_CONTAINER:
+                comps.append({
+                    "name": "image",
+                    "label": "JD2コンテナイメージ (Eclipse Temurin 21 JRE・ダイジェスト固定)",
+                    "pinned_version": "21-jre",
+                    "installed": (self._state.get("container") or {}).get("image") ==
+                    container_runtime.IMAGE_JD2,
+                    "version": None, "sha256": container_runtime.IMAGE_JD2.split(":")[-1][:12],
+                    "size": None, "source": "docker.io/library/eclipse-temurin"})
+            for name in (("jd2",) if mode == MODE_CONTAINER else ("java", "jd2")):
                 item = self.manifest[name]
                 if name == "java":
                     ok = bool(java) and self.java_bin.exists()
@@ -249,8 +338,18 @@ class EngineManager:
                               "installed": ok, "version": version,
                               "sha256": item["sha256"][:12], "size": item["size"],
                               "source": item["url"]})
-            phase = self.phase()
+            native_installed = (self._state.get("mode") or MODE_NATIVE) == MODE_NATIVE and \
+                self.installed
             return {
+                "mode": mode,
+                "preferred_mode": MODE_CONTAINER if cs_version else MODE_NATIVE,
+                "container": {"available": bool(cs_version), "version": cs_version,
+                              "state": self._c_status or ("running" if self._c_alive else "unknown"),
+                              "name": container_runtime.JD2_NAME,
+                              "network": container_runtime.JD2_NET,
+                              "image": container_runtime.IMAGE_JD2.split("@")[0],
+                              "mounted_dir": (self._state.get("container") or {}).get("mounted_dir")},
+                "can_migrate": bool(native_installed and cs_version and not self._setup_active),
                 "phase": phase,
                 "installed": self.installed,
                 "running": phase in ("running", "starting"),
@@ -258,7 +357,7 @@ class EngineManager:
                 "setup_running": self._setup_active,
                 "autostart": self.autostart,
                 "preset_applied": self.preset_applied,
-                "steps": [dict(step) for step in self._steps],
+                "steps": self._steps_view(mode),
                 "error": self._error,
                 "components": comps,
                 "heap_mb": self._heap_mb,
@@ -297,10 +396,49 @@ class EngineManager:
         with self._lock:
             popen, pid, ticks = self._popen, self._pid, self._ticks
         if pid is None:
-            return False
+            return self._container_alive() if self.mode == MODE_CONTAINER else False
         if popen is not None and popen.poll() is not None:
             return False
         return self._identity_ok(pid, ticks)
+
+    def _container_alive(self, force=False):
+        now = self._now()
+        with self._lock:
+            if not force and self._c_checked is not None and \
+                    now - self._c_checked < CONTAINER_STATE_TTL:
+                return self._c_alive
+            previous = self._c_alive
+        try:
+            info = self.runtime.container_state(container_runtime.JD2_NAME)
+        except container_runtime.ContainerError:
+            return previous   # unknown: keep the last known answer
+        alive = bool(info["exists"] and info["managed"] and info["running"])
+        with self._lock:
+            self._c_alive, self._c_status, self._c_checked = alive, info["status"], now
+        return alive
+
+    def _forget_container(self):
+        with self._lock:
+            self._c_alive, self._c_checked, self._ip_cache = False, None, None
+            self._c_status = None
+            self._ready = False
+
+    def _container_ip(self):
+        """Verified container IP (docker inspect; label, network, no ports), cached 10 s."""
+        now = self._now()
+        with self._lock:
+            cached = self._ip_cache
+        if cached is not None and now - cached[1] < CONTAINER_IP_TTL:
+            return cached[0]
+        try:
+            address = self.runtime.inspect_ip(container_runtime.JD2_NAME, container_runtime.JD2_NET)
+        except container_runtime.ContainerError as error:
+            with self._lock:
+                self._ip_cache = None
+            raise jd2_local.LocalUnavailable("コンテナの接続先を検証できません: %s" % error) from None
+        with self._lock:
+            self._ip_cache = (address, now)
+        return address
 
     def is_ours_running(self):
         return self._alive()
@@ -308,6 +446,10 @@ class EngineManager:
     def connection_target(self):
         with self._lock:
             pid, ticks = self._pid, self._ticks
+        if pid is None and self.mode == MODE_CONTAINER:
+            # No /proc listener-owner check: the target is re-verified by
+            # docker inspect instead (labelled container, our network only).
+            return (self._container_ip(), self.api_port)
         if pid is None or not self._identity_ok(pid, ticks):
             raise jd2_local.LocalUnavailable("エンジン未起動/未導入")
         jd2_local.verify_listener(self.api_port, pid, self.proc_root)
@@ -322,6 +464,15 @@ class EngineManager:
 
     # ----------------------------------------------------------- process ctl
     def _launch_process(self):
+        if self.mode == MODE_CONTAINER:
+            return self._launch_container()
+        self._guard_single_writer_native()
+        try:
+            self.switch_api_config(MODE_NATIVE)
+        except SetupFailure as error:
+            # Unknown content: leave it. The native listener check still
+            # refuses anything that is not loopback-only.
+            self.log("[hub] 接続設定は変更しません: %s" % error)
         with self._lock:
             if self._pid is not None and self._alive():
                 raise EngineError("エンジンはすでに起動しています")
@@ -346,6 +497,117 @@ class EngineManager:
             self._save_state()
         self.log("[hub] エンジンを起動しました (pid %d, -Xmx%dm)" % (popen.pid, self._heap_mb))
         threading.Thread(target=self._pump, args=(popen,), daemon=True).start()
+
+    def _guard_single_writer_native(self):
+        """Never run the native engine while our container may hold engine/jd2."""
+        if self._state.get("container") is None:
+            return
+        try:
+            if self._container_alive(force=True):
+                raise EngineError("コンテナ版のエンジンが稼働中のため内蔵エンジンは起動できません")
+        except container_runtime.ContainerError:
+            pass
+
+    # ------------------------------------------------------ container control
+    def _launch_container(self):
+        if self._pid is not None and self._alive():
+            raise EngineError("内蔵エンジンが稼働中です。停止してから起動してください")
+        if self._container_alive(force=True):
+            raise EngineError("エンジンはすでに起動しています")
+        if not self.jar.is_file():
+            raise EngineError("エンジンが導入されていません。初期設定を実行してください")
+        folder = self.store.settings().get("download_dir")
+        if not folder or not os.path.isdir(folder):
+            raise EngineError("ダウンロード保存先フォルダが選択されていません")
+        mounted = str(Path(folder).resolve())
+        try:
+            self.switch_api_config(MODE_CONTAINER)
+            uid, gid = container_runtime.prepare_data_owner(str(self.jd2_dir))
+            container_runtime.check_memory(self.meminfo_path)
+            self.runtime.network_ensure(container_runtime.JD2_NET)
+            self.runtime.remove(container_runtime.JD2_NAME)   # stale, ours only
+            self.runtime.run_jd2(str(self.jd2_dir), mounted, uid, gid)
+        except (container_runtime.ContainerError, SetupFailure) as error:
+            self.log("[hub] コンテナ起動失敗: %s" % error)
+            raise EngineError(str(error)) from None
+        finally:
+            self._forget_container()
+        info = dict(self._state.get("container") or {})
+        info.update(image=container_runtime.IMAGE_JD2, mounted_dir=mounted)
+        self._update_state(container=info, process=None)
+        self._container_alive(force=True)
+        with self._lock:
+            self._ready = False
+        self.log("[hub] JD2コンテナを起動しました (%s, 保存先 %s -> /downloads)" % (
+            container_runtime.JD2_NAME, mounted))
+
+    def _terminate_container(self):
+        try:
+            stopped = self.runtime.stop(container_runtime.JD2_NAME)
+            self.runtime.remove(container_runtime.JD2_NAME)
+        except container_runtime.ContainerError as error:
+            self.log("[hub] コンテナ停止失敗: %s" % error)
+            raise EngineError("コンテナを停止できませんでした: %s" % error) from None
+        finally:
+            self._forget_container()
+        self._clear_process()
+        return stopped
+
+    # -------------------------------------------------- RemoteAPI config file
+    def _match_owner(self, *paths):
+        """Hub is root: give files it wrote to the container user (the jd2 dir owner)."""
+        try:
+            if os.geteuid() != 0:
+                return
+            info = os.stat(str(self.jd2_dir))
+            if info.st_uid == 0:
+                return
+            for path in paths:
+                os.lchown(str(path), info.st_uid, info.st_gid)
+        except OSError:
+            pass
+
+    def switch_api_config(self, mode):
+        """Create or update cfg/RemoteAPIConfig.json for `mode`.
+
+        JD2 rewrites its cfg files with extra keys after the first start, so
+        the file is merged, not compared: it must be a JSON object whose
+        deprecatedapienabled is true (or missing) and deprecatedapiport is
+        3128 (or missing). Only those two keys and deprecatedapilocalhostonly
+        are set (false in container mode, true in native mode); every other key
+        is preserved. Written atomically with fsync. Anything else is refused
+        with a reason. Returns "created", "same" or "rewritten".
+        """
+        path = self.jd2_dir / "cfg" / API_CONFIG_NAME
+        wanted = API_CONFIG_CONTAINER if mode == MODE_CONTAINER else API_CONFIG
+        if not (path.exists() or path.is_symlink()):
+            durability.write_json(path, wanted)
+            if mode == MODE_CONTAINER:
+                self._match_owner(path.parent, path)
+            return "created"
+        if path.is_symlink() or not path.is_file():
+            raise SetupFailure("既存の接続設定ファイルを安全に更新できないため中止しました（通常のファイルではありません）: cfg/" + API_CONFIG_NAME)
+        try:
+            current = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            raise SetupFailure("既存の接続設定ファイルを安全に更新できないため中止しました（JSONとして読めません）: cfg/" + API_CONFIG_NAME) from None
+        if not isinstance(current, dict):
+            raise SetupFailure("既存の接続設定ファイルを安全に更新できないため中止しました（JSONオブジェクトではありません）: cfg/" + API_CONFIG_NAME)
+        enabled = current.get("deprecatedapienabled", True)
+        port = current.get("deprecatedapiport", wanted["deprecatedapiport"])
+        if enabled is not True:
+            raise SetupFailure("既存の接続設定でdeprecatedapienabledがtrueではないため中止しました: cfg/" + API_CONFIG_NAME)
+        if type(port) is not int or port != wanted["deprecatedapiport"]:
+            raise SetupFailure("既存の接続設定のdeprecatedapiportが%dではないため中止しました: cfg/%s" % (
+                wanted["deprecatedapiport"], API_CONFIG_NAME))
+        merged = dict(current)
+        merged.update(wanted)
+        if merged == current:
+            return "same"
+        durability.write_json(path, merged)
+        if mode == MODE_CONTAINER:
+            self._match_owner(path.parent, path)
+        return "rewritten"
 
     def _pump(self, popen):
         stream = popen.stdout
@@ -372,7 +634,7 @@ class EngineManager:
         with self._lock:
             pid, ticks, popen = self._pid, self._ticks, self._popen
         if pid is None:
-            return False
+            return self._terminate_container() if self.mode == MODE_CONTAINER else False
         if not self._identity_ok(pid, ticks):
             self.log("[hub] pid %d は記録したエンジンと一致しないためシグナルを送りません" % pid)
             self._clear_process()
@@ -515,6 +777,10 @@ class EngineManager:
             return "adopted"
         if pid is not None:
             self._clear_process()
+        if self.installed and self.mode == MODE_CONTAINER and self._container_alive(force=True):
+            self.log("[hub] 稼働中のJD2コンテナを引き継ぎました")
+            self._begin_supervision()
+            return "adopted"
         if self.installed and self.autostart:
             threading.Thread(target=self._autostart, daemon=True).start()
             return "autostart"
@@ -533,23 +799,45 @@ class EngineManager:
             self.log("[hub] 停止失敗: %s" % error)
 
     # ----------------------------------------------------------------- setup
-    def start_setup(self):
+    def resolve_mode(self, requested=None):
+        """Mode for a setup run: explicit, else the installed one, else the best available."""
+        if requested not in (None, MODE_CONTAINER, MODE_NATIVE):
+            raise ValueError("modeはcontainerまたはnativeで指定してください")
+        if requested is None:
+            if self.installed:
+                requested = self._state.get("mode") or MODE_NATIVE
+            else:
+                # Never fall back to native silently: it must be chosen explicitly.
+                requested = MODE_CONTAINER
+        if requested == MODE_CONTAINER and not self.container_available(refresh=True):
+            raise EngineError(NO_CONTAINER_STATION)
+        return requested
+
+    def _begin_setup(self, requested):
         with self._lock:
             if self._setup_active:
                 raise SetupBusy("初期設定はすでに実行中です")
-            if self._alive():
+        mode = self.resolve_mode(requested)
+        # Migration: a running native engine is stopped by the container setup.
+        migrating = mode == MODE_CONTAINER and self._pid is not None
+        alive = self._alive()
+        with self._lock:
+            if self._setup_active:
+                raise SetupBusy("初期設定はすでに実行中です")
+            if alive and not migrating:
                 raise EngineError("エンジンを停止してから再実行してください")
             self._setup_active = True
+            self._setup_mode = mode
+            self._error = None
+        return mode
+
+    def start_setup(self, mode=None):
+        self._begin_setup(mode)
         threading.Thread(target=self._setup_thread, daemon=True).start()
 
-    def run_setup(self):
+    def run_setup(self, mode=None):
         """Synchronous variant (tests); same guard as start_setup."""
-        with self._lock:
-            if self._setup_active:
-                raise SetupBusy("初期設定はすでに実行中です")
-            if self._alive():
-                raise EngineError("エンジンを停止してから再実行してください")
-            self._setup_active = True
+        self._begin_setup(mode)
         self._setup_thread()
 
     def _setup_thread(self):
@@ -558,15 +846,25 @@ class EngineManager:
         finally:
             with self._lock:
                 self._setup_active = False
+                self._setup_mode = None
 
     def _execute_setup(self):
-        self._reset_steps()
+        mode = self._setup_mode or MODE_NATIVE
+        self._reset_steps(mode)
         self._error = None
-        steps = (("precheck", self._s_precheck), ("java_fetch", self._s_java_fetch),
-                 ("java_extract", self._s_java_extract), ("jd2_fetch", self._s_jd2_fetch),
-                 ("api_config", self._s_api_config), ("first_run", self._s_first_run),
-                 ("resident", self._s_resident), ("verify", self._s_verify),
-                 ("preset", self._s_preset))
+        if mode == MODE_CONTAINER:
+            steps = (("precheck", self._c_precheck), ("migrate", self._c_migrate),
+                     ("memory", self._c_memory), ("image", self._c_image),
+                     ("network", self._c_network), ("jd2_fetch", self._s_jd2_fetch),
+                     ("api_config", self._c_api_config), ("first_run", self._s_first_run),
+                     ("resident", self._s_resident), ("verify", self._s_verify),
+                     ("preset", self._s_preset))
+        else:
+            steps = (("precheck", self._s_precheck), ("java_fetch", self._s_java_fetch),
+                     ("java_extract", self._s_java_extract), ("jd2_fetch", self._s_jd2_fetch),
+                     ("api_config", self._s_api_config), ("first_run", self._s_first_run),
+                     ("resident", self._s_resident), ("verify", self._s_verify),
+                     ("preset", self._s_preset))
         current = "precheck"
         try:
             for sid, function in steps:
@@ -577,15 +875,16 @@ class EngineManager:
             current = "done"
             self._step("done", "running")
             if self.installed:
-                self._update_state(setup_complete=True)
+                self._update_state(setup_complete=True, mode=mode)
             else:
                 # First completion enables autostart (can be switched off).
-                self._update_state(setup_complete=True, autostart=True)
+                self._update_state(setup_complete=True, autostart=True, mode=mode)
             self._step("done", "done", "初期設定が完了しました")
         except Exception as error:
             if isinstance(error, (SetupFailure, components.DownloadError,
                                   components.ExtractError, jd2_local.LocalUnavailable,
-                                  jd2_policy.PresetUnavailable, jd2_policy.PresetChanged)):
+                                  jd2_policy.PresetUnavailable, jd2_policy.PresetChanged,
+                                  container_runtime.ContainerError, EngineError)):
                 reason = str(error)
             else:
                 reason = "予期しないエラー: %s" % type(error).__name__
@@ -602,7 +901,7 @@ class EngineManager:
     def _machine_name(self):
         return self._machine if self._machine is not None else platform.machine()
 
-    def _s_precheck(self):
+    def _precheck_common(self):
         if not sys.platform.startswith("linux") or self._machine_name().lower() not in ("x86_64", "amd64"):
             raise SetupFailure("x86_64 Linux以外では初期設定を開始できません")
         folder = self.store.settings().get("download_dir")
@@ -612,6 +911,65 @@ class EngineManager:
             raise SetupFailure("保存先フォルダに書き込み権限がありません")
         self.engine_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
         components.check_disk_free(self.engine_dir, usage=self._disk_usage)
+        return folder
+
+    # ---- container mode steps (docs/container-runtime.md section 3)
+    def _c_precheck(self):
+        self._precheck_common()
+        version = self.container_available(refresh=True)
+        if not version:
+            raise SetupFailure(NO_CONTAINER_STATION)
+        return "done", "Container Station (Docker %s) を検出しました" % version
+
+    def _c_migrate(self):
+        if self._pid is None:
+            return "skipped", "停止が必要な内蔵エンジンはありません"
+        self.log("[hub] 移行のため内蔵エンジンを停止します（単一ライター保証）")
+        self.stop()
+        if self._pid is not None or self._alive():
+            raise SetupFailure("内蔵エンジンを停止できないため移行を中止しました")
+        return "done", "内蔵エンジンを停止しました（engine/jd2のデータはそのまま使います）"
+
+    def _c_memory(self):
+        available = container_runtime.check_memory(self.meminfo_path)
+        return "done", "空きメモリ %d MiB（必要 %d MiB 以上）" % (
+            available // 1024, container_runtime.MIN_AVAILABLE_KIB // 1024)
+
+    def _c_image(self):
+        ref = container_runtime.IMAGE_JD2
+        if self.runtime.image_present(ref):
+            detail = "取得済みのイメージを使います"
+            status = "skipped"
+        else:
+            self._step("image", "running", "取得中（ダイジェスト固定）…")
+            self.runtime.pull(ref)
+            detail, status = "ダイジェスト固定のイメージを取得しました", "done"
+        info = dict(self._state.get("container") or {})
+        info["image"] = ref
+        self._update_state(container=info)
+        return status, detail
+
+    def _c_network(self):
+        created = self.runtime.network_ensure(container_runtime.JD2_NET)
+        return ("done" if created else "skipped"), \
+            ("%s を作成しました（ポート非公開）" % container_runtime.JD2_NET if created
+             else "作成済みです")
+
+    def _c_api_config(self):
+        action = self.switch_api_config(MODE_CONTAINER)
+        uid, gid = container_runtime.prepare_data_owner(str(self.jd2_dir))
+        folder = self.store.settings().get("download_dir")
+        if not container_runtime.writable_by(os.stat(folder), uid, gid):
+            raise SetupFailure(
+                "保存先フォルダにコンテナ利用者(uid %d)の書き込み権限がありません。"
+                "共有フォルダの権限を確認してください" % uid)
+        text = {"created": "作成しました", "rewritten": "内蔵エンジン用から切り替えました",
+                "same": "作成済みです"}[action]
+        return ("skipped" if action == "same" else "done"), \
+            "コンテナ用の接続設定（専用ネットワーク内のみ）を%s / 実行uid %d:%d" % (text, uid, gid)
+
+    def _s_precheck(self):
+        self._precheck_common()
         kib = read_mem_total_kib(self.meminfo_path)
         self._heap_mb = select_heap(kib) if kib else 256
         return "done", "RAM %s MiB / Javaヒープ -Xmx%dm" % (
@@ -710,17 +1068,11 @@ class EngineManager:
         return "done", "SHA-256とサイズを検証して配置しました"
 
     def _s_api_config(self):
-        path = self.jd2_dir / "cfg" / API_CONFIG_NAME
-        if path.exists() or path.is_symlink():
-            try:
-                same = (not path.is_symlink() and json.loads(path.read_text(encoding="utf-8")) == API_CONFIG)
-            except (OSError, ValueError):
-                same = False
-            if same:
-                return "skipped", "作成済みです"
-            raise SetupFailure("既存の接続設定ファイルがあるため上書きせず中止しました: cfg/" + API_CONFIG_NAME)
-        durability.write_json(path, API_CONFIG)
-        return "done", "127.0.0.1:%d のみで有効化する設定を作成しました" % API_CONFIG["deprecatedapiport"]
+        action = self.switch_api_config(MODE_NATIVE)
+        if action == "same":
+            return "skipped", "作成済みです"
+        return "done", "127.0.0.1:%d のみで有効化する設定を%sしました" % (
+            API_CONFIG["deprecatedapiport"], "作成" if action == "created" else "切り替え")
 
     def _s_first_run(self):
         if (self._state.get("jd2") or {}).get("initialized") and self._alive():
@@ -774,10 +1126,14 @@ class EngineManager:
         with self._lock:
             self._core_revision = str(revision)
             self._ready = True
+        if self.mode == MODE_CONTAINER:
+            return "done", "コンテナ（専用ネットワーク・ポート非公開）をinspectで検証 / Core revision %s" % revision
         return "done", "loopback限定・Hub起動プロセスの待受を確認 / Core revision %s" % revision
 
     def _s_preset(self):
         folder = self.store.settings().get("download_dir")
+        if self.mode == MODE_CONTAINER:
+            folder = container_runtime.CONTAINER_DOWNLOADS   # JD2 sees only /downloads
         notes = []
         found = self.adapter.set_default_download_folder(folder)
         if not found:

@@ -1,4 +1,6 @@
-# 内蔵JD2エンジンの初期設定（v0.1.11 / ロードマップM1）
+# 内蔵JD2エンジンの初期設定（v0.1.11 / ロードマップM1、v0.1.15でコンテナ方式を追加）
+
+> **v0.1.15:** 既定は「コンテナ方式」（下の「コンテナ方式」節）。Container Stationが無い環境では、以下に書く従来の「QTS直接実行（ネイティブ）方式」が詳細設定からのフォールバックとして使える。両方式は同時に動かさない（単一ライター）。
 
 ## 決定事項（2026-11-02）
 - **MyJDownloader連携は削除する**（利用者の指示）。JD2との通信はNAS内ローカル接続のみ。
@@ -70,3 +72,35 @@ engine/
 
 ## 非対象（後続）
 JD2ログのRAM化・HDDアクセス計測（M3）、ダウンロード操作ボタン（M2）、Javaの自動更新（ピン値更新はHubリリースで行う）。
+
+
+## コンテナ方式（v0.1.15、`docs/container-runtime.md` §2〜3）
+
+実機未検証。`engine/state.json` に `mode`（`container` / `native`）を記録する。モード未記録の既存導入は `native` として扱う。
+
+### 実行形態
+- Docker CLIは `container_runtime.py` の固定関数だけで使う（`/sbin/getcfg container-station Install_Path -f /etc/config/qpkg.conf` → `<path>/bin/docker`、無ければ `/usr/local/bin/docker`）。list引数・タイムアウト・最小環境変数、シェル不使用。ラベル `org.qnapdownloader.managed=1` かつ名前 `qnapdl-` 始まりのHub自身のコンテナ以外は、一覧も停止も削除もしない（既存のDocker版JD2を含む）。
+- イメージはダイジェスト固定の `eclipse-temurin:21-jre@sha256:0b99b337…6901`。専用ネットワーク `qnapdl-jd2-net`（bridge、ラベル付き）に `qnapdl-jd2` を1台だけ置く。**`-p` なし**。
+- `docker run -d --restart no --read-only --log-driver none --memory 1g --memory-swap 1g --pids-limit 512 --cap-drop ALL --security-opt no-new-privileges --user <uid>:<gid>`。マウントは `engine/jd2`→`/jd2`（rw）と選択済み保存先→`/downloads`（rw）のみ。`--tmpfs /jd2/logs:size=64m`、`--tmpfs /tmp:rw,exec,nosuid,nodev,size=64m`（JNA等のネイティブヘルパーを読み込めるようexec。`/jd2/logs` はnoexecのまま）。コマンドは `java -Xmx512m -XX:+UseSerialGC -Djava.awt.headless=true -jar /jd2/JDownloader.jar -norestart`。
+- 再起動ポリシーは付けない。Hubが監督する（Hub起動時に自動起動設定なら起動、落ちたら既存のバックオフで再起動）。停止は `docker stop -t 30` の後、自コンテナだけ `docker rm -f`。Hub終了時もコンテナを止める。
+- 起動前に `MemAvailable ≥ 1.5GiB` を確認し、不足なら起動せず理由を表示する（他アプリは止めない）。
+- 実行ユーザー: `engine/jd2` の所有者 uid:gid。Hubがroot所有のデータを見つけた場合のみ `engine/jd2` 配下を 1000:1000 に変更する（シンボリックリンクは辿らない）。rootでは実行しない。保存先がそのuidで書込できない（モードビットで判定。ACLは評価しない）場合は理由を表示して起動しない。
+- コンテナのログは保存しない（`--log-driver none`）。コンテナ方式では画面の「ログ」にJD2の出力は出ない（Hubの操作ログのみ）。
+
+### ローカルAPIと接続の安全確認
+- `cfg/org.jdownloader.api.RemoteAPIConfig.json` はコンテナ方式では `{"deprecatedapienabled": true, "deprecatedapiport": 3128, "deprecatedapilocalhostonly": false}`。コンテナ外（ホスト）から届かせるため。到達できるのは、ポート非公開の専用ブリッジネットワーク上のコンテナIPだけ。
+- モード切替でこのファイルだけを書き換える。JD2は初回起動後に項目を追記するため、JSONオブジェクトとして読み、`deprecatedapienabled` がtrue（または無し）かつ `deprecatedapiport` が3128（または無し）のときだけ、`deprecatedapienabled`・`deprecatedapiport`・`deprecatedapilocalhostonly` の3項目を設定し、他の項目は保持して原子的に書き込む。JSONでない・オブジェクトでない・ポートが別の値・無効化されている場合は理由を表示して中止する。ネイティブ起動時のみ例外として、更新できない場合は変更せず続行する（loopback限定のリスナー検査が残るため）。
+- ホスト→JD2は、`docker inspect` で次を**毎回**確認したコンテナIP:3128へ接続する（結果は最大10秒キャッシュ）: ラベルが付いている、起動中、接続先ネットワークが `qnapdl-jd2-net` のみ、公開ポートなし、IPがプライベート。コンテナ方式では `/proc` のリスナー所有者検査は行わない（置き換え）。
+- 保存先の変換: JD2から見る保存先は `/downloads`。送信先は起動時にマウントした保存先の配下だけが `/downloads/…` に変換され、外は拒否する（保存先を変更したらエンジンを再起動してマウントし直す）。
+
+### 初期設定の段階（コンテナ方式）
+Container Station検出と事前確認 → 内蔵エンジンの停止（移行時のみ） → メモリ確認 → イメージ取得（取得済みなら再利用） → 専用ネットワーク作成 → JD2取得・検証・配置（既存なら再利用、**Java取得は行わない**） → ローカル接続設定 → 初回起動・公式アップデート（コンテナが終了したら再実行、最大6回） → 常駐起動 → 接続確認（inspect と `jd/getCoreRevision`） → 保存先（`/downloads`）と推奨設定 → 完了。失敗した段階で止まり、再実行は完了済みの段階を飛ばす。
+
+### 移行（ネイティブ → コンテナ）
+画面の「コンテナへ移行」（ネイティブ導入済みでContainer Stationが使えるときだけ表示）。実行中のネイティブJD2を先に停止し（単一ライター）、同じ `engine/jd2` を使ってコンテナ版の段階を実行する。設定・キュー・アカウントは消えない。ネイティブ用のJava（`engine/java`）は削除しない。
+
+### API
+`POST /api/engine/setup {"confirmed": true, "mode": "container"|"native"}`（`mode` 省略時は導入済みならそのモード、未導入ならコンテナ。Container Stationが無い場合に自動でネイティブへ落とさない）。`GET /api/engine/status` に `mode`・`preferred_mode`・`can_migrate`・`container`（`available`/`version`/`state`/`name`/`network`/`image`/`mounted_dir`）を追加。
+
+### 画面
+設定 › エンジンに実行方式（「コンテナ (Container Station)」/「QTS直接実行」）を表示。Container Stationが無いときは「QTSのApp CenterでContainer Stationをインストールしてください」と案内し（リンクなし）、「詳細」から非推奨のネイティブ初期設定を選べる。

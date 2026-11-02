@@ -25,7 +25,7 @@ import runtime_diagnostics
 import engine_supervisor
 import updater
 
-VERSION = "0.1.14"
+VERSION = "0.1.15"
 PORT = 17864
 ROOT = Path(__file__).resolve().parent
 FILES = {"/": ("web/index.html", "text/html; charset=utf-8"),
@@ -610,8 +610,11 @@ class Handler(BaseHTTPRequestHandler):
                     raise ValueError("初期設定の開始には確認が必要です")
                 # The destination must still be inside the allowed shares.
                 checked_directory(self.store.settings().get("download_dir"))
+                requested = body.get("mode")
+                if requested not in (None, "container", "native"):
+                    raise ValueError("modeはcontainerまたはnativeで指定してください")
                 try:
-                    self.server.engine.start_setup()
+                    self.server.engine.start_setup(requested)
                 except engine_supervisor.SetupBusy as exc:
                     return self.reject(str(exc), 409)
                 return self.send_data(202, {"started": True})

@@ -17,6 +17,16 @@ import jd2_local
 from test_engine_components import FakeOpener, FakeResponse, make_tar
 
 
+class NoContainerStation:
+    """Runtime stand-in: Container Station missing (native fallback)."""
+
+    def version(self):
+        return None
+
+    def available(self):
+        return False
+
+
 class Store:
     def __init__(self, folder):
         self.folder = folder
@@ -220,7 +230,7 @@ class SetupTests(unittest.TestCase):
         return SimpleNamespace(returncode=0, stdout=b'openjdk version "21.0.1"\n')
 
     def manager(self, **extra):
-        manager = es.EngineManager(self.data, Store(str(self.folder)), manifest=self.manifest,
+        manager = es.EngineManager(self.data, Store(str(self.folder)), manifest=self.manifest, runtime=NoContainerStation(),
                                    opener=self.opener(), run=self.run_fake, machine="x86_64",
                                    disk_usage=lambda p: SimpleNamespace(free=10 ** 12),
                                    meminfo_path=str(self.root / "nomem"), **extra)
@@ -234,7 +244,7 @@ class SetupTests(unittest.TestCase):
 
     def test_full_setup_then_resume_skips_verified_artifacts(self):
         manager = self.manager()
-        manager.run_setup()
+        manager.run_setup("native")
         status = manager.status()
         self.assertIsNone(status["error"], status)
         self.assertEqual(len(self.fetched), 2)
@@ -251,7 +261,7 @@ class SetupTests(unittest.TestCase):
         self.assertEqual(self.runs, [[str(manager.java_bin), "-version"]])
         # Resume with a fresh manager reading state.json.
         again = self.manager()
-        again.run_setup()
+        again.run_setup("native")
         self.assertEqual(len(self.fetched), 2)
         steps = self.statuses(again)
         self.assertEqual(steps["java_fetch"], "skipped")
@@ -270,11 +280,11 @@ class SetupTests(unittest.TestCase):
                 raise es.SetupFailure("java -version の結果が想定と一致しません")
             real()
         manager._java_version_check = flaky
-        manager.run_setup()
+        manager.run_setup("native")
         self.assertEqual(self.statuses(manager)["java_extract"], "failed")
         self.assertFalse(manager.installed)
         self.assertEqual(len(self.fetched), 1)
-        manager.run_setup()
+        manager.run_setup("native")
         self.assertTrue(manager.installed)
         self.assertEqual(len(self.fetched), 2)  # java once + jd2 once, no re-download
 
@@ -282,7 +292,7 @@ class SetupTests(unittest.TestCase):
         self.java_data_served = self.java_data
         self.manifest["java"]["sha256"] = "0" * 64
         manager = self.manager()
-        manager.run_setup()
+        manager.run_setup("native")
         status = manager.status()
         self.assertEqual(self.statuses(manager)["java_fetch"], "failed")
         self.assertIn("公式の値と一致しません", status["error"])
@@ -295,7 +305,7 @@ class SetupTests(unittest.TestCase):
         cfg = manager.jd2_dir / "cfg"
         cfg.mkdir(parents=True)
         (cfg / es.API_CONFIG_NAME).write_text('{"deprecatedapienabled": false}')
-        manager.run_setup()
+        manager.run_setup("native")
         self.assertEqual(self.statuses(manager)["api_config"], "failed")
         self.assertEqual((cfg / es.API_CONFIG_NAME).read_text(), '{"deprecatedapienabled": false}')
         self.assertFalse(manager.installed)
@@ -303,13 +313,13 @@ class SetupTests(unittest.TestCase):
     def test_precheck_requires_folder_platform_and_space(self):
         manager = self.manager()
         manager.store = Store("")
-        manager.run_setup()
+        manager.run_setup("native")
         self.assertIn("保存先", manager.status()["error"])
         manager = self.manager(); manager._machine = "aarch64"
-        manager.run_setup()
+        manager.run_setup("native")
         self.assertIn("x86_64", manager.status()["error"])
         manager = self.manager(); manager._disk_usage = lambda p: SimpleNamespace(free=1)
-        manager.run_setup()
+        manager.run_setup("native")
         self.assertIn("空き容量", manager.status()["error"])
         self.assertEqual(self.fetched, [])
 
@@ -319,7 +329,7 @@ class SetupTests(unittest.TestCase):
         with self.assertRaises(es.SetupBusy):
             manager.start_setup()
         with self.assertRaises(es.SetupBusy):
-            manager.run_setup()
+            manager.run_setup("native")
         self.assertEqual(manager.phase(), "setup")
 
     def test_paths_never_come_from_requests(self):

@@ -18,7 +18,7 @@
 - **メモリ**: 各コンテナに `--memory` と `--memory-swap`（同値＝swap不使用）を設定。起動前に `/proc/meminfo` の `MemAvailable` を確認し、閾値未満なら起動しない（他アプリを止めない）。
 - 非root利用者（`--user 1000:1000`）、`--cap-drop ALL`、`--security-opt no-new-privileges`、`--pids-limit`。
 
-## 3. JD2コンテナ（v0.1.15）
+## 3. JD2コンテナ（v0.1.15、実装済み・実機未検証）
 - 実行: `eclipse-temurin:21-jre@…` に `engine/jd2` を `/jd2` へ、選択済み保存先を `/downloads` へバインドマウント（それ以外のNASパスはマウントしない）。`/jd2/logs` は `--tmpfs`（64MB、RAMのみ）。
 - メモリ: `--memory 1g`、Javaヒープ `-Xmx512m`。起動条件 `MemAvailable ≥ 1.5GiB`。
 - ローカルAPI: コンテナ内JD2の旧API(3128)を `0.0.0.0` で待受（コンテナ内のみ。ポート公開なし）。設定ファイルの `deprecatedapilocalhostonly` を false に変更（コンテナ外＝ホストから届かせるため）。ホストからは専用ネットワークのコンテナIPでのみ到達。
