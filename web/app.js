@@ -3866,9 +3866,10 @@ function longPress(clientX, clientY) {
 
 // ---- mirror display (v0.1.39) ----
 // The NAS browser renders the page; the Hub sends a sanitized copy (HTML + CSS, no scripts, every image
-// and font a Hub reference). It is shown in <iframe id="mirrorFrame" sandbox="allow-same-origin">:
-// no script, form, popup or top-navigation permission is granted, so nothing in it can run code,
-// submit a form, open a window or navigate. The iframe's document is /api/rb/mirror/doc (this origin,
+// and font a Hub reference). It is shown in <iframe id="mirrorFrame"> (v0.1.41: without the sandbox
+// attribute: WebKit drops every event listener on a script-less sandboxed document, so taps never
+// arrived on iPhone). Nothing in it can run code: the Hub strips scripts and handlers, and the
+// document's CSP (header and <meta>) is default-src 'none'; form-action 'none'; links carry no href. The iframe's document is /api/rb/mirror/doc (this origin,
 // with its own strict CSP header); later versions of the same page are applied to the iframe's DOM
 // (parsed with DOMParser) and its <style>. This code only listens (taps, long presses, touches): every
 // action goes to the Hub, which validates it again. The page is never given an address of its own.

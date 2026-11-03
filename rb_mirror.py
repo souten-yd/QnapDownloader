@@ -37,8 +37,11 @@ CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 # ------------------------------------------------------------------ document shell
 DOC_CSP = ("default-src 'none'; img-src 'self' data:; style-src 'unsafe-inline'; font-src 'self'; "
            "media-src 'none'; frame-src 'none'; form-action 'none'; base-uri 'none'")
-# The header also sandboxes the document itself, so it can never run scripts even if opened directly.
-DOC_CSP_HEADER = DOC_CSP + "; frame-ancestors 'self'; sandbox allow-same-origin"
+# v0.1.41: no `sandbox` here or on the iframe. WebKit (iPhone Safari) does not run ANY event listener on
+# a document whose frame may not run scripts, including the listeners the app attaches from outside,
+# so taps never arrived. Scripts stay impossible without it: the Hub strips them and every handler,
+# and this policy (header + <meta>) is default-src 'none', which blocks inline, external and eval code.
+DOC_CSP_HEADER = DOC_CSP + "; frame-ancestors 'self'"
 RES_SVG_CSP = "default-src 'none'; style-src 'unsafe-inline'"
 OWN_CSS = (
     "html{-webkit-text-size-adjust:100%;text-size-adjust:100%}"

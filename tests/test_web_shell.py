@@ -52,8 +52,10 @@ class WebShellStaticTests(unittest.TestCase):
                 with self.subTest(file=path.name, token=token):
                     self.assertNotIn(token, body)
         self.assertEqual(self.html.count("<iframe"), 1)
-        self.assertIn('<iframe id="mirrorFrame" class="mirror-frame" sandbox="allow-same-origin"', self.html)
-        self.assertEqual(len(re.findall(r'sandbox="', self.html)), 1)
+        # v0.1.41: no sandbox attribute (WebKit would drop the app's listeners); the document's own
+        # CSP (default-src 'none') keeps every script out instead
+        self.assertIn('<iframe id="mirrorFrame" class="mirror-frame" title=', self.html)
+        self.assertEqual(len(re.findall(r'sandbox="', self.html)), 0)
         self.assertNotRegex(self.js, r"createElement\([\"']iframe[\"']\)")
         self.assertNotIn('setAttribute("sandbox"', self.js)
         self.assertNotIn(".sandbox", self.js)
