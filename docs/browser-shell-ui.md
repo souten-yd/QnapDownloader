@@ -322,3 +322,18 @@ Cloudflare等で手元のブラウザ（iframe）では開けないサイトを�
 
 ### 未検証
 - 実機NAS（Chromiumコンテナ）での動作、iOS Safariでのsandbox付きiframe・ネイティブスクロールの挙動（検証はデスクトップChromeと390px幅のエミュレーションのみ）。
+
+## v0.1.44 自己テスト（設定›診断›自己テスト）（実機未検証）
+「ボタンを押すと自動でテストして結果を出し、改善につなげる」ための画面。GitHubのE2Eでは見えない実機のNAS（TS-253Be）・iPhone Safari・実サイトの状態を、そのまま貼れる1つのレポートにする。
+
+- 画面: 診断の最初のサブ。「自己テストを実行」（同時に1回、進み具合、中止）、任意の「実サイトも測る（URL、改行で最大5件）」（オムニボックスと同じ検証。入力はlocalStorageに記憶）、
+  結果（合格/注意/失敗と所要時間、セクションごとの表、各行の状態アイコン・値・「改善のヒント」）、「結果をコピー」（クリップボード、だめなら選択できるテキスト欄）、「結果を保存」（端末側で作るファイル。Hubは何も書かない）、
+  「URLを含める」（既定オフ。オフならURLはホスト名だけ）、直近5件の履歴（HubのRAMのみ）。
+- Hub側（`selftest.py`、背景スレッド、上限4分）: 環境（CPU・メモリ・データ領域・Container Station・イメージ・JD2）→ NASブラウザの起動 → 内蔵テストページ
+  （リーダー・ミラー・JSメニュー・動的更新・タイル・ライブのフレームレート・変化通知）→ 任意の実サイト → 後片付け。内蔵ページは `Fetch.fulfillRequest` でRAMから返す仮想サイト
+  （`https://selftest.example.com/`）で、ネットワークを使わず、内部タブとしてユーザーのタブ数に数えず、最後に必ず閉じる。
+- 端末側（`web/app.js`）: 画面外の保持領域で、アプリの純関数（`cleanReaderData`・`mirrorUnsafe`・`mirrorMorph`・`wireMirrorDoc`）をそのまま使って測る。ユーザーのタブや表示には触れない。測定値だけをHubへ送り、判定はHubが行う。
+- API: `GET /api/selftest/status?since=&wait=`（ロングポーリング）、`GET /api/selftest/results[?id=]`、`GET /api/selftest/report?id=&urls=0|1`、
+  `POST /api/selftest/start`・`/cancel`・`/client`（管理者・CSRF・Origin。`/client` は32 KiB上限・項目の型と範囲を検証）。同時実行は409。
+- レポート: アプリのバージョン、NASの事実、端末のUA・viewport・DPR・エンジンのフラグ、全項目の値・しきい値・状態、デバッグログ末尾50行（rb/render/engine/http）。パスワード等とURLの中身は入れません。
+- 未検証: 実機NAS、実iPhone（WebKit）、実サイト、headfulなChromiumでのライブfps（ヘッドレスでは断続的になるため、fpsは注意止まり）。

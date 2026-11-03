@@ -68,6 +68,11 @@ REDUCED_MOTION = {"features": [{"name": "prefers-reduced-motion", "value": "redu
 # Document requests are ever paused; every other request is untouched.
 FETCH_PATTERNS = tuple({"urlPattern": pattern, "resourceType": "Document"} for pattern in (
     "*://rapidgator.net/file/*", "*://*.rapidgator.net/file/*", "*://rg.to/file/*"))
+# v0.1.44 self-test: the internal fixture tab loads a virtual site that is answered from the Hub's RAM
+# (Fetch.fulfillRequest); nothing is fetched from the network. A real, valid-looking public https name
+# is used so the normal validators (mirror, reader) treat the page like any other.
+SELFTEST_ORIGIN = "https://selftest.example.com"
+SELFTEST_TABS = 1              # self-test tabs open at once (they do not count against MAX_TABS)
 INTERCEPT_CAP = 20             # events kept per tab (RAM only)
 INTERCEPT_DEDUP = 2.0          # an identical event within this many seconds is one event
 BYPASS_TTL = 30.0              # a "page open" bypass is valid for one navigation, this long
@@ -984,6 +989,8 @@ class Tab:
         self.mirror_sem = threading.BoundedSemaphore(MIRROR_FETCH_PARALLEL)
         self.mirror_tree = None    # (time, {url: (frame id, type, mime)})
         self.client_dpr = 2.0      # the viewer's device pixel ratio (image choice)
+        self.selftest = False      # v0.1.44: opened by the self-test (not a user tab; closed at its end)
+        self.fixture = None        # self-test fixture tab: callable(url) -> (status, content type, bytes) | None
 
 
 class Snapshot:
@@ -1221,7 +1228,8 @@ class RemoteBrowser:
             stale = self._stale
             state = self._state
             setup = self._setup_active
-            tabs = [{"id": t.id, "url": t.url, "title": t.title} for t in self._tabs.values()]
+            tabs = [{"id": t.id, "url": t.url, "title": t.title} for t in self._tabs.values()
+                    if not t.selftest]
             steps = [dict(s) for s in (self._steps if (setup or self._error or
                      any(s["status"] != "pending" for s in self._steps)) else self._fresh_steps())]
             error = self._error
@@ -1803,7 +1811,7 @@ class RemoteBrowser:
             resident = self._resident
             state = self._state
             hold = self._user_stopped
-            tabs = len(self._tabs)
+            tabs = sum(1 for t in self._tabs.values() if not t.selftest)
         wd = self.wd.snapshot()
         total = rb_resident.mem_total_kib(self._meminfo)
         memory = self.container_memory()
@@ -1844,15 +1852,27 @@ class RemoteBrowser:
             raise TabGone("このタブはすでに閉じられています")
         return tab
 
-    def open_tab(self, url):
-        checked = browser_safety.validate(url)
+    def open_tab(self, url, selftest=None):
+        """Opens a tab. `selftest` (v0.1.44, only the self-test passes it) is a dict: the tab is marked as a
+        self-test tab (not counted as a user tab) and, with a "fixture" callable, `url` is a virtual page
+        under SELFTEST_ORIGIN that the Hub itself answers (no validation of user input is skipped:
+        only that exact origin is accepted for a fixture)."""
+        if selftest is not None and selftest.get("fixture") is not None:
+            if not isinstance(url, str) or not url.startswith(SELFTEST_ORIGIN + "/"):
+                raise BrowserError("セルフテスト用のページではありません")
+            checked = url
+        else:
+            checked = browser_safety.validate(url)
         with self._open_lock:
             self._touch()
             with self._lock:
                 if self._state == "stopping":
                     raise BrowserError("停止処理中です。数秒後にもう一度お試しください")
-                if len(self._tabs) >= MAX_TABS:
-                    raise BrowserError("NASブラウザのタブは最大%d枚です。不要なタブを閉じてください" % MAX_TABS)
+                if selftest is None:
+                    if sum(1 for t in self._tabs.values() if not t.selftest) >= MAX_TABS:
+                        raise BrowserError("NASブラウザのタブは最大%d枚です。不要なタブを閉じてください" % MAX_TABS)
+                elif sum(1 for t in self._tabs.values() if t.selftest) >= SELFTEST_TABS:
+                    raise BrowserError("セルフテスト用のタブがすでに開いています")
                 running = self._state == "running"
             if not running:
                 if not self.image_ready(refresh=True):
@@ -1868,11 +1888,12 @@ class RemoteBrowser:
             if not running:
                 self._start()
                 self.wd.succeeded()       # a pending automatic restart is done by this open
-            created = self._create_tab(checked)
-            debuglog.log("rb", "info", "tab open", {"tab": created.get("id"), "host": self._host_of(checked)})
+            created = self._create_tab(checked, selftest)
+            debuglog.log("rb", "info", "tab open", {"tab": created.get("id"), "host": self._host_of(checked),
+                                                    "selftest": selftest is not None})
             return created
 
-    def _create_tab(self, checked):
+    def _create_tab(self, checked, selftest=None):
         created = self._call("Target.createTarget", {
             "url": "about:blank", "newWindow": True,
             "width": WINDOW_SIZE[0], "height": WINDOW_SIZE[1]})
@@ -1884,6 +1905,9 @@ class RemoteBrowser:
             self._next_id += 1
             tab = Tab(ident, self._clock())
             tab.target_id = target
+            if selftest is not None:
+                tab.selftest = True
+                tab.fixture = selftest.get("fixture")
             self._tabs[ident] = tab
         try:
             session = self._call("Target.attachToTarget",
@@ -1895,8 +1919,11 @@ class RemoteBrowser:
                 self._by_session[session] = tab
             self._call("Page.enable", session=session)
             self._call("Emulation.setFocusEmulationEnabled", {"enabled": True}, session=session)
+            patterns = [dict(p) for p in FETCH_PATTERNS]
+            if tab.fixture is not None:
+                patterns.append({"urlPattern": SELFTEST_ORIGIN + "/*"})
             try:
-                self._call("Fetch.enable", {"patterns": [dict(p) for p in FETCH_PATTERNS]},
+                self._call("Fetch.enable", {"patterns": patterns},
                            session=session)
             except BrowserError as error:
                 # Not a safety control: without it hoster pages simply load.
@@ -1907,7 +1934,7 @@ class RemoteBrowser:
             except BrowserError as error:
                 self.log("setEmulatedMedia failed: %s" % error)
             tab.page_host = self._host_of(checked)
-            if self._ads_wanted(tab.page_host):
+            if tab.fixture is None and self._ads_wanted(tab.page_host):
                 try:
                     for method, params in self._ads_commands(True):
                         self._call(method, params, session=session)
@@ -1995,6 +2022,46 @@ class RemoteBrowser:
         tab.snap_gen += 1
         self._call("Page.navigate", {"url": checked}, session=tab.session)
         return {"id": tab.id, "url": checked}
+
+    # ------------------------------------------------------------ self-test support (v0.1.44)
+    def selftest_tabs(self):
+        """Ids of the tabs the self-test opened (RAM)."""
+        with self._lock:
+            return [t.id for t in self._tabs.values() if t.selftest]
+
+    def selftest_info(self, ident):
+        """Small read-only view of a tab for the self-test: loading flag, url, rev and screencast frame counter."""
+        tab = self._tab(ident)
+        with self._lock:
+            return {"url": tab.url, "title": tab.title, "loading": bool(tab.loading), "rev": tab.rev,
+                    "seq": tab.seq, "screencast": tab.screencast, "challenge": bool(tab.page_challenge)}
+
+    def selftest_goto(self, ident, path):
+        """Navigates a fixture tab to another page of the virtual site (nothing else is accepted)."""
+        tab = self._tab(ident)
+        if tab.fixture is None or not isinstance(path, str) or not path.startswith("/") or "//" in path:
+            raise BrowserError("セルフテスト用のタブではありません")
+        self._touch()
+        with self._lock:
+            tab.blocked = None
+            tab.snap_gen += 1
+        self._call("Page.navigate", {"url": SELFTEST_ORIGIN + path}, session=tab.session)
+        return SELFTEST_ORIGIN + path
+
+    def image_tag(self):
+        """Tag of the Hub-built browser image (its suffix identifies the build), or None."""
+        return self._tag()
+
+    def browser_version(self):
+        """Chromium product string (e.g. "HeadlessChrome/126.0.6478.55"), or None."""
+        with self._lock:
+            if self._state != "running":
+                return None
+        try:
+            value = self._call("Browser.getVersion", timeout=5.0).get("product")
+        except BrowserError:
+            return None
+        return value[:80] if isinstance(value, str) else None
 
     # ------------------------------------------------------------ viewport
     @staticmethod
@@ -2219,10 +2286,14 @@ class RemoteBrowser:
         now = self._clock()
         with self._cv:
             tab = self._by_session.get(session)
+            fixture = tab.fixture if tab is not None else None
             bypassed = False
             if tab is not None:
                 tab.bypass = {u: t for u, t in tab.bypass.items() if t > now}
                 bypassed = tab.bypass.pop(url, None) is not None
+        if fixture is not None and url.startswith(SELFTEST_ORIGIN + "/"):
+            self._serve_fixture(fixture, session, request_id, url, conn)
+            return
         normalized = rapidgator_extract.normalize(url) if len(url) <= 4096 else None
         try:
             if tab is None or bypassed or params.get("resourceType") != "Document" or normalized is None:
@@ -2234,6 +2305,29 @@ class RemoteBrowser:
         except CDPError:
             return
         self._add_intercept(tab, "hoster", normalized)
+
+    @staticmethod
+    def _serve_fixture(fixture, session, request_id, url, conn):
+        """Answers a request of the self-test virtual site from RAM (never from the network)."""
+        try:
+            answer = fixture(url)
+        except Exception:
+            answer = None
+        try:
+            if answer is None:
+                conn.send_nowait("Fetch.fulfillRequest", {
+                    "requestId": request_id, "responseCode": 404,
+                    "responseHeaders": [{"name": "Content-Type", "value": "text/plain"}],
+                    "body": base64.b64encode(b"not found").decode("ascii")}, session=session)
+                return
+            code, ctype, body = answer
+            conn.send_nowait("Fetch.fulfillRequest", {
+                "requestId": request_id, "responseCode": code,
+                "responseHeaders": [{"name": "Content-Type", "value": ctype},
+                                    {"name": "Cache-Control", "value": "no-store"}],
+                "body": base64.b64encode(body).decode("ascii") if body else ""}, session=session)
+        except CDPError:
+            return
 
     def _on_download(self, params):
         url = params.get("url")
@@ -2318,7 +2412,7 @@ class RemoteBrowser:
         the opener tab itself. Runs off the CDP reader thread (it may call docker)."""
         with self._lock:
             alive = self._tabs.get(owner.id) is owner
-            room = len(self._tabs) < MAX_TABS
+            room = sum(1 for t in self._tabs.values() if not t.selftest) < MAX_TABS
         if not alive:
             return
         if room and self.memory_reason() is None:

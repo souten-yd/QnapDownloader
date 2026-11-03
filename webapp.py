@@ -30,11 +30,12 @@ import runtime_diagnostics
 import engine_supervisor
 import rb_mirror
 import remote_browser
+import selftest
 import state_hub
 import ttlcache
 import updater
 
-VERSION = "0.1.43"
+VERSION = "0.1.44"
 PORT = 17864
 ROOT = Path(__file__).resolve().parent
 FILES = {"/": ("web/index.html", "text/html; charset=utf-8"),
@@ -60,7 +61,7 @@ SESSION_LOCK = threading.RLock()
 CREDENTIALS_TRANSPORT_ERROR = "パスワードはHTTPSまたはTailscale経由でのみ送信できます"
 ACCOUNT_BODY_MAX = 4096
 DEBUG_BODY_MAX = 320000     # 100 entries of at most ~3 KB each
-DEBUG_SKIP_HTTP = ("/api/debug/",)
+DEBUG_SKIP_HTTP = ("/api/debug/", "/api/selftest/status")
 HTTP_LOG_GATE = 1.0         # seconds between debug entries of the same method+path
 
 
@@ -401,6 +402,19 @@ def server_diskio(server):
     return meter
 
 
+def server_selftest(server):
+    """Per-server self-test runner (v0.1.44); created on first use. Results live in RAM only."""
+    runner = getattr(server, "selftest", None)
+    if runner is None:
+        with SESSION_LOCK:
+            runner = getattr(server, "selftest", None)
+            if runner is None:
+                runner = server.selftest = selftest.SelfTest(
+                    server.rb, engine=getattr(server, "engine", None), jd2=getattr(server, "jd2", None),
+                    version=VERSION, data_dir=getattr(server, "data_dir", None))
+    return runner
+
+
 def server_state_hub(server):
     hub = getattr(server, "state_hub", None)
     if hub is None:
@@ -414,7 +428,8 @@ def server_state_hub(server):
 # Writes under these prefixes change nothing the cached reads show (screen input only).
 RB_QUIET_POSTS = ("/api/debug/log", "/api/diag/diskio/start", "/api/diag/diskio/stop", "/api/rb/input", "/api/rb/viewport", "/api/rb/snapshot", "/api/rb/snapshot/release",
                   "/api/rb/tap-page", "/api/rb/reader", "/api/rb/probe", "/api/rb/intercepts/open",
-                  "/api/rb/mirror", "/api/rb/mirror/click", "/api/rb/mirror/release")
+                  "/api/rb/mirror", "/api/rb/mirror/click", "/api/rb/mirror/release",
+                  "/api/selftest/start", "/api/selftest/cancel", "/api/selftest/client")
 
 
 GZIP_MIN = 1024
@@ -592,6 +607,8 @@ class Handler(BaseHTTPRequestHandler):
             maximum = ACCOUNT_BODY_MAX
         if path == "/api/debug/log":
             maximum = DEBUG_BODY_MAX
+        if path == "/api/selftest/client":
+            maximum = selftest.CLIENT_BODY_MAX
         if not 0 <= size <= maximum:
             raise ValueError("リクエストが大きすぎます")
         value = json.loads(self.rfile.read(size))
@@ -732,6 +749,36 @@ class Handler(BaseHTTPRequestHandler):
                 result = debuglog.LOG.entries(int(since_text), int(limit_text))
                 result["status"] = debuglog.LOG.status()
                 return self.send_data(200, result)
+            if path == "/api/selftest/status":
+                query = parse_qs(urlsplit(self.path).query)
+                since_text = query.get("since", [None])[0]
+                wait_text = query.get("wait", ["0"])[0]
+                if ((since_text is not None and (not since_text.isdecimal() or len(since_text) > 12)) or
+                        not wait_text.isdecimal() or len(wait_text) > 2 or int(wait_text) > int(selftest.STATUS_WAIT_MAX)):
+                    raise ValueError("sinceまたはwaitが不正です")
+                return self.send_data(200, server_selftest(self.server).status(
+                    None if since_text is None else int(since_text), int(wait_text)))
+            if path == "/api/selftest/results":
+                query = parse_qs(urlsplit(self.path).query)
+                ident = query.get("id", [None])[0]
+                runner = server_selftest(self.server)
+                if ident is None:
+                    return self.send_data(200, {"items": runner.history()})
+                if not selftest.RUN_ID.match(ident):
+                    raise ValueError("idが不正です")
+                result = runner.result(ident)
+                if result is None:
+                    return self.reject("この結果は見つかりません（HubのRAMには直近5件だけ残ります）", 404)
+                return self.send_data(200, result)
+            if path == "/api/selftest/report":
+                query = parse_qs(urlsplit(self.path).query)
+                ident = query.get("id", [None])[0]
+                if ident is not None and not selftest.RUN_ID.match(ident):
+                    raise ValueError("idが不正です")
+                report = server_selftest(self.server).report(ident, query.get("urls", ["0"])[0] == "1")
+                if report is None:
+                    return self.reject("この結果は見つかりません（HubのRAMには直近5件だけ残ります）", 404)
+                return self.send_data(200, report)
             if path == "/api/diagnostics/io":
                 # Reads /proc/self/io only; no writes or background polling.
                 return self.send_data(200, runtime_diagnostics.snapshot())
@@ -1252,6 +1299,29 @@ class Handler(BaseHTTPRequestHandler):
                     return self.send_data(200, send_link(self.server, url=item["url"], dedupe=True))
                 except AlreadySent:
                     return self.send_data(200, {"state": "dup"})
+            if path == "/api/selftest/start":
+                urls = body.get("urls", [])
+                if not isinstance(urls, list) or len(urls) > selftest.MAX_URLS:
+                    raise ValueError("実サイトのURLは最大%d件です" % selftest.MAX_URLS)
+                checked_urls = []
+                for number, raw in enumerate(urls, 1):
+                    try:
+                        checked = browser_safety.validate(raw)
+                        self.reject_hub_origin(checked)
+                    except ValueError as exc:
+                        raise ValueError("%d件目のURL: %s" % (number, exc)) from None
+                    if checked not in [item["url"] for item in checked_urls]:
+                        checked_urls.append({"url": checked})
+                try:
+                    run_id = server_selftest(self.server).start({
+                        "urls": checked_urls, "viewport": body.get("viewport"), "client": body.get("client", True)})
+                except selftest.Busy as exc:
+                    return self.reject(str(exc), 409)
+                return self.send_data(202, {"run_id": run_id})
+            if path == "/api/selftest/cancel":
+                return self.send_data(200, {"cancelled": server_selftest(self.server).cancel()})
+            if path == "/api/selftest/client":
+                return self.send_data(200, server_selftest(self.server).submit_client(body))
             if path == "/api/diag/diskio/start":
                 return self.send_data(200, server_diskio(self.server).start())
             if path == "/api/diag/diskio/stop":
@@ -1365,6 +1435,7 @@ def main():
     store = storage.Store(data)
     server = ThreadingHTTPServer(("0.0.0.0" if args.lan else "127.0.0.1", args.port), Handler)
     server.store = store
+    server.data_dir = data
     server.secure_cookies = args.secure_cookie
     remove_legacy_setup_token(data)
     server.updates = self_update.UpdateManager(data, ROOT, VERSION, "x86_64", args.port)

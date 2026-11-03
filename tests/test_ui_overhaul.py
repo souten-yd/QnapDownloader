@@ -31,7 +31,7 @@ class SettingsStructureTests(unittest.TestCase):
                               ("browser", ["nas", "rules", "bookmarks"]),
                               ("connection", ["https", "share"]),
                               ("system", ["updates", "about"]),
-                              ("diag", ["tools", "disk", "debug"])):
+                              ("diag", ["selftest", "tools", "disk", "debug"])):
             block = re.search(r'data-section="%s" hidden>(.*?)</section>' % section, body, re.S).group(1)
             self.assertEqual(re.findall(r'data-sub="(\w+)"', block), subs)
 
@@ -101,6 +101,52 @@ assert.strictEqual(r("system", "diagnostics").redirect, "#/settings/diag");   //
         self.assertIn("ensureSettings();", JS[JS.index("async function enterSettings"):])
         self.assertIn("ensureRemote();", JS[JS.index("async function openRemote"):])
         self.assertIn("if (remote) ensureRemote();", JS)
+
+
+class SelfTestClientTests(unittest.TestCase):
+    """v0.1.44: the one-button self-test lives first under Settings > Diagnostics."""
+    def test_selftest_is_the_first_diagnostics_sub_with_its_controls(self):
+        block = re.search(r'<div class="sub" data-sub="selftest">(.*?)<div class="sub" data-sub="tools">', HTML, re.S).group(1)
+        for needle in ("自己テストを実行", "中止", "実サイトも測る（URL、改行で最大5件）", "結果をコピー", "結果を保存",
+                       "URLを含める", "selftestTables"):
+            self.assertIn(needle, block)
+        for ident in ("selftestRun", "selftestCancel", "selftestUrls", "selftestCopy", "selftestSave",
+                      "selftestIncludeUrls", "selftestText", "selftestHistory"):
+            self.assertIn('id="%s"' % ident, block)
+        self.assertRegex(block, r'<input type="checkbox" id="selftestIncludeUrls" role="switch"')
+        self.assertLess(HTML.index('data-sub="selftest"'), HTML.index('data-sub="tools"'))
+
+    def test_route_and_sub_list_in_the_router(self):
+        self.assertIn('diag: ["selftest", "tools", "disk", "debug"]', JS)
+
+    def test_client_uses_only_the_selftest_endpoints_it_needs(self):
+        used = set(re.findall(r'"(/api/selftest/[a-z]+)', JS))
+        self.assertEqual(used, {"/api/selftest/status", "/api/selftest/start", "/api/selftest/cancel",
+                                "/api/selftest/client", "/api/selftest/report", "/api/selftest/results"})
+
+    def test_urls_are_remembered_only_through_the_guarded_storage_helpers(self):
+        self.assertIn("writeLocal(SELFTEST_URLS_KEY", JS)
+        self.assertIn("readLocal(SELFTEST_URLS_KEY", JS)
+        self.assertNotRegex(JS, r"localStorage\.(?:get|set)Item\(SELFTEST")
+
+    def test_copy_has_a_selectable_textarea_fallback_and_save_is_client_side(self):
+        self.assertIn("navigator.clipboard", JS)
+        self.assertIn("selftestText", JS)
+        self.assertIn(".select()", JS)
+        self.assertRegex(JS, r"new Blob\(")
+        self.assertIn("text/plain", JS)
+        self.assertIn("=== JSON ===", JS)
+
+    def test_phone_side_measures_do_not_touch_the_users_display(self):
+        start = JS.index("async function selftestClient")
+        body = JS[start:start + 20000]
+        self.assertIn("wireMirrorDoc", body)
+        self.assertIn("mirrorProbes", JS)
+        self.assertNotIn('createElement("iframe")', JS)
+
+    def test_result_styles_exist_and_fit_a_phone(self):
+        for cls in (".selftest-progress", ".selftest-step", ".selftest-summary", ".selftest-text"):
+            self.assertIn(cls, CSS)
 
 
 class LinksAndTimersTests(unittest.TestCase):

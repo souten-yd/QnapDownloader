@@ -96,7 +96,7 @@ const DEBUG_VIEW_MAX = 1000;
 const DISK_REFRESH_MS = 10000;     // disk write table (the Hub samples every 10 s)
 const SETTINGS_SECTIONS = ["jd2", "browser", "connection", "system", "diag"];
 const SETTINGS_SUBS = {jd2: ["engine", "accounts", "storage", "send"], browser: ["nas", "rules", "bookmarks"],
-  connection: ["https", "share"], system: ["updates", "about"], diag: ["tools", "disk", "debug"]};
+  connection: ["https", "share"], system: ["updates", "about"], diag: ["selftest", "tools", "disk", "debug"]};
 // Old one-section routes land on their new place.
 const SETTINGS_REDIRECTS = {engine: "jd2/engine", accounts: "jd2/accounts", storage: "jd2/storage",
   https: "connection/https", share: "connection/share", bookmarks: "browser/bookmarks",
@@ -4293,8 +4293,13 @@ function mirrorScrollToAnchor(doc, id) {
 }
 
 // Listeners inside the iframe's document (the parent runs them; the frame itself runs no script).
+// A probe registered for `doc` in mirrorProbes (v0.1.44, self-test only) receives every tap the handlers
+// recognise instead of the app acting on it, so the self-test can prove the listeners fire in THIS browser.
+const mirrorProbes = new WeakMap();
+
 function wireMirrorDoc(doc) {
   if (!doc || mirrorWired.has(doc)) return;
+  const probe = mirrorProbes.get(doc) || null;
   mirrorWired.add(doc);
   const tabNow = () => {
     const t = remoteTab();
@@ -4368,6 +4373,7 @@ function wireMirrorDoc(doc) {
     handleTap(event);
   });
   function handleTap(event) {
+    if (probe) { probe.tap(event); return; }
     const tab = tabNow();
     if (!tab) return;
     const el = mirrorClosest(event.target, "[data-m]");
@@ -6054,6 +6060,7 @@ async function enterSettings(route, force = false) {
   } else if (section === "diag") {
     renderDebugCard();
     loadDisk().catch(() => {});
+    selftestAttach().catch(() => {});
   }
   scrollToSub(route);
 }
@@ -7404,6 +7411,7 @@ function debugFps() {
 function wireDiagnostics() {
   buildDebugControls();
   renderDebugCard();
+  wireSelftest();
   $("diskToggle").addEventListener("click", () => perform(async () => {
     const measuring = $("diskToggle").textContent === "計測を停止";
     renderDisk(await api("/api/diag/diskio/" + (measuring ? "stop" : "start"), {}));
@@ -7438,6 +7446,512 @@ function wireDiagnostics() {
     dbgView.seq = 0;
     await pollDebugView(true);
   }));
+}
+
+// ---- Settings › 診断 › 自己テスト (v0.1.44)
+// One button: the Hub measures the NAS, the NAS browser and built-in test pages (selftest.py), and while it
+// waits this page measures ITS OWN side on the same internal fixture tab (reader / mirror / tiles / live)
+// in an off-screen container that never touches the user's tabs or displays. Everything is RAM only; the
+// Hub judges both halves and builds the report text.
+const SELFTEST_URLS_KEY = "qdl.selftest.urls";
+const SELFTEST_RUN_KEY = "qdl.selftest.run";
+const SELFTEST_WAIT_S = 20;
+const SELFTEST_LIVE_MS = 3000;
+const SELFTEST_STATUS_LABEL = {pass: "合格", warn: "注意", fail: "失敗", skip: "省略"};
+const SELFTEST_STATUS_ICON = {pass: "✓", warn: "!", fail: "×", skip: "–"};
+const SELFTEST_SECTION_ICON = {pending: "・", running: "…", done: "✓", skipped: "–"};
+const selftestUi = {runId: "", rev: -1, snap: null, watching: false, clientRun: "", shownId: "", text: ""};
+
+function selftestUrlLines() {
+  return $("selftestUrls").value.split(/\r?\n/).map(line => line.trim()).filter(Boolean);
+}
+
+function selftestViewport() {
+  const dpr = Math.min(3, Math.max(1, Number(window.devicePixelRatio) || 1));
+  return {width: Math.min(1600, Math.max(320, Math.round(window.innerWidth))),
+    height: Math.min(2400, Math.max(320, Math.round(window.innerHeight))), dpr: Math.round(dpr * 100) / 100};
+}
+
+function wireSelftest() {
+  const saved = readLocal(SELFTEST_URLS_KEY);
+  if (saved) $("selftestUrls").value = saved.slice(0, 2000);
+  $("selftestUrls").addEventListener("input", () => writeLocal(SELFTEST_URLS_KEY, $("selftestUrls").value.slice(0, 2000)));
+  $("selftestRun").addEventListener("click", () => perform(selftestStart));
+  $("selftestCancel").addEventListener("click", () => perform(async () => {
+    $("selftestCancel").disabled = true;
+    await api("/api/selftest/cancel", {});
+  }));
+  $("selftestCopy").addEventListener("click", () => perform(selftestCopy));
+  $("selftestSave").addEventListener("click", () => perform(selftestSave));
+}
+
+async function selftestStart() {
+  const lines = selftestUrlLines();
+  if (lines.length > 5) throw new Error("実サイトのURLは最大5件です");
+  const urls = [];
+  for (const [i, line] of lines.entries()) {      // same rules as the omnibox (the Hub checks again)
+    try { urls.push(await validateUrl(line)); } catch (e) { throw new Error((i + 1) + "件目のURL: " + e.message); }
+  }
+  writeLocal(SELFTEST_URLS_KEY, $("selftestUrls").value.slice(0, 2000));
+  $("selftestRun").disabled = true;
+  try {
+    const r = await api("/api/selftest/start", {urls, viewport: selftestViewport(), client: true});
+    selftestUi.runId = r.run_id;
+    writeSession(SELFTEST_RUN_KEY, r.run_id);       // only the page that started a run measures its own side
+    selftestUi.rev = -1;
+    selftestUi.shownId = "";
+    $("selftestText").hidden = true;
+  } catch (e) {
+    $("selftestRun").disabled = false;
+    if (e.status === 409) { await selftestAttach(); return; }
+    throw e;
+  }
+  selftestWatch().catch(() => {});
+}
+
+// Shows the newest run of the Hub (also after a reload) and follows it while it runs.
+async function selftestAttach() {
+  if (selftestUi.watching) return;
+  const snap = await api("/api/selftest/status");
+  selftestUi.runId = snap.run_id || "";
+  selftestUi.rev = snap.rev;
+  renderSelftest(snap);
+  if (snap.state === "running") selftestWatch().catch(() => {});
+}
+
+async function selftestWatch() {
+  if (selftestUi.watching) return;
+  selftestUi.watching = true;
+  let fails = 0;
+  try {
+    for (;;) {
+      let snap;
+      try {
+        const since = selftestUi.rev >= 0 ? "&since=" + selftestUi.rev : "";
+        snap = await api("/api/selftest/status?wait=" + SELFTEST_WAIT_S + since);
+        fails = 0;
+      } catch (e) {
+        if (++fails >= 5) { $("selftestState").textContent = "進み具合を取得できません: " + e.message; return; }
+        await delay(2000);
+        continue;
+      }
+      selftestUi.rev = snap.rev;
+      renderSelftest(snap);
+      if (snap.state === "running" && snap.phase === "client" && snap.tab && selftestUi.clientRun !== snap.run_id &&
+          readSession(SELFTEST_RUN_KEY) === snap.run_id) {
+        selftestUi.clientRun = snap.run_id;
+        selftestClient(snap).catch(() => {});
+      }
+      if (snap.state !== "running") return;
+    }
+  } finally {
+    selftestUi.watching = false;
+  }
+}
+
+function selftestSecondsText(ms) { return Math.round((ms || 0) / 100) / 10 + "秒"; }
+
+function renderSelftest(snap) {
+  selftestUi.snap = snap;
+  const running = snap.state === "running";
+  $("selftestRun").disabled = running;
+  setShown("selftestCancel", running);
+  $("selftestCancel").disabled = false;
+  const state = $("selftestState");
+  if (!snap.run_id) state.textContent = "まだ実行していません";
+  else if (running) state.textContent = (snap.current || "実行中") + "（" + selftestSecondsText(snap.elapsed_ms) + "）";
+  else state.textContent = {done: "完了しました", cancelled: "中止しました", timeout: "4分の上限で終了しました",
+    error: "途中でエラーになりました"}[snap.state] + "（" + selftestSecondsText(snap.elapsed_ms) + "）";
+  const progress = $("selftestProgress");
+  progress.hidden = !snap.run_id;
+  progress.replaceChildren(...(snap.sections || []).map(sec => {
+    const li = element("li", undefined, "selftest-step is-" + sec.status);
+    li.appendChild(element("span", SELFTEST_SECTION_ICON[sec.status] || "・", "selftest-mark"));
+    li.appendChild(element("span", sec.label + (sec.n ? "（" + sec.n + "件）" : ""), "selftest-step-label"));
+    return li;
+  }));
+  if (selftestUi.shownId && selftestUi.shownId !== snap.run_id && running) selftestUi.shownId = "";
+  renderSelftestResult(snap);
+  renderSelftestHistory(snap.history || []);
+}
+
+function renderSelftestResult(snap) {
+  const has = Boolean(snap.run_id) && (snap.checks || []).length > 0;
+  setShown("selftestResult", has);
+  if (!has) return;
+  const sum = snap.summary || {};
+  const running = snap.state === "running";
+  $("selftestSummary").textContent = "合格 " + (sum.pass || 0) + " / 注意 " + (sum.warn || 0) + " / 失敗 " + (sum.fail || 0) +
+    (sum.skip ? " / 省略 " + sum.skip : "") + "　所要 " + selftestSecondsText(snap.elapsed_ms) + (running ? "（実行中）" : "");
+  $("selftestSummary").className = "selftest-summary " + (sum.fail ? "has-fail" : sum.warn ? "has-warn" : "is-ok");
+  setShown("selftestCopy", !running);
+  setShown("selftestSave", !running);
+  const wrap = $("selftestTables");
+  const nodes = [];
+  for (const sec of snap.sections || []) {
+    const rows = snap.checks.filter(c => c.section === sec.id);
+    if (!rows.length) continue;
+    nodes.push(element("h3", sec.label, "selftest-h"));
+    const table = element("table", undefined, "data-table selftest-table");
+    const body = element("tbody");
+    for (const c of rows) {
+      const tr = element("tr", undefined, "selftest-row is-" + c.status);
+      const mark = element("td", SELFTEST_STATUS_ICON[c.status] || "?", "selftest-st");
+      mark.setAttribute("aria-label", SELFTEST_STATUS_LABEL[c.status] || c.status);
+      tr.appendChild(mark);
+      const cell = element("td", undefined, "selftest-cell");
+      cell.appendChild(element("div", c.name, "selftest-name"));
+      if (c.value) cell.appendChild(element("div", c.value, "selftest-val"));
+      if (c.threshold) cell.appendChild(element("div", "基準: " + c.threshold, "selftest-th"));
+      if (c.hint) cell.appendChild(element("div", "改善のヒント: " + c.hint, "selftest-hint"));
+      tr.appendChild(cell);
+      body.appendChild(tr);
+    }
+    table.appendChild(body);
+    const holder = element("div", undefined, "table-wrap");
+    holder.appendChild(table);
+    nodes.push(holder);
+  }
+  wrap.replaceChildren(...nodes);
+}
+
+function renderSelftestHistory(items) {
+  setShown("selftestHistory", items.length > 0);
+  $("selftestHistoryList").replaceChildren(...items.map(item => {
+    let when = "";
+    try { when = new Date(item.started * 1000).toLocaleString("ja-JP", {month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit"}); } catch (e) { when = ""; }
+    const button = element("button", when + " 合格" + item.pass + " 注意" + item.warn + " 失敗" + item.fail, "btn small");
+    button.type = "button";
+    if (item.id === (selftestUi.snap && selftestUi.snap.run_id)) button.classList.add("primary");
+    button.addEventListener("click", () => perform(async () => {
+      const full = await api("/api/selftest/results?id=" + encodeURIComponent(item.id));
+      selftestUi.runId = full.run_id;
+      selftestUi.rev = full.rev;
+      full.history = items;
+      renderSelftest(full);
+    }));
+    return button;
+  }));
+}
+
+async function selftestReport() {
+  const id = selftestUi.snap && selftestUi.snap.run_id;
+  if (!id) throw new Error("結果がありません");
+  const urls = $("selftestIncludeUrls").checked ? "1" : "0";
+  return api("/api/selftest/report?id=" + encodeURIComponent(id) + "&urls=" + urls);
+}
+
+// Clipboard when the browser allows it; otherwise the text is shown selected so a long press can copy it.
+async function selftestCopy() {
+  const report = await selftestReport();
+  selftestUi.text = report.text;
+  const area = $("selftestText");
+  area.value = report.text;
+  try {
+    await navigator.clipboard.writeText(report.text);
+    area.hidden = true;
+    flash("結果をコピーしました。開発者へ貼り付けてください");
+    return;
+  } catch (e) { /* no clipboard permission (HTTP, iOS rules): fall back below */ }
+  area.hidden = false;
+  area.focus();
+  area.select();
+  try { area.setSelectionRange(0, area.value.length); } catch (e) { /* older browser */ }
+  let copied = false;
+  try { copied = document.execCommand("copy"); } catch (e) { copied = false; }
+  flash(copied ? "結果をコピーしました" : "下のテキストを長押しして「コピー」してください");
+}
+
+// Client-side file (the Hub writes nothing): the readable report followed by the same data as JSON.
+async function selftestSave() {
+  const report = await selftestReport();
+  const body = report.text + "\n\n=== JSON ===\n" + JSON.stringify(report.data, null, 1) + "\n";
+  const url = URL.createObjectURL(new Blob([body], {type: "text/plain;charset=utf-8"}));
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = "qnapdl-selftest-" + new Date().toISOString().replace(/[:.]/g, "-") + ".txt";
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+function selftestDevice() {
+  const flags = {
+    pointer_events: typeof window.PointerEvent === "function",
+    intersection_observer: typeof window.IntersectionObserver === "function",
+    stream_body: typeof Response === "function" && "body" in Response.prototype,
+    abort_controller: typeof window.AbortController === "function",
+    img_decode: typeof HTMLImageElement === "function" && "decode" in HTMLImageElement.prototype,
+    clipboard_api: Boolean(navigator.clipboard && navigator.clipboard.writeText),
+    secure_context: window.isSecureContext === true,
+    https: location.protocol === "https:",
+    stream_failed_before: Boolean(state.tabs.some(t => t.rb && t.rb.streamFailed)),
+    rb_default_mode: String((state.settings && state.settings.rb_default_mode) || "?").slice(0, 20),
+    rb_quality: String(state.rbQuality || "?").slice(0, 20),
+    rb_resident: Boolean(state.settings && state.settings.rb_resident === true),
+  };
+  writeLocal("qdl.selftest.probe", "1");
+  const storage = readLocal("qdl.selftest.probe") === "1";      // the wrappers swallow a blocked storage
+  removeLocal("qdl.selftest.probe");
+  let standalone = false;
+  try { standalone = navigator.standalone === true || window.matchMedia("(display-mode: standalone)").matches; } catch (e) { standalone = false; }
+  const view = selftestViewport();
+  return {ua: String(navigator.userAgent || "").slice(0, 300), lang: String(navigator.language || "").slice(0, 20),
+    platform: String(navigator.platform || "").slice(0, 60), width: view.width, height: view.height, dpr: view.dpr,
+    touch: Number(navigator.maxTouchPoints) || 0, standalone, storage, clipboard: flags.clipboard_api, flags};
+}
+
+const selftestMedian = values => {
+  const sorted = values.slice().sort((a, b) => a - b);
+  return sorted.length ? sorted[Math.floor(sorted.length / 2)] : null;
+};
+
+function selftestWaitFor(test, timeoutMs, stepMs = 50) {
+  return new Promise(resolve => {
+    const end = performance.now() + timeoutMs;
+    const tick = () => {
+      let ok = false;
+      try { ok = test(); } catch (e) { ok = false; }
+      if (ok) resolve(true);
+      else if (performance.now() >= end) resolve(false);
+      else setTimeout(tick, stepMs);
+    };
+    tick();
+  });
+}
+
+// The phone's half. Always posts something (even after an error) and removes everything it created.
+async function selftestClient(snap) {
+  const runId = snap.run_id, tab = snap.tab;
+  const view = snap.viewport || selftestViewport();
+  const checks = [];
+  const note = text => String(text || "").slice(0, 160);
+  const step = async (id, fn) => {
+    const now = selftestUi.snap;
+    if (now && now.run_id === runId && now.state !== "running") return;     // cancelled / finished meanwhile
+    $("selftestState").textContent = "この端末で測っています: " + (CLIENT_STEP_LABEL[id] || id);
+    try { checks.push(Object.assign({id}, await fn())); }
+    catch (e) { checks.push({id, ok: false, note: note("エラー: " + (e && e.message ? e.message : e))}); }
+  };
+  const holder = document.createElement("div");
+  holder.setAttribute("aria-hidden", "true");
+  holder.style.cssText = "position:fixed;left:-10000px;top:0;width:" + view.width + "px;height:" + view.height +
+    "px;opacity:0;pointer-events:none;overflow:hidden";
+  document.body.appendChild(holder);
+  const created = {urls: [], frame: null};
+  const device = selftestDevice();
+  try {
+    checks.push({id: "client.storage", ok: device.storage});
+    checks.push({id: "client.clipboard", ok: device.clipboard});
+    await step("client.rtt", async () => {
+      const times = [];
+      for (let i = 0; i < 5; i++) {
+        const t0 = performance.now();
+        const res = await fetch("/api/health", {cache: "no-store", credentials: "same-origin"});
+        await res.text();
+        times.push(performance.now() - t0);
+      }
+      return {ms: Math.round(selftestMedian(times) * 10) / 10};
+    });
+    try { await api("/api/rb/viewport", {tab, width: view.width, height: view.height, dpr: view.dpr}); } catch (e) { /* the Hub set it already */ }
+    await step("client.reader", () => selftestReaderStep(tab, holder));
+    await step("client.mirror_load", async () => {
+      const out = await selftestMirrorLoad(tab, holder, created);
+      return out;
+    });
+    await step("client.mirror_events", () => selftestMirrorEvents(created));
+    await step("client.mirror_morph", () => selftestMirrorMorph(tab, created));
+    await step("client.tiles", () => selftestTilesStep(tab, created));
+    await step("client.live", () => selftestLiveStep(tab, holder));
+  } catch (e) {
+    checks.push({id: "client.error", ok: false, note: note(e && e.message ? e.message : e)});
+  } finally {
+    for (const url of created.urls) URL.revokeObjectURL(url);
+    holder.remove();
+    for (const path of ["/api/rb/mirror/release", "/api/rb/snapshot/release"]) {
+      api(path, {tab}).catch(() => {});
+    }
+    try {
+      await api("/api/selftest/client", {run_id: runId, device, checks});
+    } catch (e) {
+      $("selftestState").textContent = "端末側の結果を送れませんでした: " + (e && e.message ? e.message : e);
+    }
+  }
+}
+
+const CLIENT_STEP_LABEL = {"client.rtt": "Hubとの通信", "client.reader": "リーダー表示", "client.mirror_load": "ミラーの読み込み",
+  "client.mirror_events": "ミラー内のタップ", "client.mirror_morph": "ミラーの差し替え", "client.tiles": "高速表示",
+  "client.live": "ライブ表示"};
+
+async function selftestReaderStep(tab, holder) {
+  const t0 = performance.now();
+  const raw = await api("/api/rb/reader", {tab});
+  const data = cleanReaderData(raw);
+  if (!data || !data.blocks.length) return {ok: false, ms: Math.round(performance.now() - t0), n: 0};
+  const box = element("div", undefined, "reader-body");
+  holder.appendChild(box);
+  const frag = document.createDocumentFragment();
+  for (const b of data.blocks) {
+    if (b.t === "h") frag.appendChild(element("h" + Math.min(6, Math.max(1, b.level)), b.text));
+    else if (b.t === "p" || b.t === "li") {
+      const p = element(b.t === "li" ? "li" : "p");
+      for (const run of b.runs) p.appendChild(element(run.href ? "a" : "span", run.text));
+      frag.appendChild(p);
+    } else if (b.t === "pre") frag.appendChild(element("pre", b.text));
+    else if (b.t === "img") frag.appendChild(element("div", "[画像" + b.i + "]", "reader-fig"));
+    else frag.appendChild(element("hr"));
+  }
+  box.appendChild(frag);
+  void box.offsetHeight;                      // layout once, like the real display
+  const ms = Math.round(performance.now() - t0);
+  const images = data.blocks.filter(b => b.t === "img");
+  let imageNote = "";
+  if (images.length) {                         // one real image through the Hub (decode on this device)
+    const i0 = performance.now();
+    const res = await fetch("/api/rb/reader/img?tab=" + encodeURIComponent(tab) + "&i=" + images[0].i,
+      {cache: "no-store", credentials: "same-origin"});
+    if (res.ok) {
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      const img = new Image();
+      img.src = url;
+      try { await img.decode(); imageNote = "画像1枚 " + Math.round(performance.now() - i0) + " ms"; } catch (e) { imageNote = "画像のデコードに失敗"; }
+      URL.revokeObjectURL(url);
+    } else imageNote = "画像の取得に失敗 HTTP " + res.status;
+  }
+  return {ok: true, ms, n: data.blocks.length, note: imageNote};
+}
+
+async function selftestMirrorLoad(tab, holder, created) {
+  const t0 = performance.now();
+  const data = await api("/api/rb/mirror", {tab, full: false, force: true});
+  if (!data || typeof data.doc !== "string" || !MIRROR_DOC_RE.test(data.doc)) throw new Error("ミラーのデータが不正です");
+  const frame = $("mirrorFrame").cloneNode(false);      // the same element as the real display, without its id
+  frame.removeAttribute("id");
+  frame.removeAttribute("src");
+  frame.title = "セルフテスト用ミラー（画面外）";
+  frame.style.cssText = "position:absolute;left:0;top:0;width:100%;height:100%";
+  holder.appendChild(frame);
+  created.frame = frame;
+  frame.contentWindow.location.replace(data.doc);        // validated above, same-origin Hub document
+  const ready = () => {
+    try { const d = frame.contentDocument; return Boolean(d && d.body && d.getElementById("mirrorCss")); } catch (e) { return false; }
+  };
+  const ok = await selftestWaitFor(ready, MIRROR_LOAD_TIMEOUT_MS);
+  const doc = ok ? frame.contentDocument : null;
+  return {ok, ms: Math.round(performance.now() - t0), n: data.stats ? data.stats.nodes : 0,
+    note: ok ? "" : "ミラーのページを読み込めませんでした"};
+}
+
+// Dispatches pointer / click events inside the mirror document and checks the app's listeners saw them.
+async function selftestMirrorEvents(created) {
+  const frame = created.frame;
+  const doc = frame && frame.contentDocument;
+  if (!doc || !doc.body) throw new Error("ミラーのページがありません");
+  const seen = [];
+  mirrorProbes.set(doc, {tap: event => seen.push(event.type)});
+  wireMirrorDoc(doc);
+  const el = doc.querySelector("[data-m]");
+  if (!el) throw new Error("ミラー内に操作できる要素がありません");
+  const win = doc.defaultView;
+  const box = el.getBoundingClientRect();
+  const x = Math.round(box.left + Math.min(box.width, 40) / 2), y = Math.round(box.top + Math.min(box.height, 20) / 2);
+  const fire = (type, Ctor, extra) => el.dispatchEvent(new Ctor(type, Object.assign(
+    {bubbles: true, cancelable: true, view: win, clientX: x, clientY: y}, extra)));
+  const Pointer = typeof win.PointerEvent === "function" ? win.PointerEvent : win.MouseEvent;
+  const pointer = {pointerId: 7, pointerType: "touch", isPrimary: true, button: 0};
+  fire("pointerdown", Pointer, pointer);
+  fire("pointerup", Pointer, pointer);
+  const pointerOk = seen.filter(t => t === "pointerup").length >= 1;
+  await delay(900);                               // the app ignores a click that follows its own tap closely
+  const before = seen.length;
+  fire("click", win.MouseEvent, {button: 0});
+  const clickOk = seen.length > before && seen[seen.length - 1] === "click";
+  return {ok: pointerOk && clickOk, flags: {pointer: pointerOk, click: clickOk},
+    note: Pointer === win.PointerEvent ? "" : "PointerEventなし（MouseEventで代用）"};
+}
+
+async function selftestMirrorMorph(tab, created) {
+  const doc = created.frame && created.frame.contentDocument;
+  if (!doc || !doc.body) throw new Error("ミラーのページがありません");
+  const data = await api("/api/rb/mirror", {tab, full: true, force: true});
+  if (mirrorUnsafe(data)) throw new Error("安全でないミラーのデータを受け取りました");
+  const t0 = performance.now();
+  mirrorMorph(doc, data, null);
+  const ms = Math.round((performance.now() - t0) * 10) / 10;
+  return {ok: doc.body.childNodes.length > 0, ms};
+}
+
+async function selftestTilesStep(tab, created) {
+  const t0 = performance.now();
+  const meta = await api("/api/rb/snapshot", {tab, force: true});
+  const res = await fetch("/api/rb/tile.jpg?tab=" + encodeURIComponent(tab) + "&snap=" + encodeURIComponent(meta.snap_id) + "&i=0",
+    {cache: "no-store", credentials: "same-origin"});
+  if (!res.ok) throw new Error("タイルを取得できません HTTP " + res.status);
+  const blob = await res.blob();
+  const url = URL.createObjectURL(blob);
+  created.urls.push(url);
+  const img = new Image();
+  img.src = url;
+  await img.decode();
+  return {ok: blob.type === "image/jpeg" && img.naturalWidth > 0, ms: Math.round(performance.now() - t0), n: meta.tiles,
+    kb: Math.round(blob.size / 1024)};
+}
+
+// Live display as the app does it: an <img> on the MJPEG stream must show a first frame within
+// RB_STREAM_FIRST_MS (else the app polls); then the frames of the stream are counted for 3 s.
+async function selftestLiveStep(tab, holder) {
+  const img = new Image();
+  img.style.cssText = "position:absolute;left:0;top:0;width:100%;height:auto";
+  holder.appendChild(img);
+  const t0 = performance.now();
+  img.src = streamUrl({id: tab});
+  const first = await selftestWaitFor(() => img.naturalWidth > 0 && img.currentSrc.indexOf("/api/rb/stream.mjpg") >= 0, RB_STREAM_FIRST_MS, 100);
+  const firstMs = Math.round(performance.now() - t0);
+  img.removeAttribute("src");
+  img.remove();
+  await delay(500);
+  let frames = 0, bytes = 0, elapsed = SELFTEST_LIVE_MS, how = "stream";
+  if (typeof AbortController === "function" && typeof Response === "function" && "body" in Response.prototype) {
+    const ctl = new AbortController();
+    const marker = Array.from("--qdlframe", c => c.charCodeAt(0));
+    let tail = new Uint8Array(0);
+    const started = performance.now();
+    const stopTimer = setTimeout(() => ctl.abort(), SELFTEST_LIVE_MS);
+    try {
+      const res = await fetch(streamUrl({id: tab}), {signal: ctl.signal, cache: "no-store", credentials: "same-origin"});
+      if (!res.ok || !res.body) throw new Error("HTTP " + res.status);
+      const reader = res.body.getReader();
+      for (;;) {
+        const {done, value} = await reader.read();
+        if (done) break;
+        bytes += value.length;
+        const joined = new Uint8Array(tail.length + value.length);
+        joined.set(tail, 0);
+        joined.set(value, tail.length);
+        for (let i = 0; i + marker.length <= joined.length; i++) {
+          if (joined[i] !== marker[0]) continue;
+          let k = 1;
+          while (k < marker.length && joined[i + k] === marker[k]) k++;
+          if (k === marker.length) { frames++; i += marker.length - 1; }
+        }
+        tail = joined.slice(Math.max(0, joined.length - (marker.length - 1)));
+      }
+    } catch (e) {
+      if (!(e && e.name === "AbortError")) how = "stream-error: " + (e && e.message ? e.message : e);
+    } finally {
+      clearTimeout(stopTimer);
+      ctl.abort();
+    }
+    elapsed = performance.now() - started;
+  } else {
+    how = "このブラウザはストリームを読めません";
+  }
+  const fps = Math.round(frames / Math.max(elapsed / 1000, 0.1) * 10) / 10;
+  const out = {ok: frames > 0, fps, kb: frames ? Math.round(bytes / frames / 1024) : 0, ms: firstMs,
+    flags: {img: first}, note: first ? (how === "stream" ? "最初の画面 " + firstMs + " ms" : how) : "最初の画面が届かない（5秒）"};
+  return out;
 }
 
 // ---- Settings › NASブラウザ (v0.1.16)

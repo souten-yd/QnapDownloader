@@ -157,7 +157,10 @@ if (bad.length) { console.error("mismatch: " + bad.join(",")); process.exit(1); 
         # one tile <img> (blob: object URL of /api/rb/tile.jpg bytes) and, since v0.1.30,
         # one reader <img> (blob: object URL of /api/rb/reader/img bytes) and the two places
         # that point the live <img> at the same-origin MJPEG stream URL.
-        self.assertEqual(len(re.findall(r"\.src\s*=", self.js)), 9)
+        # v0.1.44 self-test: + the reader image and the first tile (blob: object URLs of the same Hub bytes, to
+        # decode them on this device) and the stream <img> (same-origin MJPEG URL): 12. Its mirror frame is
+        # navigated with location.replace of the validated /api/rb/mirror/doc URL, never with a src assignment.
+        self.assertEqual(len(re.findall(r"\.src\s*=", self.js)), 12)
         self.assertNotIn("frame.src", self.js)
         self.assertIn("img.src = next;", self.js)
 
@@ -361,7 +364,7 @@ const eq = (a, b, m) => { if (JSON.stringify(a) !== JSON.stringify(b)) { console
         self.assertEqual(order, ["jd2", "browser", "connection", "system", "diag"])
         subs = re.findall(r'data-sub="(\w+)"', self.html)
         self.assertEqual(subs, ["engine", "accounts", "storage", "send", "nas", "rules", "bookmarks",
-                                "https", "share", "updates", "about", "tools", "disk", "debug"])
+                                "https", "share", "updates", "about", "selftest", "tools", "disk", "debug"])
         self.assertRegex(self.js, r"AUTO_REFRESH_MS\s*=\s*5000\b")
         self.assertNotIn("BADGE_REFRESH_MS", self.js)
         self.assertRegex(self.js, r"PASTE_DEBOUNCE_MS\s*=\s*400\b")
@@ -455,10 +458,12 @@ if (out !== want) { console.error(JSON.stringify(out)); process.exit(1); }
 
     def test_v0122_image_source_is_only_a_blob_url_from_the_binary_api(self):
         assignments = re.findall(r"(\w+)\.src\s*=\s*(.+?);", self.js)
-        self.assertEqual(sorted(a[0] for a in assignments), ["img", "img", "img", "img", "img", "img", "mf", "probe"])
+        self.assertEqual(sorted(a[0] for a in assignments),
+                         ["img", "img", "img", "img", "img", "img", "img", "img", "img", "mf", "probe"])
         # the only other <img> sources are the same-origin MJPEG stream URLs (v0.1.30)
         self.assertEqual(sorted(v for k, v in assignments if k == "img"),
-                         ["e.url", "next", "streamUrl(rb)", "streamUrl(rb)", "t.url", "url"])
+                         ["e.url", "next", "streamUrl(rb)", "streamUrl(rb)", "streamUrl({id: tab})", "t.url", "url", "url",
+                          "url"])
         self.assertIn("t.url = URL.createObjectURL(blob);", self.js)
         self.assertIn("e.url = URL.createObjectURL(blob);", self.js)       # reader image (v0.1.30)
         self.assertIn("/api/rb/tile.jpg?tab=", self.js)

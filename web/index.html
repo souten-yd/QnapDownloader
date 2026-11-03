@@ -551,6 +551,38 @@
 
      <section class="settings-section" data-section="diag" hidden>
       <h1>診断</h1>
+      <div class="sub" data-sub="selftest">
+       <h2>自己テスト</h2>
+       <div class="set-desc"><span class="set-text">ボタン1つでNAS・NASブラウザ・この端末を測ります</span>
+        <details class="hint"><summary aria-label="詳しい説明">ⓘ</summary><p>NASの空き・NASブラウザの起動時間・内蔵テストページ（ネットワーク不要）でのリーダー/ミラー/タイル/ライブの速さと動作・この端末での表示と操作を測り、改善のヒントつきの結果にします。「結果をコピー」で開発者へ貼り付けられます。約1〜2分かかります。結果はHubのRAMに直近5件だけ残り、ディスクには書きません。実行中もほかの画面は普通に使えます。</p></details></div>
+       <label for="selftestUrls">実サイトも測る（URL、改行で最大5件）</label>
+       <textarea id="selftestUrls" rows="3" maxlength="2000" placeholder="https://…（空でも実行できます）" autocomplete="off" autocapitalize="off" spellcheck="false"></textarea>
+       <div class="actions">
+        <button type="button" id="selftestRun" class="btn primary">自己テストを実行</button>
+        <button type="button" id="selftestCancel" class="btn" hidden>中止</button>
+       </div>
+       <p id="selftestState" class="set-text muted" role="status" aria-live="polite"></p>
+       <ol id="selftestProgress" class="selftest-progress" aria-label="進み具合" hidden></ol>
+       <div id="selftestResult" class="selftest-result" hidden>
+        <p id="selftestSummary" class="selftest-summary"></p>
+        <div id="selftestTables"></div>
+        <div class="set-row">
+         <div class="set-main"><span class="set-label">URLを含める</span>
+          <span class="set-text">URL全体を入れる（既定はホスト名のみ）</span></div>
+         <label class="switch" for="selftestIncludeUrls"><input type="checkbox" id="selftestIncludeUrls" role="switch" aria-label="URLを含める"><span class="switch-track" aria-hidden="true"></span></label>
+        </div>
+        <div class="actions">
+         <button type="button" id="selftestCopy" class="btn small primary">結果をコピー</button>
+         <button type="button" id="selftestSave" class="btn small">結果を保存</button>
+        </div>
+        <textarea id="selftestText" class="selftest-text" rows="8" readonly spellcheck="false" aria-label="結果のテキスト" hidden></textarea>
+       </div>
+       <div id="selftestHistory" class="selftest-history" hidden>
+        <h3>直近の結果（Hub内に5件まで）</h3>
+        <div id="selftestHistoryList" class="actions"></div>
+       </div>
+      </div>
+
       <div class="sub" data-sub="tools">
        <h2>Hubの確認</h2>
        <p class="set-text muted">手動で実行する読取専用の診断です</p>

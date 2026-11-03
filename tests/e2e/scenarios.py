@@ -22,7 +22,7 @@ def scenario(name, engines=("chromium", "webkit"), display="mirror"):
 # ------------------------------------------------------------------ app shell
 
 ROUTES = ("#/home", "#/downloads", "#/links", "#/settings/storage", "#/settings/updates",
-          "#/settings/diagnostics", "#/settings/engine", "#/settings/https", "#/settings/share",
+          "#/settings/diagnostics", "#/settings/diag/selftest", "#/settings/engine", "#/settings/https", "#/settings/share",
           "#/settings/browser", "#/settings/accounts", "#/settings/system")
 
 
@@ -280,3 +280,53 @@ def auto_live_fast(ph):
 @scenario("auto-live-mirror", display="mirror")
 def auto_live_mirror(ph):
     ph.log("returned %.1fs after redirect" % _auto_live(ph, "mirror"))
+
+
+# ------------------------------------------------------------------ self-test (v0.1.44)
+
+@scenario("selftest")
+def selftest(ph):
+    """The 診断 › 自己テスト button runs the whole self-test (Hub part, built-in pages, THIS phone's part and one
+    real-looking site) and the copied report names every section. Nothing of it may be left behind."""
+    ph.js("(r)=>{location.hash=r}", "#/settings/diag/selftest")
+    ph.wait(lambda: ph.js("(()=>{const b=document.getElementById('selftestRun');return !!b&&!b.hidden&&b.offsetParent!==null})()"),
+            10, "self-test button")
+    ph.page.fill("#selftestUrls", BASE + "/article.html")
+    ph.page.click("#selftestRun")
+    ph.wait(lambda: ph.js("!!(selftestUi.snap&&selftestUi.snap.state==='running')"), 10, "run started")
+    # while it runs the progress list is shown and cancel is offered
+    assert ph.js("!document.getElementById('selftestProgress').hidden")
+    ph.wait(lambda: ph.js("selftestUi.snap&&selftestUi.snap.state") == "done", 170, "self-test finished")
+    snap = ph.js("selftestUi.snap")
+    checks = {c["id"]: c for c in snap["checks"]}
+    builtin = [c for c in snap["checks"] if c["section"] == "builtin"]
+    assert len(builtin) >= 10, "built-in checks: %s" % [c["id"] for c in builtin]
+    bad = [(c["id"], c["status"], c["value"]) for c in builtin if c["status"] == "fail"]
+    assert not bad, "failed built-in checks: %s" % bad
+    for cid in ("builtin.reader", "builtin.mirror", "builtin.mirror_safe", "builtin.menu", "builtin.tiles", "builtin.fps"):
+        assert cid in checks, "missing check " + cid
+    client = [c for c in snap["checks"] if c["section"] == "client"]
+    assert snap["client"] == "received" and len(client) >= 8, "client section: %s" % [(c["id"], c["status"]) for c in client]
+    bad = [(c["id"], c["status"], c["value"]) for c in client if c["status"] == "fail"]
+    assert not bad, "failed client checks (this browser): %s" % bad
+    events = checks["client.mirror_events"]
+    assert events["status"] == "pass", "mirror taps did not reach the app's listeners here: %s" % events
+    sites = [c for c in snap["checks"] if c["section"] == "sites"]
+    assert [c["id"] for c in sites][:1] == ["site.1.open"] and not [c for c in sites if c["status"] == "fail"], sites
+    assert checks["cleanup.tabs"]["status"] == "pass"
+    assert ph.env.rb.selftest_tabs() == [] and ph.env.tabs() == {}, "tabs left behind: %s" % list(ph.env.tabs())
+    # the view shows summary and tables; the copied text is a self-contained report
+    assert "合格" in ph.js("document.getElementById('selftestSummary').textContent")
+    assert ph.js("document.querySelectorAll('#selftestTables table').length") >= 4
+    ph.page.click("#selftestCopy")
+    ph.wait(lambda: len(ph.js("selftestUi.text")) > 500, 10, "report text")
+    text = ph.js("selftestUi.text")
+    for needle in ("== QnapDownloader 自己テスト", "app: v" + ph.env.version, "[NAS] cpu=", "[Phone] ua=", "viewport=",
+                   "## 環境", "## 内蔵テストページ", "## この端末", "## 実サイト", "## 後片付け", "builtin.reader", "client.mirror_events",
+                   "value:", "threshold:", "## debug log (last 50 lines"):
+        assert needle in text, "report lacks %r" % needle
+    assert "a.example.com" in text and "/article.html" not in text, "real-site URLs must be reduced to the host by default"
+    assert text.count("\n") < 400
+    # a second click while idle starts a new run only after this one is over; cancel is hidden now
+    assert ph.js("document.getElementById('selftestCancel').hidden")
+    assert not ph.js("document.getElementById('selftestRun').disabled")
