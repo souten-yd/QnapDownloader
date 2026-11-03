@@ -1351,3 +1351,18 @@ class MirrorTapTest(unittest.TestCase):
         self.assertIn('doc.addEventListener("pointerup"', block)
         self.assertIn("handleTap(event)", block)
         self.assertIn("tap.handledAt", block)          # the later click (desktop) is not handled twice
+
+
+class MirrorToggleAndLostTabTest(unittest.TestCase):
+    """v0.1.42: menu toggles are clicked on the NAS (no reload); lost tabs reopen without a panel."""
+
+    def test_toggles_and_reopen(self):
+        root = Path(__file__).resolve().parents[1]
+        app = (root / "web" / "app.js").read_text(encoding="utf-8")
+        mirror = (root / "rb_mirror.py").read_text(encoding="utf-8")
+        self.assertIn("const MIRROR_TOGGLE", app)
+        self.assertIn("var same=u.href.split('#')[0]===cur.href.split('#')[0];", mirror)  # "#" and this page: click
+        self.assertIn("[aria-haspopup],[aria-expanded]", mirror)
+        start = app.index("function remoteLost(tab)")
+        self.assertIn('tab.error = "";', app[start:start + 1200])
+        self.assertIn('"もう一度開く"', app)

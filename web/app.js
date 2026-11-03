@@ -1123,9 +1123,10 @@ function remoteLost(tab) {
     renderIntercept();
   }
   tab.rb = null;
-  // v0.1.38: right after the watchdog restarted the NAS browser the tab is simply reopened when shown.
-  tab.error = Date.now() - state.rbCrashAt < RB_CRASH_QUIET_MS ? "" : RB_LOST_TEXT;
-  if (!tab.error) tab.reopenAt = 0;
+  // v0.1.42: a tab the NAS side closed (idle timeout, restart, memory) simply reopens its current
+  // address when shown; the panel appears only when that reopen fails.
+  tab.error = "";
+  tab.reopenAt = 0;
   state.rbPolling = "";
   state.rbPollMode = "";
   state.rbGen++;
@@ -1615,8 +1616,13 @@ function updateRemoteView(tab) {
   const blocked = !live && !reopening && Boolean(tab.notReady || tab.error || state.rbReady === false);
   setShown("rbNotReady", blocked);
   if (blocked) {
+    // Not set up → the way to Settings; set up but this page failed → just try again (v0.1.42).
+    const setup = Boolean(tab.notReady || state.rbReady === false);
+    $("rbNotReadyTitle").textContent = setup ? "NASブラウザが準備できていません" : "ページを開けませんでした";
     $("rbNotReadyText").textContent = tab.error ||
-      "初期設定（イメージの作成）が済んでいません。設定 › ブラウザで準備してください。";
+      (setup ? "初期設定（イメージの作成）が済んでいません。設定 › ブラウザで準備してください。" : "");
+    $("rbNotReadyBtn").textContent = setup ? "設定 › ブラウザを開く" : "もう一度開く";
+    $("rbNotReadyBtn").dataset.mode = setup ? "setup" : "retry";
   }
   if (!live) $("remoteIdle").hidden = blocked;
   $("remoteIdleText").textContent = "画面を待っています…";
@@ -3873,6 +3879,7 @@ function longPress(clientX, clientY) {
 // with its own strict CSP header); later versions of the same page are applied to the iframe's DOM
 // (parsed with DOMParser) and its <style>. This code only listens (taps, long presses, touches): every
 // action goes to the Hub, which validates it again. The page is never given an address of its own.
+const MIRROR_TOGGLE = "[aria-haspopup],[aria-expanded],[aria-controls],[data-toggle],[data-bs-toggle],[role=button],summary,button";
 const MIRROR_MIN_MS = 1000;           // recaptures are at least this far apart
 const MIRROR_DOC_RE = /^\/api\/rb\/mirror\/doc\?tab=b[0-9]{1,6}&rev=[0-9]{1,12}$/;
 const MIRROR_LOAD_TIMEOUT_MS = 12000;
@@ -3984,10 +3991,10 @@ function mirrorCopyAttrs(from, to) {
 }
 
 // Replaces the page content of the iframe with a newer capture, keeping the reading position.
-function mirrorMorph(doc, data) {
+function mirrorMorph(doc, data, startTop = null) {
   const scroller = mirrorScroller(doc);
   const before = scroller.scrollTop;
-  const anchor = mirrorAnchorOf(doc);
+  const anchor = startTop === null ? mirrorAnchorOf(doc) : null;
   const sheet = doc.getElementById("mirrorCss");
   if (sheet.textContent !== data.css) sheet.textContent = data.css;
   // parsed by the iframe's own DOMParser so the iframe's policy (inline styles allowed), not the app's, applies
@@ -3999,7 +4006,7 @@ function mirrorMorph(doc, data) {
   const frag = doc.createDocumentFragment();
   for (const node of Array.from(parsed.body.childNodes)) frag.appendChild(doc.importNode(node, true));
   doc.body.replaceChildren(frag);
-  let top = before;
+  let top = startTop === null ? before : startTop;
   if (anchor) {
     const again = doc.querySelector('[data-m="' + CSS.escape(anchor.id) + '"]');
     if (again) top = scroller.scrollTop + (again.getBoundingClientRect().top - anchor.top);
@@ -4070,9 +4077,14 @@ async function runMirror(tab, opts = {}) {
         throw new Error("ミラーの内容を安全に表示できません");
       }
       const last = mirrorHost.last;
+      // v0.1.42: a capture of ANOTHER page (the address changed after this request started, or the
+      // page navigated by script) starts at the top / its remembered place, never at the old offset.
+      const noHash = u => String(u || "").split("#")[0];
+      const pageChanged = Boolean(rb.mirror && data.url && noHash(data.url) !== noHash(rb.mirror.url));
       if (!last || last.html !== data.html || last.css !== data.css || last.ha !== data.html_attrs || last.ba !== data.body_attrs) {
         const t0 = performance.now();
-        mirrorMorph(doc0, data);
+        mirrorMorph(doc0, data, pageChanged ? mirrorPosTop(rb, url) : null);
+        if (pageChanged) mirrorHost.pageUrl = url;
         applied = performance.now() - t0;
         dlog("render", "debug", "mirror morph", {ms: Math.round(applied), rev: data.rev});
       }
@@ -4318,11 +4330,17 @@ function wireMirrorDoc(doc) {
   function handleTap(event) {
     const tab = tabNow();
     if (!tab) return;
-    const link = mirrorClosest(event.target, "[data-href]");
-    if (link) { perform(() => mirrorNavigate(tab, link.getAttribute("data-href"))); return; }
-    const frag = mirrorClosest(event.target, "[data-frag]");
-    if (frag) { mirrorScrollToAnchor(doc, frag.getAttribute("data-frag")); return; }
     const el = mirrorClosest(event.target, "[data-m]");
+    // v0.1.42: menu toggles (ARIA/toggle markers, buttons, links to this page) are clicked on the NAS
+    // so the page's own script opens them; navigating would only reload the page.
+    const toggle = mirrorClosest(event.target, MIRROR_TOGGLE);
+    const link = mirrorClosest(event.target, "[data-href]");
+    if (link && !(toggle && (link.contains(toggle) || toggle.contains(link)))) {
+      perform(() => mirrorNavigate(tab, link.getAttribute("data-href")));
+      return;
+    }
+    const frag = !toggle && mirrorClosest(event.target, "[data-frag]");
+    if (frag) mirrorScrollToAnchor(doc, frag.getAttribute("data-frag"));   // and the page may react too
     if (el) perform(() => mirrorClick(tab, el, event));
   }
   // Native scrolling: remember the place per page, and hold recaptures back while a finger is down.
@@ -4728,7 +4746,13 @@ function wireRemote() {
   $("remoteSheetClose").addEventListener("click", closeRemoteSheet);
   $("remoteAdd").addEventListener("click", () => perform(remoteAdd));
   $("remoteSend").addEventListener("click", () => perform(remoteSend));
-  $("rbNotReadyBtn").addEventListener("click", () => navigate("#/settings/browser/nas"));
+  $("rbNotReadyBtn").addEventListener("click", () => {
+    if ($("rbNotReadyBtn").dataset.mode !== "retry") { navigate("#/settings/browser/nas"); return; }
+    const tab = activeWebTab();
+    if (!tab) return;
+    tab.error = ""; tab.reopenAt = 0;
+    updateRemoteView(tab);
+  });
   $("autoLiveChip").addEventListener("click", () => returnToFast(activeWebTab()));
   document.addEventListener("visibilitychange", syncRemotePoll);
   wireTiles();
