@@ -34,7 +34,15 @@ python3 tests/e2e/run.py --engines chromium,webkit --out /tmp/e2e
 settings-routes / display-reader・mirror・tiles・live / mirror-tap-link（クリックを止めたiOS相当のタップ・遷移後スクロール0）/
 mirror-menu-toggle（`href="#"` と自ページ宛の2種類のトグルが再読み込みにならない）/ mirror-dynamic / mirror-security（CSP・スクリプト不実行）/
 reader-cards（ラベル・サイズあり/なし、ページ送りチップ）/ gesture-flick-mirror・tiles、gesture-close-tab（Chromiumのみ: CDPタッチが必要）/
-reload-reattach / auto-live-fast・mirror（リダイレクト後 6 秒以内に元の表示へ）。
+reload-reattach / auto-live-fast・mirror（リダイレクト後 6 秒以内に元の表示へ）/
+selftest（設定›診断›自己テストを実行して、全項目が終わり、レポートに NAS・端末・ログが入り、URLがホスト名だけになり、テスト用タブが残らない）。
+
+### 実機の自己テスト（v0.1.44）
+GitHubのE2Eでは実機のNAS・iPhone・実サイトを測れないため、アプリ自身に「設定›診断›自己テスト」を持たせている。
+ボタン1つでHub（`selftest.py`）がNASの環境・NASブラウザの起動・内蔵テストページ（`https://selftest.example.com/` をRAMから返す仮想サイト）・任意の実サイトを測り、
+続けて端末（iPhone等）がリーダー描画・ミラー読み込み・`wireMirrorDoc` のpointer/click到達・ミラー差し替え・タイル・ライブ受信・Hubとの往復時間を測って `POST /api/selftest/client` で返す。
+判定は常にHub側。「結果をコピー」の本文（日本語＋English、秘密なし、URLはホスト名のみ、デバッグログ末尾50行つき）を開発者へ貼ると、実機でしか出ない不具合を直せる。
+結果はHubのRAMに直近5件だけ残り、ディスクへは書かない。上限は4分で、中止・エラー時もテスト用タブと一時的に入れたデバッグログを元に戻す。
 
 未対応: 長押しのhosterプローブ（`rapidgator.net` 等の実ドメインが必要でフィクスチャに向けられないため）。
 

@@ -697,3 +697,27 @@ h5.reader-h,h6.reader-h{font-size:1em}
 .gesture-hint{position:fixed;left:50%;top:calc(env(safe-area-inset-top) + 64px);transform:translateX(-50%);z-index:80;padding:8px 16px;
   border-radius:999px;background:rgba(0,0,0,.75);color:#fff;font-size:14px;font-weight:600;pointer-events:none}
 .gesture-hint[hidden]{display:none}
+
+/* ---- self-test (v0.1.44) */
+.selftest-progress{list-style:none;margin:8px 0;padding:0;display:flex;flex-wrap:wrap;gap:6px}
+.selftest-step{display:inline-flex;align-items:center;gap:5px;padding:3px 10px;border:1px solid var(--border);border-radius:14px;font-size:12px;color:var(--muted);background:var(--surface)}
+.selftest-step.is-running{border-color:var(--accent);color:var(--text);font-weight:600}
+.selftest-step.is-done{color:var(--ok)}
+.selftest-mark{font-weight:700}
+.selftest-summary{margin:10px 0;padding:9px 12px;border-radius:8px;font-size:15px;font-weight:700;background:var(--ok-soft);color:var(--ok)}
+.selftest-summary.has-warn{background:var(--surface-2);color:var(--warn)}
+.selftest-summary.has-fail{background:var(--danger-soft);color:var(--danger)}
+.selftest-h{margin:16px 0 4px;font-size:13px;color:var(--muted)}
+.selftest-table td{text-align:left;white-space:normal;vertical-align:top;font-size:13px}
+.selftest-table td.selftest-st{min-width:0;width:30px;padding-right:2px;text-align:center;font-weight:700;font-size:15px}
+.selftest-row.is-pass .selftest-st{color:var(--ok)}
+.selftest-row.is-warn .selftest-st{color:var(--warn)}
+.selftest-row.is-fail .selftest-st{color:var(--danger)}
+.selftest-row.is-skip .selftest-st{color:var(--muted)}
+.selftest-name{font-weight:600}
+.selftest-val{overflow-wrap:anywhere}
+.selftest-th{color:var(--muted);font-size:12px;overflow-wrap:anywhere}
+.selftest-hint{margin-top:4px;padding:4px 8px;border-left:3px solid var(--warn);background:var(--surface-2);font-size:12px;line-height:1.5}
+.selftest-row.is-fail .selftest-hint{border-left-color:var(--danger)}
+.selftest-text{width:100%;font:12px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre;overflow:auto}
+.selftest-history h3{margin:14px 0 4px;font-size:13px;color:var(--muted)}

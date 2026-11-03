@@ -206,6 +206,7 @@ class Env:
         self.port = self.server.server_address[1]
         server = self.server
         server.store = self.store
+        server.data_dir = root
         server.engine = engine_supervisor.EngineManager(root, self.store)
         server.jd2 = jd2_control.JD2Controller(server.engine.adapter)
         server.secure_cookies = False
