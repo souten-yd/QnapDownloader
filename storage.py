@@ -32,7 +32,7 @@ DEFAULTS = {
     "rb_resident": False,
 }
 BOOL_OPTIONS = ("send_autostart", "block_ads", "probe_autosend", "rb_link_boxes", "rb_resident")
-ENUM_OPTIONS = {"rb_default_mode": ("reader", "fast", "live")}
+ENUM_OPTIONS = {"rb_default_mode": ("reader", "mirror", "fast", "live")}
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY,value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS accounts(id INTEGER PRIMARY KEY CHECK(id=1),

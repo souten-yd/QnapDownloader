@@ -490,7 +490,7 @@ class HttpTests(unittest.TestCase):
                                          headers={"Host": "192.168.68.57:17864"})
         with self.client.open(request, timeout=4) as response:
             self.assertEqual(response.status, 200)
-            self.assertEqual(json.load(response)["version"], "0.1.38")
+            self.assertEqual(json.load(response)["version"], "0.1.39")
         with self.client.open(self.url + "/icon.svg", timeout=4) as response:
             self.assertEqual(response.status, 200)
             self.assertEqual(response.headers.get_content_type(), "image/svg+xml")
@@ -578,7 +578,7 @@ class HttpTests(unittest.TestCase):
             self.assertIn("default-src 'none'", csp)
             self.assertIn("frame-ancestors 'none'", csp)
             # v0.1.35: no iframe browser any more, so nothing may be framed at all
-            self.assertIn("frame-src 'none'", csp)
+            self.assertIn("frame-src 'self'", csp)
             self.assertNotIn("frame-src https:", csp)
             self.assertNotIn("child-src", csp)
             self.assertEqual(response.headers.get("X-Frame-Options"), "DENY")
@@ -742,10 +742,11 @@ class HttpTests(unittest.TestCase):
         script = (Path(webapp.__file__).parent / "web/app.js").read_text()
         self.assertNotIn("SANDBOX_", script)
         self.assertNotIn("createElement(\"iframe\")", script)
-        self.assertIn("frame-src 'none'",csp)
+        self.assertIn("frame-src 'self'",csp)
         self.assertNotIn("frame-src https:",csp)
         self.assertIn("frame-ancestors 'none'",csp)
-        self.assertNotIn("allow-same-origin",html)
+        self.assertEqual(html.count('sandbox="allow-same-origin"'),1)  # the mirror copy only (v0.1.39)
+        self.assertNotIn("allow-scripts",html)
         self.assertNotIn("allow-downloads",html)
 
     def test_browser_validate_rejects_hub_own_host_and_tailnet_names(self):
@@ -1399,7 +1400,7 @@ class HttpTests(unittest.TestCase):
         self.assertFalse(info["supported"])
         code, _ = self.req("/api/update/apply", {"version": "v0.1.8"})
         self.assertEqual(code, 400)
-        self.assertEqual(self.req("/api/health")[1]["version"], "0.1.38")
+        self.assertEqual(self.req("/api/health")[1]["version"], "0.1.39")
         self.assertFalse(self.req("/api/jd2/status")[1]["connected"])
         self.assertEqual(self.req("/api/jd2/update/apply", {"confirmed": True})[0], 400)
         self.assertEqual(self.req("/api/jd2/preset/apply", {"confirmed": True})[0], 400)

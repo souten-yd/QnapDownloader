@@ -295,3 +295,30 @@ Cloudflare等で手元のブラウザ（iframe）では開けないサイトを�
 - 本文: `BLOCKQUOTE` 内の段落は `p` ブロックの `q:true`（Hubは真偽値 `true` のときだけ通す）で、罫線つきの引用として表示。リストの行頭は折り返してもそろう（ぶら下げ）。約物のぶら下げ（`hanging-punctuation`）・見出しだけの `palt`／`text-spacing-trim` は対応ブラウザのみ。
 - 進行状況バー（既定ON）と読む位置の記憶: タブ×URLごとにRAMへスクロール位置を保持（最大40件）。同じURLの取り直し・表示の切替・タブ切替から戻っても同じ位置へ。
 - セキュリティは従来どおり: ページのHTML/CSS/スクリプトは端末へ届かず、画像はHubのエンドポイント経由のblob:のみ、リンクは `data-href`、新しいフィールド（`q`・代替URL）もHubが再検証し、CSPは変更なし。
+
+## v0.1.39 ミラー表示（デジタルツイン・フェーズ1／実機未検証）
+
+4つ目の表示方法「ミラー」。NASのChromiumがページを描画し、Hubがその**無害化したコピー（HTML＋CSS、スクリプトなし）**を作り、iPhoneは `<iframe>` でそれを表示します。スクロールは端末のネイティブ（慣性・ラバーバンド）で、レイアウトはNASの幅（端末の幅）で確定済みのものです。メニューの「表示」は4分割（リーダー／ミラー／高速／ライブ、320px幅でも1行）、設定 › ブラウザ › 既定の表示方法にも「ミラー」を追加。サイトごとの記憶・`tabDisplay`/`applyDisplay` はほかの表示方法と同じです。
+
+### 構成
+- NAS側（`rb_mirror.py`、`remote_browser.py`）:
+  - ページごとに分離されたworld（`Page.createIsolatedWorld`）で**固定のシリアライザ**を実行（ページのJSからは見えない／書き換えられない）。`script`/`noscript`/`template`/`iframe`/`object`/`embed`/`canvas`/`video` などは落として「埋め込みコンテンツ」のプレースホルダーに、`on*`・`javascript:`・`srcdoc` などは除去、`form`は`div`、`input`/`textarea`は`readonly`＋`inputmode=none`（キーボードは出さない）。リンクは `data-href`、要素には `data-m` の安定ID。画像は `srcset`/`<picture>` から「幅1280px以上で最小」をリーダーと同じ規則で選択。
+  - CSSはCDP（`CSS.getStyleSheetText` ほか）から取得し、`url()` はすべてHubのトークンに置換。`@import` は取り込み、`behavior`/`-moz-binding`/`expression()` は除去。
+  - 上限: 要素30000／HTML 2 MiB／CSS 2 MiB／リソース参照500（超過は切り詰めて通知）。キャプチャは（URL, DOMの版）ごとにキャッシュ。
+  - DOM変更はMutationObserver（800 msに1回まで）でカウントし、`/api/rb/meta` の `mirror_rev` として長いポーリングに乗せます。
+- Hubのエンドポイント（すべてログイン・CSRF・Origin必須）:
+  - `POST /api/rb/mirror`（gzip対応）／`GET /api/rb/mirror/doc?tab=&rev=`（iframeの文書）／`GET /api/rb/mirror/res?tab=&r=`（画像・フォント。RAM LRU 48 MiB、`Cache-Control: private, max-age=300`、SVGは `default-src 'none'; style-src 'unsafe-inline'` のCSP付き）／`POST /api/rb/mirror/click`（リンクは既存の遷移経路、それ以外は scrollIntoView＋実マウスクリック）／`POST /api/rb/mirror/release`。
+  - 失敗は日本語のメッセージ（古い表示は410、非対応の形式は415、取得失敗は502）。debug-log のカテゴリは `render`。
+- 端末側（`web/app.js` の mirror 節）: iframeの文書はHubから読み、以後の版は `DOMParser`（iframe自身のもの）で解析して `body` を差し替え（読み位置を保持）。タップ・長押し（既存のprobe）・クリック転送は親が `contentDocument` に付けたリスナーで処理。更新は1秒以上あけ、触っている間は待ちます。2回失敗するか空の結果なら高速表示に戻してトースト通知。速度表示は「ミラー · 要素 N · HTML N KB · CSS N KB · 画像 n · 取得 N ms」。
+
+### セキュリティモデル
+- iframeは `sandbox="allow-same-origin"` のみ（`allow-scripts`・フォーム・ポップアップ・トップ遷移なし）。スクリプトが動かないため、親が `contentDocument` を操作できても中身は何も実行できません。
+- 二重のCSP: 文書のレスポンスヘッダ（`default-src 'none'; img-src 'self' data:; style-src 'unsafe-inline'; font-src 'self'; frame-ancestors 'self'` ほか）と、文書内の同じ内容の `<meta>`。アプリ本体のCSPは `frame-src 'self'`（外部ページは枠に入れない。`srcdoc` は親のCSPを継承してしまうので使わず、同一オリジンの `/api/rb/mirror/doc` を読む）。
+- 端末は外部サイトと一切通信しません。画像・フォントはHubのトークン経由（トークンはタブごと・RAMのみ・遷移で破棄、中身は先頭バイトで形式確認）。
+- NAS側の実行はページから分離されたworldに限り、`Runtime.enable` は使いません（検知対策。カウンタはHubがポーリング）。
+
+### 今後（フェーズ2・3）
+- 差分（DOM増分）の送信、フォーム入力の転送、フォントまわりの調整。
+
+### 未検証
+- 実機NAS（Chromiumコンテナ）での動作、iOS Safariでのsandbox付きiframe・ネイティブスクロールの挙動（検証はデスクトップChromeと390px幅のエミュレーションのみ）。

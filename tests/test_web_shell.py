@@ -41,18 +41,23 @@ class WebShellStaticTests(unittest.TestCase):
                     self.assertNotIn(token, body)
 
     def test_v0135_iframe_modes_are_gone(self):
-        # No iframe, sandbox attribute or sandbox value anywhere: every http(s) tab is a NAS browser tab.
+        # The page itself is never framed. Since v0.1.39 the only iframe is the Hub-made mirror copy:
+        # sandbox exactly allow-same-origin (no script, form, popup or navigation permission).
         for path in text_files():
             body = path.read_text(encoding="utf-8")
-            for token in (ORIGIN_TOKEN, "SANDBOX_", "sandboxFor", "mountFrame", "compatAllowedFor",
+            for token in ("SANDBOX_", "sandboxFor", "mountFrame", "compatAllowedFor",
                           "COMPAT_CONFIRM", "MODE_LABELS", "LEGACY_EXTERNAL_MODE", "enforceLiveLimit",
                           "MAX_LIVE_FRAMES", "setMode(", "normalizeMode", "applyHostMode", "openInTab",
-                          "leaveRemote", "updateCfHint", "syncFrameVisibility"):
+                          "leaveRemote", "updateCfHint", "syncFrameVisibility", "allow-scripts"):
                 with self.subTest(file=path.name, token=token):
                     self.assertNotIn(token, body)
-        self.assertNotIn("iframe", self.html)
+        self.assertEqual(self.html.count("<iframe"), 1)
+        self.assertIn('<iframe id="mirrorFrame" class="mirror-frame" sandbox="allow-same-origin"', self.html)
+        self.assertEqual(len(re.findall(r'sandbox="', self.html)), 1)
         self.assertNotRegex(self.js, r"createElement\([\"']iframe[\"']\)")
         self.assertNotIn('setAttribute("sandbox"', self.js)
+        self.assertNotIn(".sandbox", self.js)
+        self.assertNotIn("srcdoc", self.js)
         self.assertNotRegex(self.js, r"const MODES\b")
         for ident in ("cfHint", "cfCompat", "cfRemote", "cfDismiss", "frames", "menuMode", "menuCompat",
                       "menuRemote", "remoteReopen"):
@@ -68,6 +73,19 @@ class WebShellStaticTests(unittest.TestCase):
             self.assertNotIn(selector, css)
         self.assertRegex(self.js, r"MAX_HOST_MODES\s*=\s*100\b")
         self.assertIn('name="mobile-web-app-capable"', self.html)
+
+    def test_v0139_mirror_static_contract(self):
+        self.assertIn('data-action="display:mirror"', self.html)
+        self.assertIn(">ミラー</button>", self.html)
+        self.assertIn("ミラー", self.html[self.html.index("rbDefaultMode"):])
+        self.assertIn('content="', self.html)
+        start = self.js.index("// ---- mirror display (v0.1.39) ----")
+        block = self.js[start:start + 60000]
+        for bad in ("innerHTML", "outerHTML", "document.write", "eval(", "srcdoc", "insertAdjacentHTML"):
+            with self.subTest(bad=bad):
+                self.assertNotIn(bad, block)
+        self.assertIn("要素 ", self.js)
+        self.assertIn("/api/rb/mirror/doc", self.js)
 
     def test_v0135_every_url_opens_in_the_nas_browser(self):
         # typed / bookmarked / restored URLs all go through openRemote after /api/browser/validate
@@ -137,7 +155,7 @@ if (bad.length) { console.error("mismatch: " + bad.join(",")); process.exit(1); 
         # one tile <img> (blob: object URL of /api/rb/tile.jpg bytes) and, since v0.1.30,
         # one reader <img> (blob: object URL of /api/rb/reader/img bytes) and the two places
         # that point the live <img> at the same-origin MJPEG stream URL.
-        self.assertEqual(len(re.findall(r"\.src\s*=", self.js)), 8)
+        self.assertEqual(len(re.findall(r"\.src\s*=", self.js)), 9)
         self.assertNotIn("frame.src", self.js)
         self.assertIn("img.src = next;", self.js)
 
@@ -422,7 +440,7 @@ if (out !== want) { console.error(JSON.stringify(out)); process.exit(1); }
 
     def test_v0116_remote_display_is_a_host_preference(self):
         self.assertNotIn('REMOTE_MODE = "remote"', self.js)
-        self.assertIn('REMOTE_MODES = [REMOTE_FAST_MODE, REMOTE_LIVE_MODE, REMOTE_READER_MODE]', self.js)
+        self.assertIn('REMOTE_MODES = [REMOTE_FAST_MODE, REMOTE_LIVE_MODE, REMOTE_READER_MODE, REMOTE_MIRROR_MODE]', self.js)
         for ident in ("remoteView", "remoteImg", "remoteStage", "remoteKbd", "remoteKbdBtn", "remoteLinks",
                       "remoteSheet", "remoteAdd", "remoteSend", "remoteHosts"):
             self.assertIn('id="%s"' % ident, self.html)
@@ -435,7 +453,7 @@ if (out !== want) { console.error(JSON.stringify(out)); process.exit(1); }
 
     def test_v0122_image_source_is_only_a_blob_url_from_the_binary_api(self):
         assignments = re.findall(r"(\w+)\.src\s*=\s*(.+?);", self.js)
-        self.assertEqual(sorted(a[0] for a in assignments), ["img", "img", "img", "img", "img", "img", "probe"])
+        self.assertEqual(sorted(a[0] for a in assignments), ["img", "img", "img", "img", "img", "img", "mf", "probe"])
         # the only other <img> sources are the same-origin MJPEG stream URLs (v0.1.30)
         self.assertEqual(sorted(v for k, v in assignments if k == "img"),
                          ["e.url", "next", "streamUrl(rb)", "streamUrl(rb)", "t.url", "url"])
@@ -826,7 +844,7 @@ if (o !== "リーダー · ブロック 3 · 画像 1/2 · 取得 600 ms · 画�
         # v0.1.36: a segmented 表示 control in the grouped menu
         for text in ('aria-label="表示方法"', '>高速</button>', '>ライブ</button>'):
             self.assertIn(text, self.html)
-        self.assertIn('RB_DISPLAY_LABELS = {reader: "リーダー", tiles: "高速（全体表示）", live: "ライブ"}', self.js)
+        self.assertIn('RB_DISPLAY_LABELS = {reader: "リーダー", mirror: "ミラー", tiles: "高速（全体表示）", live: "ライブ"}', self.js)
         self.assertIn('const REMOTE_LIVE_MODE = "remote-live"', self.js)
         # remembered in the existing per-host map; no entry follows the Settings default (v0.1.30)
         self.assertIn("rememberHostMode(host, MODE_OF_DISPLAY[mode])", self.js)
