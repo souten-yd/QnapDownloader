@@ -413,7 +413,7 @@ class EngineSweepTests(unittest.TestCase):
         with unittest.mock.patch.object(self.manager, "is_ours_running", return_value=True):
             self.assertEqual(self.manager.flatten_sweep(), 0)
 
-    def test_supervisor_sweeps_every_sixty_seconds_while_ready(self):
+    def test_supervisor_checks_packagizer_once_and_never_sweeps_periodically(self):
         clock = [0.0]
         loops = [0]
         manager = self.manager
@@ -428,13 +428,12 @@ class EngineSweepTests(unittest.TestCase):
             return False
         manager._wait_exit = wait_exit
         with unittest.mock.patch.object(manager, "_alive", return_value=True), \
+                unittest.mock.patch.object(manager, "is_ours_running", return_value=True), \
                 unittest.mock.patch.object(manager, "flatten_sweep") as sweep:
             manager._supervise()
-        self.assertEqual(sweep.call_count, 3)       # at t=60,120,180 of 200 s
-
-    def test_the_interval_constant(self):
-        self.assertEqual(self.es.FLATTEN_SWEEP_INTERVAL, 60.0)
-
+        self.assertEqual(sweep.call_count, 0)                     # v0.1.49: no 1-minute sweep
+        self.assertEqual(self.adapter.packagizer_folder_rules.call_count, 1)
+        self.assertFalse(hasattr(self.es, "FLATTEN_SWEEP_INTERVAL"))
 
 if __name__ == "__main__":
     unittest.main()

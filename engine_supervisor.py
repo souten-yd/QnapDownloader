@@ -40,7 +40,6 @@ RESTART_MAX = 5
 RESTART_WINDOW = 600.0
 BACKOFF = (5.0, 15.0, 30.0, 60.0, 60.0)
 READY_TIMEOUT = 180.0
-FLATTEN_SWEEP_INTERVAL = 60.0
 API_CONFIG = {"deprecatedapienabled": True, "deprecatedapiport": 3128,
               "deprecatedapilocalhostonly": True}
 # Container mode: JD2 must listen on the container's own interface so the Hub
@@ -846,7 +845,6 @@ class EngineManager:
 
     def _supervise(self):
         started = self._now()
-        swept = started
         while not self._stop_evt.is_set():
             exited = self._wait_exit(3.0 if not self._ready else 5.0)
             if self._stop_evt.is_set():
@@ -878,9 +876,8 @@ class EngineManager:
                     return
                 started = self._now()
                 continue
-            if self._ready and self._now() - swept >= FLATTEN_SWEEP_INTERVAL:
-                swept = self._now()
-                self.flatten_sweep()
+            if self._ready and not self._packagizer_checked:
+                self.check_packagizer()       # once per engine run (no periodic sweep: v0.1.49)
             if not self._ready:
                 try:
                     revision = self.adapter.core_revision()
@@ -891,6 +888,21 @@ class EngineManager:
                     if self._now() - started > READY_TIMEOUT and not self._error:
                         self._error = "エンジンの起動確認がタイムアウトしました。RAMログを確認してください"
 
+    def check_packagizer(self):
+        """Once per engine run: disable Packagizer rules that save into per-package folders
+        (they override addLinks' destination). Never raises."""
+        self._packagizer_checked = True
+        try:
+            if not self.is_ours_running():
+                return None
+            rules = self.adapter.packagizer_folder_rules(True)
+            if rules:
+                debuglog.log("jd2", "info", "Packagizerのフォルダ規則", {"result": str(rules.get("current"))[:200]})
+            return rules
+        except Exception as error:
+            debuglog.log("jd2", "debug", "Packagizerの確認に失敗", {"error": str(error)[:120]})
+            return None
+
     def flatten_sweep(self):
         """Move not-yet-started packages out of per-package subfolders (cheap, 2 calls).
 
@@ -899,17 +911,6 @@ class EngineManager:
             folder = self.store.settings().get("download_dir")
             if not folder or not self.is_ours_running():
                 return 0
-            if not self._packagizer_checked:
-                # v0.1.48: once per engine run, disable Packagizer rules that create
-                # per-package folders (they override addLinks' destination).
-                self._packagizer_checked = True
-                try:
-                    rules = self.adapter.packagizer_folder_rules(True)
-                    if rules:
-                        debuglog.log("jd2", "info", "Packagizerのフォルダ規則",
-                                     {"result": str(rules.get("current"))[:200]})
-                except Exception as error:
-                    debuglog.log("jd2", "debug", "Packagizerの確認に失敗", {"error": str(error)[:120]})
             moved = jd2_transfer.flatten_waiting(self.adapter, folder)
         except Exception as error:
             debuglog.log("jd2", "debug", "フォルダ整理の巡回に失敗", {"error": str(error)[:120]})
