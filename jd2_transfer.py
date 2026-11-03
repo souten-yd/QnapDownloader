@@ -64,6 +64,34 @@ def prepare_transfer(adapter, nas_directory):
     return destination
 
 
+def flatten_destination(adapter, nas_directory):
+    """JD2-side path of the Hub's download folder, or None when it cannot be resolved."""
+    try:
+        return jd2_destination(nas_directory, getattr(adapter, "_options", {}))
+    except TransferBlocked:
+        return None
+
+
+def flatten_waiting(adapter, nas_directory):
+    """Point not-yet-started download-list packages that sit in a subfolder of the
+    Hub's download folder at the folder itself. Returns how many were moved.
+    Started and finished packages and anything outside the folder are never touched."""
+    destination = flatten_destination(adapter, nas_directory)
+    if destination is None:
+        return 0
+    return adapter.flatten_waiting_downloads(destination)
+
+
+def schedule_flatten(adapter, destination, add_result):
+    """After a successful addLinks: fix package folders in the background. Never raises."""
+    schedule = getattr(adapter, "schedule_flatten", None)
+    if callable(schedule):
+        try:
+            schedule(destination, add_result)
+        except Exception:
+            pass
+
+
 def transfer(adapter, url, nas_directory, autostart=False):
     # Check preflight again in case the real JD2 settings changed.
     destination = prepare_transfer(adapter, nas_directory)
@@ -73,8 +101,9 @@ def transfer(adapter, url, nas_directory, autostart=False):
         result = adapter.add_link(url, destination)
     if result is False:
         raise TransferBlocked("JD2がリンク登録を拒否しました。JD2の状態を確認してください")
+    schedule_flatten(adapter, destination, result)
     if autostart is not True:
-        return {"state": "sent", "note": "JD2 LinkGrabberへ自動開始OFFで送信。保存先を明示し、Packagizerのパッケージ別フォルダは上書きします（ルール自体は変更しません）"}
+        return {"state": "sent", "note": "JD2 LinkGrabberへ自動開始OFFで送信。保存先を明示し、Packagizerのパッケージ別フォルダは上書きし、できたパッケージフォルダは保存先の直下に直します（ルール自体は変更しません）"}
     started = True
     try:
         # addLinks(autostart) confirms the link; the controller may still be idle.

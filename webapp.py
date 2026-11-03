@@ -35,7 +35,7 @@ import state_hub
 import ttlcache
 import updater
 
-VERSION = "0.1.46"
+VERSION = "0.1.47"
 PORT = 17864
 ROOT = Path(__file__).resolve().parent
 FILES = {"/": ("web/index.html", "text/html; charset=utf-8"),
@@ -842,7 +842,8 @@ class Handler(BaseHTTPRequestHandler):
                     raise ValueError("表示ページが不正です")
                 page = int(page_text)
                 return self.send_data(200, self.cached(
-                    "jd2:downloads:%d" % page, 2.0, lambda: self.server.jd2.downloads_snapshot(page)))
+                    "jd2:downloads:%d" % page, 2.0, lambda: self.server.jd2.downloads_snapshot(
+                        page, self.store.settings().get("download_dir"))))
             if path == "/api/jd2/linkgrabber":
                 # Names and ids of links JD2 holds but has not started (max 50).
                 return self.send_data(200, self.cached("jd2:linkgrabber", 2.0,
@@ -1414,6 +1415,11 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/jd2/downloads/stop":
                 return self.send_data(200, self.server.jd2.stop_downloads(
                     confirmed=body.get("confirmed") is True))
+            if path == "/api/jd2/flatten":
+                # Admin action (authorize(write=True): session + CSRF + Origin above):
+                # move not-yet-started packages out of per-package subfolders now.
+                folder = str(checked_directory(self.store.settings().get("download_dir")))
+                return self.send_data(200, self.server.jd2.flatten_waiting(folder))
             if path == "/api/jd2/connect/test":
                 return self.send_data(200, self.server.jd2.connection_test())
             if path == "/api/jd2/update/check":

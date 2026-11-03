@@ -71,10 +71,22 @@ class JD2Controller:
                 return {"connected": False, "reason": str(error),
                         "can_update": False, "can_preset": False, "can_send": False}
 
-    def downloads_snapshot(self, page=0):
-        """Read-only; never triggers JD2 updates, queue mutations or downloads."""
+    def downloads_snapshot(self, page=0, download_dir=None):
+        """Read-only; never triggers JD2 updates, queue mutations or downloads.
+
+        With `download_dir` each package carries a browser-safe "folder" marker
+        (flat / subfolder name relative to it); absolute paths stay server-side."""
         with self.lock:
-            return self._require().list_downloads(page)
+            adapter = self._require()
+            base = jd2_transfer.flatten_destination(adapter, download_dir) if download_dir else None
+            return adapter.list_downloads(page, base) if base else adapter.list_downloads(page)
+
+    def flatten_waiting(self, download_dir):
+        """Admin action: move not-yet-started packages out of subfolders now."""
+        with self.lock:
+            adapter = self._require()
+            moved = jd2_transfer.flatten_waiting(adapter, download_dir)
+            return {"moved": moved}
 
     def linkgrabber_snapshot(self):
         """Read-only list of links JD2 holds in the LinkGrabber (max 50)."""
@@ -229,11 +241,23 @@ class JD2Controller:
                 stale()  # JD2 may change settings while updating
             return {"started": True, "note": "JD2本体のみ更新中です。更新後に推奨設定を再確認してください"}
 
+    @staticmethod
+    def _package_folders(adapter, apply):
+        """Optional JD2 keys that create package subfolders (empty when JD2 has none)."""
+        reader = getattr(adapter, "package_folder_settings", None)
+        if not callable(reader):
+            return []
+        try:
+            return reader(apply)
+        except Exception:
+            return []
+
     def preset_preview(self):
         with self.lock:
             adapter = self._require()
             result = build_preview(adapter)
             self._preview = result if result["applicable"] else None
+            result["package_folders"] = self._package_folders(adapter, False)
             return result
 
     def preset_reapply(self, *, confirmed=False):
@@ -246,6 +270,7 @@ class JD2Controller:
             if old is None:
                 raise PresetUnavailable("推奨設定のプレビューをやり直してください")
             result = apply_preset(adapter, old)
+            result["package_folders"] = self._package_folders(adapter, True)
             applied = getattr(adapter, "note_preset_applied", None)
             if applied is not None:
                 applied()

@@ -490,7 +490,7 @@ class HttpTests(unittest.TestCase):
                                          headers={"Host": "192.168.68.57:17864"})
         with self.client.open(request, timeout=4) as response:
             self.assertEqual(response.status, 200)
-            self.assertEqual(json.load(response)["version"], "0.1.46")
+            self.assertEqual(json.load(response)["version"], "0.1.47")
         with self.client.open(self.url + "/icon.svg", timeout=4) as response:
             self.assertEqual(response.status, 200)
             self.assertEqual(response.headers.get_content_type(), "image/svg+xml")
@@ -1400,7 +1400,7 @@ class HttpTests(unittest.TestCase):
         self.assertFalse(info["supported"])
         code, _ = self.req("/api/update/apply", {"version": "v0.1.8"})
         self.assertEqual(code, 400)
-        self.assertEqual(self.req("/api/health")[1]["version"], "0.1.46")
+        self.assertEqual(self.req("/api/health")[1]["version"], "0.1.47")
         self.assertFalse(self.req("/api/jd2/status")[1]["connected"])
         self.assertEqual(self.req("/api/jd2/update/apply", {"confirmed": True})[0], 400)
         self.assertEqual(self.req("/api/jd2/preset/apply", {"confirmed": True})[0], 400)
@@ -1771,6 +1771,47 @@ class HttpTests(unittest.TestCase):
         adapter._options = {"nas_root": str(self.allowed), "jd2_root": "/downloads"}
         adapter.package_save_path.return_value = "/downloads/sub"
         return adapter
+
+    def test_flatten_endpoint_needs_login_csrf_and_origin_and_moves_only_via_the_adapter(self):
+        body = {}
+        self.assertEqual(self.req("/api/jd2/flatten", body)[0], 401)
+        self.login()
+        self.assertEqual(self.req("/api/jd2/flatten", body, csrf=False)[0], 403)
+        self.assertEqual(self.req("/api/jd2/flatten", body, origin=False)[0], 403)
+        self.assertEqual(self.req("/api/jd2/flatten", body)[0], 400)          # no download folder yet
+        self.assertEqual(self.req("/api/settings/folder", {"path": str(self.allowed)})[0], 200)
+        self.assertEqual(self.req("/api/jd2/flatten", body)[0], 400)          # engine not running
+        adapter = self.jd2_ready()
+        adapter._options = {"same_host": True}
+        adapter.flatten_waiting_downloads.return_value = 2
+        with patch.object(self.server.jd2, "_require", return_value=adapter):
+            code, out = self.req("/api/jd2/flatten", body)
+        self.assertEqual((code, out), (200, {"moved": 2}))
+        adapter.flatten_waiting_downloads.assert_called_once_with(str(self.allowed.resolve()))
+        self.assertNotIn(str(self.allowed), json.dumps(out))
+
+    def test_downloads_api_returns_relative_folder_markers_and_no_absolute_paths(self):
+        self.login()
+        self.assertEqual(self.req("/api/settings/folder", {"path": str(self.allowed)})[0], 200)
+        base = str(self.allowed.resolve())
+
+        class Adapter:
+            _options = {"same_host": True}
+
+            def list_downloads(self, page, base_dir=None):
+                import jd2_downloads
+                raw = [{"uuid": 1, "name": "Pack", "saveTo": base_dir + "/Pack Folder"},
+                       {"uuid": 2, "name": "Flat", "saveTo": base_dir},
+                       {"uuid": 3, "name": "Out", "saveTo": "/volume1/private"}]
+                return jd2_downloads.snapshot(raw, [], page, base_dir)
+        self.server.jd2 = jd2_control.JD2Controller(Adapter())
+        code, result = self.req("/api/jd2/downloads")
+        self.assertEqual(code, 200)
+        self.assertEqual([p["folder"] for p in result["packages"]],
+                         [{"flat": False, "name": "Pack Folder"}, {"flat": True}, None])
+        text = json.dumps(result, ensure_ascii=False)
+        for secret in (base, "/volume1", "saveTo"):
+            self.assertNotIn(secret, text)
 
     def test_item_endpoints_validate_ids_and_call_the_adapter(self):
         self.login()
