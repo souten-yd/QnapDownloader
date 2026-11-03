@@ -57,7 +57,7 @@ engine/
 ### パッケージごとのフォルダを作らない（v0.1.47、実機未検証）
 JD2が送信先の下にパッケージ名のサブフォルダを作ってしまう場合に備え、次の3段で保存先の直下へ揃える（JD2のAPI名・引数順はJD2の `DownloadsAPIV2` / `LinkCollectorAPIV2` の `setDownloadDirectory(String directory, long[] packageIds)` に基づく想定。実機で要確認）。
 1. 送信（`addLinks`）の成功後、背景スレッドで0.5秒ごと最大15秒、`linkgrabberv2/queryPackages`（uuid, name, saveTo, childCount）を読み、`saveTo` が保存先の**配下**のパッケージに `linkgrabberv2/setDownloadDirectory(保存先, [uuid…])`。クローラ完了は `addLinks` が返すjob idなら `linkgrabberv2/queryLinkCrawlerJobs({"jobIds":[id]})`、無ければ `linkgrabberv2/isCollecting`。
-2. エンジン稼働中は60秒ごとに `downloadsV2/queryPackages`（uuid, saveTo, bytesLoaded, running, finished）を読み、**未開始**（bytesLoaded==0・実行中でない・未完了）で、保存先の配下にあるものだけ `downloadsV2/setDownloadDirectory(保存先, [uuid…])`。開始済み・完了済み・保存先の外は動かさない。設定 › JD2 › 保存先の「既存の待機中パッケージをまとめる」で同じ処理を今すぐ実行できる。
+2. （v0.1.49 で定期実行は廃止）設定 › JD2 › 保存先の「既存の待機中パッケージをまとめる」を押したときだけ `downloadsV2/queryPackages`（uuid, saveTo, bytesLoaded, running, finished）を読み、**未開始**（bytesLoaded==0・実行中でない・未完了）で、保存先の配下にあるものだけ `downloadsV2/setDownloadDirectory(保存先, [uuid…])`。開始済み・完了済み・保存先の外は動かさない。Packagizer のパッケージ名フォルダのルールはエンジン起動ごとに1回だけ確認して無効にする（v0.1.48）。
 3. 初期設定・推奨設定で、`GeneralSettings` / `LinkgrabberSettings` / `PackagizerSettings` に「subfolder」を含む真偽キー（→OFF）や、その名前に threshold/count/minimum/limit を含む整数キー（→100000）が**実在する場合だけ**変更し、readbackで確認して結果に載せる。無ければ何もしない。
 `saveTo` はHub内でのみ使い、ブラウザには「保存先直下／サブフォルダ名（保存先からの相対）」だけを返す。
 
