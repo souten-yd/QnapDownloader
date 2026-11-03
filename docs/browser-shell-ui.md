@@ -262,8 +262,18 @@ Cloudflare等で手元のブラウザ（iframe）では開けないサイトを�
 
 ### ライブ表示のストリーム（MJPEG push）
 - `GET /api/rb/stream.mjpg?tab=ID`（ログイン必須、Host/接続元チェックは他と同じ）: `multipart/x-mixed-replace; boundary=qdlframe`、`Cache-Control: no-store`。各パートは `Content-Type: image/jpeg` と `Content-Length` 付き。最新フレームだけを即送信し、書き込みが遅いときは途中のフレームを飛ばす。15秒フレームが来なければ最後のフレームを再送（ハートビート）。書き込みエラー・タブ閉鎖・コンテナ停止・10分経過で終了。
-- 上限: 1タブ2本、全体4本、超過は429。ストリームは閲覧中としてカウントされ（アイドル停止の判定に入る）、他のリクエストを止めない（デーモンスレッド、ソケットのタイムアウト10秒）。最初のフレームが届いた時点で応答が始まる。
-- 端末: ライブ表示では `<img>` の `src` を同一オリジンのストリームURLにする。タブ情報・リンク位置表の版・fpsは `/api/rb/meta`（2秒ロングポーリング）から受け取る（fpsはHub側で直近3秒から算出）。ストリームが10秒以内に2回エラーになるか、5秒以内に画像が出ない場合は、そのタブだけ従来の `frame.jpg` ポーリングへ切り替える。タブが非表示・切替・表示方法の変更・ログアウトの際はストリームを閉じる（`src` を外す）。
+- 上限: 1タブ2本（v0.1.46: 3本目は同じタブの最も古い1本を終了させて受け付ける。プロキシ越しでは端末が切断しても古い接続にHubが気づけないため）、全体4本（超過は429）。ストリームは閲覧中としてカウントされ（アイドル停止の判定に入る）、他のリクエストを止めない（デーモンスレッド、ソケットのタイムアウト10秒）。最初のフレームが届いた時点で応答が始まる。
+- 端末: ライブ表示では `<img>` の `src` を同一オリジンのストリームURLにする。タブ情報・リンク位置表の版・fpsは `/api/rb/meta`（2秒ロングポーリング）から受け取る（fpsはHub側で直近3秒から算出）。ストリームが10秒以内に2回エラーになるか、最初の画像が出ない場合は次の経路へ進む（v0.1.46: 下の「SSE」参照）。タブが非表示・切替・表示方法の変更・ログアウトの際はストリームを閉じる（`src` を外す）。
+
+### v0.1.46 ライブ表示の経路: MJPEG → SSE → ポーリング
+実機（Tailscale Serve経由のiPhone）で、プロキシが `multipart/x-mixed-replace` を溜め込み、最初のフレームが届かなかった（Goのリバースプロキシは `text/event-stream` だけ即時フラッシュする）。
+- `GET /api/rb/stream.sse?tab=ID`（ログイン必須、stream.mjpgと同じ検査・上限・間隔・ハートビート・10分上限）: `Content-Type: text/event-stream`、`Cache-Control: no-store`、`X-Accel-Buffering: no`。最初に約2 KiBのコメント行（小さなプロキシのバッファを押し出す）、以降 `event: frame\ndata: <JPEGのbase64>\n\n`（最新フレームのみ）。10秒フレームが無ければ `: ping`。
+- 端末: MJPEG（`<img>`）の最初の画像が2.5秒以内に出なければ、同じタブで SSE（`fetch`＋`ReadableStream`、使えなければ `EventSource`）を読み、各フレームをBlobのオブジェクトURLにして同じ `#remoteImg` に表示（古いURLは破棄、生きているのは表示中＋デコード中の2つまで）。SSEも3秒以内にフレームが無ければ `frame.jpg` ポーリング。
+- 端末ごとに最後に使えた経路を `localStorage`（`qnapdl.livetransport.v1`、失敗しても動作に影響なし）へ記憶し、次回はその経路から始める。MJPEGの再試行は1日1回まで。
+- 速度表示: 「ライブ(ストリーム)」「ライブ(SSE: MJPEGの最初の画面が届かない)」「ライブ(ポーリング: …)」と理由つき。
+- コピーボタン（結果をコピー等）は `navigator.clipboard` が無い（http）・拒否されたとき、隠しtextarea＋`document.execCommand('copy')` を同じタップ内で実行。両方だめなときだけ長押しの案内を出す。自己テストのレポートは実行終了時に先読みしてタップ内で同期コピーできるようにする。
+- CPU: `GET /api/state` の経路（`RemoteBrowser.status()` 既定）は `docker stats` を起動しない。メモリはcgroup、または120秒以内の直近の `docker stats` 結果。`GET /api/rb/status`（設定›ブラウザ）だけ `status(fresh_memory=True)` で新しく取得（30秒キャッシュ）。タブを開く前のメモリ確認（`memory_reason()`）は従来どおり新しい値（5秒キャッシュ）。
+- cgroup探索（`diskio.container_cgroup_sources`）: コンテナinitの `/proc/<pid>/cgroup` を `/proc/self/mountinfo` の各階層（v1: memory・blkio、v2）に結合。推測（`docker/`・`system.slice/docker-<id>.scope`・`container-station/`）と、id名のディレクトリの浅い探索を最後の手段として併用。
 
 ### 速度表示（⋯ › 速度表示）
 - 先頭に表示の種類と方式を出す。ライブ（ストリーム）: 「ライブ(ストリーム)・速度優先 · 9.8 fps · 22 KB/枚 · 応答 120 ms」（応答は最初の画像が出るまで）。ライブ（ポーリング）: 「ライブ(ポーリング)・標準 · …」。高速: 「高速(全体表示)・速度優先 · タイル 4/12 · 撮影 850 ms · 1枚 140 KB」。リーダー: 「リーダー · ブロック 230 · 画像 12/40 · 取得 600 ms」（抽出時間、画像があれば「画像取得 ○ ms」の平均を追記）。fps以外は端末側で計測。
@@ -336,4 +346,5 @@ Cloudflare等で手元のブラウザ（iframe）では開けないサイトを�
 - API: `GET /api/selftest/status?since=&wait=`（ロングポーリング）、`GET /api/selftest/results[?id=]`、`GET /api/selftest/report?id=&urls=0|1`、
   `POST /api/selftest/start`・`/cancel`・`/client`（管理者・CSRF・Origin。`/client` は32 KiB上限・項目の型と範囲を検証）。同時実行は409。
 - レポート: アプリのバージョン、NASの事実、端末のUA・viewport・DPR・エンジンのフラグ、全項目の値・しきい値・状態、デバッグログ末尾50行（rb/render/engine/http）。パスワード等とURLの中身は入れません。
+- v0.1.46: 端末のライブ受信は MJPEG（最初の画像2.5秒）→ SSE（3秒のfps）→ ポーリング（3秒のfps。`remoteLoop` と同じ `since=<最後のseq>`、窓の終わりで中断）の順に個別に測り、アプリが最終的に使う経路（最初に使えたもの）を報告する。注意はその経路がポーリングで5fps未満のときだけ、フレームが全く無ければ失敗。`client.secure`（https判定）、`client.clipboard`（clipboard APIまたは `queryCommandSupported('copy')`）、`env.cgroup`（cgroup階層とコンテナごとのメモリ/I/Oの取得元。取れないときは `/proc/<pid>/cgroup` の先頭行とマウント一覧を値に載せる）を追加。実サイトは DOMContentLoaded までの時間で判定（8秒以内で合格、完全な読み込み未完了は注記のみ）し、ライブは3秒間NASのページを300msごとに200pxスクロール（隔離ワールドの `Runtime.evaluate`）して動きを作って測る。クライアントの測定中はそのタブのスクリーンキャストをアイドル停止から守る。レポートの見出しに `[Source] cgroup=…` と `[Live] transport=…` を追加。
 - 未検証: 実機NAS、実iPhone（WebKit）、実サイト、headfulなChromiumでのライブfps（ヘッドレスでは断続的になるため、fpsは注意止まり）。

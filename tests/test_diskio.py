@@ -165,6 +165,140 @@ class CgroupLookupTests(unittest.TestCase):
         self.assertEqual(diskio.container_cgroup_candidates({"id": "", "pid": 4242}, str(self.root), str(self.proc)), [])
 
 
+MEM_V1 = "total_rss 100\ntotal_cache 50\ntotal_inactive_file 10\n"
+
+
+class CgroupLayoutTests(unittest.TestCase):
+    """v0.1.46: the container's cgroup directory comes from /proc/<pid>/cgroup joined against the mounted
+    hierarchies of /proc/self/mountinfo, so any prefix works (docker/, system.slice/, container-station/ ...)."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.base = Path(self.tmp.name)
+        self.root = self.base / "cg"          # stands for /sys/fs/cgroup
+        self.proc = self.base / "proc"
+        (self.proc / "self").mkdir(parents=True)
+        (self.proc / "4242").mkdir()
+        self.root.mkdir()
+
+    def mountinfo(self, *lines):
+        (self.proc / "self" / "mountinfo").write_text("\n".join(lines) + "\n")
+
+    def v1_mount(self, name, point=None, root="/"):
+        point = point or (self.root / name)
+        point.mkdir(parents=True, exist_ok=True)
+        return "40 30 0:%d %s %s rw,nosuid,nodev,noexec,relatime shared:9 - cgroup cgroup rw,%s" % (
+            20 + len(name), root, point, name)
+
+    def v2_mount(self, point=None):
+        point = point or self.root
+        point.mkdir(parents=True, exist_ok=True)
+        return "41 30 0:30 / %s rw,nosuid,nodev,noexec,relatime shared:10 - cgroup2 cgroup2 rw" % point
+
+    def found(self):
+        return diskio.container_cgroup_paths(FakeRuntime({"id": CID, "pid": 4242, "running": True}), "n",
+                                             str(self.root), str(self.proc))
+
+    def test_mountinfo_parser(self):
+        text = ("36 35 0:30 / /sys/fs/cgroup/memory rw,nosuid shared:1 - cgroup cgroup rw,memory\n"
+                "37 35 0:31 / /sys/fs/cgroup/cpu\\040x rw shared:2 - cgroup cgroup rw,cpu,cpuacct\n"
+                "38 35 0:32 / /sys/fs/cgroup/systemd rw - cgroup cgroup rw,xattr,name=systemd\n"
+                "39 35 0:33 / /sys/fs/cgroup rw - cgroup2 cgroup2 rw\n"
+                "40 35 0:34 / /proc rw - proc proc rw\n"
+                "garbage\n")
+        mounts = diskio.parse_mountinfo_cgroups(text)
+        self.assertEqual(mounts[0], (1, "/sys/fs/cgroup/memory", frozenset(["memory"]), "/"))
+        self.assertEqual(mounts[1][1], "/sys/fs/cgroup/cpu x")
+        self.assertEqual(mounts[1][2], frozenset(["cpu", "cpuacct"]))
+        self.assertEqual(mounts[2][2], frozenset(["name=systemd"]))
+        self.assertEqual(mounts[3], (2, "/sys/fs/cgroup", frozenset(), "/"))
+        self.assertEqual(len(mounts), 4)
+
+    def test_cgroup_v1_container_station_prefix(self):
+        self.mountinfo(self.v1_mount("blkio"), self.v1_mount("memory"), self.v1_mount("cpu"))
+        (self.proc / "4242" / "cgroup").write_text(
+            "11:blkio:/container-station/docker/%s\n10:memory:/container-station/docker/%s\n"
+            "3:cpu:/container-station/docker/%s\n1:name=systemd:/docker/%s\n" % (CID, CID, CID, CID))
+        blk = self.root / "blkio" / "container-station" / "docker" / CID
+        mem = self.root / "memory" / "container-station" / "docker" / CID
+        blk.mkdir(parents=True)
+        mem.mkdir(parents=True)
+        (blk / "blkio.throttle.io_service_bytes").write_text(CGROUP_V1)
+        (mem / "memory.usage_in_bytes").write_text("5000\n")
+        (mem / "memory.stat").write_text(MEM_V1)
+        paths = self.found()
+        self.assertEqual(paths, [(1, str(blk)), (1, str(mem))])           # blkio + memory, never the cpu hierarchy
+        self.assertEqual(diskio.read_container_cgroup_io(paths), (1024, 5100, "cgroup v1"))
+        import rb_resident
+        self.assertEqual(rb_resident.read_cgroup_memory(paths)["used_bytes"], 4990)
+
+    def test_cgroup_v2_system_slice_and_docker_prefixes(self):
+        for rel in ("system.slice/docker-%s.scope" % CID, "docker/%s" % CID):
+            with self.subTest(rel=rel):
+                root = self.base / ("v2-" + rel.split("/")[0])
+                self.root = root
+                self.mountinfo(self.v2_mount(root))
+                (self.proc / "4242" / "cgroup").write_text("0::/%s\n" % rel)
+                d = root / rel
+                d.mkdir(parents=True)
+                (d / "io.stat").write_text(CGROUP_V2)
+                self.assertEqual(self.found(), [(2, str(d))])
+                self.assertEqual(diskio.read_container_cgroup_io(self.found()), (1024, 5100, "cgroup v2"))
+
+    def test_hybrid_layout_uses_the_v1_controllers_and_ignores_the_unified_one(self):
+        unified = self.root / "unified"
+        self.mountinfo(self.v1_mount("blkio"), self.v1_mount("memory"), self.v2_mount(unified))
+        (self.proc / "4242" / "cgroup").write_text(
+            "11:blkio:/docker/%s\n10:memory:/docker/%s\n0::/docker/%s\n" % (CID, CID, CID))
+        blk = self.root / "blkio" / "docker" / CID
+        blk.mkdir(parents=True)
+        (blk / "blkio.throttle.io_service_bytes").write_text(CGROUP_V1)
+        self.assertEqual(diskio.read_container_cgroup_io(self.found())[2], "cgroup v1")
+
+    def test_mount_of_a_sub_tree_is_joined_relative_to_its_root(self):
+        # Hub inside a container that sees /sys/fs/cgroup as the container's own subtree
+        self.mountinfo(self.v1_mount("memory", root="/docker/%s" % CID))
+        (self.proc / "4242" / "cgroup").write_text("10:memory:/docker/%s\n" % CID)
+        self.assertEqual(self.found(), [(1, str(self.root / "memory"))])
+        (self.proc / "4242" / "cgroup").write_text("10:memory:/elsewhere/abc\n")
+        self.assertEqual(self.found(), [])
+
+    def test_scan_finds_the_container_when_no_pid_is_known(self):
+        self.mountinfo(self.v1_mount("blkio"), self.v1_mount("memory"))
+        d = self.root / "blkio" / "qts" / "prefix" / CID
+        d.mkdir(parents=True)
+        (d / "blkio.throttle.io_service_bytes").write_text(CGROUP_V1)
+        ref = {"id": CID, "pid": 0, "running": True}
+        paths = diskio.container_cgroup_paths(FakeRuntime(ref), "n", str(self.root), str(self.proc))
+        self.assertEqual(paths, [(1, str(d))])
+        sources = diskio.container_cgroup_sources(ref, str(self.root), str(self.proc))
+        self.assertIn((1, str(d), "scan"), sources)
+
+    def test_no_mountinfo_falls_back_to_the_conventional_layout(self):
+        (self.proc / "4242" / "cgroup").write_text("11:blkio:/docker/%s\n" % CID)
+        d = self.root / "blkio" / "docker" / CID
+        d.mkdir(parents=True)
+        self.assertEqual(self.found(), [(1, str(d))])
+        self.assertEqual(diskio.cgroup_layout_summary(str(self.root), str(self.proc)), "v2+v1(blkio,memory)（推測）")
+
+    def test_layout_summary_and_report_facts(self):
+        self.mountinfo(self.v1_mount("blkio"), self.v1_mount("memory"))
+        self.assertEqual(diskio.cgroup_layout_summary(str(self.root), str(self.proc)), "v1(blkio,memory)")
+        (self.proc / "4242" / "cgroup").write_text("11:blkio:/lost/place\n")
+        ref = {"id": CID, "pid": 4242, "running": True}
+        report = diskio.cgroup_report(FakeRuntime(ref), "n", str(self.root), str(self.proc))
+        self.assertEqual((report["running"], report["io"], report["mem"], report["dir"]), (True, None, None, None))
+        self.assertEqual(report["pid_cgroup"], ["blkio:/lost/place"])
+        self.assertTrue(report["mounts"][0].startswith("v1@"))
+        self.assertEqual(diskio.cgroup_report(FakeRuntime(None), "n", str(self.root))["running"], False)
+
+    def test_traversal_in_proc_cgroup_is_still_ignored(self):
+        self.mountinfo(self.v1_mount("blkio"))
+        (self.proc / "4242" / "cgroup").write_text("11:blkio:/../../etc\n")
+        self.assertEqual(diskio.container_cgroup_candidates({"id": "", "pid": 4242}, str(self.root), str(self.proc)), [])
+
+
 class Clock:
     def __init__(self):
         self.t = 1000.0

@@ -36,6 +36,8 @@ MAX_TABS = 3
 MIN_AVAILABLE_KIB = cr.BROWSER_MIN_AVAILABLE_KIB     # MemAvailable >= 2 GiB
 MEM_LIMIT_PERCENT = 80.0
 STATS_TTL = 5.0
+STATUS_STATS_TTL = 30.0        # v0.1.46: status(fresh_memory=True) reuses a docker stats result this long
+STATS_STALE_MAX = 120.0        # v0.1.46: status() without fresh_memory shows a cached result up to this old
 VIEWER_STOP_AFTER = 5.0        # stop the screencast after this long without a poll
 NO_TAB_IDLE = 300.0            # no tabs for 5 minutes -> stop the container
 NO_VIEWER_IDLE = 600.0         # no viewer activity for 10 minutes -> stop
@@ -205,6 +207,16 @@ STREAM_MAX_SECONDS = 600.0     # a stream ends after this long (the viewer recon
 STREAM_HEARTBEAT = 15.0        # no new frame for this long: the last frame is sent again
 STREAM_FPS_WINDOW = 3.0
 STREAM_BOUNDARY = "qdlframe"
+SSE_PING_SECONDS = 10.0        # v0.1.46: `: ping` comment on an idle event stream
+SSE_PADDING = (b":" + b" " * 2047 + b"\n\n")      # 2 KiB first comment: small proxy buffers flush at once
+SSE_PING = b": ping\n\n"
+
+
+def sse_event(base64_jpeg):
+    """One `frame` event: the frame's base64 JPEG on a single data line (v0.1.46)."""
+    if isinstance(base64_jpeg, str):
+        base64_jpeg = base64_jpeg.encode("ascii")
+    return b"event: frame\ndata: " + base64_jpeg + b"\n\n"
 VP_LINK_CAP = 600              # link boxes of the visible viewport (CSS px relative to the viewport)
 # Injected once per document: flags that the map may have changed after a scroll ends (200 ms
 # debounce), a resize or any DOM mutation. A navigation is a new document, hence dirty again.
@@ -963,7 +975,11 @@ class Tab:
         self.snap_lock = threading.Lock()    # one capture at a time per tab
         self.tiles = {}            # (snapshot id, index) -> JPEG bytes, in LRU order (oldest first)
         self.tile_bytes = 0
-        self.streams = 0           # MJPEG streams being written now
+        self.streams = 0           # MJPEG / SSE streams being written now
+        self.dcl_n = 0             # v0.1.46: DOMContentLoaded events seen (self-test tabs only)
+        self.keep_until = 0.0      # v0.1.46: the screencast is not idle-stopped before this (self-test)
+        self.iso_ctx = None        # v0.1.46: isolated-world execution context of the self-test scroller
+        self.stream_stops = []     # v0.1.46: stop events of the live streams (newest last; the oldest is evicted)
         self.stream_times = deque(maxlen=128)    # monotonic send times (fps for the viewer's overlay)
         self.stream_bytes = 0      # size of the last part sent
         self.dbg_frames = 0        # debug log only: screencast frames in the current 10 s window
@@ -1085,6 +1101,7 @@ class RemoteBrowser:
         self._spawn = spawn if spawn is not None else self._spawn_thread
         self._auto_inflight = set()
         self._streams = 0
+        self._mem_none_until = 0.0
         self._probes = 0
         self._probe_queue = []     # FIFO of waiting probe tickets (dicts with the tab)
         self._probe_targets = {}   # probe target id -> Probe
@@ -1175,11 +1192,13 @@ class RemoteBrowser:
             self._stale = stale and not ready
         return ready
 
-    def _stats(self):
+    def _stats(self, ttl=None):
+        """`docker stats` of the browser container, cached `ttl` seconds (default STATS_TTL)."""
+        ttl = STATS_TTL if ttl is None else ttl
         now = self._clock()
         with self._lock:
             cached = self._stats_cache
-        if cached is not None and now - cached[0] < STATS_TTL:
+        if cached is not None and now - cached[0] < ttl:
             if cached[2] is not None:
                 raise cached[2]
             return cached[1]
@@ -1194,8 +1213,24 @@ class RemoteBrowser:
             raise error
         return value
 
-    def memory_reason(self, min_kib=None, limit_percent=None):
-        """Japanese reason a new tab (or probe) must not be started now, or None."""
+    def _cached_stats(self, max_age=STATS_STALE_MAX):
+        """The last successful `docker stats` result if it is at most `max_age` old, else None.
+
+        Never starts `docker stats` (v0.1.46): the /api/state path must stay cheap on a small CPU.
+        """
+        now = self._clock()
+        with self._lock:
+            cached = self._stats_cache
+        if cached is not None and cached[2] is None and cached[1] is not None and now - cached[0] <= max_age:
+            return cached[1]
+        return None
+
+    def memory_reason(self, min_kib=None, limit_percent=None, stats_ttl=None, cached_only=False):
+        """Japanese reason a new tab (or probe) must not be started now, or None.
+
+        The tab-open guard uses a fresh `docker stats` (STATS_TTL). status() passes `cached_only` (never starts
+        docker stats; a missing result skips only that one check) or a longer `stats_ttl`.
+        """
         min_kib = MIN_AVAILABLE_KIB if min_kib is None else min_kib
         limit_percent = MEM_LIMIT_PERCENT if limit_percent is None else limit_percent
         available = cr.read_mem_available_kib(self._meminfo)
@@ -1208,11 +1243,14 @@ class RemoteBrowser:
         with self._lock:
             running = self._state == "running"
         if running:
-            try:
-                stats = self._stats()
-            except BrowserError as error:
-                return str(error)
-            if stats["percent"] >= limit_percent:
+            if cached_only:
+                stats = self._cached_stats()
+            else:
+                try:
+                    stats = self._stats(stats_ttl)
+                except BrowserError as error:
+                    return str(error)
+            if stats is not None and stats["percent"] >= limit_percent:
                 return ("NASブラウザのメモリ使用量が上限の%d%%に達しています（%.0f%%）。"
                         "タブを閉じてから開いてください" % (limit_percent, stats["percent"]))
         return None
@@ -1221,7 +1259,10 @@ class RemoteBrowser:
         return self.memory_reason(PROBE_MIN_AVAILABLE_KIB, PROBE_MEM_LIMIT_PERCENT)
 
     # ------------------------------------------------------------- status
-    def status(self):
+    def status(self, fresh_memory=False):
+        """State of the NAS browser. `fresh_memory=False` (the /api/state path) never starts `docker stats`:
+        the memory figure comes from the cgroup or from a cached result at most STATS_STALE_MAX old.
+        GET /api/rb/status passes True (settings view) and may run `docker stats` (cached STATUS_STATS_TTL)."""
         station = self.container_station()
         ready = bool(station) and self.image_ready()
         with self._lock:
@@ -1235,22 +1276,32 @@ class RemoteBrowser:
             error = self._error
         memory = None
         if state == "running":
-            try:
-                stats = self._stats()
+            stats = None
+            if fresh_memory:
+                try:
+                    stats = self._stats(STATUS_STATS_TTL)
+                except BrowserError:
+                    stats = None
+            else:
+                stats = self._cached_stats()
+            if stats is not None:
                 memory = {"used_mib": stats["used_bytes"] // (1024 * 1024),
                           "limit_mib": stats["limit_bytes"] // (1024 * 1024),
                           "percent": stats["percent"]}
-            except BrowserError:
-                memory = None
+            else:
+                used = self.container_memory(allow_stats=False)
+                if used is not None:
+                    memory = {"used_mib": used["used_bytes"] // (1024 * 1024), "limit_mib": None, "percent": None}
         available = cr.read_mem_available_kib(self._meminfo)
         reason = None
         if ready and state in ("stopped", "running"):
-            reason = self.memory_reason()
+            reason = (self.memory_reason(stats_ttl=STATUS_STATS_TTL) if fresh_memory
+                      else self.memory_reason(cached_only=True))
             if reason is None and len(tabs) >= MAX_TABS:
                 reason = "NASブラウザのタブは最大%d枚です" % MAX_TABS
         if bool(station) and not ready and stale and not setup:
             reason = UPDATE_NEEDED
-        resident = self.resident_status()
+        resident = self.resident_status(allow_stats=fresh_memory)
         if resident["watchdog"]["state"] == rb_resident.STATE_GAVE_UP and state == "stopped":
             reason = resident["watchdog"]["message"]
         return {
@@ -1565,7 +1616,8 @@ class RemoteBrowser:
             idle_view = now - self._last_activity >= NO_VIEWER_IDLE
             lost = conn is None or conn.closed
             expired = [t for t in self._tabs.values()
-                       if t.screencast and t.pollers == 0 and now - t.last_poll > VIEWER_STOP_AFTER]
+                       if t.screencast and t.pollers == 0 and now - t.last_poll > VIEWER_STOP_AFTER
+                       and now >= t.keep_until]
             health_due = now - self._health_at >= HEALTH_INTERVAL
         if lost:
             self._unexpected_exit({"lost": True})
@@ -1760,8 +1812,12 @@ class RemoteBrowser:
                     pass
         debuglog.log("rb", "info", "memory trim")
 
-    def container_memory(self, fresh=False):
-        """Current memory of the browser container (cgroup, else docker stats), cached 5 s."""
+    def container_memory(self, fresh=False, allow_stats=True):
+        """Current memory of the browser container (cgroup, else docker stats), cached 5 s.
+
+        `allow_stats=False` (v0.1.46, the /api/state path) never starts `docker stats`: without a readable
+        cgroup it uses a cached result up to STATS_STALE_MAX old, else returns None (not cached).
+        """
         now = self._clock()
         with self._lock:
             cached = self._mem_cache
@@ -1769,8 +1825,11 @@ class RemoteBrowser:
         if not running:
             return None
         if cached is not None and not fresh and now - cached[0] < rb_resident.MEM_TTL:
-            return cached[1]
+            if cached[1] is not None or allow_stats:
+                return cached[1]
         value = None
+        if not allow_stats and not fresh and now < self._mem_none_until:
+            return None            # looked just now and found nothing cheap: do not inspect again yet
         paths = diskio.container_cgroup_paths(self.runtime, cr.BROWSER_NAME,
                                               self._cgroup_root, self._proc_root)
         found = rb_resident.read_cgroup_memory(paths) if paths else None
@@ -1778,11 +1837,15 @@ class RemoteBrowser:
             value = found
         else:
             try:
-                stats = self._stats()
-                value = {"used_bytes": stats["used_bytes"], "anon_bytes": None, "file_bytes": None,
-                         "source": "docker stats"}
+                stats = self._stats() if allow_stats else self._cached_stats()
+                if stats is not None:
+                    value = {"used_bytes": stats["used_bytes"], "anon_bytes": None, "file_bytes": None,
+                             "source": "docker stats"}
             except BrowserError:
                 value = None
+        if value is None and not allow_stats:
+            self._mem_none_until = now + 15.0
+            return None
         with self._lock:
             self._mem_cache = (now, value)
         return value
@@ -1805,7 +1868,7 @@ class RemoteBrowser:
             self.wd.event("idle_sample", "待機時メモリ %d MiB" % round(memory["used_bytes"] / 1048576))
             debuglog.log("rb", "info", "idle memory", {"mib": round(memory["used_bytes"] / 1048576)})
 
-    def resident_status(self):
+    def resident_status(self, allow_stats=False):
         """Compact resident / watchdog / memory block for /api/rb/status."""
         with self._lock:
             resident = self._resident
@@ -1814,7 +1877,7 @@ class RemoteBrowser:
             tabs = sum(1 for t in self._tabs.values() if not t.selftest)
         wd = self.wd.snapshot()
         total = rb_resident.mem_total_kib(self._meminfo)
-        memory = self.container_memory()
+        memory = self.container_memory(allow_stats=allow_stats)
         rss = rb_resident.hub_rss_bytes(self._hub_status)
         mib = 1024 * 1024
         if wd["state"] == rb_resident.STATE_GAVE_UP:
@@ -2034,7 +2097,61 @@ class RemoteBrowser:
         tab = self._tab(ident)
         with self._lock:
             return {"url": tab.url, "title": tab.title, "loading": bool(tab.loading), "rev": tab.rev,
-                    "seq": tab.seq, "screencast": tab.screencast, "challenge": bool(tab.page_challenge)}
+                    "seq": tab.seq, "screencast": tab.screencast, "challenge": bool(tab.page_challenge),
+                    "dcl": tab.dcl_n}
+
+    def selftest_keep(self, ident, seconds):
+        """Keeps the screencast of a self-test tab running (no idle stop) for `seconds`, and starts it."""
+        tab = self._tab(ident)
+        if not tab.selftest:
+            raise BrowserError("セルフテスト用のタブではありません")
+        seconds = max(0.0, min(float(seconds), 120.0))
+        with self._lock:
+            tab.keep_until = self._clock() + seconds
+            starting = not tab.screencast
+            tab.screencast = True
+        self._touch()
+        if starting:
+            try:
+                self._start_screencast(tab)
+            except BrowserError:
+                with self._lock:
+                    tab.screencast = False
+                raise
+        return {"ok": True}
+
+    def selftest_scroll(self, ident, dy=200):
+        """Scrolls the page of a self-test tab by `dy` px (back to the top at the bottom) from an isolated
+        world, so a still page produces screencast frames. Returns the new scroll offset or None."""
+        tab = self._tab(ident)
+        if not tab.selftest or not tab.session:
+            raise BrowserError("セルフテスト用のタブではありません")
+        dy = int(max(-2000, min(2000, dy)))
+        expression = ("(function(){var m=Math.max(0,document.documentElement.scrollHeight-innerHeight),"
+                      "y=window.scrollY+(%d);window.scrollTo(0,y>m?0:y<0?m:y);return window.scrollY;})()" % dy)
+        for attempt in range(2):
+            ctx = tab.iso_ctx
+            if ctx is None:
+                tree = self._call("Page.getFrameTree", session=tab.session, timeout=PROBE_CDP_TIMEOUT)
+                frame_id = ((tree.get("frameTree") or {}).get("frame") or {}).get("id")
+                if not isinstance(frame_id, str):
+                    return None
+                world = self._call("Page.createIsolatedWorld", {
+                    "frameId": frame_id, "worldName": "qdl-selftest"}, session=tab.session,
+                    timeout=PROBE_CDP_TIMEOUT)
+                ctx = world.get("executionContextId")
+                if not isinstance(ctx, int):
+                    return None
+                tab.iso_ctx = ctx
+            try:
+                value = ((self._call("Runtime.evaluate", {
+                    "expression": expression, "contextId": ctx, "returnByValue": True, "timeout": 2000},
+                    session=tab.session, timeout=PROBE_CDP_TIMEOUT).get("result") or {}).get("value"))
+            except BrowserError:
+                tab.iso_ctx = None
+                continue
+            return value if isinstance(value, (int, float)) and not isinstance(value, bool) else None
+        return None
 
     def selftest_goto(self, ident, path):
         """Navigates a fixture tab to another page of the virtual site (nothing else is accepted)."""
@@ -2141,10 +2258,16 @@ class RemoteBrowser:
             if tab is not None:
                 self._drop_tab(tab, close=False)
         elif method in ("Page.frameStartedLoading", "Page.frameStoppedLoading",
-                        "Page.loadEventFired", "Network.requestWillBeSent"):
+                        "Page.loadEventFired", "Page.domContentEventFired", "Network.requestWillBeSent"):
             probe = self._probe_sessions.get(message.get("sessionId"))
             if probe is not None:
                 self._probe_event(probe, method, params)
+                return
+            if method == "Page.domContentEventFired":
+                with self._cv:
+                    owner = self._by_session.get(message.get("sessionId"))
+                    if owner is not None and owner.selftest and owner.url not in ("", "about:blank"):
+                        owner.dcl_n += 1           # v0.1.46: the self-test times DOMContentLoaded, not load
                 return
             if method == "Page.loadEventFired":
                 with self._cv:
@@ -2566,17 +2689,25 @@ class RemoteBrowser:
                 tab.pollers -= 1
                 tab.last_poll = self._clock()
 
-    def stream(self, ident, write, max_seconds=STREAM_MAX_SECONDS, heartbeat=STREAM_HEARTBEAT):
-        """Push the tab's screencast to `write(bytes)` as multipart/x-mixed-replace parts.
+    def stream(self, ident, write, max_seconds=STREAM_MAX_SECONDS, heartbeat=STREAM_HEARTBEAT, sse=False):
+        """Push the tab's screencast to `write(bytes)` as multipart/x-mixed-replace parts (or, with `sse`,
+        as Server-Sent Events: `event: frame` + the frame's base64 JPEG, v0.1.46).
 
         Always the newest frame (a slow writer simply skips the ones in between); the last frame is
         repeated after `heartbeat` seconds without a new one. Ends when `write` raises OSError (the
-        viewer left), when the tab or the container goes away, or after `max_seconds`.
+        viewer left), when the tab or the container goes away, when a newer stream of the same tab
+        evicts it (a viewer behind a buffering proxy never shows us that its old stream is gone), or
+        after `max_seconds`. The SSE form starts with a 2 KiB comment (defeats small proxy buffers) and
+        sends a `: ping` comment every SSE_PING_SECONDS while no frame goes out.
         """
         tab = self._tab(ident)
+        stop = threading.Event()
         with self._lock:
-            if tab.streams >= STREAM_PER_TAB or self._streams >= STREAM_TOTAL:
+            if len(tab.stream_stops) >= STREAM_PER_TAB:
+                tab.stream_stops.pop(0).set()          # the oldest stream of this tab makes room
+            if sum(len(t.stream_stops) for t in self._tabs.values()) >= STREAM_TOTAL:
                 raise StreamLimit("ライブ表示の同時接続が多すぎます")
+            tab.stream_stops.append(stop)
             tab.streams += 1
             self._streams += 1
             tab.pollers += 1
@@ -2585,7 +2716,7 @@ class RemoteBrowser:
             tab.screencast = True
         stream_started = stream_logged = time.monotonic()
         stream_parts = 0
-        debuglog.log("net", "info", "stream connect", {"tab": ident})
+        debuglog.log("net", "info", "stream connect", {"tab": ident, "kind": "sse" if sse else "mjpeg"})
         try:
             self._touch()
             if starting:
@@ -2595,47 +2726,62 @@ class RemoteBrowser:
                     with self._lock:
                         tab.screencast = False
                     raise
-            started = last_sent = time.monotonic()
+            started = last_sent = last_write = time.monotonic()
+            if sse:
+                write(SSE_PADDING)
+                last_write = time.monotonic()
             end = started + max_seconds
             since, last = 0, None
-            while time.monotonic() < end:
+            while time.monotonic() < end and not stop.is_set():
                 with self._cv:
                     while (tab.seq <= since and self._tabs.get(tab.id) is tab and
-                           self._state == "running"):
+                           self._state == "running" and not stop.is_set()):
                         now = time.monotonic()
                         remaining = min(1.0, heartbeat - (now - last_sent), end - now)
+                        if sse:
+                            remaining = min(remaining, SSE_PING_SECONDS - (now - last_write))
                         if remaining <= 0:
                             break
                         self._cv.wait(remaining)
                         tab.last_poll = self._last_activity = self._clock()
-                    if self._tabs.get(tab.id) is not tab or self._state != "running":
+                    if self._tabs.get(tab.id) is not tab or self._state != "running" or stop.is_set():
                         return
                     fresh = tab.seq > since
                     since = tab.seq
                     text = tab.frame
+                if sse and not fresh and time.monotonic() - last_write >= SSE_PING_SECONDS:
+                    write(SSE_PING)
+                    last_write = time.monotonic()
                 if fresh and text:
-                    last = base64.b64decode(text)
+                    last = text if sse else base64.b64decode(text)
                 elif last is None or time.monotonic() - last_sent < heartbeat:
                     if last is None:
                         last_sent = time.monotonic()       # nothing to repeat yet: keep waiting
                     continue
-                part = ("--%s\r\nContent-Type: image/jpeg\r\nContent-Length: %d\r\n\r\n"
-                        % (STREAM_BOUNDARY, len(last))).encode("ascii") + last + b"\r\n"
+                if sse:
+                    part = sse_event(last)
+                    size = len(last) * 3 // 4
+                else:
+                    part = ("--%s\r\nContent-Type: image/jpeg\r\nContent-Length: %d\r\n\r\n"
+                            % (STREAM_BOUNDARY, len(last))).encode("ascii") + last + b"\r\n"
+                    size = len(last)
                 write(part)
-                last_sent = time.monotonic()
+                last_sent = last_write = time.monotonic()
                 stream_parts += 1
                 if debuglog.LOG._enabled and last_sent - stream_logged >= 10.0:
                     stream_logged = last_sent
                     debuglog.log("render", "debug", "stream frames", {
-                        "tab": ident, "fps": self.stream_fps(tab), "bytes": len(last)})
+                        "tab": ident, "fps": self.stream_fps(tab), "bytes": size})
                 with self._lock:
                     tab.stream_times.append(last_sent)
-                    tab.stream_bytes = len(last)
+                    tab.stream_bytes = size
                     tab.last_poll = self._last_activity = self._clock()
         finally:
             debuglog.log("net", "info", "stream disconnect", {
                 "tab": ident, "seconds": int(time.monotonic() - stream_started), "parts": stream_parts})
             with self._lock:
+                if stop in tab.stream_stops:
+                    tab.stream_stops.remove(stop)
                 tab.streams -= 1
                 self._streams -= 1
                 tab.pollers -= 1

@@ -69,13 +69,80 @@ def display_tiles(ph):
             20, "tile images loaded")
 
 
+LIVE_SHOWN = "(()=>{const i=document.getElementById('remoteImg');return !i.hidden&&i.naturalWidth>0})()"
+
+
 @scenario("display-live", display="live")
 def display_live(ph):
+    """The live picture arrives over whichever transport works here (MJPEG first, then SSE, then polling)."""
     tab = ph.open("/article.html")
     ph.wait(lambda: ph.display() == "live", 5, "display live")
-    ph.wait(lambda: ph.js("(()=>{const i=document.getElementById('remoteImg');return !i.hidden&&i.naturalWidth>0})()"),
-            20, "live frame visible")
+    ph.wait(lambda: ph.js(LIVE_SHOWN), 20, "live frame visible")
     ph.wait(lambda: ph.env.tabs()[tab].seq > 0, 10, "server has produced frames (seq>0)")
+    kind = ph.js("state.rbStream ? state.rbStream.kind : 'poll'")
+    assert kind in ("mjpeg", "sse", "poll"), kind
+    ph.notes.append("transport " + kind)
+    perf = ph.js("(()=>{setPerf(true);return perfText()})()")
+    assert "ライブ(" in perf, perf
+
+
+@scenario("live-sse-fallback", display="live")
+def live_sse_fallback(ph):
+    """MJPEG never delivers a byte (buffering proxy): after 2.5 s the client reads the event stream and draws
+    the frames; the working transport is remembered for the next start."""
+    ph.env.blocked.add("mjpeg")
+    t0 = time.monotonic()
+    tab = ph.open("/article.html")
+    ph.wait(lambda: ph.display() == "live", 5, "display live")
+    ph.wait(lambda: ph.js("state.rbStream && state.rbStream.kind") == "sse", 10, "switched to SSE")
+    ph.wait(lambda: ph.js(LIVE_SHOWN), 15, "SSE frame visible")
+    assert ph.js("document.getElementById('remoteImg').src").startswith("blob:"), "frames are drawn as blob images"
+    ph.wait(lambda: ph.env.tabs()[tab].seq > 0 and ph.env.tabs()[tab].streams >= 1, 10, "server streams to the phone")
+    ph.notes.append("SSE after %.1fs" % (time.monotonic() - t0))
+    assert ph.env.stream_hits["sse"] >= 1 and ph.env.stream_hits["mjpeg"] >= 1
+    perf = ph.js("(()=>{setPerf(true);return perfText()})()")
+    assert "ライブ(SSE: MJPEGの最初の画面が届かない)" in perf, perf
+    assert ph.js("JSON.parse(localStorage.getItem(RB_LIVE_PREF_KEY)).t") == "sse"
+    # at most two object URLs alive: the shown one (and the one being decoded)
+    # remembered: a new app start goes straight to SSE and does not touch MJPEG again today
+    hits = ph.env.stream_hits["mjpeg"]
+    ph.page.reload()
+    ph.page.wait_for_selector("#omnibox", state="attached")
+    ph.wait(lambda: ph.js("state.authed === true"), 10, "session after reload")
+    ph.wait(lambda: ph.js("state.rbStream && state.rbStream.kind") == "sse", 20, "SSE again after reload")
+    ph.wait(lambda: ph.js(LIVE_SHOWN), 15, "SSE frame visible after reload")
+    assert ph.env.stream_hits["mjpeg"] == hits, "MJPEG was retried although SSE was remembered"
+
+
+@scenario("live-polling-fallback", display="live")
+def live_polling_fallback(ph):
+    """Neither stream delivers: the client ends on frame.jpg polling and says why."""
+    ph.env.blocked.update(("mjpeg", "sse"))
+    tab = ph.open("/article.html")
+    ph.wait(lambda: ph.display() == "live", 5, "display live")
+    ph.wait(lambda: ph.js("(()=>{const t=activeWebTab();return !!(t&&t.rb&&t.rb.streamFailed)})()"), 20, "gave up on streams")
+    ph.wait(lambda: ph.js(LIVE_SHOWN), 20, "polled frame visible")
+    perf = ph.js("(()=>{setPerf(true);return perfText()})()")
+    assert "ライブ(ポーリング: " in perf, perf
+    assert ph.js("JSON.parse(localStorage.getItem(RB_LIVE_PREF_KEY)).t") == "poll"
+
+
+@scenario("copy-fallback")
+def copy_fallback(ph):
+    """No navigator.clipboard (plain http): the copy buttons use a hidden textarea + execCommand('copy')."""
+    ph.js("""()=>{
+      Object.defineProperty(navigator,'clipboard',{value:undefined,configurable:true});
+      window.__copied=null;
+      document.execCommand=function(cmd){const a=document.activeElement;
+        window.__copied={cmd,text:a&&a.value,tag:a&&a.tagName};return true;};
+    }""")
+    assert ph.js("copyText('こんにちは hello')")
+    got = ph.js("window.__copied")
+    assert got == {"cmd": "copy", "text": "こんにちは hello", "tag": "TEXTAREA"}, got
+    assert ph.js("document.querySelectorAll('body > textarea').length") == 0, "the helper textarea is removed"
+    # and when even that is refused the caller is told (the long-press hint is shown)
+    ph.js("()=>{document.execCommand=function(){return false}}")
+    assert ph.js("copyText('x')") is False
 
 
 # ------------------------------------------------------------------ mirror: taps, navigation, menus
@@ -309,10 +376,16 @@ def selftest(ph):
     assert snap["client"] == "received" and len(client) >= 8, "client section: %s" % [(c["id"], c["status"]) for c in client]
     bad = [(c["id"], c["status"], c["value"]) for c in client if c["status"] == "fail"]
     assert not bad, "failed client checks (this browser): %s" % bad
+    for cid in ("client.live", "client.secure", "client.clipboard", "env.cgroup"):
+        assert cid in checks, "missing check " + cid
+    live = checks["client.live"]
+    assert live["status"] != "fail" and "経路:" in live["value"], live
+    ph.notes.append("live: " + live["value"][:60])
     events = checks["client.mirror_events"]
     assert events["status"] == "pass", "mirror taps did not reach the app's listeners here: %s" % events
     sites = [c for c in snap["checks"] if c["section"] == "sites"]
     assert [c["id"] for c in sites][:1] == ["site.1.open"] and not [c for c in sites if c["status"] == "fail"], sites
+    assert "DOMContentLoaded" in checks["site.1.open"]["value"], checks["site.1.open"]
     assert checks["cleanup.tabs"]["status"] == "pass"
     assert ph.env.rb.selftest_tabs() == [] and ph.env.tabs() == {}, "tabs left behind: %s" % list(ph.env.tabs())
     # the view shows summary and tables; the copied text is a self-contained report
@@ -323,7 +396,8 @@ def selftest(ph):
     text = ph.js("selftestUi.text")
     for needle in ("== QnapDownloader 自己テスト", "app: v" + ph.env.version, "[NAS] cpu=", "[Phone] ua=", "viewport=",
                    "## 環境", "## 内蔵テストページ", "## この端末", "## 実サイト", "## 後片付け", "builtin.reader", "client.mirror_events",
-                   "value:", "threshold:", "## debug log (last 50 lines"):
+                   "value:", "threshold:", "## debug log (last 50 lines", "[Source] cgroup=", "[Live] transport=", "env.cgroup",
+                   "client.secure"):
         assert needle in text, "report lacks %r" % needle
     assert "a.example.com" in text and "/article.html" not in text, "real-site URLs must be reduced to the host by default"
     assert text.count("\n") < 400

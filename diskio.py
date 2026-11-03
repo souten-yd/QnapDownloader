@@ -153,39 +153,150 @@ def _read(path):
         return handle.read()
 
 
-def container_cgroup_candidates(ref, root=DEFAULT_CGROUP_ROOT, proc="/proc"):
-    """Candidate cgroup directories [(version, dir)] for a container ref {id, pid}.
+_V1_CONTROLLERS = ("blkio", "memory")
+SCAN_DEPTH = 3               # directories below a hierarchy root searched for the container's id
+SCAN_LIMIT = 400             # directories looked at in total (the scan is only a last resort)
 
-    Reusable (v0.1.36 reads memory.current from the same directory). The init process' own
-    /proc/<pid>/cgroup comes first (exact), then the usual Docker locations for both cgroup layouts.
+
+def _unescape_mount(text):
+    """Mountinfo escapes space, tab, newline and backslash as octal (\\040)."""
+    return re.sub(r"\\([0-7]{3})", lambda m: chr(int(m.group(1), 8)), text)
+
+
+def parse_mountinfo_cgroups(text):
+    """[(version, mountpoint, controllers, root)] of every cgroup / cgroup2 mount in /proc/self/mountinfo.
+
+    `controllers` is a frozenset of the v1 controller names ({'memory'}, {'cpu', 'cpuacct'}, ...), empty for v2.
+    `root` is the mount's root inside the hierarchy ('/' for a mount of the whole tree).
+    """
+    mounts = []
+    for line in text.splitlines():
+        left, sep, right = line.partition(" - ")
+        if not sep:
+            continue
+        fields = left.split()
+        after = right.split()
+        if len(fields) < 5 or not after:
+            continue
+        root, point = _unescape_mount(fields[3]), _unescape_mount(fields[4])
+        if after[0] == "cgroup2":
+            mounts.append((2, point, frozenset(), root))
+        elif after[0] == "cgroup":
+            options = after[2].split(",") if len(after) > 2 else []
+            names = frozenset(o for o in options if o and not o.startswith(("release_agent=", "xattr", "noprefix", "clone_children"))
+                              and o not in ("rw", "ro"))
+            mounts.append((1, point, names, root))
+    return mounts
+
+
+def read_cgroup_mounts(root=DEFAULT_CGROUP_ROOT, proc="/proc"):
+    """Cgroup mounts from `<proc>/self/mountinfo`; without that file the conventional layout under `root`."""
+    try:
+        mounts = parse_mountinfo_cgroups(_read("%s/self/mountinfo" % proc))
+    except OSError:
+        mounts = []
+    if mounts:
+        return mounts, "mountinfo"
+    guess = [(2, root, frozenset(), "/")]
+    guess += [(1, "%s/%s" % (root, name), frozenset([name]), "/") for name in _V1_CONTROLLERS]
+    return guess, "default"
+
+
+def _join_hierarchy(point, hroot, path):
+    """Directory for a cgroup `path` (as /proc/<pid>/cgroup shows it) inside a mount, or None."""
+    if ".." in path.split("/"):
+        return None
+    if hroot not in ("", "/"):
+        if path == hroot:
+            path = "/"
+        elif path.startswith(hroot.rstrip("/") + "/"):
+            path = path[len(hroot.rstrip("/")):]
+        else:
+            return None            # the container's cgroup is outside what this mount shows
+    return os.path.join(point, path.lstrip("/")) if path.strip("/") else point
+
+
+def _scan_for_id(top, ident):
+    """Directories named `ident` / `docker-<ident>.scope` / `cri-containerd-<ident>.scope` below `top`."""
+    wanted = {ident, "docker-%s.scope" % ident}
+    found, seen, queue = [], 0, [(top, 0)]
+    while queue and seen < SCAN_LIMIT:
+        directory, depth = queue.pop(0)
+        try:
+            with os.scandir(directory) as entries:
+                for entry in entries:
+                    try:
+                        if not entry.is_dir(follow_symlinks=False):
+                            continue
+                    except OSError:
+                        continue
+                    seen += 1
+                    if entry.name in wanted:
+                        found.append(entry.path)
+                    elif depth + 1 < SCAN_DEPTH and seen < SCAN_LIMIT:
+                        queue.append((entry.path, depth + 1))
+        except OSError:
+            continue
+    return found
+
+
+def container_cgroup_sources(ref, root=DEFAULT_CGROUP_ROOT, proc="/proc"):
+    """Candidate cgroup directories [(version, dir, how)] for a container ref {id, pid}.
+
+    How: "proc" = the container's own /proc/<pid>/cgroup joined with each mounted hierarchy from
+    /proc/self/mountinfo (exact; works for any prefix such as docker/, system.slice/ or
+    container-station/); "guess" = the usual Docker locations; "scan" = a bounded search for the
+    container id below each hierarchy. Nothing is validated for a particular controller here.
     """
     found = []
+    mounts, mount_source = read_cgroup_mounts(root, proc)
     pid = ref.get("pid") or 0
     if isinstance(pid, int) and pid > 0:
         try:
-            for controllers, path in parse_proc_cgroup(_read("%s/%d/cgroup" % (proc, pid))):
-                if ".." in path.split("/"):
-                    continue
-                if controllers == "":
-                    found.append((2, os.path.join(root, path.lstrip("/"))))
-                elif "blkio" in controllers.split(",") or "memory" in controllers.split(","):
-                    sub = "blkio" if "blkio" in controllers.split(",") else "memory"
-                    found.append((1, os.path.join(root, sub, path.lstrip("/"))))
+            entries = parse_proc_cgroup(_read("%s/%d/cgroup" % (proc, pid)))
         except OSError:
-            pass
+            entries = []
+        for controllers, path in entries:
+            names = set(c for c in controllers.split(",") if c)
+            for version, point, mount_controllers, hroot in mounts:
+                if version == 2 and not names:
+                    pass
+                elif version == 1 and names and (names & mount_controllers):
+                    pass
+                else:
+                    continue
+                if version == 1 and not (mount_controllers & set(_V1_CONTROLLERS)):
+                    continue           # cpu, devices, freezer ...: no I/O or memory counters
+                directory = _join_hierarchy(point, hroot, path)
+                if directory:
+                    found.append((version, directory, "proc"))
     ident = ref.get("id") or ""
     if re.fullmatch(r"[0-9a-f]{12,64}", ident):
-        found += [(2, "%s/system.slice/docker-%s.scope" % (root, ident)),
-                  (2, "%s/docker/%s" % (root, ident)),
-                  (1, "%s/blkio/docker/%s" % (root, ident)),
-                  (1, "%s/blkio/system.slice/docker-%s.scope" % (root, ident)),
-                  (1, "%s/memory/docker/%s" % (root, ident)),
-                  (1, "%s/memory/system.slice/docker-%s.scope" % (root, ident))]
-    unique = []
-    for item in found:
-        if item not in unique:
-            unique.append(item)
+        found += [(2, "%s/system.slice/docker-%s.scope" % (root, ident), "guess"),
+                  (2, "%s/docker/%s" % (root, ident), "guess")]
+        for name in _V1_CONTROLLERS:
+            found += [(1, "%s/%s/docker/%s" % (root, name, ident), "guess"),
+                      (1, "%s/%s/system.slice/docker-%s.scope" % (root, name, ident), "guess"),
+                      (1, "%s/%s/container-station/docker/%s" % (root, name, ident), "guess"),
+                      (1, "%s/%s/container-station/%s" % (root, name, ident), "guess")]
+        for version, point, mount_controllers, hroot in mounts:
+            if version == 1 and not (mount_controllers & set(_V1_CONTROLLERS)):
+                continue
+            if hroot not in ("", "/") or (version == 2 and mount_source != "mountinfo"):
+                continue           # (a guessed v2 root would also list the v1 hierarchies below it)
+            for directory in _scan_for_id(point, ident):
+                found.append((version, directory, "scan"))
+    unique, seen = [], set()
+    for version, directory, how in found:
+        if directory not in seen:
+            seen.add(directory)
+            unique.append((version, directory, how))
     return unique
+
+
+def container_cgroup_candidates(ref, root=DEFAULT_CGROUP_ROOT, proc="/proc"):
+    """Candidate cgroup directories [(version, dir)] for a container ref {id, pid} (see container_cgroup_sources)."""
+    return [(v, d) for v, d, _ in container_cgroup_sources(ref, root, proc)]
 
 
 def container_cgroup_paths(runtime, name, root=DEFAULT_CGROUP_ROOT, proc="/proc"):
@@ -194,13 +305,65 @@ def container_cgroup_paths(runtime, name, root=DEFAULT_CGROUP_ROOT, proc="/proc"
     `runtime.container_ref(name)` supplies id/pid. Returns [] when the container is not running or
     nothing is readable. Directories are not validated for a particular controller.
     """
+    return [(v, d) for v, d, _ in container_cgroup_found(runtime, name, root, proc)]
+
+
+def container_cgroup_found(runtime, name, root=DEFAULT_CGROUP_ROOT, proc="/proc"):
+    """Like container_cgroup_paths but [(version, dir, how)]; how is "proc", "guess" or "scan"."""
     try:
         ref = runtime.container_ref(name)
     except Exception:
         return []
     if not ref or not ref.get("running"):
         return []
-    return [(v, d) for v, d in container_cgroup_candidates(ref, root, proc) if os.path.isdir(d)]
+    return [item for item in container_cgroup_sources(ref, root, proc) if os.path.isdir(item[1])]
+
+
+def cgroup_layout_summary(root=DEFAULT_CGROUP_ROOT, proc="/proc"):
+    """Short text of the mounted cgroup hierarchies (for the self-test report): 'v1: blkio,memory' / 'v2'."""
+    mounts, source = read_cgroup_mounts(root, proc)
+    v1 = sorted(set(c for version, _, controllers, _ in mounts if version == 1 for c in controllers
+                    if c in _V1_CONTROLLERS))
+    parts = []
+    if any(version == 2 for version, _, _, _ in mounts):
+        parts.append("v2")
+    if any(version == 1 for version, _, _, _ in mounts):
+        parts.append("v1(%s)" % (",".join(v1) or "なし"))
+    return ("+".join(parts) or "不明") + ("" if source == "mountinfo" else "（推測）")
+
+
+def cgroup_report(runtime, name, root=DEFAULT_CGROUP_ROOT, proc="/proc", read_memory=None):
+    """What can be read for one container (self-test row env.cgroup): {running, io, mem, dir, how, pid_cgroup, mounts}.
+
+    `io` / `mem` name the working source ("cgroup v1", "cgroup v2") or None (then docker stats is the fallback);
+    `pid_cgroup` (first lines of /proc/<pid>/cgroup) and `mounts` are the facts needed to learn an unknown layout.
+    """
+    out = {"running": False, "io": None, "mem": None, "dir": None, "how": None, "pid_cgroup": [], "mounts": []}
+    try:
+        ref = runtime.container_ref(name)
+    except Exception:
+        ref = None
+    if not ref or not ref.get("running"):
+        return out
+    out["running"] = True
+    found = [item for item in container_cgroup_sources(ref, root, proc) if os.path.isdir(item[1])]
+    paths = [(v, d) for v, d, _ in found]
+    got = read_container_cgroup_io(paths) if paths else None
+    out["io"] = None if got is None else got[2]
+    if read_memory is not None and paths:
+        mem = read_memory(paths)
+        out["mem"] = None if mem is None else mem.get("source")
+    if found:
+        out["dir"], out["how"] = found[0][1], found[0][2]
+    pid = ref.get("pid") or 0
+    if isinstance(pid, int) and pid > 0:
+        try:
+            out["pid_cgroup"] = [("%s:%s" % (c, p))[:90] for c, p in parse_proc_cgroup(_read("%s/%d/cgroup" % (proc, pid)))[:4]]
+        except OSError:
+            pass
+    mounts, _ = read_cgroup_mounts(root, proc)
+    out["mounts"] = ["v%d@%s(%s)" % (v, point, ",".join(sorted(c)) or "-") for v, point, c, _ in mounts[:6]]
+    return out
 
 
 def read_container_cgroup_io(paths):

@@ -35,7 +35,7 @@ import state_hub
 import ttlcache
 import updater
 
-VERSION = "0.1.45"
+VERSION = "0.1.46"
 PORT = 17864
 ROOT = Path(__file__).resolve().parent
 FILES = {"/": ("web/index.html", "text/html; charset=utf-8"),
@@ -470,6 +470,31 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Permissions-Policy", "geolocation=(),camera=(),microphone=(),payment=()")
         self.send_header("Content-Security-Policy", CSP)
 
+    def stream_sse(self, tab_id):
+        """Live display as an event stream (v0.1.46). Runs until the viewer leaves (or after 10 minutes)."""
+        started = []
+
+        def write(part):
+            if not started:
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("X-Accel-Buffering", "no")
+                self.send_header("Connection", "close")
+                self.security_headers()
+                self.end_headers()
+                started.append(True)
+            self.wfile.write(part)
+            self.wfile.flush()
+
+        self.connection.settimeout(10)
+        self.close_connection = True
+        try:
+            self.server.rb.stream(tab_id, write, sse=True)
+        except OSError:
+            pass
+        if not started:
+            raise remote_browser.TabGone("このタブはすでに閉じられています")
+
     def stream_mjpeg(self, tab_id):
         """Live display push stream (multipart/x-mixed-replace). Runs until the viewer leaves."""
         started = []
@@ -860,7 +885,8 @@ class Handler(BaseHTTPRequestHandler):
                 # caller-provided file path or the updater's internal directory.
                 return self.send_data(200, {"log": self.server.updates.log_tail()})
             if path == "/api/rb/status":
-                return self.send_data(200, self.cached("rb:status", state_hub.RB_TTL, self.server.rb.status))
+                return self.send_data(200, self.cached(
+                    "rb:status:fresh", state_hub.RB_TTL, lambda: self.server.rb.status(fresh_memory=True)))
             if path == "/api/rb/log":
                 # RAM ring only (early-exit reasons from the browser container).
                 return self.send_data(200, {"lines": self.server.rb.log_lines()})
@@ -924,6 +950,11 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/rb/stream.mjpg":
                 query = parse_qs(urlsplit(self.path).query)
                 return self.stream_mjpeg(query.get("tab", [""])[0])
+            if path == "/api/rb/stream.sse":
+                # v0.1.46: the same live frames as Server-Sent Events (base64 JPEG), for proxies that
+                # buffer multipart/x-mixed-replace but flush text/event-stream at once.
+                query = parse_qs(urlsplit(self.path).query)
+                return self.stream_sse(query.get("tab", [""])[0])
             if path == "/api/rb/reader/img":
                 # Reader mode: one image, read through the NAS browser (never a remote URL).
                 query = parse_qs(urlsplit(self.path).query)

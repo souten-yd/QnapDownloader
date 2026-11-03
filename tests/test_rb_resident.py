@@ -340,11 +340,17 @@ class IdleSampleTests(ResidentBase):
     def test_falls_back_to_docker_stats_and_reports_unavailable(self):
         self.rb.set_resident(True)
         self.fake.stats_out = "512MiB / 2GiB|25.00%"
-        memory = self.rb.status()["resident"]["memory"]
+        memory = self.rb.status(fresh_memory=True)["resident"]["memory"]
         self.assertEqual((memory["used_mib"], memory["source"], memory["anon_mib"]), (512, "docker stats", None))
         self.fake.stats_fail = True
-        self.clock.now += 10
+        self.clock.now += 40
+        self.assertIsNone(self.rb.status(fresh_memory=True)["resident"]["memory"])
+        # the default status (the /api/state path) never starts docker stats
+        self.fake.stats_fail = False
+        calls = len([c for c in self.fake.docker_calls() if c[0] == "stats"])
+        self.clock.now += 40
         self.assertIsNone(self.rb.status()["resident"]["memory"])
+        self.assertEqual(len([c for c in self.fake.docker_calls() if c[0] == "stats"]), calls)
 
     def test_memory_reads_are_cached_five_seconds(self):
         self.set_cgroup(400 * MIB)
