@@ -162,9 +162,12 @@ def mirror_security(ph):
         await new Promise(r=>setTimeout(r,400));
         const r={inline:f.contentWindow.pwned===undefined,handler:f.contentWindow.pwned2===undefined};s.remove();i.remove();return r}""")
     assert out["inline"] and out["handler"], "injected script / handler ran in the mirror: %s" % out
-    # the browser reports each blocked attempt as a console error: that is the CSP doing its job
-    blocked = ph.take_errors("violates the following Content Security Policy")
-    assert blocked, "the CSP did not report the blocked inline script / handler"
+    # Chrome reports each blocked attempt as a console error (the CSP doing its job). WebKit words
+    # it differently and may not surface frame messages at all: there the "did not run" check above
+    # is the assertion that matters.
+    blocked = ph.take_errors("Content Security Policy") + ph.take_errors("Refused to execute")
+    if ph.engine == "chromium":
+        assert blocked, "the CSP did not report the blocked inline script / handler"
 
 
 # ------------------------------------------------------------------ reader
