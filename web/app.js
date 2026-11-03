@@ -7948,9 +7948,33 @@ async function selftestLiveStep(tab, holder) {
   } else {
     how = "このブラウザはストリームを読めません";
   }
+  // v0.1.44: some browsers display the stream in <img> but cannot read it with fetch (WebKit reports
+  // "Load failed"). Then the frames are counted with the polling fallback the app itself would use.
+  if (frames === 0) {
+    const started = performance.now();
+    let seq = 0;
+    while (performance.now() - started < SELFTEST_LIVE_MS) {
+      try {
+        const res = await fetch("/api/rb/frame.jpg?tab=" + encodeURIComponent(tab) + "&since=" + seq,
+          {cache: "no-store", credentials: "same-origin"});
+        if (res.status !== 200 && res.status !== 204) break;
+        const n = Number(res.headers.get("X-Frame-Seq"));
+        if (res.status === 200) {
+          const blob = await res.blob();
+          if (blob.size > 0 && n !== seq) { frames++; bytes += blob.size; }
+        }
+        if (Number.isFinite(n)) seq = n;
+      } catch (e) {
+        break;
+      }
+    }
+    elapsed = performance.now() - started;
+    if (frames > 0) how = (how === "stream" ? "" : how + " → ") + "ポーリングで計測";
+  }
   const fps = Math.round(frames / Math.max(elapsed / 1000, 0.1) * 10) / 10;
   const out = {ok: frames > 0, fps, kb: frames ? Math.round(bytes / frames / 1024) : 0, ms: firstMs,
-    flags: {img: first}, note: first ? (how === "stream" ? "最初の画面 " + firstMs + " ms" : how) : "最初の画面が届かない（5秒）"};
+    flags: {img: first, polled: how.indexOf("ポーリングで計測") >= 0},
+    note: first ? (how === "stream" ? "最初の画面 " + firstMs + " ms" : how) : "最初の画面が届かない（5秒）"};
   return out;
 }
 
