@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>E2E ダウンロードリンク</title>
+<style>body{font:16px/1.7 sans-serif;margin:0}main{padding:12px 14px}a{color:#0a58ca}</style></head><body>
+<main><article>
+<h1>第02巻 ダウンロード</h1>
+<p>これはファイルホスターのリンクが並ぶ典型的な投稿ページを模した、E2E テスト用の記事です。</p>
+<!-- 1: label + name + size in one block -->
+<p>RapidGator | <a href="https://dl.example.net/f/aaaaaaaaaaaaaaaaaaaaaaaa1">[Group]sample_title_volume_02_part1.rar</a><br>(66.76 MB)</p>
+<!-- 2: no label, size in the link text -->
+<p><a href="https://dl.example.net/f/bbbbbbbbbbbbbbbbbbbbbbbb2">[Group]sample_title_volume_02_part2.rar (12.3 MB)</a></p>
+<!-- 3: label, name, size arrives in the next block -->
+<p>FreeDL | <a href="https://dl.example.net/f/cccccccccccccccccccccccc3">[Group]sample_title_volume_02_part3.rar</a></p>
+<p>(5.5 MB)</p>
+<p>ページ送り:</p>
+<p><a href="/p/1">1</a> <a href="/p/2">2</a> <a href="/p/3">3</a> <a href="/p/4">4</a> »</p>
+<p>これは本文の最後の段落です。通常の文章はそのまま読めるように表示されます。The quick brown fox jumps over the lazy dog.</p>
+</article></main>
+<script>fetch("/__beacon?e=load&p=" + encodeURIComponent(location.pathname), {cache: "no-store"}).catch(function () {});</script>
+</body></html>

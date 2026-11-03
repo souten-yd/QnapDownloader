@@ -1,0 +1,64 @@
+# テスト
+
+## 単体・安全性テスト
+`scripts/verify.sh`（構文チェック、`python3 -m unittest discover -s tests`、node構文チェック、安全性grep）。リリース前に必ず実行する。
+
+## E2E（iPhone相当の実ブラウザ）
+手で見つかった不具合（iPhone Safariでミラーのタップが届かない、`<a href="#">` のメニューが再読み込みになる、
+ページ遷移後に古いスクロール位置が残る、アプリ再読み込みでNASタブが増える、確認画面からの復帰が遅い、など）を
+出荷前に機械的に検出するためのスイート。`tests/e2e/` にあり、`verify.sh` の単体テスト探索には含まれない。
+
+```
+scripts/e2e.sh                                   # chromium + webkit。成果物は ./e2e-artifacts
+scripts/e2e.sh --engines chromium --only mirror  # 名前に "mirror" を含むシナリオだけ
+python3 tests/e2e/run.py --engines chromium,webkit --out /tmp/e2e
+```
+
+構成（すべてローカル。外部へは出ない）:
+
+| 役割 | 実体 |
+|---|---|
+| 手元の「iPhone」 | Playwright の `chromium`（390x844 DPR3 タッチ）と `webkit`（`devices["iPhone 13"]`）。入力は常にタッチ（`touchscreen.tap` / CDP タッチ） |
+| Hub | 本物の `webapp.Handler`（同一プロセス）。コンテナ層だけ `tests/fake_docker.py` |
+| NASのブラウザ | 本物のヘッドレス Chrome。`RemoteBrowser` 自身の CDP クライアントで操作 |
+| 閲覧先 | `tests/e2e/fixtures/*.html` を配る自己署名 https サーバー。`a.example.com` などは **NAS側Chromeだけ** `--host-resolver-rules` と `--ignore-certificate-errors` でこのサーバーへ向ける（アプリのURL検証は本番と同じ） |
+
+- WebKit が入っていない環境（この開発環境など）では webkit は「SKIP（browser not installed）」になり、終了コードは変わらない。
+  `python -m playwright install --with-deps webkit` で入れられる。CI（`.github/workflows/e2e.yml`）では chromium と webkit の両方を入れて実行する。
+- NAS側Chromeは `--nas-chrome` / `$E2E_NAS_CHROME` / PATH上の `google-chrome` の順で探し、無ければ Playwright の chromium を使う。
+- 失敗したシナリオは `--out` に `<engine>-<name>-fail.png`（スクリーンショット）と `-fail.txt`（例外・コンソールエラー・NASタブ・フィクスチャへのアクセス数）を残す。
+- シナリオごとにブラウザの `console.error` / `pageerror` を集め、許可リスト（`harness.CONSOLE_ALLOW`）以外があれば失敗にする。
+  わざと起こすエラー（CSPのブロック等）は `ph.take_errors(...)` で取り除く。
+
+### シナリオ一覧
+settings-routes / display-reader・mirror・tiles・live / mirror-tap-link（クリックを止めたiOS相当のタップ・遷移後スクロール0）/
+mirror-menu-toggle（`href="#"` と自ページ宛の2種類のトグルが再読み込みにならない）/ mirror-dynamic / mirror-security（CSP・スクリプト不実行）/
+reader-cards（ラベル・サイズあり/なし、ページ送りチップ）/ gesture-flick-mirror・tiles、gesture-close-tab（Chromiumのみ: CDPタッチが必要）/
+reload-reattach / auto-live-fast・mirror（リダイレクト後 6 秒以内に元の表示へ）。
+
+未対応: 長押しのhosterプローブ（`rapidgator.net` 等の実ドメインが必要でフィクスチャに向けられないため）。
+
+### シナリオの追加方法
+1. 必要なら `tests/e2e/fixtures/<name>.html` を追加する（`/<name>.html` で配信される。ページ内スクリプトは
+   `fetch("/__beacon?e=<event>&p=<detail>")` でサーバーに合図でき、`env.fx.beacon_count(event, detail)` / `env.fx.count(path)` で確認できる）。
+   画像は `/img/<幅>/<高さ>.png?c=rrggbb` が使える。
+2. `tests/e2e/scenarios.py` に関数を足す:
+
+```python
+@scenario("my-case", engines=("chromium", "webkit"), display="mirror")   # display = 設定のRB既定表示
+def my_case(ph):
+    tab = ph.open("/article.html")                       # オムニボックスから開く
+    ph.wait(lambda: "E2E" in ph.mirror_text(), 15, "mirror content")
+    pt = ph.mirror_point("doc=>doc.querySelector('a[data-href]')")
+    ph.tap(pt["x"], pt["y"])                              # タッチ。clickは使わない
+    ph.wait(lambda: ph.env.nas_url(tab).endswith("/article2.html"), 10, "navigated")
+```
+   WebKit で再現できない操作は `raise harness.Skip("理由")`、または `engines=("chromium",)` にする。
+3. `scripts/e2e.sh --only my-case --engines chromium` で確認し、わざとアプリを壊して（例: `web/app.js` の該当処理を消して）失敗することも確かめる。
+
+### リリースワークフローへ
+リリースブランチのワークフローでは、`scripts/verify.sh` の直後に次の1行を足す:
+
+```
+      - run: python -m pip install playwright==1.63.0 && python -m playwright install --with-deps chromium webkit && bash scripts/e2e.sh --engines chromium,webkit --require-engines --out "$GITHUB_WORKSPACE/e2e-artifacts"
+```
