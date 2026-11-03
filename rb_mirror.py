@@ -735,11 +735,14 @@ var S=self.__qdm;if(!S)return {err:'gone'};
 var r=S.map.get(m),el=r?(r.deref?r.deref():r):null;
 if(!el||!el.isConnected)return {err:'gone'};
 var a=el.closest?el.closest('a[href],area[href]'):null;
-if(a){
+// v0.1.42: menu toggles are often links to "#" or to this very page, or carry ARIA/toggle
+// markers; the page's own script must handle those, so they are clicked, never navigated.
+var toggle=el.closest?el.closest('[aria-haspopup],[aria-expanded],[aria-controls],[data-toggle],[data-bs-toggle],[role=button],summary,button'):null;
+if(a&&!(toggle&&a.contains(toggle))&&!(toggle&&toggle.contains(a))){
  try{
   var u=new URL(a.getAttribute('href'),document.baseURI);
   var cur=new URL(location.href);
-  var same=u.hash&&u.href.split('#')[0]===cur.href.split('#')[0];
+  var same=u.href.split('#')[0]===cur.href.split('#')[0];
   if(/^https?:$/.test(u.protocol)&&u.href.length<=2048&&!same)return {link:u.href};
  }catch(e){}
 }
