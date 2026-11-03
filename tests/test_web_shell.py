@@ -869,7 +869,7 @@ if (o !== "リーダー · ブロック 3 · 画像 1/2 · 取得 600 ms · 画�
         self.assertIn("function syncChallenge(tab, challenge, loading)", self.js)
         self.assertIn("X-Frame-Challenge", self.js)
         # v0.1.29: the way back is a dedicated poll with two clean checks (challengeStep).
-        self.assertIn("function challengeStep(rb, challenge, loading, now, userLive)", self.js)
+        self.assertIn("function challengeStep(rb, challenge, loading, now, userLive, moved = false)", self.js)
         self.assertIn("AUTO_CLEAN_NEEDED = 2", self.js)
         self.assertIn("if (rb.autoLive) return \"live\";", self.js)
 
@@ -1336,7 +1336,7 @@ class GestureAndAutoLiveTest(unittest.TestCase):
         self.assertIn("stepHistory(tab, dx > 0 ? -1 : 1)", app)
         self.assertIn("GESTURE_EDGE_PX", app)             # screen edges stay with iOS
         self.assertIn("離すとタブを閉じます", app)
-        self.assertIn("now - rb.autoQuiet < AUTO_SETTLE_MS", app)
+        self.assertIn("now - rb.autoQuiet < (moved ? AUTO_SETTLE_MOVED_MS : AUTO_SETTLE_MS)", app)
         rb = (Path(__file__).resolve().parents[1] / "remote_browser.py").read_text(encoding="utf-8")
         self.assertIn("innerText)||'').length<400", rb)
 
@@ -1366,3 +1366,17 @@ class MirrorToggleAndLostTabTest(unittest.TestCase):
         start = app.index("function remoteLost(tab)")
         self.assertIn('tab.error = "";', app[start:start + 1200])
         self.assertIn('"もう一度開く"', app)
+
+
+class ReturnFasterTest(unittest.TestCase):
+    """v0.1.43: NAS tab reattached after a reload, one open per tab, faster way back from auto-live."""
+
+    def test_reattach_dedupe_and_auto_live(self):
+        root = Path(__file__).resolve().parents[1]
+        app = (root / "web" / "app.js").read_text(encoding="utf-8")
+        rb = (root / "remote_browser.py").read_text(encoding="utf-8")
+        self.assertIn("async function reattachRemote(tab)", app)
+        self.assertIn("nas: t.rb ? t.rb.id", app)
+        self.assertIn("tab.opening && tab.opening.url === url", app)
+        self.assertIn("moved ? 1 : AUTO_CLEAN_NEEDED", app)
+        self.assertIn("self._settle(tab, before_rev, wait_load=False)", rb)
