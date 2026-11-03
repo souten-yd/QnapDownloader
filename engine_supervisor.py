@@ -169,6 +169,7 @@ class EngineManager:
         self._machine = machine
         self._disk_usage = disk_usage
         self._lock = threading.RLock()
+        self._packagizer_checked = False   # Packagizer folder rules checked for this engine run
         self._ring = deque(maxlen=RING_LINES)
         self._ring_lock = threading.Lock()
         self._steps = [{"id": i, "label": l, "status": "pending", "detail": "", "progress": None}
@@ -807,6 +808,7 @@ class EngineManager:
 
     def _begin_supervision(self):
         with self._lock:
+            self._packagizer_checked = False
             self._want_running = True
             self._stop_evt.clear()
             thread = threading.Thread(target=self._supervise, daemon=True)
@@ -897,6 +899,17 @@ class EngineManager:
             folder = self.store.settings().get("download_dir")
             if not folder or not self.is_ours_running():
                 return 0
+            if not self._packagizer_checked:
+                # v0.1.48: once per engine run, disable Packagizer rules that create
+                # per-package folders (they override addLinks' destination).
+                self._packagizer_checked = True
+                try:
+                    rules = self.adapter.packagizer_folder_rules(True)
+                    if rules:
+                        debuglog.log("jd2", "info", "Packagizerのフォルダ規則",
+                                     {"result": str(rules.get("current"))[:200]})
+                except Exception as error:
+                    debuglog.log("jd2", "debug", "Packagizerの確認に失敗", {"error": str(error)[:120]})
             moved = jd2_transfer.flatten_waiting(self.adapter, folder)
         except Exception as error:
             debuglog.log("jd2", "debug", "フォルダ整理の巡回に失敗", {"error": str(error)[:120]})

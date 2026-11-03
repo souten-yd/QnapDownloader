@@ -279,6 +279,17 @@ def filter_config_keys(entries):
     return result
 
 
+def packagizer_rule_makes_folder(rule):
+    """An enabled Packagizer rule whose download destination is a per-package folder."""
+    if not isinstance(rule, dict) or rule.get("enabled") is not True:
+        return False
+    dest = rule.get("downloadDestination")
+    if not isinstance(dest, str):
+        return False
+    lowered = dest.lower()
+    return "<jd:packagename>" in lowered or "<jd:subfolderbyplugin>" in lowered
+
+
 class LocalAdapter:
     """Same interface the old remote adapter had; talks to 127.0.0.1 only.
 
@@ -689,7 +700,53 @@ class LocalAdapter:
                 except LocalUnavailable:
                     item["compliant"] = False
             report.append(item)
+        rules = self.packagizer_folder_rules(apply)
+        if rules is not None:
+            report.append(rules)
         return report
+
+    def packagizer_folder_rules(self, apply=False):
+        """v0.1.48: Packagizer rules that send files into a per-package folder.
+
+        JD2's Packagizer (PackagizerSettings.rulelist) ships rules whose download
+        destination contains <jd:packagename> (e.g. "subfolder by package name");
+        they win over addLinks' destinationFolder. Such enabled rules are reported and,
+        with apply=True, disabled (the whole list is written back and read back).
+        Returns a report item, or None when JD2 has no Packagizer rule list."""
+        handle, rules = None, None
+        for entry in self._config_entries():
+            interface = entry.get("interfaceName") or entry.get("configInterface")
+            key = entry.get("key")
+            storage = entry.get("storage")
+            if (isinstance(interface, str) and "packagizer" in interface.lower() and
+                    isinstance(key, str) and key.lower() == "rulelist" and
+                    (storage is None or isinstance(storage, str))):
+                handle = (interface, storage, key)
+                break
+        if handle is None:
+            return None
+        rules = self._call("config", "get", *handle)
+        if not isinstance(rules, list) or len(rules) > 500:
+            return {"interface": "PackagizerSettings", "key": "rulelist", "current": "読めません",
+                    "target": "パッケージ名フォルダのルールを無効", "compliant": False}
+        hits = [i for i, rule in enumerate(rules) if packagizer_rule_makes_folder(rule)]
+        names = [str(rules[i].get("name") or "")[:60] for i in hits]
+        item = {"interface": "PackagizerSettings", "key": "rulelist",
+                "current": ("有効: " + "、".join(names)) if hits else "該当ルールなし",
+                "target": "パッケージ名フォルダのルールを無効", "compliant": not hits}
+        if apply and hits:
+            updated = [dict(rule) for rule in rules]
+            for i in hits:
+                updated[i]["enabled"] = False
+            try:
+                done = self._call("config", "set", *handle, updated) is True
+                again = self._call("config", "get", *handle)
+                still = [r for r in again if packagizer_rule_makes_folder(r)] if isinstance(again, list) else [None]
+                item["compliant"] = done and not still
+                item["current"] = ("無効にしました: " + "、".join(names)) if item["compliant"] else "変更を確認できません"
+            except LocalUnavailable:
+                item["compliant"] = False
+        return item
 
     def add_link(self, url, destination, autostart=False):
         # `autostart` is the per-call flag of addLinks (Hub setting send_autostart);
