@@ -239,6 +239,7 @@
      <a href="#/settings/browser" data-section="browser">ブラウザ</a>
      <a href="#/settings/connection" data-section="connection">接続</a>
      <a href="#/settings/system" data-section="system">システム</a>
+     <a href="#/settings/diag" data-section="diag">診断</a>
     </nav>
     <div class="settings-body">
      <section class="settings-section" data-section="jd2" hidden>
@@ -525,43 +526,6 @@
        <p class="set-text muted">QPKGとして導入した環境のみ更新できます（JD2本体はJD2の「エンジン」）</p>
       </div>
 
-      <div class="sub" data-sub="diagnostics">
-       <h2>診断</h2>
-       <p class="set-text muted">手動で実行する読取専用の診断です</p>
-       <div class="actions">
-        <button type="button" id="diagnosticIo" class="btn">HubのI/Oを確認</button>
-       </div>
-       <p id="diagnosticResult" class="set-text muted" role="status" aria-live="polite"></p>
-
-       <h3 class="sub-h">ディスク書き込み</h3>
-       <div class="set-desc"><span class="set-text">NASのディスクへ書き込んでいる場所を測ります</span>
-        <details class="hint"><summary aria-label="詳しい説明">ⓘ</summary><p>HubとJD2・NASブラウザのコンテナ、NASの各ディスク／RAIDの書き込み量を10秒ごとに記録し（この画面を開いている間だけ。RAMのみでディスクには書きません）、直近1分・10分の平均と、開始からの合計を表示します。コンテナはcgroup、読めなければdocker statsから取得します。取得できない項目は「取得できません」と表示します。</p></details></div>
-       <div class="actions">
-        <button type="button" id="diskToggle" class="btn small primary">計測を開始</button>
-        <span id="diskState" class="set-text muted" role="status"></span>
-       </div>
-       <div class="table-wrap"><table class="data-table" aria-label="ディスク書き込み">
-        <thead><tr><th scope="col">項目</th><th scope="col">1分平均</th><th scope="col">10分平均</th><th scope="col">合計</th></tr></thead>
-        <tbody id="diskRows"><tr><td colspan="4" class="muted">読み込み中…</td></tr></tbody>
-       </table></div>
-
-       <h3 class="sub-h">デバッグログ</h3>
-       <div class="set-row">
-        <div class="set-main"><span class="set-label">ログを記録する</span>
-         <span class="set-desc"><span class="set-text" id="debugNote">オフ（RAMのみ・60分で自動オフ）</span>
-          <details class="hint"><summary aria-label="詳しい説明">ⓘ</summary><p>オンの間だけ、画面操作・通信・NASブラウザ・JD2・ディスクなどの動きをHubのRAM（最大5000件／2MiB）に記録します。ディスクには書きません。パスワード・トークン・Cookieは記録せず、URLはホスト名だけにします。60分で自動的にオフになります。「ダウンロード」を押したときだけ、この端末にファイルとして保存されます。</p></details></span></div>
-        <label class="switch" for="debugEnabled"><input type="checkbox" id="debugEnabled" role="switch" aria-label="デバッグログ"><span class="switch-track" aria-hidden="true"></span></label>
-       </div>
-       <div class="set-row">
-        <div class="set-main"><span class="set-label">記録するレベル</span></div>
-        <select id="debugLevel" class="inline-select" aria-label="記録するレベル"></select>
-       </div>
-       <div id="debugCats" class="switch-grid" role="group" aria-label="記録するカテゴリ"></div>
-       <div class="actions">
-        <button type="button" id="debugView" class="btn small primary">ログを見る</button>
-       </div>
-      </div>
-
       <div class="sub" data-sub="about">
        <h2>このアプリについて</h2>
        <p><b>QnapDownloader</b> <span class="js-version"></span></p>
@@ -583,6 +547,51 @@
         <li><a href="https://github.com/souten-yd/QnapDownloader/blob/main/docs/roadmap.md" target="_blank" rel="noopener noreferrer">ロードマップ</a></li>
        </ul>
       </div>
+     </section>
+
+     <section class="settings-section" data-section="diag" hidden>
+      <h1>診断</h1>
+      <div class="sub" data-sub="tools">
+       <h2>Hubの確認</h2>
+       <p class="set-text muted">手動で実行する読取専用の診断です</p>
+       <div class="actions">
+        <button type="button" id="diagnosticIo" class="btn">HubのI/Oを確認</button>
+       </div>
+       <p id="diagnosticResult" class="set-text muted" role="status" aria-live="polite"></p>
+      </div>
+
+      <div class="sub" data-sub="disk">
+       <h2>ディスク書き込み</h2>
+       <div class="set-desc"><span class="set-text">NASのディスクへ書き込んでいる場所を測ります</span>
+        <details class="hint"><summary aria-label="詳しい説明">ⓘ</summary><p>HubとJD2・NASブラウザのコンテナ、NASの各ディスク／RAIDの書き込み量を10秒ごとに記録し（この画面を開いている間だけ。RAMのみでディスクには書きません）、直近1分・10分の平均と、開始からの合計を表示します。コンテナはcgroup、読めなければdocker statsから取得します。取得できない項目は「取得できません」と表示します。</p></details></div>
+       <div class="actions">
+        <button type="button" id="diskToggle" class="btn small primary">計測を開始</button>
+        <span id="diskState" class="set-text muted" role="status"></span>
+       </div>
+       <div class="table-wrap"><table class="data-table" aria-label="ディスク書き込み">
+        <thead><tr><th scope="col">項目</th><th scope="col">1分平均</th><th scope="col">10分平均</th><th scope="col">合計</th></tr></thead>
+        <tbody id="diskRows"><tr><td colspan="4" class="muted">読み込み中…</td></tr></tbody>
+       </table></div>
+      </div>
+
+      <div class="sub" data-sub="debug">
+       <h2>デバッグログ</h2>
+       <div class="set-row">
+        <div class="set-main"><span class="set-label">ログを記録する</span>
+         <span class="set-desc"><span class="set-text" id="debugNote">オフ（RAMのみ・60分で自動オフ）</span>
+          <details class="hint"><summary aria-label="詳しい説明">ⓘ</summary><p>オンの間だけ、画面操作・通信・NASブラウザ・JD2・ディスクなどの動きをHubのRAM（最大5000件／2MiB）に記録します。ディスクには書きません。パスワード・トークン・Cookieは記録せず、URLはホスト名だけにします。60分で自動的にオフになります。「ダウンロード」を押したときだけ、この端末にファイルとして保存されます。</p></details></span></div>
+        <label class="switch" for="debugEnabled"><input type="checkbox" id="debugEnabled" role="switch" aria-label="デバッグログ"><span class="switch-track" aria-hidden="true"></span></label>
+       </div>
+       <div class="set-row">
+        <div class="set-main"><span class="set-label">記録するレベル</span></div>
+        <select id="debugLevel" class="inline-select" aria-label="記録するレベル"></select>
+       </div>
+       <div id="debugCats" class="switch-grid" role="group" aria-label="記録するカテゴリ"></div>
+       <div class="actions">
+        <button type="button" id="debugView" class="btn small primary">ログを見る</button>
+       </div>
+      </div>
+
      </section>
     </div>
    </div>

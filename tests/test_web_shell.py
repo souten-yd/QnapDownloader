@@ -356,10 +356,10 @@ const eq = (a, b, m) => { if (JSON.stringify(a) !== JSON.stringify(b)) { console
 
     def test_settings_order_and_auto_refresh_interval(self):
         order = re.findall(r'<a href="#/settings/(\w+)" data-section', self.html)
-        self.assertEqual(order, ["jd2", "browser", "connection", "system"])
+        self.assertEqual(order, ["jd2", "browser", "connection", "system", "diag"])
         subs = re.findall(r'data-sub="(\w+)"', self.html)
         self.assertEqual(subs, ["engine", "accounts", "storage", "send", "nas", "rules", "bookmarks",
-                                "https", "share", "updates", "diagnostics", "about"])
+                                "https", "share", "updates", "about", "tools", "disk", "debug"])
         self.assertRegex(self.js, r"AUTO_REFRESH_MS\s*=\s*5000\b")
         self.assertNotIn("BADGE_REFRESH_MS", self.js)
         self.assertRegex(self.js, r"PASTE_DEBOUNCE_MS\s*=\s*400\b")
@@ -534,7 +534,7 @@ if (out !== want) { console.error(JSON.stringify(out)); process.exit(1); }
             self.assertIn('id="%s"' % ident, section)
         for text in ("初期設定（イメージ作成）", "停止", "2GiB", "80%", "5分", "10分", "Container Station"):
             self.assertIn(text, section)
-        self.assertIn('SETTINGS_SECTIONS = ["jd2", "browser", "connection", "system"]', self.js)
+        self.assertIn('SETTINGS_SECTIONS = ["jd2", "browser", "connection", "system", "diag"]', self.js)
 
     def test_v0116_native_leftover_row(self):
         self.assertRegex(self.html, r'<div id="engineNativeRow"[^>]*hidden')
@@ -1337,3 +1337,15 @@ class GestureAndAutoLiveTest(unittest.TestCase):
         self.assertIn("now - rb.autoQuiet < AUTO_SETTLE_MS", app)
         rb = (Path(__file__).resolve().parents[1] / "remote_browser.py").read_text(encoding="utf-8")
         self.assertIn("innerText)||'').length<400", rb)
+
+
+class MirrorTapTest(unittest.TestCase):
+    """v0.1.40: taps in the mirror are recognised from pointer events (iOS sends no click there)."""
+
+    def test_tap_without_click(self):
+        app = (Path(__file__).resolve().parents[1] / "web" / "app.js").read_text(encoding="utf-8")
+        start = app.index("function wireMirrorDoc(doc)")
+        block = app[start:start + 8000]
+        self.assertIn('doc.addEventListener("pointerup"', block)
+        self.assertIn("handleTap(event)", block)
+        self.assertIn("tap.handledAt", block)          # the later click (desktop) is not handled twice

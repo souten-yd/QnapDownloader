@@ -25,12 +25,13 @@ def settings_html():
 class SettingsStructureTests(unittest.TestCase):
     def test_four_sections_with_subsections_in_the_specified_order(self):
         self.assertEqual(re.findall(r'<a href="#/settings/(\w+)" data-section', HTML),
-                         ["jd2", "browser", "connection", "system"])
+                         ["jd2", "browser", "connection", "system", "diag"])
         body = settings_html()
         for section, subs in (("jd2", ["engine", "accounts", "storage", "send"]),
                               ("browser", ["nas", "rules", "bookmarks"]),
                               ("connection", ["https", "share"]),
-                              ("system", ["updates", "diagnostics", "about"])):
+                              ("system", ["updates", "about"]),
+                              ("diag", ["tools", "disk", "debug"])):
             block = re.search(r'data-section="%s" hidden>(.*?)</section>' % section, body, re.S).group(1)
             self.assertEqual(re.findall(r'data-sub="(\w+)"', block), subs)
 
@@ -70,7 +71,7 @@ const assert = require("assert");
 const r = (a, b) => settingsRoute(a, b);
 const want = {engine: "jd2/engine", accounts: "jd2/accounts", storage: "jd2/storage", https: "connection/https",
   share: "connection/share", bookmarks: "browser/bookmarks", updates: "system/updates",
-  diagnostics: "system/diagnostics", about: "system/about"};
+  diagnostics: "diag/tools", about: "system/about"};
 for (const [old, target] of Object.entries(want)) {
   const route = r(old);
   assert.strictEqual(route.redirect, "#/settings/" + target, old);
@@ -81,6 +82,7 @@ assert.deepStrictEqual(r("jd2", "accounts"), {view: "settings", section: "jd2", 
 assert.deepStrictEqual(r("system", "nope"), {view: "settings", section: "system", sub: ""});
 assert.strictEqual(r(undefined).section, "jd2");
 assert.strictEqual(r("bogus").redirect, undefined);
+assert.strictEqual(r("system", "diagnostics").redirect, "#/settings/diag");   // v0.1.40: own section
 """)
 
     def test_folder_picker_is_a_bottom_sheet_that_closes_after_selection(self):
