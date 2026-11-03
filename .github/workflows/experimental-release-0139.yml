@@ -1,0 +1,43 @@
+name: Publish QnapDownloader v0.1.39-rc1 mirror
+on:
+  push:
+    branches: [release/experimental-0.1.39-rc1]
+permissions:
+  contents: write
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Full unit, web, shell and safety verification
+        run: bash scripts/verify.sh
+      - name: Install QDK 2.5.3 and build-only dependencies
+        run: |
+          curl -fLSs --retry 2 https://github.com/qnap-dev/QDK/releases/download/v2.5.3/qdk_2.5.3_amd64.deb -o /tmp/qdk.deb
+          sudo apt-get update -qq
+          sudo apt-get install -y /tmp/qdk.deb rsync
+          python3 -m pip install --disable-pip-version-check 'cairosvg==2.8.2' 'pillow>=10,<13'
+      - name: Build and checksum x86_64 QPKG
+        run: |
+          bash scripts/build-qpkg.sh x86_64 dist
+          (cd dist && sha256sum QnapDownloader_0.1.39_x86_64.qpkg > SHA256SUMS && sha256sum -c SHA256SUMS)
+      - name: Publish as prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view v0.1.39-rc1 >/dev/null 2>&1; then
+            echo 'Existing tag; refusing to overwrite'
+            exit 1
+          fi
+          gh release create v0.1.39-rc1 dist/QnapDownloader_0.1.39_x86_64.qpkg dist/SHA256SUMS \
+            --repo "${{ github.repository }}" --target "dff3c4bbf94008c4e2f8feeadfcea36a40da221d" \
+            --title "QnapDownloader v0.1.39-rc1: Mirror display (digital twin) phase 1" \
+            --prerelease \
+            --notes "Experimental QNAP x86_64 build. New display method Mirror: the NAS browser's page is copied as sanitized HTML and CSS without scripts and shown in a sandboxed frame with native scrolling; links navigate the NAS browser, images and fonts come through the Hub, other taps click the same element on the NAS, and changes made by page scripts refresh the copy."
