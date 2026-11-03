@@ -20,7 +20,7 @@ python3 tests/e2e/run.py --engines chromium,webkit --out /tmp/e2e
 |---|---|
 | 手元の「iPhone」 | Playwright の `chromium`（390x844 DPR3 タッチ）と `webkit`（`devices["iPhone 13"]`）。入力は常にタッチ（`touchscreen.tap` / CDP タッチ） |
 | Hub | 本物の `webapp.Handler`（同一プロセス）。コンテナ層だけ `tests/fake_docker.py` |
-| NASのブラウザ | 本物のヘッドレス Chrome。`RemoteBrowser` 自身の CDP クライアントで操作 |
+| NASのブラウザ | 本物のヘッドレス Chrome。`RemoteBrowser` 自身の CDP クライアントで操作。`env.blocked`（`{"mjpeg","sse"}`）に入れた経路は、リクエストを受けても応答を始めない（溜め込むプロキシの再現） |
 | 閲覧先 | `tests/e2e/fixtures/*.html` を配る自己署名 https サーバー。`a.example.com` などは **NAS側Chromeだけ** `--host-resolver-rules` と `--ignore-certificate-errors` でこのサーバーへ向ける（アプリのURL検証は本番と同じ） |
 
 - WebKit が入っていない環境（この開発環境など）では webkit は「SKIP（browser not installed）」になり、終了コードは変わらない。
@@ -35,6 +35,7 @@ settings-routes / display-reader・mirror・tiles・live / mirror-tap-link（ク
 mirror-menu-toggle（`href="#"` と自ページ宛の2種類のトグルが再読み込みにならない）/ mirror-dynamic / mirror-security（CSP・スクリプト不実行）/
 reader-cards（ラベル・サイズあり/なし、ページ送りチップ）/ gesture-flick-mirror・tiles、gesture-close-tab（Chromiumのみ: CDPタッチが必要）/
 reload-reattach / auto-live-fast・mirror（リダイレクト後 6 秒以内に元の表示へ）/
+live-sse-fallback（MJPEGが1バイトも届かない状態を再現: 2.5秒後にSSEへ切替わりフレームが届く・経路を記憶して再読み込み後はMJPEGを触らない）/ live-polling-fallback（MJPEGもSSEも届かない: ポーリングで表示し理由を出す）/ copy-fallback（`navigator.clipboard` が無くても隠しtextarea＋execCommandでコピー）/
 selftest（設定›診断›自己テストを実行して、全項目が終わり、レポートに NAS・端末・ログが入り、URLがホスト名だけになり、テスト用タブが残らない）。
 
 ### 実機の自己テスト（v0.1.44）

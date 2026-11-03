@@ -261,7 +261,7 @@ eq(readHostModes(), [], "unreadable storage is harmless");
                 self.assertIn(needle, self.js)
         # instrumented places
         for needle in ('dlog("ui", "info", "route"', '"display mode"', '"stream open"', '"stream first frame"',
-                       '"stream fallback to polling"', '"reader render"', '"tile mount"', '"polling frame rate"'):
+                       '"stream fallback"', '"reader render"', '"tile mount"', '"polling frame rate"'):
             with self.subTest(needle=needle):
                 self.assertIn(needle, self.js)
         # nothing is stored on the device and nothing is written by the Hub: the file is a client-side Blob
@@ -749,6 +749,7 @@ const state = {rbPerf: true, rbPerfSamples: [], rbPerfSince: 0, rbQuality: "stan
 const RB_QUALITY_LABELS = {speed: "速度優先", standard: "標準", high: "高画質"};
 const remoteTab = () => null;
 const tabDisplay = tab => tab.display;
+const LIVE_KIND_LABEL = {mjpeg: "ストリーム", sse: "SSE", poll: "ポーリング"};
 """ + record + text + """
 let t = 0;
 const mk = () => ({now: () => t});
@@ -773,6 +774,11 @@ const live = {display: "live", rb: {stream: {}, streamFailed: false,
   perf: {fps: 9.84, frameBytes: 22528, streamMs: 120}}};
 let o = perfText(live);
 if (o !== "ライブ(ストリーム)・速度優先 · 9.8 fps · 22 KB/枚 · 応答 120 ms") { console.error("stream: " + o); process.exit(1); }
+live.rb.stream = {kind: "sse"};
+live.rb.perf.fallback = "MJPEGの最初の画面が届かない";
+o = perfText(live);
+if (o !== "ライブ(SSE: MJPEGの最初の画面が届かない)・速度優先 · 9.8 fps · 22 KB/枚 · 応答 120 ms") { console.error("sse: " + o); process.exit(1); }
+live.rb.perf.fallback = "";
 live.rb.streamFailed = true;
 if (!perfText(live).startsWith("ライブ(ポーリング)・速度優先 · ")) { console.error("fallback: " + perfText(live)); process.exit(1); }
 const fast = {display: "tiles", rb: {view: {tiles: [{url: "a"}, {url: "b"}, {url: ""}, {url: "c"}]},
@@ -788,23 +794,105 @@ if (o !== "リーダー · ブロック 3 · 画像 1/2 · 取得 600 ms · 画�
         result = subprocess.run(["node", "-e", script], capture_output=True, text=True, timeout=20)
         self.assertEqual(result.returncode, 0, result.stderr)
 
+    def test_v0146_sse_parser_transport_memory_and_copy_helpers(self):
+        def fn(name):
+            return re.search(r"(?:async )?function %s\(.*?\n\}\n" % name, self.js, re.S).group(0)
+        script = """
+(async function () {
+const RB_LIVE_PREF_KEY = "k"; const RB_LIVE_RETRY_MS = 24 * 60 * 60 * 1000;
+const store = {};
+const readLocal = key => (key in store ? store[key] : null);
+const writeLocal = (key, value) => { store[key] = value; };
+let sseOn = true;
+const sseSupported = () => sseOn;
+""" + fn("liveLoadPref") + fn("liveSavePref") + fn("liveStartKind") + fn("sseParser") + """
+const eq = (a, b, what) => { if (JSON.stringify(a) !== JSON.stringify(b)) { console.error(what + ": " + JSON.stringify(a) + " != " + JSON.stringify(b)); process.exit(1); } };
+// event stream parsing: comments and pings are ignored, events may be split anywhere
+const seen = [];
+const feed = sseParser((name, data) => seen.push([name, data]));
+feed(":" + " ".repeat(2047) + "\\n\\n");
+feed("event: frame\\ndata: QUJ");
+feed("D\\n\\n: ping\\n\\nevent: frame\\ndata: WFla\\n\\n");
+eq(seen, [["frame", "QUJD"], ["frame", "WFla"]], "sse events");
+// transport memory: nothing stored -> MJPEG; a remembered SSE / polling sticks for a day, then MJPEG is retried
+eq(liveStartKind(), "mjpeg", "default");
+writeLocal(RB_LIVE_PREF_KEY, JSON.stringify({t: "sse", mjpegAt: Date.now() - 1000}));
+eq(liveStartKind(), "sse", "sticky sse");
+writeLocal(RB_LIVE_PREF_KEY, JSON.stringify({t: "poll", mjpegAt: Date.now() - 1000}));
+eq(liveStartKind(), "poll", "sticky poll");
+writeLocal(RB_LIVE_PREF_KEY, JSON.stringify({t: "sse", mjpegAt: Date.now() - RB_LIVE_RETRY_MS - 1000}));
+eq(liveStartKind(), "mjpeg", "daily MJPEG retry");
+writeLocal(RB_LIVE_PREF_KEY, JSON.stringify({t: "mjpeg", mjpegAt: Date.now()}));
+eq(liveStartKind(), "mjpeg", "mjpeg stays");
+writeLocal(RB_LIVE_PREF_KEY, JSON.stringify({t: "sse", mjpegAt: Date.now()}));
+sseOn = false;
+eq(liveStartKind(), "poll", "sse remembered but unsupported here");
+writeLocal(RB_LIVE_PREF_KEY, "not json");
+eq(liveStartKind(), "mjpeg", "garbage is ignored");
+liveSavePref({t: "sse"}); liveSavePref({mjpegAt: 5});
+eq(JSON.parse(store[RB_LIVE_PREF_KEY]), {t: "sse", mjpegAt: 5}, "merge");
+})();
+"""
+        result = subprocess.run(["node", "-e", script], capture_output=True, text=True, timeout=20)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_v0146_every_copy_button_has_the_textarea_fallback(self):
+        copy = re.search(r"function execCopy\(text\) \{.*?\n\}\n", self.js, re.S).group(0)
+        for token in ('document.createElement("textarea")', "setSelectionRange", 'document.execCommand("copy")', "area.remove()"):
+            self.assertIn(token, copy)
+        helper = re.search(r"async function copyToClipboard\(text\) \{.*?\n\}\n", self.js, re.S).group(0)
+        self.assertIn("navigator.clipboard && navigator.clipboard.writeText", helper)
+        self.assertIn("return execCopy(text);", helper)
+        # no copy button calls navigator.clipboard directly any more
+        self.assertEqual(len(re.findall(r"await navigator\.clipboard\.writeText\(", self.js)), 1)
+        self.assertEqual(len(re.findall(r"= document\.execCommand\(", self.js)), 1)
+        selftest = re.search(r"async function selftestCopy\(\) \{.*?\n\}\n", self.js, re.S).group(0)
+        self.assertIn("copyToClipboard(", selftest)
+        self.assertIn("selftestUi.cache", selftest)           # the report is prefetched: the tap copies inside the gesture
+        self.assertIn("下のテキストを長押し", selftest)
+        for button in ("accountSchemaCopy", "debugCopy", "httpsCmdCopy", "shareTokenCopy", "shareEndpointCopy",
+                       "shareJsCopy", "shareBookmarkletCopy", "engineKeysCopy"):
+            line = re.search(r'\$\("%s"\)\.addEventListener\("click".*?\n(?:.*\n)?' % button, self.js).group(0)
+            self.assertIn("copyText(", line, button)
+
+    def test_v0146_selftest_client_measures_each_live_transport_in_the_apps_order(self):
+        step = re.search(r"async function selftestLiveStep\(tab, holder\) \{.*?\n\}\n", self.js, re.S).group(0)
+        self.assertLess(step.index("selftestLiveMjpeg("), step.index("selftestLiveSse("))
+        self.assertLess(step.index("selftestLiveSse("), step.index("selftestLivePoll("))
+        self.assertIn("RB_MJPEG_FIRST_MS", self.js[self.js.index("async function selftestLiveMjpeg"):])
+        poll = re.search(r"async function selftestLivePoll\(tab, out\) \{.*?\n\}\n", self.js, re.S).group(0)
+        self.assertIn('"&since=" + seq', poll)               # exactly like remoteLoop: since = last seq, no rev
+        self.assertNotIn("&rev=", poll)
+        self.assertIn("ctl.abort()", poll)                   # a long poll waiting for a frame cannot stretch the window
+        self.assertIn("client.secure", self.js)
+        self.assertIn("queryCommandSupported", self.js)
+
     def test_v0130_overlay_names_the_mode_and_live_uses_the_stream(self):
         text = re.search(r"function perfText\(tab = remoteTab\(\)\) \{.*?\n\}\n", self.js, re.S).group(0)
-        for label in ("ライブ(ストリーム)", "ライブ(ポーリング", "高速(全体表示)", "リーダー"):
+        for label in ('"ライブ("', "LIVE_KIND_LABEL", "ライブ(ポーリング", "高速(全体表示)", "リーダー"):
             self.assertIn(label, text)
+        self.assertIn('{mjpeg: "ストリーム", sse: "SSE", poll: "ポーリング"}', self.js)
         # live display: the <img> points at the stream; metadata still comes from the meta long-poll
         self.assertIn("/api/rb/stream.mjpg?tab=", self.js)
+        self.assertIn("/api/rb/stream.sse?tab=", self.js)
         loop = re.search(r"async function streamLoop\(.*?\n\}\n", self.js, re.S).group(0)
-        self.assertIn("openStream(tab, tab.rb)", loop)
+        self.assertIn("openStream(tab, tab.rb, kind)", loop)
         self.assertIn("/api/rb/meta?tab=", loop)
         self.assertNotIn("frame.jpg", loop)
-        # live prefers the stream unless this tab already fell back to frame.jpg polling
-        self.assertRegex(self.js, r"if \(rb\.streamFailed \|\| typeof Image !== \"function\"\) remoteLoop\(tab, state\.rbGen\);\s+else streamLoop")
-        # fallback: two errors within 10 s, or no picture within 5 s
+        # live prefers the stream unless this tab already fell back to frame.jpg polling (v0.1.46: MJPEG -> SSE -> polling)
+        self.assertRegex(self.js, r'const kind = rb\.streamFailed \|\| typeof Image !== "function" \? "poll" : liveStartKind\(\);')
+        self.assertIn('if (kind === "poll") {', self.js)
+        self.assertIn("remoteLoop(tab, state.rbGen);", self.js)
+        self.assertIn("streamLoop(tab, state.rbGen, kind)", self.js)
+        # fallback: two errors within 10 s, or no picture within 2.5 s (MJPEG, then SSE 3 s) before polling
         self.assertIn("RB_STREAM_FIRST_MS = 5000", self.js)
+        self.assertIn("RB_MJPEG_FIRST_MS = 2500", self.js)
+        self.assertIn("RB_SSE_FIRST_MS = 3000", self.js)
         self.assertIn("RB_STREAM_ERR_WINDOW_MS = 10000", self.js)
         self.assertIn("s.errors.length >= 2", self.js)
-        self.assertRegex(self.js, r"function streamFallback\(tab, rb\) \{\s+dlog\([^\n]*\n\s+rb\.streamFailed = true;")
+        advance = re.search(r"function streamAdvance\(tab, rb, reason\) \{.*?\n\}\n", self.js, re.S).group(0)
+        self.assertIn('openStream(tab, rb, "sse")', advance)
+        self.assertIn("rb.streamFailed = true;", advance)
         # closed when hidden / switched / mode changes / the picture is dropped / logout
         sync = re.search(r"function syncRemotePoll\(\) \{.*?\n\}\n", self.js, re.S).group(0)
         self.assertIn("closeStream();", sync)

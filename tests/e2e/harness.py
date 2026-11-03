@@ -15,6 +15,7 @@ use real-looking public https names without a port.
 import re
 import json
 import os
+import select
 import shutil
 import socket
 import ssl
@@ -152,6 +153,8 @@ class Env:
         self.fx = FixtureServer(self.tmp)
         self.cdp_port = free_port()
         self.setup_done = False
+        self.blocked = set()        # {"mjpeg", "sse"}: the stream never sends a byte (what a buffering proxy does)
+        self.stream_hits = Counter()
         self._start_nas_chrome(find_chrome(nas_chrome))
         self._start_webapp()
 
@@ -225,11 +228,36 @@ class Env:
             connect=lambda ip: rb.WebSocket.connect("127.0.0.1", cdp, rb.fetch_ws_path("127.0.0.1", cdp)),
             monitor=False, frame_interval=0.05, start_timeout=10.0)
         webapp.wire_remote_browser(server)
+        self._wrap_streams(webapp)
         server.updates = self_update.UpdateManager(root, webapp.ROOT, webapp.VERSION, "x86_64", self.port)
         self.rb = server.rb
         self.version = webapp.VERSION
         threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.1}, daemon=True).start()
         self.url = "http://127.0.0.1:%d/" % self.port
+
+    def _wrap_streams(self, webapp):
+        """Scenarios can make a live transport 'buffered by a proxy': the request is accepted and the response
+        never starts (no headers, no byte), until the phone gives up and closes the connection."""
+        env = self
+        for attr, kind in (("stream_mjpeg", "mjpeg"), ("stream_sse", "sse")):
+            original = getattr(webapp.Handler, attr)
+
+            def wrapper(handler, tab_id, _original=original, _kind=kind):
+                env.stream_hits[_kind] += 1
+                if _kind not in env.blocked:
+                    return _original(handler, tab_id)
+                handler.close_connection = True
+                end = time.monotonic() + 20
+                while time.monotonic() < end and _kind in env.blocked:
+                    readable, _, _ = select.select([handler.connection], [], [], 0.2)
+                    if readable:
+                        try:
+                            if not handler.connection.recv(1, socket.MSG_PEEK):
+                                return        # the phone closed the connection
+                        except OSError:
+                            return
+                return
+            setattr(webapp.Handler, attr, wrapper)
 
     # -- helpers for scenarios
     def tabs(self):
@@ -237,6 +265,8 @@ class Env:
 
     def reset_tabs(self):
         """Between scenarios: close every NAS tab and forget the fixture counters."""
+        self.blocked.clear()
+        self.stream_hits.clear()
         self.fx.hits.clear()
         self.fx.times.clear()
         del self.fx.beacons[:]

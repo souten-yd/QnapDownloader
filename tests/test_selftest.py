@@ -61,7 +61,7 @@ def good_payload(run_id, **over):
                "checks": [{"id": "client.rtt", "ms": 40},
                           {"id": "client.reader", "ok": True, "ms": 120, "n": 12},
                           {"id": "client.mirror_events", "flags": {"pointer": True, "click": True}},
-                          {"id": "client.live", "fps": 12.5, "kb": 30, "flags": {"img": True}}]}
+                          {"id": "client.live", "fps": 12.5, "kb": 30, "flags": {"mjpeg": True}}]}
     payload.update(over)
     return payload
 
@@ -135,7 +135,8 @@ class HelperTests(unittest.TestCase):
         for key, text in selftest.HINTS.items():
             with self.subTest(key=key):
                 self.assertTrue(text.strip())
-                self.assertNotIn("http", text)
+                if key != "client.secure":          # the one hint that names the Tailscale https address
+                    self.assertNotIn("http", text)
 
 
 class ClientValidationTests(unittest.TestCase):
@@ -210,12 +211,44 @@ class ClientEvaluateTests(unittest.TestCase):
         self.assertEqual((half["status"], half["variant"]), (WARN, "click"))
         self.assertEqual(self.ev(id="client.mirror_events", flags={"pointer": True, "click": True})["status"], PASS)
 
-    def test_live(self):
-        self.assertEqual(self.ev(id="client.live", fps=0, flags={"img": True})["status"], FAIL)
-        poll = self.ev(id="client.live", fps=3, flags={"img": False})
+    def test_live_transports(self):
+        live = lambda **kw: self.ev(id="client.live", **kw)
+        # no frame on any transport (or no fps) is the failure
+        self.assertEqual(live(fps=0, flags={"mjpeg": False, "sse": False, "poll": False})["status"], FAIL)
+        self.assertEqual(live(fps=0, flags={"mjpeg": True})["status"], FAIL)
+        self.assertEqual(live(fps=5, flags={})["status"], FAIL)
+        # the app ends on the first transport that works: MJPEG, then SSE, then polling
+        for flags, label in (({"mjpeg": True, "sse": True, "poll": True}, "MJPEG"),
+                             ({"mjpeg": False, "sse": True, "poll": True}, "SSE"),
+                             ({"mjpeg": False, "sse": False, "poll": True}, "ポーリング")):
+            with self.subTest(flags=flags):
+                out = live(fps=12, flags=flags, fps_mjpeg=12, fps_sse=11, fps_poll=4)
+                self.assertEqual(out["status"], PASS)             # 12 fps on whichever transport
+                self.assertIn("経路: ストリーム(%s)" % label if label != "ポーリング" else "経路: ポーリング", out["value"])
+        # only polling below 5 fps is a warning; a slow stream on its own is not
+        poll = live(fps=3, flags={"mjpeg": False, "sse": False, "poll": True}, fps_poll=3)
         self.assertEqual((poll["status"], poll["variant"]), (WARN, "polling"))
-        self.assertEqual(self.ev(id="client.live", fps=2, flags={"img": True})["status"], WARN)
-        self.assertEqual(self.ev(id="client.live", fps=12, flags={"img": True})["status"], PASS)
+        self.assertEqual(live(fps=7, flags={"mjpeg": False, "sse": False, "poll": True})["status"], PASS)
+        self.assertEqual(live(fps=2, flags={"mjpeg": False, "sse": True})["status"], PASS)
+        self.assertEqual(live(fps=2, flags={"mjpeg": True})["status"], PASS)
+        # the value tells every measured transport
+        out = live(fps=6.5, flags={"mjpeg": False, "sse": True, "poll": True}, fps_mjpeg=0, fps_sse=6.5, fps_poll=0.1)
+        for part in ("経路: ストリーム(SSE)", "MJPEG 届かず", "SSE 6.5 fps", "ポーリング 0.1 fps"):
+            self.assertIn(part, out["value"])
+        self.assertEqual(selftest.live_transport({"sse": True}), "sse")
+        self.assertIsNone(selftest.live_transport({"mjpeg": False}))
+        self.assertIn("ストリーム", selftest.HINTS["client.live:polling"])
+
+    def test_clipboard_and_secure_context(self):
+        self.assertEqual(self.ev(id="client.clipboard", ok=True, flags={"api": False})["status"], PASS)
+        self.assertIn("copyコマンド", self.ev(id="client.clipboard", ok=True, flags={"api": False})["value"])
+        self.assertIn("clipboard API", self.ev(id="client.clipboard", ok=True, flags={"api": True})["value"])
+        self.assertEqual(self.ev(id="client.clipboard", ok=False)["status"], WARN)
+        self.assertEqual(self.ev(id="client.secure", ok=True)["status"], PASS)
+        no = self.ev(id="client.secure", ok=False)
+        self.assertEqual(no["status"], WARN)
+        self.assertIn("https", selftest.HINTS["client.secure"])
+        self.assertIn("ts.net", selftest.HINTS["client.secure"])
 
 
 class StateMachineTests(unittest.TestCase):
@@ -656,3 +689,247 @@ import webapp  # noqa: E402  (after the fixture import so test_webapp patches ap
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ------------------------------------------------------------------------------ v0.1.46
+class FakeSiteRB:
+    """The part of RemoteBrowser the real-site measurement uses, on a fake clock."""
+
+    def __init__(self, clock, dcl_at=None, load_at=None, scrollable=True):
+        self.clock, self.dcl_at, self.load_at, self.scrollable = clock, dcl_at, load_at, scrollable
+        self.t0 = None
+        self.seq = 0
+        self.y = 0
+        self.scrolls = []
+        self.closed = []
+
+    def memory_reason(self):
+        return None
+
+    def open_tab(self, url, selftest=None):
+        self.t0 = self.clock()
+        return {"id": "s1"}
+
+    def set_viewport(self, *args):
+        pass
+
+    def selftest_info(self, tab):
+        t = self.clock() - self.t0
+        loaded = self.load_at is not None and t >= self.load_at
+        return {"loading": not loaded, "url": "https://site.example/", "title": "", "rev": 1, "seq": self.seq,
+                "screencast": True, "challenge": False,
+                "dcl": 1 if self.dcl_at is not None and t >= self.dcl_at else 0}
+
+    def page_meta(self, tab, wait=0):
+        return {"challenge": False}
+
+    def reader(self, tab):
+        return {"count": 12, "blocks": []}
+
+    def mirror(self, tab, full=False, force=False):
+        return {"stats": {"nodes": 80, "html_bytes": 1000, "css_bytes": 1000}}
+
+    def snapshot(self, tab, force=False):
+        return {"tiles": 3}
+
+    def selftest_scroll(self, tab, dy=200):
+        self.scrolls.append(dy)
+        if not self.scrollable:
+            return 0
+        self.y += dy
+        return self.y
+
+    def stream(self, tab, write, max_seconds=0):
+        time.sleep(0.8)                       # real time: the scroller thread runs while "the stream" is open
+        for _ in range(int(max_seconds * 7)):  # 7 fps on the fake clock
+            self.clock.now += 1.0 / 7
+            self.seq += 1
+            write(b"x" * 2048)
+
+    def close_tab(self, tab):
+        self.closed.append(tab)
+
+
+class SiteTests(unittest.TestCase):
+    def measure(self, **kwargs):
+        clock = Clock()
+        runner = make_runner(clock=clock, sleep=lambda s: setattr(clock, "now", clock.now + s))
+        runner.rb = FakeSiteRB(clock, **kwargs)
+        runner.start({"client": False})
+        run = runner._run
+        item = {"url": "https://site.example/", "host": "site.example"}
+        runner._site(run, 1, item, "実サイト1（site.example）", 390, 844, 3.0)
+        return runner, run, {c["id"]: c for c in run.checks}, clock
+
+    def test_open_is_judged_by_dom_content_loaded_and_unfinished_load_is_only_a_note(self):
+        runner, run, checks, clock = self.measure(dcl_at=2.0, load_at=None)
+        opened = checks["site.1.open"]
+        self.assertEqual(opened["status"], PASS)
+        self.assertIn("DOMContentLoaded 2000 ms", opened["value"])
+        self.assertIn("完全な読み込みは未完了（広告など）", opened["value"])
+        self.assertLess(clock.now - 1000, 12)                  # did not wait the full 25 s for an ad-bound load
+        self.assertEqual(runner.rb.closed, ["s1"])
+
+    def test_open_with_load_reports_both_times_and_slow_dcl_warns(self):
+        runner, run, checks, clock = self.measure(dcl_at=1.0, load_at=2.5)
+        self.assertEqual(checks["site.1.open"]["status"], PASS)
+        self.assertIn("完全な読み込み 2", checks["site.1.open"]["value"])
+        runner, run, checks, clock = self.measure(dcl_at=9.0, load_at=10.0)
+        self.assertEqual(checks["site.1.open"]["status"], WARN)
+        self.assertTrue(checks["site.1.open"]["hint"])
+
+    def test_open_fails_only_without_dom_content_loaded(self):
+        runner, run, checks, clock = self.measure(dcl_at=None, load_at=None)
+        self.assertEqual(checks["site.1.open"]["status"], FAIL)
+        self.assertIn("DOMContentLoadedが来ませんでした", checks["site.1.open"]["value"])
+        # a finished load without the event still counts (the event is implied)
+        runner, run, checks, clock = self.measure(dcl_at=None, load_at=1.5)
+        self.assertEqual(checks["site.1.open"]["status"], PASS)
+
+    def test_live_scrolls_the_page_so_a_still_site_makes_frames(self):
+        runner, run, checks, clock = self.measure(dcl_at=1.0, load_at=1.5)
+        live = checks["site.1.live"]
+        self.assertGreaterEqual(len(runner.rb.scrolls), 2)
+        self.assertEqual(set(runner.rb.scrolls), {selftest.SITE_SCROLL_PX})
+        self.assertEqual(live["status"], PASS)
+        self.assertIn("スクロール", live["value"])
+        self.assertEqual(live["hint"], "")
+
+    def test_live_on_a_page_that_cannot_scroll_is_not_a_failure(self):
+        runner, run, checks, clock = self.measure(dcl_at=1.0, load_at=1.5, scrollable=False)
+        self.assertEqual(checks["site.1.live"]["status"], PASS)
+        self.assertIn("スクロールできないページ", checks["site.1.live"]["value"])
+
+    def test_live_warns_only_below_5_fps_with_movement(self):
+        clock = Clock()
+        runner = make_runner(clock=clock, sleep=lambda s: setattr(clock, "now", clock.now + s))
+        fake = FakeSiteRB(clock, dcl_at=1.0, load_at=1.5)
+        fake.stream = lambda tab, write, max_seconds=0: (time.sleep(0.8), setattr(clock, "now", clock.now + 3.0),
+                                                         write(b"x"), write(b"x"))      # 2 frames in 3 s
+        runner.rb = fake
+        runner.start({"client": False})
+        run = runner._run
+        runner._site(run, 1, {"url": "https://site.example/", "host": "site.example"}, "s", 390, 844, 3.0)
+        live = {c["id"]: c for c in run.checks}["site.1.live"]
+        self.assertEqual(live["status"], WARN)
+        self.assertEqual(live["hint"], selftest.HINTS["site.live"])
+
+
+class FakeCgroupRuntime:
+    def __init__(self, refs):
+        self.refs = refs
+
+    def container_ref(self, name):
+        return self.refs.get(name)
+
+
+class EnvCgroupAndReportTests(unittest.TestCase):
+    def make(self, refs, root, proc):
+        import container_runtime as cr
+        runner = make_runner()
+        runner.rb = type("RB", (), {"runtime": FakeCgroupRuntime(refs), "_cgroup_root": str(root),
+                                    "_proc_root": str(proc)})()
+        runner.start({"client": False})
+        return runner, runner._run, cr
+
+    def layout(self, tmp, with_dir):
+        from pathlib import Path
+        root, proc = Path(tmp) / "cg", Path(tmp) / "proc"
+        (proc / "self").mkdir(parents=True)
+        (proc / "77").mkdir()
+        cid = "cd" * 32
+        mem = root / "memory" / "container-station" / cid
+        blk = root / "blkio" / "container-station" / cid
+        for d in (mem, blk):
+            d.mkdir(parents=True)
+        (proc / "self" / "mountinfo").write_text(
+            "36 35 0:30 / %s rw - cgroup cgroup rw,memory\n37 35 0:31 / %s rw - cgroup cgroup rw,blkio\n" % (
+                root / "memory", root / "blkio"))
+        (proc / "77" / "cgroup").write_text(
+            "11:blkio:/container-station/%s\n10:memory:/container-station/%s\n" % (cid, cid))
+        if with_dir:
+            (mem / "memory.usage_in_bytes").write_text("1000\n")
+            (blk / "blkio.throttle.io_service_bytes").write_text("8:0 Read 5\n8:0 Write 7\n")
+        return root, proc, cid
+
+    def test_env_cgroup_row_names_the_working_source_and_the_layout(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            root, proc, cid = self.layout(tmp, True)
+            import container_runtime as cr
+            runner, run, _ = self.make({cr.BROWSER_NAME: {"id": cid, "pid": 77, "running": True}}, root, proc)
+            runner._cgroup_row(run)
+            row = [c for c in run.checks if c["id"] == "env.cgroup"][0]
+            self.assertEqual(row["status"], PASS)
+            for part in ("v1(blkio,memory)", "browser: メモリ=cgroup v1 I/O=cgroup v1", "container-station", "(proc)",
+                         "jd2: 停止中"):
+                self.assertIn(part, row["value"])
+            self.assertIn("cgroup v1", run.info["cgroup_sources"])
+            self.assertEqual(run.info["cgroup"], "v1(blkio,memory)")
+
+    def test_env_cgroup_row_warns_and_prints_the_facts_when_only_docker_stats_is_left(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            root, proc, cid = self.layout(tmp, False)
+            import shutil
+            shutil.rmtree(str(root / "memory"))
+            shutil.rmtree(str(root / "blkio"))
+            (root / "memory").mkdir()
+            (root / "blkio").mkdir()
+            import container_runtime as cr
+            runner, run, _ = self.make({cr.JD2_NAME: {"id": cid, "pid": 77, "running": True}}, root, proc)
+            runner._cgroup_row(run)
+            row = [c for c in run.checks if c["id"] == "env.cgroup"][0]
+            self.assertEqual(row["status"], WARN)
+            self.assertIn("docker stats", row["value"])
+            self.assertIn("pid-cgroup=blkio:/container-station/", row["value"])
+            self.assertIn("mounts=v1@", row["value"])
+            self.assertEqual(row["hint"], selftest.HINTS["env.cgroup"])
+
+    def test_env_cgroup_row_is_skipped_when_no_container_runs(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            root, proc, cid = self.layout(tmp, True)
+            runner, run, _ = self.make({}, root, proc)
+            runner._cgroup_row(run)
+            row = [c for c in run.checks if c["id"] == "env.cgroup"][0]
+            self.assertEqual(row["status"], SKIP)
+
+    def test_report_header_has_transport_and_cgroup_facts(self):
+        runner = make_runner()
+        runner.start({"client": False})
+        run = runner._run
+        run.info.update(cgroup="v1(blkio,memory)", cgroup_sources="browser mem=cgroup v1 io=docker stats")
+        with runner._cv:
+            run.state, run.phase, run.client = "running", "client", "pending"
+        payload = good_payload(run.id)
+        payload["checks"][-1] = {"id": "client.live", "fps": 6.5, "kb": 20, "fps_sse": 6.5, "fps_poll": 0.3,
+                                 "fps_mjpeg": 0, "flags": {"mjpeg": False, "sse": True, "poll": True}}
+        payload["checks"] += [{"id": "client.clipboard", "ok": True, "flags": {"api": False}},
+                              {"id": "client.secure", "ok": False}]
+        runner.submit_client(payload)
+        text = runner.report(run.id)["text"]
+        self.assertIn("[Source] cgroup=v1(blkio,memory) | container-stats=browser mem=cgroup v1 io=docker stats", text)
+        self.assertIn("[Live] transport=sse fps=6.5", text)
+        self.assertIn("[PASS] client.clipboard", text)
+        self.assertIn("[WARN] client.secure", text)
+        self.assertIn("ts.net", text)
+        self.assertEqual(run.info["live_transport"], "sse")
+
+    def test_keep_is_requested_for_the_phone_phase(self):
+        clock = Clock()
+        runner = make_runner(clock=clock)
+        calls = []
+        runner.rb = type("RB", (), {
+            "selftest_goto": lambda self, tab, path: None,
+            "selftest_info": lambda self, tab: {"loading": False, "url": selftest.SelfTest._origin() + "/anim"},
+            "selftest_keep": lambda self, tab, seconds: calls.append((tab, seconds))})()
+        runner.start({"client": False})
+        run = runner._run
+        run.options["client"] = True
+        run.cancel.clear()
+        run.client_evt.set()
+        with runner._cv:
+            run.state = "running"
+        runner._client_phase(run, "t1")
+        self.assertEqual(calls, [("t1", selftest.CLIENT_WAIT + 15.0)])

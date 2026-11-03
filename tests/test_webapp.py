@@ -124,7 +124,7 @@ class HttpTests(unittest.TestCase):
 
     RB_GET = ("/api/rb/status", "/api/rb/log", "/api/rb/links?tab=b1",
               "/api/rb/frame.jpg?tab=b1&since=0&wait=0", "/api/rb/intercepts?tab=b1&since=0",
-              "/api/rb/stream.mjpg?tab=b1")
+              "/api/rb/stream.mjpg?tab=b1", "/api/rb/stream.sse?tab=b1")
     RB_POST = (("/api/rb/setup", {"confirmed": True}), ("/api/rb/stop", {"confirmed": True}),
                ("/api/rb/tabs", {"url": "https://example.com/"}), ("/api/rb/tabs/close", {"id": "b1"}),
                ("/api/rb/navigate", {"tab": "b1", "url": "https://example.com/"}),
@@ -490,7 +490,7 @@ class HttpTests(unittest.TestCase):
                                          headers={"Host": "192.168.68.57:17864"})
         with self.client.open(request, timeout=4) as response:
             self.assertEqual(response.status, 200)
-            self.assertEqual(json.load(response)["version"], "0.1.45")
+            self.assertEqual(json.load(response)["version"], "0.1.46")
         with self.client.open(self.url + "/icon.svg", timeout=4) as response:
             self.assertEqual(response.status, 200)
             self.assertEqual(response.headers.get_content_type(), "image/svg+xml")
@@ -1400,7 +1400,7 @@ class HttpTests(unittest.TestCase):
         self.assertFalse(info["supported"])
         code, _ = self.req("/api/update/apply", {"version": "v0.1.8"})
         self.assertEqual(code, 400)
-        self.assertEqual(self.req("/api/health")[1]["version"], "0.1.45")
+        self.assertEqual(self.req("/api/health")[1]["version"], "0.1.46")
         self.assertFalse(self.req("/api/jd2/status")[1]["connected"])
         self.assertEqual(self.req("/api/jd2/update/apply", {"confirmed": True})[0], 400)
         self.assertEqual(self.req("/api/jd2/preset/apply", {"confirmed": True})[0], 400)
@@ -2042,15 +2042,25 @@ class HttpTests(unittest.TestCase):
             meta = self.req("/api/rb/meta?tab=b1&wait=0")[1]
             self.assertEqual(meta["streams"], 1)
             self.assertIn("fps", meta)
-            # per-tab limit: the third stream gets 429 while two are open
+            # per-tab limit (v0.1.46): a third stream replaces the oldest one instead of being refused
             conn2, second = self.stream_open()
             try:
                 for _ in range(200):
                     if self.server.rb._tabs["b1"].streams == 2:
                         break
                     time.sleep(0.01)
-                code, headers, data = self.get_raw("/api/rb/stream.mjpg?tab=b1")
-                self.assertEqual(code, 429)
+                conn3, third = self.stream_open()
+                try:
+                    self.assertEqual(third.status, 200)
+                    while response.read(65536):          # the oldest stream is ended by the Hub: EOF
+                        pass
+                    for _ in range(300):
+                        if self.server.rb._tabs["b1"].streams == 2:
+                            break
+                        time.sleep(0.01)
+                    self.assertEqual(self.server.rb._tabs["b1"].streams, 2)
+                finally:
+                    conn3.close()
             finally:
                 conn2.close()
             # closing the tab ends the stream
@@ -2062,6 +2072,67 @@ class HttpTests(unittest.TestCase):
             self.assertEqual(self.server.rb._streams, 0)
         finally:
             conn.close()
+
+
+    def test_rb_stream_sse_headers_events_auth_and_close(self):
+        self.assertEqual(self.raw("/api/rb/stream.sse?tab=b1")[0], 401)
+        self.login()
+        self.assertEqual(self.get_raw("/api/rb/stream.sse?tab=b9")[0], 404)
+        self.assertEqual(self.raw("/api/rb/stream.sse?tab=b1", host="evil.example")[0], 403)
+        self.req("/api/rb/tabs", {"url": "https://example.com/a"})
+        jpeg = b"\xff\xd8\xff\xe0JFIF-sse"
+        conn, response = self.stream_open("/api/rb/stream.sse?tab=b1")
+        try:
+            self.assertEqual(response.status, 200)       # headers go out with the padding, before any frame
+            self.assertEqual(response.getheader("Content-Type"), "text/event-stream")
+            self.assertEqual(response.getheader("Cache-Control"), "no-store")
+            self.assertEqual(response.getheader("X-Accel-Buffering"), "no")
+            self.assertEqual(response.getheader("X-Content-Type-Options"), "nosniff")
+            self.assertIsNone(response.getheader("Content-Length"))
+            pad = response.readline()
+            self.assertTrue(pad.startswith(b":") and len(pad) >= 2048)
+            self.assertEqual(response.readline(), b"\n")
+            self.rb_ws.emit("Page.screencastFrame", {
+                "data": base64.b64encode(jpeg).decode(), "sessionId": 1,
+                "metadata": {"deviceWidth": 390, "deviceHeight": 700}}, "SESSION1")
+            self.assertEqual(response.readline(), b"event: frame\n")
+            data = response.readline()
+            self.assertEqual(data, b"data: " + base64.b64encode(jpeg) + b"\n")
+            self.assertEqual(response.readline(), b"\n")
+            self.assertEqual(self.req("/api/rb/meta?tab=b1&wait=0")[1]["streams"], 1)
+            self.assertEqual(self.req("/api/rb/tabs/close", {"id": "b1"})[0], 200)
+            for _ in range(300):
+                if self.server.rb._streams == 0:
+                    break
+                time.sleep(0.01)
+            self.assertEqual(self.server.rb._streams, 0)
+        finally:
+            conn.close()
+
+    def test_state_polls_with_a_running_browser_never_start_docker_stats(self):
+        self.login()
+        self.req("/api/rb/tabs", {"url": "https://example.com/a"})
+
+        def stats_calls():
+            return len([c for c in self.rb_fake.docker_calls() if c[0] == "stats"])
+        real, seen = self.server.rb.status, []
+
+        def spy(*args, **kwargs):
+            seen.append(kwargs)
+            return real(*args, **kwargs)
+        self.server.rb.status = spy
+        self.addCleanup(lambda: setattr(self.server.rb, "status", real))
+        baseline = stats_calls()
+        for _ in range(5):
+            webapp.server_cache(self.server).invalidate()           # every poll recomputes the browser part
+            webapp.server_state_hub(self.server)._refresh(force=True)
+            self.assertEqual(self.req("/api/state?full=1")[0], 200)
+        self.assertGreaterEqual(len(seen), 5)                       # the state really asked rb.status() ...
+        self.assertTrue(all(not kw.get("fresh_memory") for kw in seen))
+        self.assertEqual(stats_calls(), baseline)                   # ... and docker stats never ran for it
+        webapp.server_cache(self.server).invalidate()
+        self.assertEqual(self.req("/api/rb/status")[0], 200)        # the settings view asks for fresh figures
+        self.assertTrue(seen[-1].get("fresh_memory"))
 
 
     # ---- v0.1.38: resident NAS browser ------------------------------------------------

@@ -68,7 +68,11 @@ const RB_QUALITIES = ["speed", "standard", "high"];
 const RB_QUALITY_LABELS = {speed: "速度優先", standard: "標準", high: "高画質"};
 const RB_DISPLAY_LABELS = {reader: "リーダー", mirror: "ミラー", tiles: "高速（全体表示）", live: "ライブ"};
 const RB_PERF_WINDOW_MS = 5000;
-const RB_STREAM_FIRST_MS = 5000;
+const RB_STREAM_FIRST_MS = 5000;     // MJPEG only (no SSE available): first picture within this, else polling
+const RB_MJPEG_FIRST_MS = 2500;      // v0.1.46: MJPEG first picture within this, else the event stream (SSE)
+const RB_SSE_FIRST_MS = 3000;        // v0.1.46: SSE first frame within this, else polling
+const RB_LIVE_PREF_KEY = "qnapdl.livetransport.v1";
+const RB_LIVE_RETRY_MS = 24 * 60 * 60 * 1000;   // a device that fell back to SSE / polling retries MJPEG once a day
 const RB_STREAM_ERR_WINDOW_MS = 10000;
 const RB_STREAM_META_S = 2;
 const RB_STREAM_RECONNECT_MS = 9 * 60 * 1000;
@@ -1384,14 +1388,114 @@ async function sendViewport(tab) {
 
 const nextPaint = () => new Promise(resolve => requestAnimationFrame(() => resolve()));
 
-// ---- live display over MJPEG push (v0.1.30) ----
-// The <img> points at /api/rb/stream.mjpg (same origin, cookie sent); the Hub pushes the newest frame.
-// Metadata (address, title, loading, link-map revision, fps) still comes from the /api/rb/meta
-// long-poll. Two stream errors within 10 s, or no picture within 5 s, fall back to frame.jpg
-// polling for that tab. The stream is closed whenever the tab is hidden, switched or the mode changes.
+// ---- live display: MJPEG push (v0.1.30), event stream (SSE, v0.1.46), polling ----
+// 1. The <img> points at /api/rb/stream.mjpg (same origin, cookie sent); the Hub pushes the newest frame.
+// 2. Some proxies (Tailscale Serve, nginx ...) buffer multipart/x-mixed-replace but flush text/event-stream
+//    at once, so when no MJPEG picture arrives in RB_MJPEG_FIRST_MS the same frames are read from
+//    /api/rb/stream.sse (fetch + ReadableStream, else EventSource) and drawn into the same <img>.
+// 3. No SSE frame in RB_SSE_FIRST_MS: frame.jpg polling as before.
+// Metadata (address, title, loading, link-map revision, fps) still comes from the /api/rb/meta long-poll.
+// The transport that worked is remembered per device (MJPEG is retried at most once a day).
+// The stream is closed whenever the tab is hidden, switched or the mode changes.
 let streamNonce = 0;
 function streamUrl(rb) {
   return "/api/rb/stream.mjpg?tab=" + encodeURIComponent(rb.id) + "&n=" + (++streamNonce);
+}
+function sseUrl(rb) {
+  return "/api/rb/stream.sse?tab=" + encodeURIComponent(rb.id) + "&n=" + (++streamNonce);
+}
+
+const LIVE_KIND_LABEL = {mjpeg: "ストリーム", sse: "SSE", poll: "ポーリング"};
+
+function sseFetchOk() {
+  return typeof fetch === "function" && typeof AbortController === "function" && typeof TextDecoder === "function" &&
+    typeof Response === "function" && "body" in Response.prototype;
+}
+function sseSupported() { return sseFetchOk() || typeof EventSource === "function"; }
+
+function liveLoadPref() {
+  try {
+    const value = JSON.parse(readLocal(RB_LIVE_PREF_KEY) || "{}");
+    return value && typeof value === "object" ? value : {};
+  } catch (e) { return {}; }
+}
+function liveSavePref(patch) {
+  writeLocal(RB_LIVE_PREF_KEY, JSON.stringify(Object.assign(liveLoadPref(), patch)));
+}
+
+// Which transport a live tab starts with: the remembered one, except that MJPEG is retried once a day.
+function liveStartKind() {
+  const pref = liveLoadPref();
+  const now = Date.now();
+  if ((pref.t === "sse" || pref.t === "poll") && !(now - (Number(pref.mjpegAt) || 0) > RB_LIVE_RETRY_MS)) {
+    return pref.t === "sse" && !sseSupported() ? "poll" : pref.t;
+  }
+  return "mjpeg";
+}
+
+// Server-Sent Events text -> onEvent(name, data). Comments (": ping") are ignored.
+function sseParser(onEvent) {
+  let buffer = "";
+  return chunk => {
+    buffer += chunk;
+    if (buffer.length > 8 * 1024 * 1024) buffer = "";
+    for (;;) {
+      const end = buffer.indexOf("\n\n");
+      if (end < 0) return;
+      const block = buffer.slice(0, end);
+      buffer = buffer.slice(end + 2);
+      let name = "message", data = "";
+      for (const line of block.split("\n")) {
+        if (line.startsWith("event:")) name = line.slice(6).trim();
+        else if (line.startsWith("data:")) data += line.slice(5).trim();
+      }
+      if (data) onEvent(name, data);
+    }
+  };
+}
+
+function base64ToBlob(text) {
+  const raw = atob(text);
+  const bytes = new Uint8Array(raw.length);
+  for (let i = 0; i < raw.length; i++) bytes[i] = raw.charCodeAt(i);
+  return new Blob([bytes], {type: "image/jpeg"});
+}
+
+// One connection to the event stream. onFrame(base64) per `frame` event; resolves when it ends
+// (rejects on a network / HTTP error). `handle.close()` ends it. fetch + ReadableStream when the browser
+// can, else EventSource.
+function sseConnect(url, onFrame) {
+  const handle = {close: () => {}};
+  const done = new Promise((resolve, reject) => {
+    if (sseFetchOk()) {
+      const ctl = new AbortController();
+      handle.close = () => ctl.abort();
+      (async () => {
+        try {
+          const res = await fetch(url, {signal: ctl.signal, cache: "no-store", credentials: "same-origin"});
+          if (!res.ok || !res.body) throw new Error("HTTP " + res.status);
+          const reader = res.body.getReader();
+          const decoder = new TextDecoder();
+          const feed = sseParser((name, data) => { if (name === "frame") onFrame(data); });
+          for (;;) {
+            const {done: finished, value} = await reader.read();
+            if (finished) break;
+            feed(decoder.decode(value, {stream: true}));
+          }
+          resolve();
+        } catch (e) {
+          if (e && e.name === "AbortError") resolve(); else reject(e);
+        }
+      })();
+    } else {
+      const es = new EventSource(url, {withCredentials: true});
+      handle.close = () => { es.close(); resolve(); };
+      es.addEventListener("frame", event => onFrame(String(event.data || "")));
+      es.onerror = () => { es.close(); reject(new Error("EventSource error")); };
+    }
+  });
+  handle.done = done;
+  return handle;
 }
 
 // The Hub ends a stream after 10 min and an <img> may not report that: reconnect every 9 min
@@ -1404,7 +1508,8 @@ function reconnectStream(rb) {
   s.loaded = false;
   s.stalledSince = 0;
   s.arm();
-  $("remoteImg").src = streamUrl(rb);
+  if (s.kind === "sse") connectSse(s);
+  else $("remoteImg").src = streamUrl(rb);
 }
 
 function checkStream(rb, meta) {
@@ -1422,42 +1527,94 @@ function closeStream() {
   if (!s) return;
   state.rbStream = null;
   s.rb.stream = null;
+  s.rb.present++;                   // a frame still decoding must not reappear after the stream is closed
   clearTimeout(s.timer);
   clearTimeout(s.retry);
+  if (s.conn) { s.conn.close(); s.conn = null; }
   const img = $("remoteImg");
   img.onload = null;
   img.onerror = null;
   if (rbShown.owner === s.rb) {
     rbShown.owner = null;
+    if (rbShown.url) URL.revokeObjectURL(rbShown.url);
     rbShown.url = "";
     img.removeAttribute("src");
     img.hidden = true;
   }
 }
 
-function streamFallback(tab, rb) {
-  dlog("net", "warn", "stream fallback to polling", {reason: rb.perf.fallback || ""});
+// The current transport did not deliver: MJPEG -> SSE -> polling. `reason` is shown in the speed overlay.
+function streamAdvance(tab, rb, reason) {
+  const s = state.rbStream;
+  const kind = s ? s.kind : "mjpeg";
+  rb.perf.fallback = reason;
+  dlog("net", "warn", "stream fallback", {from: kind, reason});
+  if (kind === "mjpeg" && sseSupported()) {
+    openStream(tab, rb, "sse");
+    return;
+  }
   rb.streamFailed = true;
+  liveSavePref({t: "poll"});
   closeStream();
   state.rbPollMode = "";             // make syncRemotePoll restart this tab with frame.jpg polling
   syncRemotePoll();
 }
 
-function openStream(tab, rb) {
+// SSE: (re)connect `s`; every frame is decoded off-screen and swapped in by presentRemoteFrame (at most two
+// object URLs alive: the shown one and the one being decoded).
+function connectSse(s) {
+  if (s.conn) s.conn.close();
+  const {rb} = s;
+  const tab = remoteTabOf(rb);
+  const conn = sseConnect(sseUrl(rb), data => {
+    if (state.rbStream !== s || s.conn !== conn) return;
+    let blob;
+    try { blob = base64ToBlob(data); } catch (e) { return; }
+    if (!s.loaded) {
+      s.loaded = true;
+      clearTimeout(s.timer);
+      rb.perf.streamMs = performance.now() - s.opened;
+      liveSavePref({t: "sse"});
+      dlog("net", "info", "sse first frame", {ms: Math.round(rb.perf.streamMs)});
+    }
+    if (tab) presentRemoteFrame(tab, rb, blob).catch(() => {});
+  });
+  s.conn = conn;
+  s.connAt = performance.now();
+  conn.done.then(() => ended(false), () => ended(true));
+  function ended(failed) {
+    if (state.rbStream !== s || s.conn !== conn) return;
+    const now = performance.now();
+    s.errors = s.errors.filter(t => now - t < RB_STREAM_ERR_WINDOW_MS);
+    if (failed || now - s.connAt < 2000) s.errors.push(now);      // an end right after the start is an error too
+    dlog("net", failed ? "warn" : "info", "sse ended", {failed, count: s.errors.length});
+    if (s.errors.length >= 2) { streamAdvance(remoteTabOf(rb), rb, "SSEのエラー"); return; }
+    s.retry = setTimeout(() => { if (state.rbStream === s && s.conn === conn) connectSse(s); }, failed ? 500 : 50);
+  }
+}
+
+function remoteTabOf(rb) {
+  return state.tabs.find(t => t.rb === rb) || null;
+}
+
+function openStream(tab, rb, kind = "mjpeg") {
   closeStream();
   dropRemoteImage(rb);
   const img = $("remoteImg");
-  const s = {rb, opened: performance.now(), loaded: false, errors: [], timer: 0, retry: 0, stalledSince: 0, arm: null};
+  const s = {rb, kind, opened: performance.now(), loaded: false, errors: [], timer: 0, retry: 0, stalledSince: 0,
+    arm: null, conn: null, connAt: 0};
   state.rbStream = s;
   rb.stream = s;
   rbShown.owner = rb;
   rbShown.url = "";
+  const limit = kind === "sse" ? RB_SSE_FIRST_MS : (sseSupported() ? RB_MJPEG_FIRST_MS : RB_STREAM_FIRST_MS);
   const shown = () => {
     if (state.rbStream !== s) return;
     if (!s.loaded) {
       s.loaded = true;
       clearTimeout(s.timer);
       rb.perf.streamMs = performance.now() - s.opened;
+      liveSavePref({t: "mjpeg"});
       dlog("net", "info", "stream first frame", {ms: Math.round(rb.perf.streamMs)});
     }
     img.hidden = false;
@@ -1467,16 +1624,26 @@ function openStream(tab, rb) {
   // never ends), so the first frame is also detected by the decoded size (v0.1.34).
   const arm = () => {
     clearTimeout(s.timer);
-    const deadline = performance.now() + RB_STREAM_FIRST_MS;
+    const deadline = performance.now() + limit;
     const check = () => {
       if (state.rbStream !== s || s.loaded) return;
-      if (img.naturalWidth > 0 && img.currentSrc.indexOf("/api/rb/stream.mjpg") >= 0) { shown(); return; }
-      if (performance.now() >= deadline) { rb.perf.fallback = "最初の画面が届かない"; streamFallback(tab, rb); return; }
+      if (kind === "mjpeg" && img.naturalWidth > 0 && img.currentSrc.indexOf("/api/rb/stream.mjpg") >= 0) { shown(); return; }
+      if (performance.now() >= deadline) {
+        streamAdvance(tab, rb, kind === "sse" ? "SSEも最初の画面が届かない" : "MJPEGの最初の画面が届かない");
+        return;
+      }
       s.timer = setTimeout(check, 250);
     };
     s.timer = setTimeout(check, 250);
   };
   s.arm = arm;
+  if (kind === "sse") {
+    dlog("net", "info", "sse open", {});
+    arm();
+    connectSse(s);
+    return;
+  }
+  liveSavePref({mjpegAt: Date.now()});    // MJPEG is tried now: not again for a day if it fails
   img.onload = shown;
   img.onerror = () => {
     if (state.rbStream !== s) return;
@@ -1484,7 +1651,7 @@ function openStream(tab, rb) {
     s.errors = s.errors.filter(t => now - t < RB_STREAM_ERR_WINDOW_MS);
     s.errors.push(now);
     dlog("net", "warn", "stream error", {count: s.errors.length});
-    if (s.errors.length >= 2) { rb.perf.fallback = "ストリームのエラー"; streamFallback(tab, rb); return; }
+    if (s.errors.length >= 2) { streamAdvance(tab, rb, "MJPEGのエラー"); return; }
     s.loaded = false;
     s.opened = now;
     arm();
@@ -1495,14 +1662,14 @@ function openStream(tab, rb) {
   img.src = streamUrl(rb);
 }
 
-async function streamLoop(tab, gen) {
+async function streamLoop(tab, gen, kind = "mjpeg") {
   let fails = 0, first = true;
   await nextPaint();
   await nextPaint();
   if (gen !== state.rbGen || !tab.rb) return;
   await sendViewport(tab).catch(() => {});
   if (gen !== state.rbGen || !tab.rb) return;
-  openStream(tab, tab.rb);
+  openStream(tab, tab.rb, kind);
   while (gen === state.rbGen && tab.rb) {
     const rb = tab.rb;
     try {
@@ -1611,8 +1778,11 @@ function syncRemotePoll() {
   if (rb.shown && rb.shown !== mode) leaveDisplay(rb, rb.shown);
   rb.shown = mode;
   if (mode === "live") {
-    if (rb.streamFailed || typeof Image !== "function") remoteLoop(tab, state.rbGen);
-    else streamLoop(tab, state.rbGen).catch(() => {});
+    const kind = rb.streamFailed || typeof Image !== "function" ? "poll" : liveStartKind();
+    if (kind === "poll") {
+      if (!rb.streamFailed) { rb.streamFailed = true; rb.perf.fallback = "前回ストリームが届かなかったため"; }
+      remoteLoop(tab, state.rbGen);
+    } else streamLoop(tab, state.rbGen, kind).catch(() => {});
     scheduleViewportLinks(tab, true);      // the link map of the live picture (v0.1.30)
   } else if (mode === "reader") {
     readerLoop(tab, state.rbGen).catch(() => {});
@@ -1971,7 +2141,8 @@ function perfText(tab = remoteTab()) {
       " · 取得 " + Math.round(p.extractMs || 0) + " ms" + (p.imgs ? " · 画像取得 " + Math.round(each) + " ms" : "");
   }
   if (rb && rb.stream && !rb.streamFailed) {
-    return "ライブ(ストリーム)・" + quality + " · " + (p.fps || 0).toFixed(1) + " fps · " +
+    return "ライブ(" + LIVE_KIND_LABEL[rb.stream.kind === "sse" ? "sse" : "mjpeg"] + (p.fallback ? ": " + p.fallback : "") + ")・" +
+      quality + " · " + (p.fps || 0).toFixed(1) + " fps · " +
       kb(p.frameBytes || 0) + "/枚 · 応答 " + Math.round(p.streamMs || 0) + " ms";
   }
   const now = performance.now();
@@ -6104,11 +6275,43 @@ function renderHttps() {
   $("httpsCmd").textContent = HTTPS_SERVE_COMMAND;
 }
 
-async function copyText(text) {
+// Copies text. navigator.clipboard when there is one (secure contexts); otherwise, or when it refuses, a hidden
+// textarea + document.execCommand("copy") (works on plain http in Safari). Call it directly from the tap
+// handler with text that is already at hand: the copy command needs the user gesture. Resolves to true/false.
+function execCopy(text) {
+  const area = document.createElement("textarea");
+  area.value = text;
+  area.setAttribute("readonly", "");
+  area.setAttribute("aria-hidden", "true");
+  area.style.cssText = "position:fixed;left:0;top:0;width:1px;height:1px;padding:0;border:0;opacity:0;font-size:16px";
+  const keep = document.activeElement;
+  document.body.appendChild(area);
+  let ok = false;
   try {
-    await navigator.clipboard.writeText(text);
-    flash("コピーしました");
-  } catch (e) { flash("コピーできませんでした。長押しで選択してください"); }
+    area.focus({preventScroll: true});
+    area.select();
+    area.setSelectionRange(0, text.length);
+    ok = document.execCommand("copy") === true;
+  } catch (e) { ok = false; }
+  area.remove();
+  try { if (keep && keep.focus) keep.focus({preventScroll: true}); } catch (e) { /* ignore */ }
+  return ok;
+}
+
+async function copyToClipboard(text) {
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    try {
+      await navigator.clipboard.writeText(text);
+      return true;
+    } catch (e) { /* refused (permissions, not focused): try the copy command */ }
+  }
+  return execCopy(text);
+}
+
+async function copyText(text) {
+  const ok = await copyToClipboard(text);
+  flash(ok ? "コピーしました" : "コピーできませんでした。長押しで選択してください");
+  return ok;
 }
 
 function shareEndpoint() { return location.origin + "/api/share"; }
@@ -7482,7 +7685,7 @@ const SELFTEST_LIVE_MS = 3000;
 const SELFTEST_STATUS_LABEL = {pass: "合格", warn: "注意", fail: "失敗", skip: "省略"};
 const SELFTEST_STATUS_ICON = {pass: "✓", warn: "!", fail: "×", skip: "–"};
 const SELFTEST_SECTION_ICON = {pending: "・", running: "…", done: "✓", skipped: "–"};
-const selftestUi = {runId: "", rev: -1, snap: null, watching: false, clientRun: "", shownId: "", text: ""};
+const selftestUi = {runId: "", rev: -1, snap: null, watching: false, clientRun: "", shownId: "", text: "", cache: null, fetching: ""};
 
 function selftestUrlLines() {
   return $("selftestUrls").value.split(/\r?\n/).map(line => line.trim()).filter(Boolean);
@@ -7504,6 +7707,7 @@ function wireSelftest() {
     await api("/api/selftest/cancel", {});
   }));
   $("selftestCopy").addEventListener("click", () => perform(selftestCopy));
+  $("selftestIncludeUrls").addEventListener("change", () => { if (selftestUi.snap && selftestUi.snap.state !== "running") selftestPrefetch(); });
   $("selftestSave").addEventListener("click", () => perform(selftestSave));
 }
 
@@ -7608,6 +7812,7 @@ function renderSelftestResult(snap) {
   $("selftestSummary").className = "selftest-summary " + (sum.fail ? "has-fail" : sum.warn ? "has-warn" : "is-ok");
   setShown("selftestCopy", !running);
   setShown("selftestSave", !running);
+  if (!running) selftestPrefetch();
   const wrap = $("selftestTables");
   const nodes = [];
   for (const sec of snap.sections || []) {
@@ -7663,25 +7868,48 @@ async function selftestReport() {
   return api("/api/selftest/report?id=" + encodeURIComponent(id) + "&urls=" + urls);
 }
 
-// Clipboard when the browser allows it; otherwise the text is shown selected so a long press can copy it.
+// Copies the report. The text is prefetched when the run ends (selftestPrefetch), so the tap copies it at once,
+// inside the user gesture: navigator.clipboard when available, else a hidden textarea + execCommand("copy")
+// (plain http in Safari). Only when both fail the text is shown selected for a long press.
 async function selftestCopy() {
-  const report = await selftestReport();
-  selftestUi.text = report.text;
+  const key = selftestCacheKey();
+  const cached = selftestUi.cache && selftestUi.cache.key === key ? selftestUi.cache.text : null;
+  let text = cached;
+  let copied = false;
+  if (text !== null) copied = await copyToClipboard(text);
+  else {
+    text = (await selftestReport()).text;
+    copied = await copyToClipboard(text);
+  }
+  selftestUi.text = text;
   const area = $("selftestText");
-  area.value = report.text;
-  try {
-    await navigator.clipboard.writeText(report.text);
+  area.value = text;
+  if (copied) {
     area.hidden = true;
     flash("結果をコピーしました。開発者へ貼り付けてください");
     return;
-  } catch (e) { /* no clipboard permission (HTTP, iOS rules): fall back below */ }
+  }
   area.hidden = false;
   area.focus();
   area.select();
   try { area.setSelectionRange(0, area.value.length); } catch (e) { /* older browser */ }
-  let copied = false;
-  try { copied = document.execCommand("copy"); } catch (e) { copied = false; }
-  flash(copied ? "結果をコピーしました" : "下のテキストを長押しして「コピー」してください");
+  flash("下のテキストを長押しして「コピー」してください");
+}
+
+function selftestCacheKey() {
+  const id = selftestUi.snap && selftestUi.snap.run_id;
+  return id ? id + "|" + ($("selftestIncludeUrls").checked ? "1" : "0") : "";
+}
+
+async function selftestPrefetch() {
+  const key = selftestCacheKey();
+  if (!key || (selftestUi.cache && selftestUi.cache.key === key) || selftestUi.fetching === key) return;
+  selftestUi.fetching = key;
+  try {
+    const report = await selftestReport();
+    if (selftestCacheKey() === key) selftestUi.cache = {key, text: report.text};
+  } catch (e) { /* the tap fetches it then */ }
+  if (selftestUi.fetching === key) selftestUi.fetching = "";
 }
 
 // Client-side file (the Hub writes nothing): the readable report followed by the same data as JSON.
@@ -7698,6 +7926,10 @@ async function selftestSave() {
   setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
+function selftestExecCopySupported() {
+  try { return typeof document.queryCommandSupported === "function" && document.queryCommandSupported("copy") === true; } catch (e) { return false; }
+}
+
 function selftestDevice() {
   const flags = {
     pointer_events: typeof window.PointerEvent === "function",
@@ -7706,6 +7938,9 @@ function selftestDevice() {
     abort_controller: typeof window.AbortController === "function",
     img_decode: typeof HTMLImageElement === "function" && "decode" in HTMLImageElement.prototype,
     clipboard_api: Boolean(navigator.clipboard && navigator.clipboard.writeText),
+    exec_copy: selftestExecCopySupported(),
+    sse: sseSupported(),
+    live_pref: String(liveLoadPref().t || "-").slice(0, 8),
     secure_context: window.isSecureContext === true,
     https: location.protocol === "https:",
     stream_failed_before: Boolean(state.tabs.some(t => t.rb && t.rb.streamFailed)),
@@ -7721,7 +7956,7 @@ function selftestDevice() {
   const view = selftestViewport();
   return {ua: String(navigator.userAgent || "").slice(0, 300), lang: String(navigator.language || "").slice(0, 20),
     platform: String(navigator.platform || "").slice(0, 60), width: view.width, height: view.height, dpr: view.dpr,
-    touch: Number(navigator.maxTouchPoints) || 0, standalone, storage, clipboard: flags.clipboard_api, flags};
+    touch: Number(navigator.maxTouchPoints) || 0, standalone, storage, clipboard: flags.clipboard_api || flags.exec_copy, flags};
 }
 
 const selftestMedian = values => {
@@ -7765,7 +8000,8 @@ async function selftestClient(snap) {
   const device = selftestDevice();
   try {
     checks.push({id: "client.storage", ok: device.storage});
-    checks.push({id: "client.clipboard", ok: device.clipboard});
+    checks.push({id: "client.clipboard", ok: device.clipboard, flags: {api: device.flags.clipboard_api}});
+    checks.push({id: "client.secure", ok: device.flags.secure_context});
     await step("client.rtt", async () => {
       const times = [];
       for (let i = 0; i < 5; i++) {
@@ -7804,7 +8040,7 @@ async function selftestClient(snap) {
 
 const CLIENT_STEP_LABEL = {"client.rtt": "Hubとの通信", "client.reader": "リーダー表示", "client.mirror_load": "ミラーの読み込み",
   "client.mirror_events": "ミラー内のタップ", "client.mirror_morph": "ミラーの差し替え", "client.tiles": "高速表示",
-  "client.live": "ライブ表示"};
+  "client.live": "ライブ表示（MJPEG・SSE・ポーリング）"};
 
 async function selftestReaderStep(tab, holder) {
   const t0 = performance.now();
@@ -7921,21 +8157,24 @@ async function selftestTilesStep(tab, created) {
     kb: Math.round(blob.size / 1024)};
 }
 
-// Live display as the app does it: an <img> on the MJPEG stream must show a first frame within
-// RB_STREAM_FIRST_MS (else the app polls); then the frames of the stream are counted for 3 s.
-async function selftestLiveStep(tab, holder) {
+// Live display the way the app does it, in the app's order, each transport measured on its own:
+//   1. MJPEG: an <img> on stream.mjpg must show a first frame within RB_MJPEG_FIRST_MS (then its frames are
+//      counted for SELFTEST_LIVE_MS with a fetch reader, else the Hub's own fps figure is used);
+//   2. SSE: stream.sse read for SELFTEST_LIVE_MS (frames per second);
+//   3. polling: frame.jpg requested exactly like remoteLoop (since = last seq, no rev) for SELFTEST_LIVE_MS.
+// The app ends on the first of them that works; the Hub judges (client_evaluate) from the flags.
+async function selftestLiveMjpeg(tab, holder, out) {
   const img = new Image();
   img.style.cssText = "position:absolute;left:0;top:0;width:100%;height:auto";
   holder.appendChild(img);
   const t0 = performance.now();
   img.src = streamUrl({id: tab});
-  const first = await selftestWaitFor(() => img.naturalWidth > 0 && img.currentSrc.indexOf("/api/rb/stream.mjpg") >= 0, RB_STREAM_FIRST_MS, 100);
-  const firstMs = Math.round(performance.now() - t0);
-  img.removeAttribute("src");
-  img.remove();
-  await delay(500);
-  let frames = 0, bytes = 0, elapsed = SELFTEST_LIVE_MS, how = "stream";
-  if (typeof AbortController === "function" && typeof Response === "function" && "body" in Response.prototype) {
+  const first = await selftestWaitFor(() => img.naturalWidth > 0 && img.currentSrc.indexOf("/api/rb/stream.mjpg") >= 0, RB_MJPEG_FIRST_MS, 100);
+  out.flags.mjpeg = first;
+  out.firstMs = Math.round(performance.now() - t0);
+  if (!first) { img.removeAttribute("src"); img.remove(); return; }
+  let frames = 0, bytes = 0, elapsed = SELFTEST_LIVE_MS;
+  if (sseFetchOk()) {
     const ctl = new AbortController();
     const marker = Array.from("--qdlframe", c => c.charCodeAt(0));
     let tail = new Uint8Array(0);
@@ -7960,44 +8199,81 @@ async function selftestLiveStep(tab, holder) {
         }
         tail = joined.slice(Math.max(0, joined.length - (marker.length - 1)));
       }
-    } catch (e) {
-      if (!(e && e.name === "AbortError")) how = "stream-error: " + (e && e.message ? e.message : e);
-    } finally {
-      clearTimeout(stopTimer);
-      ctl.abort();
-    }
+    } catch (e) { /* abort at the end of the window, or the reader cannot read it (WebKit "Load failed") */ }
+    finally { clearTimeout(stopTimer); ctl.abort(); }
     elapsed = performance.now() - started;
   } else {
-    how = "このブラウザはストリームを読めません";
+    await delay(SELFTEST_LIVE_MS);
   }
-  // v0.1.44: some browsers display the stream in <img> but cannot read it with fetch (WebKit reports
-  // "Load failed"). Then the frames are counted with the polling fallback the app itself would use.
   if (frames === 0) {
-    const started = performance.now();
-    let seq = 0;
-    while (performance.now() - started < SELFTEST_LIVE_MS) {
-      try {
-        const res = await fetch("/api/rb/frame.jpg?tab=" + encodeURIComponent(tab) + "&since=" + seq,
-          {cache: "no-store", credentials: "same-origin"});
-        if (res.status !== 200 && res.status !== 204) break;
-        const n = Number(res.headers.get("X-Frame-Seq"));
-        if (res.status === 200) {
-          const blob = await res.blob();
-          if (blob.size > 0 && n !== seq) { frames++; bytes += blob.size; }
-        }
-        if (Number.isFinite(n)) seq = n;
-      } catch (e) {
-        break;
-      }
-    }
-    elapsed = performance.now() - started;
-    if (frames > 0) how = (how === "stream" ? "" : how + " → ") + "ポーリングで計測";
+    // The <img> showed it but fetch cannot read it: the Hub's own figure for the stream that is still open.
+    try {
+      const meta = await api("/api/rb/meta?tab=" + encodeURIComponent(tab) + "&wait=0");
+      if (Number.isFinite(meta.fps) && meta.fps > 0) { out.fps_mjpeg = Math.round(meta.fps * 10) / 10; out.kb = Math.round((meta.frame_bytes || 0) / 1024); }
+    } catch (e) { /* no figure */ }
+  } else {
+    out.fps_mjpeg = Math.round(frames / Math.max(elapsed / 1000, 0.1) * 10) / 10;
+    out.kb = Math.round(bytes / frames / 1024);
   }
-  const fps = Math.round(frames / Math.max(elapsed / 1000, 0.1) * 10) / 10;
-  const out = {ok: frames > 0, fps, kb: frames ? Math.round(bytes / frames / 1024) : 0, ms: firstMs,
-    flags: {img: first, polled: how.indexOf("ポーリングで計測") >= 0},
-    note: first ? (how === "stream" ? "最初の画面 " + firstMs + " ms" : how) : "最初の画面が届かない（5秒）"};
-  return out;
+  img.removeAttribute("src");
+  img.remove();
+  if (!Number.isFinite(out.fps_mjpeg)) out.fps_mjpeg = 0;
+}
+
+async function selftestLiveSse(tab, out) {
+  let frames = 0, bytes = 0;
+  const started = performance.now();
+  let conn = null;
+  try {
+    conn = sseConnect(sseUrl({id: tab}), data => { frames++; bytes += Math.floor(data.length * 3 / 4); });
+    conn.done.catch(() => {});
+    await delay(SELFTEST_LIVE_MS);
+  } catch (e) { /* unsupported */ }
+  if (conn) conn.close();
+  const elapsed = performance.now() - started;
+  out.fps_sse = Math.round(frames / Math.max(elapsed / 1000, 0.1) * 10) / 10;
+  out.flags.sse = frames > 0;
+  if (frames > 0 && !out.kb) out.kb = Math.round(bytes / frames / 1024);
+}
+
+async function selftestLivePoll(tab, out) {
+  let frames = 0, bytes = 0, seq = 0;
+  const ctl = new AbortController();
+  const started = performance.now();
+  const stopTimer = setTimeout(() => ctl.abort(), SELFTEST_LIVE_MS);
+  try {
+    while (performance.now() - started < SELFTEST_LIVE_MS) {
+      const res = await fetch("/api/rb/frame.jpg?tab=" + encodeURIComponent(tab) + "&since=" + seq,
+        {signal: ctl.signal, cache: "no-store", credentials: "same-origin"});
+      if (res.status !== 200 && res.status !== 204) break;
+      const n = Number(res.headers.get("X-Frame-Seq"));
+      if (res.status === 200) {
+        const blob = await res.blob();
+        if (blob.size > 0 && blob.type === "image/jpeg") { frames++; bytes += blob.size; }
+      }
+      if (Number.isFinite(n)) seq = Math.max(seq, n);
+    }
+  } catch (e) { /* the window ended while a long poll was waiting for a new frame */ }
+  finally { clearTimeout(stopTimer); }
+  const elapsed = performance.now() - started;
+  out.fps_poll = Math.round(frames / Math.max(elapsed / 1000, 0.1) * 10) / 10;
+  out.flags.poll = frames > 0;
+  if (frames > 0 && !out.kb) out.kb = Math.round(bytes / frames / 1024);
+}
+
+async function selftestLiveStep(tab, holder) {
+  const out = {flags: {}, kb: 0, firstMs: 0};
+  await selftestLiveMjpeg(tab, holder, out);
+  await delay(300);
+  if (sseSupported()) await selftestLiveSse(tab, out);
+  await delay(300);
+  await selftestLivePoll(tab, out);
+  const chosen = out.flags.mjpeg ? "mjpeg" : out.flags.sse ? "sse" : out.flags.poll ? "poll" : "";
+  const fps = chosen === "mjpeg" ? out.fps_mjpeg : chosen === "sse" ? out.fps_sse : chosen === "poll" ? out.fps_poll : 0;
+  const note = out.flags.mjpeg ? "MJPEGの最初の画面 " + out.firstMs + " ms" : "MJPEGの最初の画面が届かない（" + (RB_MJPEG_FIRST_MS / 1000) + "秒）";
+  const result = {ok: Boolean(chosen), fps: fps || 0, kb: out.kb, ms: out.firstMs, flags: out.flags, note};
+  for (const key of ["fps_mjpeg", "fps_sse", "fps_poll"]) if (Number.isFinite(out[key])) result[key] = out[key];
+  return result;
 }
 
 // ---- Settings › NASブラウザ (v0.1.16)
@@ -8144,7 +8420,8 @@ function renderBrowserStatus(r) {
     r.update_needed ? "初期設定を再実行" : "初期設定（イメージ作成）";
   $("rbStop").hidden = !(r.phase === "running" || r.phase === "starting");
   const parts = [];
-  if (r.memory) parts.push("ブラウザのメモリ " + r.memory.used_mib + " / " + r.memory.limit_mib + " MiB（" + r.memory.percent + "%）");
+  if (r.memory) parts.push("ブラウザのメモリ " + r.memory.used_mib + (Number.isFinite(r.memory.limit_mib) ?
+    " / " + r.memory.limit_mib + " MiB（" + r.memory.percent + "%）" : " MiB"));
   if (typeof r.available_mib === "number") parts.push("NAS空きメモリ " + r.available_mib + " MiB");
   parts.push("タブ " + (r.tabs || []).length + " / " + r.max_tabs);
   $("rbMemory").textContent = parts.join(" · ");
@@ -8325,10 +8602,7 @@ function wireEngine() {
   }));
   $("engineKeys").addEventListener("click", () => perform(loadEngineKeys));
   $("engineKeysCopy").addEventListener("click", async () => {
-    try {
-      await navigator.clipboard.writeText($("engineKeysOut").textContent);
-      flash("コピーしました");
-    } catch (e) { flash("コピーできませんでした"); }
+    copyText($("engineKeysOut").textContent);
   });
   $("engineLogBox").addEventListener("toggle", () => {
     if ($("engineLogBox").open) perform(loadEngineLog);

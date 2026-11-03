@@ -9,6 +9,7 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import container_runtime as cr
 import remote_browser as rb
@@ -373,13 +374,22 @@ class LifecycleTests(BrowserBase):
     def test_stats_are_cached_for_five_seconds_and_target_only_our_container(self):
         self.open()
         before = len([c for c in self.fake.docker_calls() if c[0] == "stats"])
-        self.rb.status()
-        self.rb.status()
+        self.rb.memory_reason()
         self.rb.memory_reason()
         self.assertLessEqual(len([c for c in self.fake.docker_calls() if c[0] == "stats"]) - before, 1)
         self.clock.now += 6
+        self.rb.memory_reason()                # the tab-open guard stays fresh (5 s)
+        self.assertEqual(len([c for c in self.fake.docker_calls() if c[0] == "stats"]) - before, 2)
+        # v0.1.46: status() (the /api/state path) never starts docker stats; the settings view's status()
+        # reuses a result up to 30 s old
+        self.clock.now += 6
         self.rb.status()
         self.assertEqual(len([c for c in self.fake.docker_calls() if c[0] == "stats"]) - before, 2)
+        self.rb.status(fresh_memory=True)
+        self.assertEqual(len([c for c in self.fake.docker_calls() if c[0] == "stats"]) - before, 2)
+        self.clock.now += 31
+        self.rb.status(fresh_memory=True)
+        self.assertEqual(len([c for c in self.fake.docker_calls() if c[0] == "stats"]) - before, 3)
         for call in self.fake.docker_calls():
             if call[0] == "stats":
                 self.assertEqual(call[-1], "qnapdl-browser")
@@ -3118,7 +3128,7 @@ class ReaderImageTests(ReaderBase):
 
 
 # ------------------------------------------------------------ v0.1.30: MJPEG stream
-class StreamTests(BrowserBase):
+class StreamBase(BrowserBase):
     def setUp(self):
         super().setUp()
         self.open("https://example.com/a")
@@ -3174,6 +3184,9 @@ class StreamTests(BrowserBase):
         length = int([l for l in lines if l.startswith(b"Content-Length:")][0].split(b":")[1])
         return lines, rest[:length], rest[length:]
 
+
+
+class StreamTests(StreamBase):
     def test_parts_have_boundary_type_and_exact_lengths(self):
         out, errors, thread = self.run_stream()
         self.assertTrue(self.wait_for(lambda: self.rb._tabs["b1"].streams == 1))
@@ -3223,22 +3236,26 @@ class StreamTests(BrowserBase):
     def test_limits_per_tab_and_overall(self):
         outs = [self.run_stream("b1"), self.run_stream("b1")]
         self.assertTrue(self.wait_for(lambda: self.rb._tabs["b1"].streams == 2))
-        with self.assertRaises(rb.StreamLimit) as caught:
-            self.rb.stream("b1", lambda part: None)
+        # v0.1.46: a third stream of the same tab ends the oldest one (a viewer behind a buffering proxy
+        # never shows that its old stream is gone) instead of being refused
+        outs.append(self.run_stream("b1"))
+        outs[0][2].join(3)
+        self.assertFalse(outs[0][2].is_alive())
+        self.assertTrue(self.wait_for(lambda: self.rb._tabs["b1"].streams == 2))
         self.assertTrue(issubclass(rb.StreamLimit, rb.ProbeQueueFull))        # HTTP 429
-        self.assertIn("同時接続", str(caught.exception))
         self.open("https://example.com/b")
         self.open("https://example.com/c")
         outs += [self.run_stream("b2"), self.run_stream("b2")]
         self.assertTrue(self.wait_for(lambda: self.rb._streams == 4))
-        with self.assertRaises(rb.StreamLimit):
+        with self.assertRaises(rb.StreamLimit) as caught:
             self.rb.stream("b3", lambda part: None)
+        self.assertIn("同時接続", str(caught.exception))
         self.assertEqual(self.rb._tabs["b3"].streams, 0)
         self.rb.close_tab("b2")
         self.assertTrue(self.wait_for(lambda: self.rb._streams == 2))
         self.rb.close_tab("b1")
         self.assertTrue(self.wait_for(lambda: self.rb._streams == 0))
-        self.assertEqual([e for _, e, _ in outs], [[], [], [], []])
+        self.assertEqual([e for _, e, _ in outs], [[], [], [], [], []])
 
     def test_ends_after_max_seconds_on_write_error_and_on_container_stop(self):
         out, errors, thread = self.run_stream(max_seconds=0.3)
@@ -3393,3 +3410,270 @@ eq(pickBest([{u: "s", w: 0}, {u: "t", w: 900}], 1280).u, "t", "unknown widths lo
         with self.assertRaises(rb.ImageUnavailable):
             self.rb.reader_image("b1", 0)
         self.assertEqual(asked, [big])
+
+
+# ------------------------------------------------------------ v0.1.46: SSE live stream
+class SseStreamTests(StreamBase):
+    """The event-stream form of the live stream: same pacing and limits as the MJPEG stream."""
+
+    def run_sse(self, ident="b1", write=None, **kwargs):
+        return self.run_stream(ident, write, sse=True, **kwargs)
+
+    @staticmethod
+    def events(out):
+        """[(event name, data)] of the writes (comments are skipped)."""
+        found = []
+        for part in out:
+            text = part.decode("ascii")
+            if text.startswith(":"):
+                continue
+            lines = text.split("\n")
+            found.append((lines[0][len("event: "):], lines[1][len("data: "):]))
+            assert text.endswith("\n\n") and len(lines) == 4, text
+        return found
+
+    def test_starts_with_2k_padding_then_base64_frames_in_the_event_format(self):
+        out, errors, thread = self.run_sse()
+        self.assertTrue(self.wait_for(lambda: self.rb._tabs["b1"].streams == 1))
+        self.assertTrue(self.wait_for(lambda: len(out) == 1))
+        self.assertTrue(out[0].startswith(b":") and out[0].endswith(b"\n\n"))
+        self.assertGreaterEqual(len(out[0]), 2048)
+        self.assertEqual(out[0].count(b"\n"), 2)             # one comment line, nothing a parser would deliver
+        for data in (b"\xff\xd8\xff-one", b"\xff\xd8\xff-second-frame"):
+            before = len(out)
+            self.feed("SESSION1", data=self.jpeg(data))
+            self.assertTrue(self.wait_for(lambda: len(out) > before))
+            self.assertEqual(out[-1], b"event: frame\ndata: " + self.jpeg(data).encode() + b"\n\n")
+            self.assertEqual(base64.b64decode(self.events(out)[-1][1]), data)
+        self.rb.close_tab("b1")
+        thread.join(3)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(errors, [])
+
+    def test_a_slow_writer_gets_only_the_newest_frame(self):
+        gate = threading.Event()
+        first = []
+
+        def slow_first(part):
+            if part.startswith(b"event:") and not first:
+                first.append(1)
+                gate.wait(3)
+        out, errors, thread = self.run_sse(write=slow_first)
+        self.assertTrue(self.wait_for(lambda: self.rb._tabs["b1"].streams == 1))
+        self.feed("SESSION1", data=self.jpeg(b"\xff\xd8\xff-A"))
+        self.assertTrue(self.wait_for(lambda: len(self.events(out)) == 1))
+        for name in (b"B", b"C", b"D"):
+            self.feed("SESSION1", data=self.jpeg(b"\xff\xd8\xff-" + name))
+        gate.set()
+        self.assertTrue(self.wait_for(lambda: len(self.events(out)) >= 2))
+        self.assertEqual(base64.b64decode(self.events(out)[1][1]), b"\xff\xd8\xff-D")
+        time.sleep(0.2)
+        self.assertEqual(len(self.events(out)), 2)
+
+    def test_idle_stream_sends_pings_and_the_heartbeat_resends_the_last_frame(self):
+        with mock.patch.object(rb, "SSE_PING_SECONDS", 0.15):
+            out, errors, thread = self.run_sse(heartbeat=0.5)
+            self.assertTrue(self.wait_for(lambda: self.rb._tabs["b1"].streams == 1))
+            self.assertTrue(self.wait_for(lambda: out.count(b": ping\n\n") >= 2, 3.0))
+            self.assertEqual(self.events(out), [])                 # no frame yet: nothing to repeat
+            self.feed("SESSION1", data=self.jpeg(b"\xff\xd8\xff-HB"))
+            self.assertTrue(self.wait_for(lambda: len(self.events(out)) >= 2, 3.0))
+            self.assertEqual({d for _, d in self.events(out)[:2]}, {self.jpeg(b"\xff\xd8\xff-HB")})
+
+    def test_ends_on_a_write_error_after_max_seconds_and_when_the_tab_closes(self):
+        out, errors, thread = self.run_sse(max_seconds=0.3)
+        thread.join(3)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual((errors, self.rb._streams, self.rb._tabs["b1"].streams), ([], 0, 0))
+
+        def broken(part):
+            if part.startswith(b"event:"):
+                raise OSError("peer left")
+        out, errors, thread = self.run_sse(write=broken)
+        self.assertTrue(self.wait_for(lambda: self.rb._tabs["b1"].streams == 1))
+        self.feed("SESSION1", data=self.jpeg(b"\xff\xd8\xff-x"))
+        thread.join(3)
+        self.assertIsInstance(errors[0], OSError)
+        self.assertEqual((self.rb._streams, self.rb._tabs["b1"].streams, self.rb._tabs["b1"].pollers), (0, 0, 0))
+
+        def broken_at_once(part):
+            raise OSError("peer left at the padding")
+        out, errors, thread = self.run_sse(write=broken_at_once)
+        thread.join(3)
+        self.assertIsInstance(errors[0], OSError)
+        self.assertEqual((self.rb._streams, self.rb._tabs["b1"].streams), (0, 0))
+
+    def test_a_third_stream_of_a_tab_replaces_the_oldest_instead_of_failing(self):
+        # A viewer behind a buffering proxy never shows us that its old stream is gone.
+        first = self.run_sse()
+        second = self.run_stream()
+        self.assertTrue(self.wait_for(lambda: self.rb._tabs["b1"].streams == 2))
+        third = self.run_sse()
+        first[2].join(3)
+        self.assertFalse(first[2].is_alive())
+        self.assertTrue(second[2].is_alive() and third[2].is_alive())
+        self.assertTrue(self.wait_for(lambda: self.rb._tabs["b1"].streams == 2))
+        self.assertEqual((first[1], second[1], third[1]), ([], [], []))
+
+    def test_mjpeg_and_sse_streams_share_the_overall_limit(self):
+        self.open("https://example.com/b")
+        self.open("https://example.com/c")
+        keep = [self.run_sse("b1"), self.run_stream("b1"), self.run_sse("b2"), self.run_stream("b2")]
+        self.assertTrue(self.wait_for(lambda: self.rb._streams == 4))
+        with self.assertRaises(rb.StreamLimit):
+            self.rb.stream("b3", lambda part: None, sse=True)
+
+    def test_meta_reports_the_fps_of_an_sse_stream(self):
+        out, errors, thread = self.run_sse()
+        self.assertTrue(self.wait_for(lambda: self.rb._tabs["b1"].streams == 1))
+        for i in range(6):
+            self.feed("SESSION1", data=self.jpeg(b"\xff\xd8\xff-%d" % i))
+            time.sleep(0.02)
+        self.assertTrue(self.wait_for(lambda: len(self.events(out)) >= 1))
+        meta = self.rb.page_meta("b1", None, wait=0)
+        self.assertGreater(meta["fps"], 0)
+        self.assertGreater(meta["frame_bytes"], 0)
+
+
+# ------------------------------------------------------------ v0.1.46: no docker stats on the /api/state path
+class StatusWithoutDockerStatsTests(BrowserBase):
+    def stats_calls(self):
+        return [c for c in self.fake.docker_calls() if c[0] == "stats"]
+
+    def test_status_never_starts_docker_stats_by_default(self):
+        self.open()
+        self.assertEqual(self.stats_calls(), [])
+        for _ in range(6):
+            self.clock.now += 3
+            status = self.rb.status()
+            self.rb.resident_status()
+        self.assertEqual(self.stats_calls(), [])
+        self.assertIsNone(status["memory"])
+        self.assertTrue(status["can_open"])
+
+    def test_status_uses_the_cgroup_when_there_is_one(self):
+        self.open()
+        scope = Path(self.temp.name) / "cg" / "system.slice" / ("docker-" + "ab" * 32 + ".scope")
+        scope.mkdir(parents=True)
+        (scope / "memory.current").write_text("%d\n" % (300 * 1024 * 1024))
+        (scope / "memory.stat").write_text("anon 1\nfile 1\n")
+        self.rb._cgroup_root = str(Path(self.temp.name) / "cg")
+        self.rb._proc_root = str(Path(self.temp.name) / "noproc")
+        self.fake.containers[cr.BROWSER_NAME]["id"] = "ab" * 32
+        self.clock.now += 30
+        status = self.rb.status()
+        self.assertEqual(self.stats_calls(), [])
+        self.assertEqual(status["memory"], {"used_mib": 300, "limit_mib": None, "percent": None})
+
+    def test_status_shows_a_cached_result_up_to_120_seconds_old_but_never_refreshes_it(self):
+        self.open()
+        self.rb.status(fresh_memory=True)                       # the settings view: one docker stats
+        self.assertEqual(len(self.stats_calls()), 1)
+        self.clock.now += 100
+        status = self.rb.status()
+        self.assertEqual(status["memory"], {"used_mib": 512, "limit_mib": 2048, "percent": 25.0})
+        self.clock.now += 30                                    # now 130 s old: not shown, still not refreshed
+        self.assertIsNone(self.rb.status()["memory"])
+        self.assertEqual(len(self.stats_calls()), 1)
+
+    def test_fresh_status_caches_docker_stats_for_30_seconds(self):
+        self.open()
+        for _ in range(4):
+            self.rb.status(fresh_memory=True)
+        self.assertEqual(len(self.stats_calls()), 1)
+        self.clock.now += 31
+        self.rb.status(fresh_memory=True)
+        self.assertEqual(len(self.stats_calls()), 2)
+
+    def test_the_tab_open_guard_stays_fresh(self):
+        self.open()
+        before = len(self.stats_calls())
+        self.clock.now += 6
+        self.assertIsNone(self.rb.memory_reason())
+        self.assertEqual(len(self.stats_calls()), before + 1)
+        self.fake.stats_out = "1900MiB / 2GiB|92.00%"
+        self.clock.now += 6
+        self.assertIn("上限", self.rb.memory_reason())
+
+    def test_cached_high_usage_still_blocks_the_open_button_without_a_new_stats_call(self):
+        self.open()
+        self.fake.stats_out = "1900MiB / 2GiB|92.00%"
+        self.clock.now += 6
+        self.rb.memory_reason()
+        calls = len(self.stats_calls())
+        self.clock.now += 10
+        status = self.rb.status()
+        self.assertFalse(status["can_open"])
+        self.assertEqual(len(self.stats_calls()), calls)
+
+
+# ------------------------------------------------------------ v0.1.46: self-test helpers of the browser
+class SelftestHelperTests(BrowserBase):
+    def open_selftest(self):
+        info = self.rb.open_tab("https://example.com/a", selftest={})
+        return info["id"]
+
+    def test_dom_content_loaded_is_counted_for_selftest_tabs_only_and_not_for_about_blank(self):
+        tab = self.open_selftest()
+        other = self.open("https://example.com/b")["id"]
+        self.assertEqual(self.rb.selftest_info(tab)["dcl"], 0)
+        self.ws.emit("Page.domContentEventFired", {"timestamp": 0.5}, "SESSION1")     # the initial about:blank
+        self.barrier()
+        self.assertEqual(self.rb.selftest_info(tab)["dcl"], 0)
+        self.ws.emit("Target.targetInfoChanged", {"targetInfo": {
+            "targetId": "TARGET00001", "type": "page", "url": "https://example.com/a", "title": "x"}})
+        self.barrier()
+        self.ws.emit("Page.domContentEventFired", {"timestamp": 1.0}, "SESSION1")
+        self.barrier()
+        self.assertEqual(self.rb.selftest_info(tab)["dcl"], 1)
+        self.ws.emit("Page.domContentEventFired", {"timestamp": 2.0}, "SESSION2")
+        self.barrier()
+        self.assertEqual(self.rb._tabs[other].dcl_n, 0)
+        self.rb._tabs[tab].url = "about:blank"
+        self.ws.emit("Page.domContentEventFired", {"timestamp": 3.0}, "SESSION1")
+        self.barrier()
+        self.assertEqual(self.rb.selftest_info(tab)["dcl"], 1)
+
+    def test_keep_survives_the_idle_stop_and_starts_the_screencast(self):
+        tab = self.open_selftest()
+        self.rb.selftest_keep(tab, 40)
+        t = self.rb._tabs[tab]
+        self.assertTrue(t.screencast)
+        self.clock.now += rb.VIEWER_STOP_AFTER + 5
+        self.rb.tick()
+        self.assertTrue(t.screencast)
+        self.clock.now += 60
+        self.rb.tick()
+        self.assertFalse(t.screencast)
+        user = self.open("https://example.com/b")["id"]
+        with self.assertRaises(rb.BrowserError):
+            self.rb.selftest_keep(user, 5)
+
+    def test_scroll_runs_in_an_isolated_world_and_reuses_the_context(self):
+        tab = self.open_selftest()
+        self.ws.results["Page.getFrameTree"] = {"frameTree": {"frame": {"id": "FRAME1"}}}
+        self.ws.results["Page.createIsolatedWorld"] = {"executionContextId": 77}
+        self.ws.eval_value = 200
+        self.assertEqual(self.rb.selftest_scroll(tab, 200), 200)
+        self.assertEqual(self.rb.selftest_scroll(tab, 200), 200)
+        self.assertEqual(len(self.ws.calls("Page.createIsolatedWorld")), 1)
+        evals = [m for m in self.ws.calls("Runtime.evaluate") if m["params"].get("contextId") == 77]
+        self.assertEqual(len(evals), 2)
+        self.assertIn("scrollTo", evals[0]["params"]["expression"])
+        self.assertIn("200", evals[0]["params"]["expression"])
+        user = self.open("https://example.com/b")["id"]
+        with self.assertRaises(rb.BrowserError):
+            self.rb.selftest_scroll(user, 200)
+
+    def test_scroll_recreates_a_lost_context(self):
+        tab = self.open_selftest()
+        self.ws.results["Page.getFrameTree"] = {"frameTree": {"frame": {"id": "FRAME1"}}}
+        self.ws.results["Page.createIsolatedWorld"] = {"executionContextId": 5}
+        self.ws.eval_value = 100
+        self.rb.selftest_scroll(tab, 100)
+        self.ws.fail["Runtime.evaluate"] = "Cannot find context with specified id"
+        self.assertIsNone(self.rb.selftest_scroll(tab, 100))
+        self.assertIsNone(self.rb._tabs[tab].iso_ctx)
+        del self.ws.fail["Runtime.evaluate"]
+        self.assertEqual(self.rb.selftest_scroll(tab, 100), 100)
+        self.assertEqual(len(self.ws.calls("Page.createIsolatedWorld")), 3)    # 1 first, 1 retry (failed), 1 after

@@ -71,6 +71,12 @@ FPS_WARN = 5.0
 FPS_SECONDS = 3.0
 SITE_OPEN_WARN_MS = 8000
 SITE_FPS_SECONDS = 3.0
+SITE_SCROLL_STEP_S = 0.3      # v0.1.46: the real-site live measurement scrolls the NAS page this often
+SITE_SCROLL_PX = 200
+SITE_LOAD_LIMIT_S = 25.0
+SITE_LOAD_GRACE_S = 5.0        # after DOMContentLoaded: how long the full load event is awaited
+LIVE_MJPEG_FIRST_S = 2.5       # shown to the user: MJPEG first frame, then SSE, then polling
+LIVE_SSE_FIRST_S = 3.0
 HUB_WRITE_WARN_KIB = 512
 CLIENT_RTT_WARN_MS = 300
 CLIENT_RTT_FAIL_MS = 2000
@@ -88,6 +94,7 @@ HINTS = {
     "env.image": "設定›ブラウザで「初期設定」（NASブラウザのイメージ作成）を実行してください。",
     "env.jd2": "設定›JD2でエンジンを起動してください（JD2を使わない場合は無視して構いません）。",
     "env.jd2:slow": "JD2の応答が遅いです。ダウンロード中のCPU・ディスク負荷が高い可能性があります。",
+    "env.cgroup": "コンテナのメモリ・ディスクI/Oをcgroupから読めず、docker statsに頼っています（CPU負荷が大きくなります）。この結果（cgroupの行）を開発者へ送ってください。",
     "env.guard": "空きメモリの保護でNASブラウザを開けません。メモリが空くまで待つか、他のアプリを止めてください。",
     "browser.cold": "常駐をオンにすると開くのが速くなります（設定›ブラウザ›常駐）。",
     "browser.start": "NASブラウザを起動できませんでした。設定›ブラウザの状態表示と、この結果のログを開発者へ送ってください。",
@@ -107,6 +114,7 @@ HINTS = {
     "builtin.meta": "ページの変化の通知が遅いです。NASの負荷かネットワークを確認してください。",
     "client.storage": "この端末でlocalStorageが使えません（プライベートブラウズ等）。表示の記憶ができませんが動作はします。",
     "client.clipboard": "クリップボードへ直接コピーできません。結果のテキストを長押しして選択し、コピーしてください。",
+    "client.secure": "https（Tailscaleの https://…ts.net）で開くと、クリップボードや一部の機能が安定します。",
     "client.rtt": "この端末からHubまでの通信が遅いです。Tailscaleの経路（直接接続かDERP中継か）やWi-Fiを確認してください。",
     "client.reader": "この端末でのリーダー表示の描画が期待どおりではありません。この結果を開発者へ送ってください。",
     "client.reader:slow": "この端末でのリーダー表示が遅いです。画像を減らす設定や高速表示を試してください。",
@@ -116,16 +124,16 @@ HINTS = {
     "client.mirror_events:click": "ミラー内のclickが届きません（pointerは届いています）。通常の操作には影響しませんが、開発者へ知らせてください。",
     "client.mirror_morph": "ミラーの差し替えが遅いです。重いページでは高速表示やリーダー表示が向いています。",
     "client.tiles": "高速表示のタイルの表示が遅いです。Hubへの通信速度を確認し、画質を速度優先にしてください。",
-    "client.live": "ライブ表示の受信が遅いか届きません。画質を速度優先にしてください。ストリームが届かない場合は自動で静止画ポーリングに切り替わります。",
-    "client.live:polling": "ライブ表示のストリーム（MJPEG）がこの端末で最初のフレームを表示できず、静止画ポーリングに切り替わります。この結果を開発者へ送ってください。",
+    "client.live": "ライブ表示のフレームが届きません。経路（プロキシ）がストリームを溜め込んでいる可能性があります。この結果を開発者へ送ってください。",
+    "client.live:polling": "ストリーム（MJPEG・SSE）がこの端末へ届かず、静止画ポーリング（5fps未満）で動いています。経由しているプロキシがストリームを溜め込んでいる可能性があります。画質を速度優先にし、この結果を開発者へ送ってください。",
     "client.error": "端末側のテストが途中で止まりました。この結果を開発者へ送ってください。",
     "client.missing": "端末側の結果が届きませんでした（画面を閉じた・通信が切れた等）。もう一度実行してください。",
-    "site.open": "ページの読み込みが遅いです。NASの回線か、サイト側の混雑かもしれません。",
+    "site.open": "ページの読み込み（DOMContentLoaded）が遅いか、完了しませんでした。NASの回線か、サイト側の混雑かもしれません。",
     "site.challenge": "Cloudflare等の確認ページです。ライブ表示で人間が通過する必要があります（自動では通しません）。",
     "site.reader": "このサイトのリーダー抽出が期待どおりではありません。ミラー表示や高速表示を使ってください。",
     "site.mirror": "このサイトのミラー表示が重い／失敗します。リーダー表示や高速表示が向いています。",
     "site.tiles": "このサイトの高速表示（タイル）の取得が遅いです。",
-    "site.live": "このサイトのライブ表示のフレームレートが低いです。画質を速度優先にしてください。",
+    "site.live": "スクロールで動きを作ってもライブ表示のフレームレートが低いです。画質を速度優先にしてください。",
     "cleanup.tabs": "セルフテスト用のタブが閉じられていません。NASブラウザを停止して再起動してください。",
     "cleanup.disk": "テスト中にHubがディスクへ多く書き込みました。デバッグログやDBの書き込みを確認してください。",
     "run.error": "セルフテストが途中で例外になりました。この結果を開発者へ送ってください。",
@@ -135,6 +143,7 @@ HINTS = {
 CLIENT_NAMES = {
     "client.storage": "localStorage",
     "client.clipboard": "クリップボード",
+    "client.secure": "安全なコンテキスト（https）",
     "client.rtt": "Hubまでの往復時間",
     "client.reader": "リーダー表示の描画",
     "client.mirror_load": "ミラー表示の読み込み",
@@ -146,7 +155,7 @@ CLIENT_NAMES = {
 }
 CLIENT_ID = re.compile(r"client\.[a-z_]{1,24}\Z")
 RUN_ID = re.compile(r"[A-Za-z0-9_-]{8,40}\Z")
-NUM_KEYS = ("ms", "n", "kb", "fps")
+NUM_KEYS = ("ms", "n", "kb", "fps", "fps_mjpeg", "fps_sse", "fps_poll")
 
 
 class Busy(RuntimeError):
@@ -339,15 +348,20 @@ def sanitize_viewport(value):
 def client_evaluate(item):
     """The check (id, name, status, value, threshold) for one validated measurement of the phone."""
     cid = item["id"]
-    ms, n, kb, fps = (item.get(k) for k in NUM_KEYS)
+    ms, n, kb, fps = (item.get(k) for k in NUM_KEYS[:4])
     flags = item.get("flags") or {}
     note = item.get("note") or ""
     name = CLIENT_NAMES.get(cid, cid)
     status, value, threshold, variant = PASS, "", "", None
-    if cid in ("client.storage", "client.clipboard"):
+    if cid in ("client.storage", "client.clipboard", "client.secure"):
         ok = item.get("ok") is True
         status, value = (PASS if ok else WARN), ("使える" if ok else "使えません")
         threshold = "使えること"
+        if cid == "client.clipboard":
+            value = ("使える（%s）" % ("clipboard API" if flags.get("api") is True else "copyコマンド")) if ok else "使えません"
+        elif cid == "client.secure":
+            value = "はい（https）" if ok else "いいえ（httpのため）"
+            threshold = "secure context であること"
     elif cid == "client.rtt":
         status = rate(ms, CLIENT_RTT_WARN_MS, CLIENT_RTT_FAIL_MS)
         value = "中央値 %s ms" % _fmt(ms)
@@ -387,16 +401,21 @@ def client_evaluate(item):
         value = "最初のタイル %s ms / %s 枚" % (_fmt(ms), _fmt(n))
         threshold = "<= %d ms" % CLIENT_TILE_WARN_MS
     elif cid == "client.live":
-        img_first = flags.get("img") is True
-        if not _num(fps) or fps <= 0:
+        transport = live_transport(flags)
+        label = TRANSPORT_LABEL.get(transport, "なし")
+        if transport is None or not _num(fps) or fps <= 0:
             status = FAIL
-        elif not img_first:
+        elif transport == "poll" and fps < FPS_WARN:
             status, variant = WARN, "polling"
-        elif fps < FPS_WARN:
-            status = WARN
-        value = "%s fps / %s KB毎フレーム / ストリーム%s" % (
-            _fmt(fps), _fmt(kb), "OK" if img_first else "NG（静止画ポーリングに切替）")
-        threshold = ">= %g fps" % FPS_WARN
+        parts = []
+        for key, name_, fkey in (("mjpeg", "MJPEG", "fps_mjpeg"), ("sse", "SSE", "fps_sse"), ("poll", "ポーリング", "fps_poll")):
+            figure = item.get(fkey)
+            if flags.get(key) is True:
+                parts.append("%s %s fps" % (name_, _fmt(figure)) if _num(figure) else "%s OK" % name_)
+            elif key in flags or _num(figure):
+                parts.append("%s 届かず" % name_ if not _num(figure) or figure <= 0 else "%s %s fps" % (name_, _fmt(figure)))
+        value = "経路: %s / %s fps / %s KB毎フレーム（%s）" % (label, _fmt(fps), _fmt(kb), "、".join(parts) or "測定なし")
+        threshold = "ストリーム(MJPEG/SSE)が届くこと。ポーリングなら >= %g fps" % FPS_WARN
     else:
         status, value = FAIL, "エラー"
         threshold = ""
@@ -404,6 +423,17 @@ def client_evaluate(item):
         value = "%s（%s）" % (value, note) if value else note
     return {"id": cid, "name": name, "status": status, "value": value[:300], "threshold": threshold,
             "variant": variant}
+
+
+TRANSPORT_LABEL = {"mjpeg": "ストリーム(MJPEG)", "sse": "ストリーム(SSE)", "poll": "ポーリング"}
+
+
+def live_transport(flags):
+    """The transport the app would end up on, in its own order: MJPEG, then SSE, then polling (or None)."""
+    for key in ("mjpeg", "sse", "poll"):
+        if (flags or {}).get(key) is True:
+            return key
+    return None
 
 
 def _fmt(value):
@@ -626,6 +656,9 @@ class SelfTest:
             run.device = data["device"]
             for item in data["checks"]:
                 result = client_evaluate(item)
+                if item["id"] == "client.live":
+                    run.info["live_transport"] = live_transport(item.get("flags"))
+                    run.info["live_fps"] = item.get("fps")
                 self._add_locked(run, "client", result["id"], result["name"], result["status"],
                                  result["value"], result["threshold"], hint_key=result["id"],
                                  variant=result.get("variant"))
@@ -687,7 +720,7 @@ class SelfTest:
             hint = HINTS.get("%s:%s" % (key, variant)) if variant else None
             hint = hint or HINTS.get(key, "")
         check = {"id": cid, "section": section, "name": name, "status": status,
-                 "value": str(value)[:300], "threshold": str(threshold)[:120], "hint": hint}
+                 "value": str(value)[:600], "threshold": str(threshold)[:120], "hint": hint}
         if extra:
             check.update(extra)
         run.checks.append(check)
@@ -850,6 +883,7 @@ class SelfTest:
         info["image"] = (tag.rsplit(":", 1)[-1][:12] if isinstance(tag, str) else None)
         self._add(run, "env", "env.image", "NASブラウザのイメージ", PASS if image_ready else FAIL,
                   ("あり（%s）" % info["image"]) if image_ready else "ありません", "作成済みであること")
+        self._cgroup_row(run)
         resident = status.get("resident") or {}
         info["resident"] = resident.get("on") is True
         self._add(run, "env", "env.resident", "常駐の設定", PASS, "オン" if info["resident"] else "オフ")
@@ -867,6 +901,44 @@ class SelfTest:
                 usable = False
         self._leave(run, "env")
         return usable
+
+    def _cgroup_row(self, run):
+        """env.cgroup: which source gives container memory / disk I/O here (cgroup layout or docker stats)."""
+        runtime = getattr(self.rb, "runtime", None)
+        info = run.info
+        root = getattr(self.rb, "_cgroup_root", diskio.DEFAULT_CGROUP_ROOT)
+        proc = getattr(self.rb, "_proc_root", "/proc")
+        info["cgroup"] = diskio.cgroup_layout_summary(root, proc)
+        if runtime is None:
+            self._add(run, "env", "env.cgroup", "コンテナの計測元（cgroup）", SKIP, "取得できません")
+            return
+        rows, ok_any, run_any, sources = [], False, False, []
+        for label, name in (("browser", cr.BROWSER_NAME), ("jd2", cr.JD2_NAME)):
+            try:
+                rep = diskio.cgroup_report(runtime, name, root, proc, read_memory=rb_resident.read_cgroup_memory)
+            except Exception:
+                rep = {"running": False}
+            if not rep.get("running"):
+                rows.append("%s: 停止中" % label)
+                continue
+            run_any = True
+            mem, io = rep.get("mem"), rep.get("io")
+            ok_any = ok_any or bool(mem or io)
+            sources.append("%s mem=%s io=%s" % (label, mem or "docker stats", io or "docker stats"))
+            where = ""
+            if rep.get("dir"):
+                where = " dir=%s(%s)" % (_short(rep["dir"].replace("/sys/fs/cgroup", "…"), 70), rep.get("how"))
+            rows.append("%s: メモリ=%s I/O=%s%s" % (label, mem or "docker stats", io or "docker stats", where))
+            if not (mem and io):
+                rows.append("  pid-cgroup=%s mounts=%s" % (" ".join(rep.get("pid_cgroup") or []) or "?",
+                                                           " ".join(rep.get("mounts") or []) or "?"))
+        info["cgroup_sources"] = "; ".join(sources) if sources else "コンテナ停止中"
+        value = "層=%s | %s" % (info["cgroup"], " | ".join(rows))
+        if not run_any:
+            self._add(run, "env", "env.cgroup", "コンテナの計測元（cgroup）", SKIP, value, "cgroupから読めること")
+        else:
+            self._add(run, "env", "env.cgroup", "コンテナの計測元（cgroup）", PASS if ok_any else WARN, value,
+                      "cgroupから読めること（docker statsはCPUを使う）")
 
     def _engine_check(self, run):
         engine, jd2 = self.engine, self.jd2
@@ -1203,27 +1275,53 @@ class SelfTest:
         except Exception as error:
             self._add(run, sec, "builtin.fps", "ライブ表示（スクリーンキャスト）", FAIL, _short(str(error), 160))
 
-    def _measure_stream(self, run, tab, seconds):
-        """(fps, KB per frame, frames) of the live stream of `tab` over `seconds` (the Hub's own stream)."""
+    def _measure_stream(self, run, tab, seconds, scroll=False):
+        """(fps, KB per frame, frames[, moved]) of the live stream of `tab` over `seconds` (the Hub's own stream).
+
+        With `scroll` the NAS page is scrolled every SITE_SCROLL_STEP_S from an isolated world so that a still
+        real site produces frames too; the result then has a fourth value, the number of scrolls that moved it."""
         counts = {"parts": 0, "bytes": 0}
         before = self.rb.selftest_info(tab)["seq"]
+        stop = threading.Event()
+        moved = [0]
+
+        def scroller():
+            last = 0              # the page starts at the top
+            while not stop.is_set():
+                try:
+                    y = self.rb.selftest_scroll(tab, SITE_SCROLL_PX)
+                except Exception:
+                    y = None
+                if y is not None and y != last:
+                    moved[0] += 1
+                last = y if y is not None else last
+                stop.wait(SITE_SCROLL_STEP_S)
 
         def write(part):
             counts["parts"] += 1
             counts["bytes"] += len(part)
             if run.cancel.is_set():
                 raise OSError("cancelled")
+        worker = None
+        if scroll:
+            worker = threading.Thread(target=scroller, daemon=True, name="selftest-scroll")
+            worker.start()
         started = self._clock()
         try:
             self.rb.stream(tab, write, max_seconds=seconds)
         except OSError:
             pass
+        finally:
+            stop.set()
+            if worker is not None:
+                worker.join(2.0)
         elapsed = max(self._clock() - started, 0.001)
         frames = counts["parts"]
         # a stream sends only fresh frames; seq shows how many the page really produced
         produced = max(0, self.rb.selftest_info(tab)["seq"] - before)
         frames = min(frames, produced) if produced else frames
-        return frames / elapsed, (counts["bytes"] // max(counts["parts"], 1)) // 1024, frames
+        result = (frames / elapsed, (counts["bytes"] // max(counts["parts"], 1)) // 1024, frames)
+        return result + (moved[0],) if scroll else result
 
     # ---------------------------------------------------------------- section 4: the phone
     def _client_phase(self, run, tab):
@@ -1237,6 +1335,11 @@ class SelfTest:
         try:
             self.rb.selftest_goto(tab, "/anim")
             self._wait_loaded(run, tab, "/anim")
+        except Exception:
+            pass
+        try:
+            # v0.1.46: the phone's measurements must not lose the screencast to the idle stop
+            self.rb.selftest_keep(tab, CLIENT_WAIT + 15.0)
         except Exception:
             pass
         with self._cv:
@@ -1314,29 +1417,41 @@ class SelfTest:
             except Exception:
                 pass
             early = None
+            dcl = None
             loaded = None
-            while self._clock() - t < 25.0:
+            while self._clock() - t < SITE_LOAD_LIMIT_S:
                 self._guard(run)
                 info = rb.selftest_info(tab)
                 elapsed = self._clock() - t
                 if early is None and elapsed >= 3.0:
-                    early = info["loading"]
+                    early = info["loading"] or not info.get("dcl")
+                if dcl is None and info.get("dcl"):
+                    dcl = int(elapsed * 1000)
                 if not info["loading"] and info["url"] and info["url"] != "about:blank":
                     loaded = int(elapsed * 1000)
+                    if dcl is None:
+                        dcl = loaded           # no DOMContentLoaded event seen: the finished load implies it
                     break
+                if dcl is not None and elapsed - dcl / 1000.0 >= SITE_LOAD_GRACE_S:
+                    break                      # ads and trackers can keep a page "loading" for ever
                 self._wait(run, 0.1)
             if early is None:
                 early = False
             meta = rb.page_meta(tab, wait=0)
             challenge = meta.get("challenge") is True
-            value = ("読み込み完了 %d ms" % loaded) if loaded is not None else "25秒で読み込み未完了"
+            if dcl is not None:
+                value = "DOMContentLoaded %d ms" % dcl
+                value += (" / 完全な読み込み %d ms" % loaded) if loaded is not None else " / 完全な読み込みは未完了（広告など）"
+            else:
+                value = "%d秒でDOMContentLoadedが来ませんでした" % int(SITE_LOAD_LIMIT_S)
             value += "（3秒時点: %s）" % ("まだ読み込み中" if early else "読み込み済み")
             if challenge:
                 self._add(run, sec, base + "open", label + " 開く", WARN, value + " / 確認ページ（チャレンジ）を検出",
                           "チャレンジなし", hint_key="site.challenge", extra=extra)
                 return
-            status = FAIL if loaded is None else rate(loaded, SITE_OPEN_WARN_MS)
-            self._add(run, sec, base + "open", label + " 開く", status, value, "<= %d ms" % SITE_OPEN_WARN_MS,
+            status = FAIL if dcl is None else rate(dcl, SITE_OPEN_WARN_MS)
+            self._add(run, sec, base + "open", label + " 開く", status, value,
+                      "DOMContentLoaded <= %d ms" % SITE_OPEN_WARN_MS,
                       hint_key="site.open", extra=extra)
             self._step(run, "%s のリーダー抽出を測っています" % item["host"])
             self._site_measure(run, base + "reader", label + " リーダー", "site.reader", extra,
@@ -1401,11 +1516,13 @@ class SelfTest:
             "%d ms / タイル %s 枚" % (ms, snap.get("tiles", "?")), "<= %d ms" % TILES_WARN_MS
 
     def _m_live(self, run, tab):
-        fps, kb, frames = self._measure_stream(run, tab, SITE_FPS_SECONDS)
-        # a still page makes no frames: that is not a failure of the stream
-        status = PASS if frames == 0 else rate(fps, FPS_WARN, low=True)
-        return status, "%.1f fps（%d フレーム）/ %d KB" % (fps, frames, kb) + (
-            " / ページが静止しているため更新なし" if frames == 0 else ""), ">= %g fps（動きがあるとき）" % FPS_WARN
+        fps, kb, frames, moved = self._measure_stream(run, tab, SITE_FPS_SECONDS, scroll=True)
+        if moved == 0:
+            # nothing could be scrolled (a page that fits the screen): a still page makes no frames, not a failure
+            return PASS, "%.1f fps（%d フレーム）/ %d KB / スクロールできないページのため動きなし" % (fps, frames, kb), \
+                ">= %g fps（動きがあるとき）" % FPS_WARN
+        return rate(fps, FPS_WARN, low=True), "%.1f fps（%d フレーム）/ %d KB / スクロール %d 回" % (fps, frames, kb, moved), \
+            ">= %g fps（スクロール中）" % FPS_WARN
 
     # ---------------------------------------------------------------- section 6: cleanup
     def _section_cleanup(self, run, state):
@@ -1515,6 +1632,11 @@ class SelfTest:
                 info.get("cpu", "?"), info.get("cores", "?"), info.get("ram_total_mib", "?"),
                 info.get("ram_avail_mib", "?"), info.get("container_station") or "?", info.get("image") or "?",
                 info.get("chromium") or "?", "on" if info.get("resident") else "off", info.get("engine") or "?"),
+            "[Source] cgroup=%s | container-stats=%s" % (info.get("cgroup") or "?", info.get("cgroup_sources") or "?"),
+            "[Live] transport=%s fps=%s" % (
+                ({"poll": "polling"}.get(info.get("live_transport"), info.get("live_transport")) or "none")
+                if run.client == "received" else "n/a",
+                _fmt(info.get("live_fps")) if run.client == "received" else "-"),
         ]
         if dev:
             flags = dev.get("flags") or {}
