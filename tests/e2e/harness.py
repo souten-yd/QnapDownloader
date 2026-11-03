@@ -308,6 +308,10 @@ CONSOLE_ALLOW = (
     "favicon",
     "the server responded with a status of 502",     # a fixture resource the NAS browser cannot read
     "the server responded with a status of 404",     # missing fixture resource (e.g. favicon via the mirror)
+    # browser back restores the mirror frame's earlier address for an instant before the app puts the
+    # current copy back (keepMirrorFrame): an expired copy (410) or the blocked app root in the frame
+    "the server responded with a status of 410",
+    "violates the following Content Security Policy directive: \"frame-ancestors 'none'\"",
 )
 # WebKit reports a request the app itself aborted (the /api/state long-poll when the page or view
 # changes) as "Fetch API cannot load <own /api/...> due to access control checks", sometimes as a

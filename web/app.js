@@ -555,7 +555,7 @@ function applyRoute() {
     schedulePaste(0);
     state.route = {view: "links"};
   }
-  if (route.view === "tab") state.lastWebTabId = route.tabId;
+  if (route.view === "tab") { state.lastWebTabId = route.tabId; armBackGuard(); }
   if (route.view === "settings") state.lastSection = route.section;
   closeMenu(false);
   closeSwitcher(false);
@@ -4173,7 +4173,15 @@ function mirrorLoadDoc(docUrl, cover) {
     const onLoad = () => finish(Boolean(mirrorDoc()));
     const timer = setTimeout(() => finish(false), MIRROR_LOAD_TIMEOUT_MS);
     mf.addEventListener("load", onLoad);
-    mf.src = docUrl;
+    // v0.1.50: replace, never add, the frame's history entry. A new src adds an entry to the
+    // page's session history, so the browser back (the iOS edge swipe) stepped through earlier
+    // copies of the mirror ("goes back to the same page").
+    mf.dataset.doc = docUrl;
+    try {
+      mf.contentWindow.location.replace(new URL(docUrl, location.href).href);
+    } catch (e) {
+      mf.src = docUrl;
+    }
   });
 }
 
@@ -4999,7 +5007,7 @@ const reloadTab = tab => tab.rb ? rbInputFor(tab, {type: "reload"}) : openInRemo
 
 async function rbInputFor(tab, event) {
   try {
-    await api("/api/rb/input", Object.assign({tab: tab.rb.id}, event));
+    return await api("/api/rb/input", Object.assign({tab: tab.rb.id}, event));
   } catch (e) {
     if (e.status === 404) remoteLost(tab);
     else throw e;
@@ -5007,7 +5015,49 @@ async function rbInputFor(tab, event) {
 }
 
 async function stepHistory(tab, delta) {
-  if (tab.rb) await rbInputFor(tab, {type: delta < 0 ? "back" : "forward"});
+  if (tab.rb) return rbInputFor(tab, {type: delta < 0 ? "back" : "forward"});
+  return null;
+}
+
+// v0.1.50: on a web page, the browser's own back (the iOS edge swipe in the home-screen app) goes
+// back in THAT page, like Safari. A guard entry with the same address sits on top of the tab's
+// history entry; popping it means "back": the NAS tab steps back and the guard is put again. When
+// the page has nothing to go back to, the back continues to the previous screen of the app.
+function armBackGuard() {
+  const r = state.route;
+  if (r.view !== "tab" || !findTab(r.tabId)) return;
+  if (history.state && history.state.qdGuard === r.tabId) return;
+  try { history.pushState({qdGuard: r.tabId}, "", location.hash); } catch (e) { /* ignore */ }
+}
+
+// Session history also restores the frame's address of the entry being returned to; put the
+// current copy back so the mirror never shows an older copy (or nothing) after a back.
+function keepMirrorFrame() {
+  const mf = $("mirrorFrame");
+  const doc = mf && mf.dataset.doc;
+  if (!doc || $("mirrorWrap").hidden) return;
+  try {
+    const want = new URL(doc, location.href).href;
+    if (mf.contentWindow.location.href !== want) mf.contentWindow.location.replace(want);
+  } catch (e) {
+    try { mf.contentWindow.location.replace(new URL(doc, location.href).href); } catch (e2) { /* ignore */ }
+  }
+}
+
+function onPopState() {
+  setTimeout(keepMirrorFrame, 0);
+  const r = state.route;
+  if (!state.authed || r.view !== "tab") return;
+  if (history.state && history.state.qdGuard === r.tabId) return;      // forward onto the guard
+  const m = /^#\/tab\/(t\d+)/.exec(location.hash);
+  if (!m || m[1] !== r.tabId) return;                                   // a real route change: hashchange
+  const tab = findTab(r.tabId);
+  if (!tab || !tab.rb) { history.back(); return; }
+  perform(async () => {
+    const res = await stepHistory(tab, -1);
+    if (res && res.moved === false) { history.back(); return; }        // nothing earlier in this page
+    armBackGuard();
+  });
 }
 
 // Open a URL typed/clicked by the user: in the active web tab, else a new tab. Always the NAS browser.
@@ -6698,6 +6748,7 @@ function onTabstripKeydown(event) {
 
 function wireShell() {
   window.addEventListener("hashchange", applyRoute);
+  window.addEventListener("popstate", onPopState);
   // One visibility gate for everything periodic: the state long-poll and the scheduler.
   document.addEventListener("visibilitychange", () => {
     syncStateLoop();

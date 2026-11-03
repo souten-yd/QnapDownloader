@@ -215,7 +215,7 @@ def mirror_security(ph):
     """The mirror document cannot run code and ships a deny-all CSP."""
     ph.open("/article.html")
     ph.wait(lambda: "E2E テスト記事" in ph.mirror_text(), 15, "mirror content")
-    doc_url = ph.js("document.getElementById('mirrorFrame').getAttribute('src')")
+    doc_url = ph.js("(f=>f.dataset.doc||f.getAttribute('src'))(document.getElementById('mirrorFrame'))")
     assert doc_url and doc_url.startswith("/api/rb/mirror/doc?"), doc_url
     res = ph.js("""async(u)=>{const r=await fetch(u,{credentials:'same-origin'});return {csp:r.headers.get('content-security-policy')||'',
         text:await r.text()}}""", doc_url)
@@ -404,3 +404,40 @@ def selftest(ph):
     # a second click while idle starts a new run only after this one is over; cancel is hidden now
     assert ph.js("document.getElementById('selftestCancel').hidden")
     assert not ph.js("document.getElementById('selftestRun').disabled")
+
+
+@scenario("omnibox-touch-type")
+def omnibox_touch_type(ph):
+    """On an open web tab, tapping the address bar (touch) and typing a URL navigates (v0.1.50)."""
+    tab = ph.open("/article.html")
+    ph.wait(lambda: "E2E テスト記事" in ph.mirror_text(), 15, "mirror content")
+    box = ph.page.locator("#omnibox").first.bounding_box()
+    ph.tap(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
+    ph.page.wait_for_timeout(300)
+    focused = ph.js("document.activeElement && document.activeElement.id")
+    assert focused == "omnibox", "tapping the address bar does not focus it (active=%s)" % focused
+    ph.page.keyboard.press("Control+A")
+    ph.page.keyboard.type(BASE + "/article2.html")
+    ph.page.keyboard.press("Enter")
+    ph.wait(lambda: ph.env.nas_url(tab).endswith("/article2.html"), 10, "navigated by typing in the address bar")
+
+
+@scenario("browser-back-is-page-back")
+def browser_back_is_page_back(ph):
+    """The browser's own back (iOS edge swipe) on a web page goes back in the page, then leaves (v0.1.50)."""
+    tab = ph.open("/article.html")
+    ph.wait(lambda: "E2E テスト記事" in ph.mirror_text(), 15, "mirror content")
+    ph.post("/api/rb/navigate", {"tab": tab, "url": BASE + "/article2.html"})
+    ph.wait(lambda: ph.env.nas_url(tab).endswith("/article2.html"), 10, "navigated to article2")
+    hash_before = ph.js("location.hash")
+    ph.log("before 1st back: hash=%s len=%s state=%s route=%s" % (hash_before, ph.js("history.length"), ph.js("JSON.stringify(history.state)"), ph.js("JSON.stringify(state.route)")))
+    ph.js("history.back()")
+    ph.page.wait_for_timeout(1500)
+    ph.log("after 1st back: hash=%s state=%s nas=%s" % (ph.js("location.hash"), ph.js("JSON.stringify(history.state)"), ph.env.nas_url(tab)))
+    ph.wait(lambda: ph.env.nas_url(tab).endswith("/article.html"), 8, "browser back = page back")
+    assert ph.js("location.hash") == hash_before, "the app left the tab (%s)" % ph.js("location.hash")
+    ph.log("before 2nd back: hash=%s len=%s state=%s" % (ph.js("location.hash"), ph.js("history.length"), ph.js("JSON.stringify(history.state)")))
+    ph.js("history.back()")               # the page has nothing earlier now: the app's previous screen
+    ph.page.wait_for_timeout(1500)
+    ph.log("after 2nd back: hash=%s state=%s nas=%s" % (ph.js("location.hash"), ph.js("JSON.stringify(history.state)"), ph.env.nas_url(tab)))
+    ph.wait(lambda: ph.js("location.hash") != hash_before, 8, "second back leaves the tab")
