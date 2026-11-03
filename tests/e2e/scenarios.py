@@ -1,0 +1,279 @@
+"""E2E scenarios. Each one is a function ``fn(ph)`` taking a ``harness.Phone``; it raises AssertionError to fail
+and ``harness.Skip`` to skip. Register new ones with the ``@scenario`` decorator (see docs/testing.md).
+
+Phone input is always touch (Playwright touchscreen / CDP touch), never mouse clicks: taps on iOS have no
+``click`` for elements without href, which is the class of bug this suite exists to catch.
+"""
+import time
+
+from harness import BASE, Skip
+
+SCENARIOS = []
+
+
+def scenario(name, engines=("chromium", "webkit"), display="mirror"):
+    """Register a scenario. ``display`` is the Settings default display the phone starts with."""
+    def deco(fn):
+        SCENARIOS.append({"name": name, "fn": fn, "engines": engines, "display": display})
+        return fn
+    return deco
+
+
+# ------------------------------------------------------------------ app shell
+
+ROUTES = ("#/home", "#/downloads", "#/links", "#/settings/storage", "#/settings/updates",
+          "#/settings/diagnostics", "#/settings/engine", "#/settings/https", "#/settings/share",
+          "#/settings/browser", "#/settings/accounts", "#/settings/system")
+
+
+@scenario("settings-routes")
+def settings_routes(ph):
+    """Every management route renders without console errors or error toasts."""
+    for route in ROUTES:
+        ph.js("(r)=>{location.hash=r}", route)
+        ph.page.wait_for_timeout(350)
+        toasts = ph.page.eval_on_selector_all("#notice .toast.error", "els=>els.map(e=>e.dataset.message||e.textContent)")
+        assert not toasts, "%s: error toast %s" % (route, toasts)
+    assert ph.js("state.authed === true")
+
+
+# ------------------------------------------------------------------ display modes
+
+@scenario("display-reader", display="reader")
+def display_reader(ph):
+    ph.open("/article.html")
+    ph.wait(lambda: ph.display() == "reader", 5, "display reader")
+    ph.wait(lambda: ph.js("document.querySelectorAll('#readerBody .reader-p').length") >= 3, 15, "reader paragraphs")
+    assert ph.js("document.getElementById('readerTitle').textContent").strip() != ""
+    assert "E2E" in ph.js("document.getElementById('readerBody').innerText")
+    # the picture is loaded through the Hub (srcset image chosen by the NAS browser)
+    ph.wait(lambda: ph.js("(()=>{const i=document.querySelector('#readerBody img.reader-img');return !!i&&i.complete&&i.naturalWidth>0})()"),
+            15, "reader image loaded")
+
+
+@scenario("display-mirror", display="mirror")
+def display_mirror(ph):
+    ph.open("/article.html")
+    ph.wait(lambda: ph.display() == "mirror", 5, "display mirror")
+    ph.wait(lambda: "E2E テスト記事" in ph.mirror_text(), 15, "mirror content")
+    ph.wait(lambda: ph.js("(()=>{const d=mirrorDoc();const i=d&&d.querySelector('img');return !!i&&i.complete&&i.naturalWidth>0})()"),
+            15, "mirror image loaded")
+    assert ph.js("getComputedStyle(document.getElementById('mirrorWrap')).display") != "none"
+
+
+@scenario("display-tiles", display="fast")
+def display_tiles(ph):
+    ph.open("/article.html")
+    ph.wait(lambda: ph.display() == "tiles", 5, "display tiles")
+    ph.wait(lambda: ph.js("[...document.querySelectorAll('#tileScroll img')].filter(i=>i.complete&&i.naturalWidth>0).length") >= 1,
+            20, "tile images loaded")
+
+
+@scenario("display-live", display="live")
+def display_live(ph):
+    tab = ph.open("/article.html")
+    ph.wait(lambda: ph.display() == "live", 5, "display live")
+    ph.wait(lambda: ph.js("(()=>{const i=document.getElementById('remoteImg');return !i.hidden&&i.naturalWidth>0})()"),
+            20, "live frame visible")
+    ph.wait(lambda: ph.env.tabs()[tab].seq > 0, 10, "server has produced frames (seq>0)")
+
+
+# ------------------------------------------------------------------ mirror: taps, navigation, menus
+
+@scenario("mirror-tap-link")
+def mirror_tap_link(ph):
+    """iOS-like tap (no synthesized click) on a link far down a long page: NAS navigates, new page starts at the top."""
+    tab = ph.open("/long1.html")
+    ph.wait(lambda: "長いページ 1" in ph.mirror_text(), 15, "long page in mirror")
+    ph.suppress_ios_click()
+    ph.js("(()=>{const d=mirrorDoc();mirrorScroller(d).scrollTop=2400})()")
+    ph.wait(lambda: ph.mirror_scroll_top() >= 2000, 5, "mirror scrolled")
+    ph.page.wait_for_timeout(1500)     # a recapture while scrolled must keep the place
+    assert ph.mirror_scroll_top() >= 2000, "scroll position lost on recapture: %s" % ph.mirror_scroll_top()
+    pt = ph.wait(lambda: ph.mirror_point(
+        "doc=>[...doc.querySelectorAll('a[data-href]')].find(a=>{const r=a.getBoundingClientRect();return r.top>120&&r.bottom<innerHeight-60})"),
+        5, "a visible link")
+    ph.tap(pt["x"], pt["y"])
+    ph.wait(lambda: ph.env.nas_url(tab).endswith("/long2.html"), 10, "NAS navigated to long2 (url=%s)" % ph.env.nas_url(tab))
+    ph.wait(lambda: "長いページ 2" in ph.mirror_text(), 10, "mirror shows the new page")
+    deadline = time.monotonic() + 2.5      # and stays at the top (the old offset must not come back)
+    while time.monotonic() < deadline:
+        assert ph.mirror_scroll_top() == 0, "new page did not start at the top: scrollTop=%s" % ph.mirror_scroll_top()
+        ph.page.wait_for_timeout(250)
+
+
+@scenario("mirror-menu-toggle")
+def mirror_menu_toggle(ph):
+    """A JS dropdown toggle (<a href="#" aria-expanded>) opens the menu on the NAS page; it must not reload it."""
+    fx = ph.env.fx
+    tab = ph.open("/menu.html")
+    ph.wait(lambda: "JS メニューのテスト" in ph.mirror_text(), 15, "menu page in mirror")
+    assert "メニュー項目" not in ph.mirror_text(), "menu should start closed"
+    loads, hits = fx.beacon_count("load", "/menu.html"), fx.count("/menu.html")
+    ph.suppress_ios_click()
+    pt = ph.wait(lambda: ph.mirror_point("doc=>doc.querySelector('[aria-expanded]')"), 5, "toggle in mirror")
+    ph.tap(pt["x"], pt["y"])
+    ph.wait(lambda: fx.beacon_count("toggle", "open") == 1, 8, "the page's own script ran the toggle")
+    ph.wait(lambda: "メニュー項目 記事" in ph.mirror_text(), 8, "menu items in the mirror copy")
+    assert ph.env.nas_url(tab).endswith("/menu.html"), "NAS navigated away: " + ph.env.nas_url(tab)
+    assert fx.count("/menu.html") == hits and fx.beacon_count("load", "/menu.html") == loads, "the page was reloaded"
+    # and it closes again the same way
+    pt = ph.mirror_point("doc=>doc.querySelector('[aria-expanded]')")
+    ph.tap(pt["x"], pt["y"])
+    ph.wait(lambda: fx.beacon_count("toggle", "close") == 1, 8, "second toggle ran")
+    ph.wait(lambda: "メニュー項目" not in ph.mirror_text(), 8, "menu closed in the mirror copy")
+    assert fx.count("/menu.html") == hits, "reloaded on the second tap"
+    # a toggle that is a link to this very page (href="/menu.html" + aria-expanded) must be clicked, not followed
+    pt = ph.mirror_point("doc=>doc.querySelector('[aria-controls=dd2]')")
+    assert pt, "toggle B not in the mirror"
+    ph.tap(pt["x"], pt["y"])
+    ph.wait(lambda: fx.beacon_count("toggle", "open-b") == 1, 8, "toggle B ran on the NAS page (link to this page)")
+    ph.wait(lambda: "B項目" in ph.mirror_text(), 8, "menu B items in the mirror copy")
+    assert fx.count("/menu.html") == hits and fx.beacon_count("load", "/menu.html") == loads, "toggle B reloaded the page"
+
+
+@scenario("mirror-dynamic")
+def mirror_dynamic(ph):
+    """Script-driven changes reach the mirror copy: after load, and after a tap on a JS button."""
+    ph.open("/dynamic.html")
+    ph.wait(lambda: "LATE-ADDED" in ph.mirror_text(), 15, "script-added row in mirror")
+    ph.suppress_ios_click()
+    pt = ph.wait(lambda: ph.mirror_point("doc=>doc.querySelector('#more')||[...doc.querySelectorAll('button')][0]"), 5, "button")
+    ph.tap(pt["x"], pt["y"])
+    ph.wait(lambda: "MORE-CLICKED 1" in ph.mirror_text(), 10, "button effect in mirror")
+
+
+@scenario("mirror-security")
+def mirror_security(ph):
+    """The mirror document cannot run code and ships a deny-all CSP."""
+    ph.open("/article.html")
+    ph.wait(lambda: "E2E テスト記事" in ph.mirror_text(), 15, "mirror content")
+    doc_url = ph.js("document.getElementById('mirrorFrame').getAttribute('src')")
+    assert doc_url and doc_url.startswith("/api/rb/mirror/doc?"), doc_url
+    res = ph.js("""async(u)=>{const r=await fetch(u,{credentials:'same-origin'});return {csp:r.headers.get('content-security-policy')||'',
+        text:await r.text()}}""", doc_url)
+    assert "default-src 'none'" in res["csp"], "CSP header: %r" % res["csp"]
+    assert "<script" not in res["text"].lower(), "script tag in the mirror document"
+    assert "default-src 'none'" in res["text"], "no CSP <meta> in the mirror document"
+    assert ph.js("mirrorDoc().querySelectorAll('script,iframe,object,embed,form[action]').length") == 0, "live code elements in the mirror"
+    out = ph.js("""async()=>{const f=document.getElementById('mirrorFrame');const d=f.contentDocument;
+        const s=d.createElement('script');s.textContent='window.pwned=1';d.body.appendChild(s);
+        const i=d.createElement('img');i.setAttribute('onerror','window.pwned2=1');i.src='x:';d.body.appendChild(i);
+        await new Promise(r=>setTimeout(r,400));
+        const r={inline:f.contentWindow.pwned===undefined,handler:f.contentWindow.pwned2===undefined};s.remove();i.remove();return r}""")
+    assert out["inline"] and out["handler"], "injected script / handler ran in the mirror: %s" % out
+    # the browser reports each blocked attempt as a console error: that is the CSP doing its job
+    blocked = ph.take_errors("violates the following Content Security Policy")
+    assert blocked, "the CSP did not report the blocked inline script / handler"
+
+
+# ------------------------------------------------------------------ reader
+
+@scenario("reader-cards", display="reader")
+def reader_cards(ph):
+    """Hoster links become cards (label/size present or missing); page-number rows become chips."""
+    ph.open("/hoster.html")
+    ph.wait(lambda: ph.js("document.querySelectorAll('#readerBody .reader-card').length") == 3, 15, "3 link cards")
+    cards = ph.js("""[...document.querySelectorAll('#readerBody .reader-card')].map(a=>({
+        label:(a.querySelector('.reader-card-label')||{}).textContent||'', size:(a.querySelector('.reader-card-size')||{}).textContent||'',
+        title:(a.querySelector('.reader-card-title')||{}).textContent||'', host:(a.querySelector('.reader-card-host')||{}).textContent||''}))""")
+    assert cards[0]["label"] == "RapidGator" and cards[0]["size"] == "66.76 MB", cards[0]
+    assert cards[1]["size"] == "12.3 MB" and cards[1]["label"] == "dl.example.net", "label missing -> host: %s" % cards[1]
+    assert cards[2]["label"] == "FreeDL" and cards[2]["size"] == "5.5 MB", "size from the next block: %s" % cards[2]
+    assert all(c["title"] for c in cards), cards
+    chips = ph.js("document.querySelectorAll('#readerBody .reader-chips .reader-chip').length")
+    assert chips >= 4, "pagination chips: %s" % chips
+
+
+# ------------------------------------------------------------------ gestures
+
+def _flick(ph, dx):
+    x0 = 120 if dx > 0 else 300
+    y = 420
+    ph.cdp_touch([(x0, y, 0), (x0 + dx // 2, y, 40), (x0 + dx, y, 40)])
+
+
+@scenario("gesture-flick-mirror", engines=("chromium",))
+def gesture_flick_mirror(ph):
+    """Horizontal flick over the mirror = browser back / forward on the NAS tab."""
+    tab = ph.open("/article.html")
+    ph.wait(lambda: "E2E テスト記事" in ph.mirror_text(), 15, "mirror content")
+    ph.post("/api/rb/navigate", {"tab": tab, "url": BASE + "/article2.html"})
+    ph.wait(lambda: ph.env.nas_url(tab).endswith("/article2.html"), 10, "navigated to article2")
+    ph.wait(lambda: "E2E 二つ目の記事" in ph.mirror_text(), 10, "article2 in mirror")
+    _flick(ph, 200)                       # right = back
+    ph.wait(lambda: ph.env.nas_url(tab).endswith("/article.html"), 8, "back to article (url=%s)" % ph.env.nas_url(tab))
+    ph.wait(lambda: "E2E テスト記事" in ph.mirror_text(), 10, "article in mirror again")
+    _flick(ph, -200)                      # left = forward
+    ph.wait(lambda: ph.env.nas_url(tab).endswith("/article2.html"), 8, "forward to article2 (url=%s)" % ph.env.nas_url(tab))
+
+
+@scenario("gesture-flick-tiles", engines=("chromium",), display="fast")
+def gesture_flick_tiles(ph):
+    tab = ph.open("/article.html")
+    ph.wait(lambda: ph.display() == "tiles", 5, "tiles")
+    ph.wait(lambda: ph.js("document.querySelectorAll('#tileScroll img').length") >= 1, 15, "tiles present")
+    ph.post("/api/rb/navigate", {"tab": tab, "url": BASE + "/article2.html"})
+    ph.wait(lambda: ph.env.nas_url(tab).endswith("/article2.html"), 10, "navigated to article2")
+    ph.page.wait_for_timeout(800)
+    _flick(ph, 200)
+    ph.wait(lambda: ph.env.nas_url(tab).endswith("/article.html"), 8, "back (url=%s)" % ph.env.nas_url(tab))
+
+
+@scenario("gesture-close-tab", engines=("chromium",))
+def gesture_close_tab(ph):
+    """Drag down from the toolbar closes the tab."""
+    tab = ph.open("/article.html")
+    ph.wait(lambda: "E2E テスト記事" in ph.mirror_text(), 15, "mirror content")
+    before = ph.js("state.tabs.length")
+    box = ph.page.locator(".toolbar").bounding_box()
+    x, y = box["x"] + 60, box["y"] + box["height"] / 2
+    ph.cdp_touch([(x, y, 0)] + [(x, y + k * 25, 20) for k in range(1, 8)])
+    ph.wait(lambda: ph.js("state.tabs.length") == before - 1, 8, "tab removed from the app")
+    ph.wait(lambda: tab not in ph.env.tabs(), 8, "NAS tab closed on the server")
+
+
+# ------------------------------------------------------------------ reload, auto-live
+
+@scenario("reload-reattach")
+def reload_reattach(ph):
+    """Reloading the app reattaches the same NAS tab; no extra tab is opened (not now, not a few seconds later)."""
+    tab = ph.open("/article.html")
+    ph.wait(lambda: "E2E テスト記事" in ph.mirror_text(), 15, "mirror content")
+    before = sorted(ph.env.tabs())
+    assert before == [tab], before
+    opens_before = ph.env.fx.count("/article.html")
+    ph.page.reload()
+    ph.page.wait_for_selector("#omnibox", state="attached")
+    ph.wait(lambda: ph.js("state.authed === true"), 10, "still logged in")
+    ph.wait(lambda: ph.tab_id() == tab, 15, "same NAS tab re-attached (now %s)" % ph.tab_id())
+    ph.wait(lambda: "E2E テスト記事" in ph.mirror_text(), 15, "mirror content after reload")
+    ph.page.wait_for_timeout(4000)
+    after = sorted(ph.env.tabs())
+    assert after == before, "tabs before %s after %s" % (before, after)
+    assert ph.env.fx.count("/article.html") <= opens_before + 1, \
+        "page loaded %d times after reload" % (ph.env.fx.count("/article.html") - opens_before)
+
+
+AUTO_LIVE_BUDGET_S = 6.0
+
+
+def _auto_live(ph, start_display):
+    tab = ph.open("/challenge.html?s=4", wait_tab=True)
+    ph.wait(lambda: ph.display() == "live", 8, "auto-live entered for the challenge page")
+    ph.wait(lambda: ph.env.fx.times.get("/after-challenge.html"), 12, "the challenge page redirected")
+    redirected = ph.env.fx.times["/after-challenge.html"]
+    ph.wait(lambda: ph.display() == start_display, AUTO_LIVE_BUDGET_S + 2, "display back to %s" % start_display)
+    took = time.monotonic() - redirected
+    assert took <= AUTO_LIVE_BUDGET_S, "returned %.1fs after the redirect (budget %.1fs)" % (took, AUTO_LIVE_BUDGET_S)
+    return took
+
+
+@scenario("auto-live-fast", display="fast")
+def auto_live_fast(ph):
+    ph.log("returned %.1fs after redirect" % _auto_live(ph, "tiles"))
+
+
+@scenario("auto-live-mirror", display="mirror")
+def auto_live_mirror(ph):
+    ph.log("returned %.1fs after redirect" % _auto_live(ph, "mirror"))

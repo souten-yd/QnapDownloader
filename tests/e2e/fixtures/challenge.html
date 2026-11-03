@@ -1,0 +1,10 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Checking</title>
+<style>body{font:16px/1.7 sans-serif;margin:0;padding:24px;text-align:center}</style></head><body>
+<h1>Checking your browser before accessing the site</h1>
+<form id="challenge-form" action="/after-challenge.html" method="get"><p>This process is automatic. Your browser will redirect shortly.</p></form>
+<script>
+fetch("/__beacon?e=load&p=" + encodeURIComponent(location.pathname), {cache: "no-store"}).catch(function () {});
+var s = Number((location.search.match(/[?&]s=(\d+)/) || [0, 3])[1]);
+setTimeout(function () { location.replace("/after-challenge.html"); }, s * 1000);
+</script></body></html>

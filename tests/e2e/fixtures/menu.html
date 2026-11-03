@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>E2E メニュー</title>
+<style>
+body{font:16px/1.7 sans-serif;margin:0}
+nav{background:#124;padding:10px 14px;position:relative}
+nav a{color:#fff;text-decoration:none}
+#dd{list-style:none;margin:8px 0 0;padding:6px 0;background:#fff;border:1px solid #99a;border-radius:6px}
+#dd[hidden]{display:none}
+#dd a{color:#0a58ca;display:block;padding:10px 12px}
+main{padding:12px 14px}
+</style></head><body>
+<nav>
+ <a href="#" id="menu-toggle" aria-expanded="false" aria-controls="dd" aria-haspopup="true">メニュー</a>
+ <a href="/menu.html" id="menu-toggle2" aria-expanded="false" aria-controls="dd2" style="margin-left:14px">メニューB</a>
+ <ul id="dd2" hidden><li><a href="/article2.html">B項目 記事2</a></li></ul>
+ <ul id="dd" hidden>
+  <li><a href="/article.html" id="m-article">メニュー項目 記事</a></li>
+  <li><a href="/article2.html">メニュー項目 記事2</a></li>
+ </ul>
+</nav>
+<main><h1>JS メニューのテスト</h1><p>メニューのトグルは href="#" のリンクで、ページ内のスクリプトが開閉します。</p>
+<p>ここを押してもページは再読み込みされてはいけません。</p></main>
+<script>
+fetch("/__beacon?e=load&p=" + encodeURIComponent(location.pathname), {cache: "no-store"}).catch(function () {});
+window.__loadedAt = Date.now();
+var t = document.getElementById("menu-toggle"), dd = document.getElementById("dd");
+t.addEventListener("click", function (ev) {
+  ev.preventDefault();
+  var open = dd.hasAttribute("hidden");
+  if (open) dd.removeAttribute("hidden"); else dd.setAttribute("hidden", "");
+  t.setAttribute("aria-expanded", open ? "true" : "false");
+  fetch("/__beacon?e=toggle&p=" + (open ? "open" : "close"), {cache: "no-store"}).catch(function () {});
+});
+var t2 = document.getElementById("menu-toggle2"), dd2 = document.getElementById("dd2");
+t2.addEventListener("click", function (ev) {   // a real href (this very page): navigating would just reload it
+  ev.preventDefault();
+  var open = dd2.hasAttribute("hidden");
+  if (open) dd2.removeAttribute("hidden"); else dd2.setAttribute("hidden", "");
+  t2.setAttribute("aria-expanded", open ? "true" : "false");
+  fetch("/__beacon?e=toggle&p=" + (open ? "open-b" : "close-b"), {cache: "no-store"}).catch(function () {});
+});
+</script></body></html>

@@ -5,6 +5,8 @@ cd "$ROOT"
 
 python3 -m py_compile webapp.py ttlcache.py state_hub.py diskio.py debuglog.py storage.py durability.py updater.py self_update.py jd2_policy.py jd2_control.py jd2_local.py jd2_transfer.py jd2_downloads.py jd2_accounts.py engine_components.py engine_supervisor.py container_runtime.py runtime_diagnostics.py browser_safety.py rb_blocklist.py rb_resident.py rb_mirror.py remote_browser.py qpkg/shared/downloader_pid.py
 python3 -m unittest discover -s tests -v
+# tests/e2e is not a package and has no test_*.py files: unittest discovery skips it; it only gets a syntax check here.
+python3 -m py_compile tests/e2e/harness.py tests/e2e/scenarios.py tests/e2e/run.py
 
 sh -n qpkg/shared/downloader.sh
 sh -n qpkg/shared/python3-path
