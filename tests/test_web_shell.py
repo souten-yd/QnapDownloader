@@ -1482,3 +1482,14 @@ class SingleFilePackageTest(unittest.TestCase):
         app = (Path(__file__).resolve().parents[1] / "web" / "app.js").read_text(encoding="utf-8")
         self.assertIn("function singleRow(pkg, file)", app)
         self.assertIn("singleRow(pkg, files[0]) : packageRow(pkg, files)", app)
+
+
+class BrowserBackTest(unittest.TestCase):
+    """v0.1.50: the browser back on a web page is a page back; the mirror frame adds no history."""
+
+    def test_back_guard_and_frame_replace(self):
+        app = (Path(__file__).resolve().parents[1] / "web" / "app.js").read_text(encoding="utf-8")
+        self.assertIn("function armBackGuard()", app)
+        self.assertIn('window.addEventListener("popstate", onPopState)', app)
+        self.assertIn("mf.contentWindow.location.replace(new URL(docUrl, location.href).href)", app)
+        self.assertNotIn("    mf.src = docUrl;\n  });", app)

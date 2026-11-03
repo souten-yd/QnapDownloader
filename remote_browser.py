@@ -2860,10 +2860,14 @@ class RemoteBrowser:
             if (not isinstance(entries, list) or not isinstance(index, int) or
                     not 0 <= index + step < len(entries)):
                 return {"ok": True, "moved": False}
-            entry = entries[index + step].get("id") if isinstance(entries[index + step], dict) else None
-            if not isinstance(entry, int):
+            target = entries[index + step] if isinstance(entries[index + step], dict) else {}
+            entry = target.get("id")
+            # v0.1.50: the blank page a tab starts on is not a page to go back to.
+            target_url = target.get("url") if isinstance(target.get("url"), str) else ""
+            if not isinstance(entry, int) or not target_url.lower().startswith(("http://", "https://")):
                 return {"ok": True, "moved": False}
             self._call("Page.navigateToHistoryEntry", {"entryId": entry}, session=session)
+            return {"ok": True, "moved": True, "editable": tab.editable}
         return {"ok": True, "editable": tab.editable}
 
     def _refresh_editable(self, tab):

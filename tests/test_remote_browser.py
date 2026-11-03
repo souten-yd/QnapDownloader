@@ -183,7 +183,7 @@ class FakeWS:
         self.eval_value = []
         self.eval_map = []             # (expression substring, value) overrides for Runtime.evaluate
         self.hook = None               # called with every command before it is answered
-        self.history = {"currentIndex": 1, "entries": [{"id": 5}, {"id": 6}, {"id": 7}]}
+        self.history = {"currentIndex": 1, "entries": [{"id": 5, "url": "https://a.example/1"}, {"id": 6, "url": "https://a.example/2"}, {"id": 7, "url": "https://a.example/3"}]}
         self.layout = {"cssContentSize": {"width": 390, "height": 4000.2}}
         self.shot_size = 100           # bytes of each captured tile
         self.results = {}              # method -> result dict (or callable(params) -> dict)
@@ -734,6 +734,9 @@ class InputTests(BrowserBase):
         self.rb.send_input("b1", {"type": "forward"})
         self.assertEqual(self.ws.calls("Page.navigateToHistoryEntry")[-1]["params"], {"entryId": 7})
         self.ws.history = {"currentIndex": 0, "entries": [{"id": 5}]}
+        self.assertEqual(self.rb.send_input("b1", {"type": "back"}), {"ok": True, "moved": False})
+        # v0.1.50: the blank start page is not a page to go back to
+        self.ws.history = {"currentIndex": 1, "entries": [{"id": 4, "url": "about:blank"}, {"id": 5, "url": "https://a.example/1"}]}
         self.assertEqual(self.rb.send_input("b1", {"type": "back"}), {"ok": True, "moved": False})
         self.rb.send_input("b1", {"type": "reload"})
         self.assertEqual(len(self.ws.calls("Page.reload")), 1)
