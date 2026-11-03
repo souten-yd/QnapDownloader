@@ -5110,6 +5110,24 @@ function fileRow(item) {
 
 function packageKey(item) { return item.id ? "id:" + item.id : "n:" + item.name; }
 
+function singleRow(pkg, file) {
+  const card = element("article", undefined, "download-card pkg single " + itemState(file));
+  const top = element("div", undefined, "pkg-top");
+  const line = element("div", undefined, "pkg-line");
+  const head = element("div", undefined, "pkg-head");
+  head.appendChild(element("span", file.name || pkg.name, "row-name"));
+  head.appendChild(stateChip(file));
+  line.appendChild(head);
+  rowTools("package", pkg, line);           // the actions act on the package (= this one file)
+  top.appendChild(line);
+  const bar = progressBar(file) || progressBar(pkg);
+  if (bar) top.appendChild(bar);
+  const meta = metaText(file, file.host);
+  if (meta) top.appendChild(element("p", meta, "download-detail"));
+  card.appendChild(itemSwipe("package", pkg, top));
+  return card;
+}
+
 function packageRow(pkg, files) {
   const key = packageKey(pkg);
   const open = state.expanded.has(key);
@@ -5659,7 +5677,11 @@ function renderDownloads() {
   const nodes = [];
   for (const pkg of snap.packages) {
     const files = pkg.id ? byPackage.get(pkg.id) || [] : [];
-    if (matchesFilter(pkg) || files.some(matchesFilter)) nodes.push(packageRow(pkg, files));
+    if (matchesFilter(pkg) || files.some(matchesFilter)) {
+      // v0.1.46: a package of one file is one row (no nested card repeating the same name/size).
+      nodes.push(files.length === 1 && (pkg.child_count === 1 || pkg.child_count === undefined) ?
+        singleRow(pkg, files[0]) : packageRow(pkg, files));
+    }
   }
   const looseShown = loose.filter(matchesFilter);
   // Without any package on the page, loose files are the list itself.

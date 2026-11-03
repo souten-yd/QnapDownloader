@@ -1385,3 +1385,12 @@ class ReturnFasterTest(unittest.TestCase):
         self.assertIn("tab.opening && tab.opening.url === url", app)
         self.assertIn("moved ? 1 : AUTO_CLEAN_NEEDED", app)
         self.assertIn("self._settle(tab, before_rev, wait_load=False)", rb)
+
+
+class SingleFilePackageTest(unittest.TestCase):
+    """v0.1.46: a package with one file is shown as one row, not a package card with a nested file card."""
+
+    def test_single_row(self):
+        app = (Path(__file__).resolve().parents[1] / "web" / "app.js").read_text(encoding="utf-8")
+        self.assertIn("function singleRow(pkg, file)", app)
+        self.assertIn("singleRow(pkg, files[0]) : packageRow(pkg, files)", app)
