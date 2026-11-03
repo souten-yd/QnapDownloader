@@ -97,7 +97,7 @@ def main(argv=None):
                 browser.close()
     finally:
         env.close()
-    return report(rows, time.monotonic() - t0, out, missing)
+    return report(rows, time.monotonic() - t0, out, missing, require=args.require_engines)
 
 
 def run_one(env, browser, ctx_kw, engine, sc, out, keep_shots):
@@ -142,7 +142,7 @@ def run_one(env, browser, ctx_kw, engine, sc, out, keep_shots):
     return (engine, name, status, time.monotonic() - start, detail)
 
 
-def report(rows, total, out, missing=()):
+def report(rows, total, out, missing=(), require=False):
     width = max([len(r[1]) for r in rows] + [8])
     print()
     print("%-9s %-*s %-5s %6s  %s" % ("engine", width, "scenario", "", "secs", "detail"))
@@ -155,7 +155,11 @@ def report(rows, total, out, missing=()):
     print("E2E: %d passed, %d failed, %d skipped in %.0fs (artifacts: %s)" % (counts["PASS"], counts["FAIL"], counts["SKIP"], total, out))
     for s in missing:
         print("SKIPPED: %s" % s)
-    if missing and args.require_engines:
+    # Full detail of each failure in the log itself (CI artifacts may be unreachable).
+    for engine, name, status, secs, detail in rows:
+        if status == "FAIL" and detail:
+            print("\n--- %s %s ---\n%s" % (engine, name, "\n".join(detail.splitlines()[:25])))
+    if missing and require:
         print("FAIL: a required browser engine is missing (--require-engines)")
         return 1
     return 1 if counts["FAIL"] else 0
