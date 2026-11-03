@@ -94,13 +94,13 @@ const DEBUG_RATE_MS = 1000;        // the same key is logged at most this often
 const DEBUG_VIEW_MS = 2000;        // the log sheet follows the server this often
 const DEBUG_VIEW_MAX = 1000;
 const DISK_REFRESH_MS = 10000;     // disk write table (the Hub samples every 10 s)
-const SETTINGS_SECTIONS = ["jd2", "browser", "connection", "system"];
+const SETTINGS_SECTIONS = ["jd2", "browser", "connection", "system", "diag"];
 const SETTINGS_SUBS = {jd2: ["engine", "accounts", "storage", "send"], browser: ["nas", "rules", "bookmarks"],
-  connection: ["https", "share"], system: ["updates", "diagnostics", "about"]};
+  connection: ["https", "share"], system: ["updates", "about"], diag: ["tools", "disk", "debug"]};
 // Old one-section routes land on their new place.
 const SETTINGS_REDIRECTS = {engine: "jd2/engine", accounts: "jd2/accounts", storage: "jd2/storage",
   https: "connection/https", share: "connection/share", bookmarks: "browser/bookmarks",
-  updates: "system/updates", diagnostics: "system/diagnostics", about: "system/about"};
+  updates: "system/updates", diagnostics: "diag/tools", about: "system/about"};
 const SVG_NS = "http://www.w3.org/2000/svg";
 const PASTE_LIMIT = 65536;
 const PASTE_DEBOUNCE_MS = 400;
@@ -496,6 +496,9 @@ function defaultSection() { return "jd2"; }
 
 // #/settings/<section>[/<sub>]; an old one-section route carries `redirect` (its new hash).
 function settingsRoute(first, second) {
+  if (first === "system" && second === "diagnostics") {     // v0.1.40: 診断 is its own section
+    return {view: "settings", section: "diag", sub: "", redirect: "#/settings/diag"};
+  }
   if (SETTINGS_SECTIONS.includes(first)) {
     const sub = (SETTINGS_SUBS[first] || []).includes(second) ? second : "";
     return {view: "settings", section: first, sub};
@@ -4276,8 +4279,25 @@ function wireMirrorDoc(doc) {
     if (event.pointerId === press.id && (press.timer || press.ring) &&
         Math.hypot(event.clientX - press.x, event.clientY - press.y) > RB_LONGPRESS_MOVE_PX) stopPress();
   });
-  doc.addEventListener("pointerup", stopPress);
-  doc.addEventListener("pointercancel", stopPress);
+  // iOS Safari sends no "click" for elements it does not consider clickable (our links have no
+  // href, menus are plain divs), so a tap is recognised from the pointer itself (v0.1.40).
+  const tap = {id: null, x: 0, y: 0, at: 0, moved: false, handledAt: 0};
+  doc.addEventListener("pointerdown", event => {
+    if (event.pointerType === "mouse" && event.button !== 0) { tap.id = null; return; }
+    tap.id = event.pointerId; tap.x = event.clientX; tap.y = event.clientY; tap.at = performance.now(); tap.moved = false;
+  }, true);
+  doc.addEventListener("pointermove", event => {
+    if (event.pointerId === tap.id && Math.hypot(event.clientX - tap.x, event.clientY - tap.y) > RB_TAP_MOVE_PX) tap.moved = true;
+  }, true);
+  doc.addEventListener("pointerup", event => {
+    const quick = event.pointerId === tap.id && !tap.moved && performance.now() - tap.at < RB_LONGPRESS_MS;
+    tap.id = null;
+    stopPress();
+    if (!quick || press.fired) return;
+    tap.handledAt = performance.now();
+    handleTap(event);
+  });
+  doc.addEventListener("pointercancel", () => { tap.id = null; stopPress(); });
   doc.addEventListener("contextmenu", event => { event.preventDefault(); });
   doc.addEventListener("submit", event => { event.preventDefault(); });
   // The copy's controls are inert: no focus, no keyboard of their own (typing goes to the NAS browser).
@@ -4291,6 +4311,10 @@ function wireMirrorDoc(doc) {
   doc.addEventListener("click", event => {
     event.preventDefault();
     if (press.fired) { press.fired = false; return; }       // the long press already started a probe
+    if (performance.now() - tap.handledAt < 800) return;    // the pointer already handled this tap
+    handleTap(event);
+  });
+  function handleTap(event) {
     const tab = tabNow();
     if (!tab) return;
     const link = mirrorClosest(event.target, "[data-href]");
@@ -4299,7 +4323,7 @@ function wireMirrorDoc(doc) {
     if (frag) { mirrorScrollToAnchor(doc, frag.getAttribute("data-frag")); return; }
     const el = mirrorClosest(event.target, "[data-m]");
     if (el) perform(() => mirrorClick(tab, el, event));
-  });
+  }
   // Native scrolling: remember the place per page, and hold recaptures back while a finger is down.
   let scrollTick = 0;
   doc.addEventListener("scroll", () => {
@@ -5961,9 +5985,10 @@ async function enterSettings(route, force = false) {
     renderShareStatic();
     await swr("share-tokens", "/api/share/tokens", renderShareDevices, {force});
   } else if (section === "system") {
+    await updateStatus(force);
+  } else if (section === "diag") {
     renderDebugCard();
     loadDisk().catch(() => {});
-    await updateStatus(force);
   }
   scrollToSub(route);
 }
@@ -7125,7 +7150,7 @@ function wireAccounts() {
 
 // ---- Settings › システム › 診断: disk writes and the debug log (v0.1.35)
 function diagVisible() {
-  return state.route.view === "settings" && state.route.section === "system";
+  return state.route.view === "settings" && state.route.section === "diag";
 }
 
 function rateText(value) {
