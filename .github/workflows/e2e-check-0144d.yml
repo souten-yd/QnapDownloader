@@ -1,0 +1,43 @@
+name: e2e-check-0144d
+
+# Phone-browser end-to-end suite (tests/e2e). Manual only (DEVELOPMENT_WORKFLOW.md: Actions are a
+# manual fallback, no automatic push/PR builds). The same suite runs inside every release workflow
+# before the QPKG is published, and locally with scripts/e2e.sh before each merge.
+on:
+  push:
+    branches: [ci/e2e-webkit-0144d]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: e2e-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install Playwright (chromium + webkit phone engines)
+        run: |
+          python -m pip install playwright==1.63.0
+          python -m playwright install --with-deps chromium webkit
+      - name: Local code and safety checks
+        run: bash scripts/verify.sh
+      - name: End-to-end suite
+        # The NAS-side browser is the runner's google-chrome (falls back to Playwright's chromium).
+        run: bash scripts/e2e.sh --engines chromium,webkit --require-engines --out "$GITHUB_WORKSPACE/e2e-artifacts" --nas-chrome "$(command -v google-chrome || true)"
+      - name: Upload screenshots and logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-artifacts
+          path: e2e-artifacts
+          if-no-files-found: ignore
+          retention-days: 7
