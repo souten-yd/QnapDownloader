@@ -12,6 +12,7 @@ The NAS Chrome resolves the fixture hosts (a.example.com / *.example.net) to the
 used for that test browser only. The app itself keeps validating URLs as in production, so fixtures
 use real-looking public https names without a port.
 """
+import re
 import json
 import os
 import shutil
@@ -277,6 +278,10 @@ CONSOLE_ALLOW = (
     "the server responded with a status of 502",     # a fixture resource the NAS browser cannot read
     "the server responded with a status of 404",     # missing fixture resource (e.g. favicon via the mirror)
 )
+# WebKit reports a request the app itself aborted (the /api/state long-poll when the page or view
+# changes) as "Fetch API cannot load <own /api/...> due to access control checks", sometimes as a
+# page error. Only our own API on the app origin is allowed; anything else still fails the scenario.
+WEBKIT_ABORT = re.compile(r"/127\.0\.0\.1:\d+/api/[a-z/]+\?[^ ]* due to access control checks")
 
 
 class Phone:
@@ -290,13 +295,21 @@ class Phone:
         self.csrf = None
         page.set_default_timeout(15000)
         page.on("console", self._console)
-        page.on("pageerror", lambda e: self.errors.append("pageerror: %s" % e))
+        page.on("pageerror", self._pageerror)
+
+    def _pageerror(self, e):
+        text = str(e)
+        if self.engine == "webkit" and WEBKIT_ABORT.search(text):
+            return
+        self.errors.append("pageerror: %s" % text)
 
     def _console(self, msg):
         if msg.type != "error":
             return
         text = msg.text or ""
         if any(token in text for token in CONSOLE_ALLOW):
+            return
+        if self.engine == "webkit" and WEBKIT_ABORT.search(text):
             return
         self.errors.append("console.error: %s @ %s" % (text[:200], json.dumps(msg.location)))
 
