@@ -2899,14 +2899,17 @@ class RemoteBrowser:
         return {"ok": True, "navigated": navigated, "editable": tab.editable,
                 "snap_needed": True}
 
-    def _settle(self, tab, before_rev):
-        """Wait for a navigation caused by a click: True when one started."""
+    def _settle(self, tab, before_rev, wait_load=True):
+        """Wait for a navigation caused by a click: True when one started. Without `wait_load` it
+        returns as soon as the navigation started (v0.1.43: the mirror follows the page itself)."""
         deadline = self._clock() + TAP_NAV_WAIT
         started = False
         with self._cv:
             while True:
                 if tab.loading or tab.rev != before_rev:
                     started = True
+                    if not wait_load:
+                        return True
                     break
                 remaining = deadline - self._clock()
                 if remaining <= 0 or self._state != "running":
@@ -3841,7 +3844,7 @@ class RemoteBrowser:
         self._call("Input.dispatchMouseEvent", dict(base, type="mousePressed", buttons=1), session)
         self._call("Input.dispatchMouseEvent", dict(base, type="mouseReleased", buttons=0), session)
         self._refresh_editable(tab)
-        started_nav = self._settle(tab, before_rev)
+        started_nav = self._settle(tab, before_rev, wait_load=False)
         with self._lock:
             navigated = started_nav or tab.url != before_url
         debuglog.log("render", "info", "mirror click", {

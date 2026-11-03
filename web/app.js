@@ -8,7 +8,7 @@
  *  - There are no iframes: since v0.1.35 every http(s) web tab is shown by the NAS browser
  *    (Chromium in a NAS container); this page only displays JPEG frames / reader data the Hub
  *    produced. The URL is validated by /api/browser/validate before it is handed to the Hub.
- *  - Storage keeps only {id, url history, index} and the last route (session), one boolean
+ *  - Storage keeps only {id, url history, index, NAS tab id} and the last route (session), one boolean
  *    preference and hostname->display pairs (local). Never tokens, passwords or cookies.
  */
 
@@ -879,7 +879,8 @@ function newTabRecord(id) {
 function saveTabs() {
   // Only id / url history / index. No tokens, cookies or page data.
   const data = {v: 1, next: state.nextTabId, tabs: state.tabs.map(t => ({
-    id: t.id, history: t.history.slice(), index: t.index}))};
+    id: t.id, history: t.history.slice(), index: t.index,
+    nas: t.rb ? t.rb.id : (t.savedNas || "")}))};   // v0.1.43: the NAS tab is reattached after a reload
   writeSession(TAB_STORAGE_KEY, JSON.stringify(data));
 }
 
@@ -896,7 +897,8 @@ function restoreTabs() {
       u.startsWith("https://")).slice(-MAX_HISTORY);
     const idx = Number.isInteger(raw.index) ? raw.index : tab.history.length - 1;
     tab.index = tab.history.length ? Math.min(Math.max(idx, 0), tab.history.length - 1) : -1;
-    state.tabs.push(tab);   // the NAS browser tab is opened when the tab is shown (autoReopen)
+    if (typeof raw.nas === "string" && /^b\d{1,9}$/.test(raw.nas)) tab.savedNas = raw.nas;
+    state.tabs.push(tab);   // the NAS browser tab is reattached or opened when the tab is shown (autoReopen)
     maxId = Math.max(maxId, Number(raw.id.slice(1)));
   }
   const next = Number.isInteger(data.next) ? data.next : 1;
@@ -967,6 +969,44 @@ async function validateUrl(value) {
 // set of inputs. The only image source is a blob: object URL made from
 // the Hub's /api/rb/frame.jpg bytes; it is never a remote URL.
 // opts.validated: `value` already came from validateUrl().
+function newRbRecord(id, tab) {
+  return {id, seq: 0, url: "", title: "", width: 0, height: 0,
+    loading: true, links: [], linksTimer: 0, blocked: null,
+    rev: null, icptSeen: 0, present: 0, vp: "", popups: 0,
+    shown: "", autoLive: false, autoSince: 0, autoClean: 0, autoChip: false,
+    autoBusy: false, autoOff: "", view: null, snap: null, snapKey: "", snapBusy: false,
+    snapAgain: null, snapTimer: 0, busy: 0, scrollTop: 0, owner: tab,
+    vmap: null, vmapRev: -1, vmapTimer: 0, vmapBusy: false, vmapAt: 0, linksRev: -1,
+    reader: null, readerBusy: false, readerPending: false, readerAgain: false,
+    readerEarly: "", readerFail: null, readerErr: false, tilesFor: "", snapEarly: "", loadUrl: "", loadSince: 0,
+    mirror: null, mirrorBusy: false, mirrorAgain: false, mirrorPending: false, mirrorEarly: "", mirrorFail: null,
+    mirrorAt: 0, mirrorMs: 0, mirrorTimer: 0, mirrorTouch: false, mirrorDeferred: false, mirrorPos: {},
+    stream: null, streamFailed: false, perf: {}};
+}
+
+// v0.1.43: after a reload of this page the NAS tab usually still exists: use it again instead of
+// opening (and loading) a new one. Returns true when it was reattached.
+async function reattachRemote(tab) {
+  const id = tab.savedNas;
+  tab.savedNas = "";
+  if (!id) return false;
+  try {
+    const res = await fetch("/api/rb/meta?tab=" + encodeURIComponent(id) + "&wait=0",
+      {credentials: "same-origin", cache: "no-store"});
+    if (res.status !== 200 || tab.rb) return false;
+    const meta = await res.json();
+    const want = tab.current || (tab.history.length ? tab.history[tab.index] : "");
+    if (state.tabs.some(t => t !== tab && t.rb && t.rb.id === id)) return false;
+    if (typeof meta.url !== "string" || !meta.url) return false;
+    tab.rb = newRbRecord(id, tab);
+    tab.current = want || meta.url;
+    dlog("rb", "info", "tab reattached", {tab: id});
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+
 async function openRemote(tab, value, commit, opts = {}) {
   ensureRemote();
   const token = ++tab.token;
@@ -1004,18 +1044,7 @@ async function openRemote(tab, value, commit, opts = {}) {
         api("/api/rb/tabs/close", {id: made.id}).catch(() => {});
         return;
       }
-      tab.rb = {id: made.id, seq: 0, url: "", title: "", width: 0, height: 0,
-        loading: true, links: [], linksTimer: 0, blocked: null,
-        rev: null, icptSeen: 0, present: 0, vp: "", popups: 0,
-        shown: "", autoLive: false, autoSince: 0, autoClean: 0, autoChip: false,
-        autoBusy: false, autoOff: "", view: null, snap: null, snapKey: "", snapBusy: false,
-        snapAgain: null, snapTimer: 0, busy: 0, scrollTop: 0, owner: tab,
-        vmap: null, vmapRev: -1, vmapTimer: 0, vmapBusy: false, vmapAt: 0, linksRev: -1,
-        reader: null, readerBusy: false, readerPending: false, readerAgain: false,
-        readerEarly: "", readerFail: null, readerErr: false, tilesFor: "", snapEarly: "", loadUrl: "", loadSince: 0,
-        mirror: null, mirrorBusy: false, mirrorAgain: false, mirrorPending: false, mirrorEarly: "", mirrorFail: null,
-        mirrorAt: 0, mirrorMs: 0, mirrorTimer: 0, mirrorTouch: false, mirrorDeferred: false, mirrorPos: {},
-        stream: null, streamFailed: false, perf: {}};
+      tab.rb = newRbRecord(made.id, tab);
     }
   } catch (e) {
     if (token === tab.token) { tab.loading = false; tab.error = e.message; updateChrome(); }
@@ -1055,7 +1084,11 @@ function releaseRemote(tab) {
 async function openInRemote(tab) {
   const url = tab.current || (tab.history.length ? tab.history[tab.index] : "");
   if (!url) return;
-  await openRemote(tab, url, u => { tab.history[tab.index] = u; });
+  // v0.1.43: several callers (restore, autoReopen, route changes) may ask at once: one open only.
+  if (tab.opening && tab.opening.url === url) return tab.opening.promise;
+  const promise = openRemote(tab, url, u => { tab.history[tab.index] = u; });
+  tab.opening = {url, promise};
+  try { await promise; } finally { if (tab.opening && tab.opening.promise === promise) tab.opening = null; }
 }
 
 function remoteTab() {
@@ -1237,16 +1270,18 @@ function applyRemoteMeta(tab, f) {
 // Cloudflare checks and logins need the live screencast. The switch is automatic and
 // temporary (rb.autoLive, never written to the per-host mode map); a dedicated poll of
 // /api/rb/meta brings the tab back to 高速 after two clean checks of a finished page.
-const AUTO_POLL_MS = 1500;
+const AUTO_POLL_MS = 1000;
 const AUTO_CLEAN_NEEDED = 2;
 const AUTO_TIMEOUT_MS = 90000;
 const AUTO_SETTLE_MS = 3000;
+const AUTO_SETTLE_MOVED_MS = 1000;
 
 // Pure state step (unit-tested in node). Returns "enter" | "return" | "chip" | null.
-function challengeStep(rb, challenge, loading, now, userLive) {
+function challengeStep(rb, challenge, loading, now, userLive, moved = false) {
   if (!rb.autoLive) {
     if (challenge && !userLive) {
       rb.autoLive = true; rb.autoSince = now; rb.autoClean = 0; rb.autoChip = false; rb.autoQuiet = 0;
+      rb.autoUrl = rb.url;
       return "enter";
     }
     return null;
@@ -1258,9 +1293,10 @@ function challengeStep(rb, challenge, loading, now, userLive) {
   }
   // Ad-heavy pages never finish "loading": 3 s after the check page is gone counts as settled (v0.1.37).
   if (!rb.autoQuiet) rb.autoQuiet = now;
-  if (loading && now - rb.autoQuiet < AUTO_SETTLE_MS) { rb.autoClean = 0; return null; }
+  // v0.1.43: once the check page has gone to another address, one clean look is enough.
+  if (loading && now - rb.autoQuiet < (moved ? AUTO_SETTLE_MOVED_MS : AUTO_SETTLE_MS)) { rb.autoClean = 0; return null; }
   rb.autoClean++;
-  if (rb.autoClean >= AUTO_CLEAN_NEEDED) {
+  if (rb.autoClean >= (moved ? 1 : AUTO_CLEAN_NEEDED)) {
     rb.autoLive = false; rb.autoClean = 0; rb.autoChip = false;
     return "return";
   }
@@ -1293,7 +1329,8 @@ async function autoPollTick(tab, rb) {
     if (res.status !== 200 || tab.rb !== rb || !rb.autoLive) return;
     const meta = await res.json();
     if (tab.rb !== rb || !rb.autoLive) return;
-    const step = challengeStep(rb, meta.challenge === true, meta.loading === true, Date.now(), false);
+    const moved = typeof meta.url === "string" && Boolean(rb.autoUrl) && meta.url !== rb.autoUrl;
+    const step = challengeStep(rb, meta.challenge === true, meta.loading === true, Date.now(), false, moved);
     if (step === "return") {
       applyDisplay(tab);   // tiles again: the tile loop takes a fresh snapshot on start
     } else if (step === "chip") {
@@ -1647,7 +1684,10 @@ function autoReopen(tab) {
   tab.reopenAt = now;
   tab.reopening = true;
   tab.error = "";
-  perform(() => openInRemote(tab)).finally(() => {
+  perform(async () => {
+    if (await reattachRemote(tab)) { saveTabs(); refreshAfterTabChange(); return; }
+    await openInRemote(tab);
+  }).finally(() => {
     tab.reopening = false;
     if (tab.rb) tab.reopenAt = 0;
     if (activeWebTab() === tab) updateRemoteView(tab);
