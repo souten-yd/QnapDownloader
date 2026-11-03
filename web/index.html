@@ -98,6 +98,7 @@
       <div class="menu-label" data-scope="remote">表示</div>
       <div class="menu-seg" role="group" aria-label="表示方法" data-scope="remote">
        <button type="button" role="menuitemradio" data-action="display:reader" data-display="reader">リーダー</button>
+       <button type="button" role="menuitemradio" data-action="display:mirror" data-display="mirror">ミラー</button>
        <button type="button" role="menuitemradio" data-action="display:tiles" data-display="tiles">高速</button>
        <button type="button" role="menuitemradio" data-action="display:live" data-display="live">ライブ</button>
       </div>
@@ -402,10 +403,11 @@
        </details>
        <div class="set-row">
         <div class="set-main"><span class="set-label">既定の表示方法</span>
-         <span class="set-desc"><span class="set-text">リーダー・高速・ライブから選びます</span>
-          <details class="hint"><summary aria-label="詳しい説明">ⓘ</summary><p>リーダーは本文・見出し・画像・リンクだけをNASで取り出して端末で組み立て直す表示、高速はページ全体を画像のタイルにして端末側でスクロール、ライブは画面をそのまま中継します。サイトごとに「⋯」メニューの「表示」で選んだ内容が優先されます。Cloudflareの確認画面は自動でライブ表示になります。</p></details></span></div>
+         <span class="set-desc"><span class="set-text">リーダー・ミラー・高速・ライブから選びます</span>
+          <details class="hint"><summary aria-label="詳しい説明">ⓘ</summary><p>リーダーは本文・見出し・画像・リンクだけをNASで取り出して端末で組み立て直す表示、ミラーはNASで描画したページのHTMLとCSS（スクリプトなし）の複製を端末のネイティブスクロールで見る表示（文字がくっきりします）、高速はページ全体を画像のタイルにして端末側でスクロール、ライブは画面をそのまま中継します。サイトごとに「⋯」メニューの「表示」で選んだ内容が優先されます。Cloudflareの確認画面は自動でライブ表示になります。</p></details></span></div>
         <select id="rbDefaultMode" name="rbDefaultMode" class="inline-select" aria-label="既定の表示方法">
          <option value="reader">リーダー</option>
+         <option value="mirror">ミラー</option>
          <option value="fast" selected>高速（全体表示）</option>
          <option value="live">ライブ</option>
         </select>
@@ -593,6 +595,9 @@
     <div id="remoteStage" class="remote-stage">
      <img id="remoteImg" class="remote-img" alt="NASブラウザの画面" draggable="false" hidden>
      <div id="tileScroll" class="tile-scroll" aria-label="NASブラウザのページ（全体表示）" hidden></div>
+     <div id="mirrorWrap" class="mirror-wrap" hidden>
+      <iframe id="mirrorFrame" class="mirror-frame" sandbox="allow-same-origin" title="NASブラウザのページ（ミラー表示）"></iframe>
+     </div>
      <div id="readerProgress" class="reader-progress" role="progressbar" aria-label="読み進み" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" hidden><div id="readerProgressFill" class="reader-progress-fill"></div></div>
      <div id="readerScroll" class="reader-scroll" aria-label="NASブラウザのページ（リーダー表示）" hidden>
       <div class="reader-head">

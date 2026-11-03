@@ -4,6 +4,7 @@ import hmac
 import http.cookies
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import ipaddress
+import gzip
 import json
 import os
 import re
@@ -27,12 +28,13 @@ import debuglog
 import diskio
 import runtime_diagnostics
 import engine_supervisor
+import rb_mirror
 import remote_browser
 import state_hub
 import ttlcache
 import updater
 
-VERSION = "0.1.38"
+VERSION = "0.1.39"
 PORT = 17864
 ROOT = Path(__file__).resolve().parent
 FILES = {"/": ("web/index.html", "text/html; charset=utf-8"),
@@ -41,9 +43,12 @@ FILES = {"/": ("web/index.html", "text/html; charset=utf-8"),
          "/icon.svg": ("web/icon.svg", "image/svg+xml"),
          "/apple-touch-icon.png": ("web/apple-touch-icon.png", "image/png"),
          "/icon-192.png": ("web/icon-192.png", "image/png")}
-# No frame-src https: since v0.1.35 (the in-phone iframe browser is gone): the page embeds nothing.
+# No frame-src https: since v0.1.35 (the in-phone iframe browser is gone). v0.1.39 adds frame-src 'self'
+# for ONE thing: the mirror display's sandboxed iframe, whose document is /api/rb/mirror/doc of this very
+# origin (a srcdoc iframe would inherit this policy and lose its inline styles; see docs/browser-shell-ui.md).
+# That response carries its own, stricter policy (rb_mirror.DOC_CSP_HEADER). External pages are never framed.
 CSP = ("default-src 'none'; img-src 'self' data: blob:; script-src 'self'; style-src 'self'; "
-       "connect-src 'self'; frame-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'")
+       "connect-src 'self'; frame-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'")
 SESSIONS = {}
 FAILED = {}
 SHARE_FAILED = {}    # per-address failed share-token attempts (RAM only)
@@ -408,7 +413,24 @@ def server_state_hub(server):
 
 # Writes under these prefixes change nothing the cached reads show (screen input only).
 RB_QUIET_POSTS = ("/api/debug/log", "/api/diag/diskio/start", "/api/diag/diskio/stop", "/api/rb/input", "/api/rb/viewport", "/api/rb/snapshot", "/api/rb/snapshot/release",
-                  "/api/rb/tap-page", "/api/rb/reader", "/api/rb/probe", "/api/rb/intercepts/open")
+                  "/api/rb/tap-page", "/api/rb/reader", "/api/rb/probe", "/api/rb/intercepts/open",
+                  "/api/rb/mirror", "/api/rb/mirror/click", "/api/rb/mirror/release")
+
+
+GZIP_MIN = 1024
+
+
+def accepts_gzip(header):
+    """True when an Accept-Encoding header allows gzip (q=0 forbids it)."""
+    for part in (header or "").split(","):
+        name, _, params = part.strip().partition(";")
+        if name.strip().lower() in ("gzip", "x-gzip"):
+            match = re.search(r"q\s*=\s*([0-9.]+)", params)
+            try:
+                return float(match.group(1)) > 0 if match else True
+            except ValueError:
+                return False
+    return False
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -458,20 +480,30 @@ class Handler(BaseHTTPRequestHandler):
             # Ended before the first part (tab closed or container stopped).
             raise remote_browser.TabGone("このタブはすでに閉じられています")
 
-    def send_data(self, status, data, content_type="application/json; charset=utf-8", extra=None):
+    def send_data(self, status, data, content_type="application/json; charset=utf-8", extra=None,
+                  compress=False, csp=None, frame="DENY"):
         raw = json.dumps(data, ensure_ascii=False).encode("utf-8") if not isinstance(data, bytes) else data
+        encoded = False
+        if compress and len(raw) > GZIP_MIN and accepts_gzip(self.headers.get("Accept-Encoding")):
+            raw = gzip.compress(raw, 5)       # v0.1.39: only the mirror endpoints ask for this
+            encoded = True
         self.send_response(status)
         if status != 204:       # a 204 has neither a body nor a Content-Length
             self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(len(raw)))
+            if encoded:
+                self.send_header("Content-Encoding", "gzip")
         for name, value in (extra or {}).items():
             self.send_header(name, value)
-        self.send_header("Cache-Control", "no-store")
+        if encoded or compress:
+            self.send_header("Vary", "Accept-Encoding")
+        if "Cache-Control" not in (extra or {}):
+            self.send_header("Cache-Control", "no-store")
         # No Strict-Transport-Security on purpose: the same host name is also
         # reached over plain HTTP on the LAN/tailnet, and HSTS would make
         # browsers refuse that URL.
         self.send_header("X-Content-Type-Options", "nosniff")
-        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("X-Frame-Options", frame)
         self.send_header("Referrer-Policy", "no-referrer")
         self.send_header("Permissions-Policy", "geolocation=(),camera=(),microphone=(),payment=()")
         # img-src blob: is needed ONLY for the remote-browser screencast: the UI
@@ -479,8 +511,8 @@ class Handler(BaseHTTPRequestHandler):
         # Blob and sets one <img> to URL.createObjectURL(blob). 'self' alone
         # cannot display a blob: URL. data: is kept unchanged (security invariant); the
         # JSON frame endpoint that used it was removed in v0.1.33. No other directive
-        # changes (default-src 'none', no inline).
-        self.send_header("Content-Security-Policy", CSP)
+        # changes (default-src 'none', no inline). Mirror documents and resources pass their own `csp`.
+        self.send_header("Content-Security-Policy", csp or CSP)
         if getattr(self, "_cookie", None):
             self.send_header("Set-Cookie", self._cookie)
         self.end_headers()
@@ -853,6 +885,23 @@ class Handler(BaseHTTPRequestHandler):
                     raise ValueError("iが不正です")
                 data, kind = self.server.rb.reader_image(query.get("tab", [""])[0], int(index_text))
                 return self.send_data(200, data, kind)
+            if path == "/api/rb/mirror/doc":
+                # Mirror display: the sanitized document of the newest capture (sandboxed iframe, no scripts).
+                query = parse_qs(urlsplit(self.path).query)
+                rev_text = query.get("rev", [""])[0]
+                if not rev_text.isdecimal() or len(rev_text) > 12:
+                    raise ValueError("revが不正です")
+                text = self.server.rb.mirror_document(query.get("tab", [""])[0], int(rev_text))
+                return self.send_data(200, text.encode("utf-8"), "text/html; charset=utf-8", compress=True,
+                                      csp=rb_mirror.DOC_CSP_HEADER, frame="SAMEORIGIN")
+            if path == "/api/rb/mirror/res":
+                # Mirror display: one image / font, read through the NAS browser (never a remote URL).
+                query = parse_qs(urlsplit(self.path).query)
+                data, mime = self.server.rb.mirror_resource(query.get("tab", [""])[0], query.get("r", [""])[0])
+                svg = mime == "image/svg+xml"
+                return self.send_data(
+                    200, data, mime, csp=rb_mirror.RES_SVG_CSP if svg else "default-src 'none'",
+                    extra={"Cache-Control": "private, max-age=300", "Content-Disposition": "inline"})
             if path == "/api/rb/site-rules":
                 return self.send_data(200, {"items": self.store.site_rules(),
                                             "block_ads": self.store.settings().get("block_ads", True),
@@ -884,6 +933,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.reject(str(exc), exc.status)
         except remote_browser.TabGone as exc:
             return self.reject(str(exc), 404)
+        except remote_browser.MirrorGone as exc:
+            return self.reject(str(exc), 410)
         except remote_browser.ProbeQueueFull as exc:
             return self.reject(str(exc), 429)
         except remote_browser.ImageRefused as exc:
@@ -1156,6 +1207,23 @@ class Handler(BaseHTTPRequestHandler):
                     body.get("tab"), body.get("snap"), body.get("x"), body.get("y")))
             if path == "/api/rb/reader":
                 return self.send_data(200, self.server.rb.reader(body.get("tab")))
+            if path == "/api/rb/mirror":
+                return self.send_data(200, self.server.rb.mirror(
+                    body.get("tab"), full=body.get("full") is not False, force=body.get("force") is True),
+                    compress=True)
+            if path == "/api/rb/mirror/click":
+                result = self.server.rb.mirror_click(
+                    body.get("tab"), body.get("m"), body.get("fx", 0.5), body.get("fy", 0.5))
+                href = result.pop("href", None)
+                if href:
+                    # A link: the NAS browser goes there, through the same checks as every navigation.
+                    checked = browser_safety.validate(href)
+                    self.reject_hub_origin(checked)
+                    self.server.rb.navigate(body.get("tab"), checked)
+                    result = {"ok": True, "navigated": True, "url": checked}
+                return self.send_data(200, result)
+            if path == "/api/rb/mirror/release":
+                return self.send_data(200, self.server.rb.mirror_release(body.get("tab")))
             if path == "/api/rb/probe":
                 result = self.server.rb.probe(
                     body.get("tab"), body.get("x"), body.get("y"), url_check=self.reject_hub_origin,
@@ -1259,6 +1327,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.reject(str(exc), exc.status)
         except remote_browser.TabGone as exc:
             return self.reject(str(exc), 404)
+        except remote_browser.MirrorGone as exc:
+            return self.reject(str(exc), 410)
         except remote_browser.ProbeQueueFull as exc:
             return self.reject(str(exc), 429)
         except (BrokenPipeError, ConnectionResetError):

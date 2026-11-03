@@ -29,6 +29,7 @@ import debuglog
 import diskio
 import rapidgator_extract
 import rb_blocklist
+import rb_mirror
 import rb_resident
 
 MAX_TABS = 3
@@ -519,6 +520,24 @@ IMAGE_FETCH_JS = (
     "return {d:btoa(s)};});}).catch(function(){return {err:'fetch'};});})(%s,%d)")
 
 
+# ---- v0.1.39: mirror display (rb_mirror.py has the serializer and the sanitizer)
+MIRROR_WORLD = "qdm"              # name of the isolated world the serializer runs in
+MIRROR_TIMEOUT = 25.0
+MIRROR_POLL = 0.5                 # DOM-change counter poll while a mirror viewer waits on the meta long-poll
+MIRROR_FETCH_PARALLEL = 4         # resource fetches in flight per tab
+MIRROR_TREE_TTL = 3.0
+MIRROR_SHEET_CAP = 3000
+MIRROR_CSS_TEXT_MAX = 2 * 1024 * 1024
+MIRROR_TOKEN = re.compile(r"[0-9a-f]{16}\Z")
+MIRROR_FETCH_JS = (
+    "(function(u,cap){return fetch(u,{credentials:'include'}).then(function(r){"
+    "if(!r.ok)return {err:'status'};var ct=r.headers.get('content-type')||'';"
+    "return r.arrayBuffer().then(function(b){if(b.byteLength>cap)return {err:'size'};"
+    "var a=new Uint8Array(b),s='',i=0;"
+    "for(;i<a.length;i+=32768)s+=String.fromCharCode.apply(null,a.subarray(i,i+32768));"
+    "return {d:btoa(s),ct:ct};});}).catch(function(){return {err:'fetch'};});})(%s,%d)")
+
+
 def looks_like_challenge(url, title):
     """True while the page is a Cloudflare check (it needs the live screencast to complete)."""
     title = (title or "").lower()
@@ -570,6 +589,10 @@ class ImageUnavailable(BrowserError):
 
 class ImageRefused(BrowserError):
     """Not an allowed image (SVG, not an image, too large): HTTP 415."""
+
+
+class MirrorGone(BrowserError):
+    """A mirror element / resource token / capture that no longer exists (HTTP 410)."""
 
 
 class WebSocketError(Exception):
@@ -945,6 +968,22 @@ class Tab:
         self.vp_lock = threading.Lock()
         self.reader_images = []    # reader image index -> absolute http(s) URL (None = refused); Hub only
         self.reader_fallbacks = [] # v0.1.36: index -> smaller alternative URL (or None); Hub only
+        # v0.1.39 mirror display (all RAM only, cleared on navigation / release / close)
+        self.mirror_on = False     # a mirror viewer is attached: DOM changes wake the meta long-poll
+        self.mirror_rev = 0        # bumped by navigation, load and (polled) DOM changes
+        self.mirror_seen = -1      # last DOM change counter read from the page
+        self.mirror_ctx = None     # execution context id of the isolated world
+        self.mirror_frame = None   # main frame id
+        self.mirror_tokens = rb_mirror.TokenMap()
+        self.mirror_cache = None   # newest capture (dict) with its rev
+        self.mirror_doc = None     # (rev, document text) built on demand
+        self.mirror_sheets = {}    # stylesheet URL -> CSS agent id
+        self.mirror_css = False    # DOM / CSS agents enabled for this tab
+        self.mirror_lock = threading.Lock()      # one capture at a time
+        self.mirror_flight = {}    # token -> Event while a resource is being fetched
+        self.mirror_sem = threading.BoundedSemaphore(MIRROR_FETCH_PARALLEL)
+        self.mirror_tree = None    # (time, {url: (frame id, type, mime)})
+        self.client_dpr = 2.0      # the viewer's device pixel ratio (image choice)
 
 
 class Snapshot:
@@ -1060,6 +1099,7 @@ class RemoteBrowser:
         self._trim_at = None         # when the last memory trim ran (resident, no tabs)
         self._idle_sample_at = None
         self._mem_cache = None
+        self._mirror_res = rb_mirror.ResourceCache()
 
     @staticmethod
     def _spawn_thread(fn):
@@ -1926,6 +1966,7 @@ class RemoteBrowser:
                 self._no_tabs_since = self._clock()
             tab.frame = None
             self._snap_clear(tab)
+            self._mirror_forget(tab)
             self._cv.notify_all()
         if close and tab.target_id:
             try:
@@ -1988,6 +2029,7 @@ class RemoteBrowser:
         mobile = width < MOBILE_WIDTH
         view = (width, height, scale, mode)
         with self._lock:
+            tab.client_dpr = float(dpr)
             if tab.viewport == view:
                 return {"ok": True, "changed": False}
             touch = tab.touch
@@ -2023,6 +2065,9 @@ class RemoteBrowser:
         elif method in ("Target.targetCreated", "Target.targetInfoChanged"):
             info = params.get("targetInfo") if isinstance(params.get("targetInfo"), dict) else {}
             self._on_target_info(method, info, conn)
+        elif method in ("Page.frameNavigated", "Page.navigatedWithinDocument", "CSS.styleSheetAdded",
+                        "CSS.styleSheetRemoved"):
+            self._on_mirror_event(message.get("sessionId"), method, params)
         elif method in ("Target.targetDestroyed", "Target.targetCrashed"):
             with self._cv:
                 tab = self._find_by_target(params.get("targetId"))
@@ -2039,6 +2084,7 @@ class RemoteBrowser:
                     stale = self._by_session.get(message.get("sessionId"))
                     if stale is not None:
                         stale.challenge_at = None
+                        self._mirror_bump(stale)
             if method not in ("Page.frameStartedLoading", "Page.frameStoppedLoading"):
                 return
             with self._cv:
@@ -2884,6 +2930,8 @@ class RemoteBrowser:
         wait = max(0.0, min(float(wait), META_WAIT_MAX))
         self._touch()
         deadline = self._clock() + wait
+        if tab.mirror_on and rev is not None and wait > 0:
+            self._mirror_wait(tab, rev, deadline)       # v0.1.39: DOM changes of a mirrored page end the wait
         with self._cv:
             while (rev is not None and tab.rev == rev and self._tabs.get(tab.id) is tab and
                    self._state == "running"):
@@ -2900,6 +2948,7 @@ class RemoteBrowser:
                 "popups": tab.popups_blocked, "editable": tab.editable, "snap": newest,
                 "width": tab.size[0], "height": tab.size[1], "links_rev": tab.vp_rev + tab.rev,
                 "streams": tab.streams, "frame_bytes": tab.stream_bytes,
+                "mirror_rev": tab.mirror_rev,
             }
         result["fps"] = self.stream_fps(tab) if tab.streams else 0.0
         result["challenge"] = self._challenge(tab)
@@ -3324,6 +3373,481 @@ class RemoteBrowser:
             if fallback is None or fallback == url:
                 raise
             return self._fetch_reader_image(tab, fallback)
+
+    # ------------------------------------------------------------ mirror display (v0.1.39)
+    # The NAS Chromium renders the page. A fixed serializer runs in an ISOLATED WORLD of the page
+    # (page scripts cannot see or change it) and returns plain text; rb_mirror re-parses it with an
+    # allow-list and rewrites every resource URL into a Hub reference. The phone shows the result in
+    # a sandboxed iframe without scripts; images and fonts come through mirror_resource(), which
+    # fetches them with the NAS browser, never from the Hub.
+    def _mirror_bump(self, tab):
+        with self._cv:
+            tab.mirror_rev += 1
+            if tab.mirror_on:
+                tab.rev += 1
+            self._cv.notify_all()
+
+    def _mirror_clear(self, tab):
+        tab.mirror_ctx = None
+        tab.mirror_frame = None
+        tab.mirror_seen = -1
+        tab.mirror_cache = None
+        tab.mirror_doc = None
+        tab.mirror_tree = None
+        tab.mirror_sheets.clear()
+        tab.mirror_tokens.clear()
+        self._mirror_res.drop_tab(tab.id)
+
+    def _mirror_reset(self, tab):
+        """A new document: nothing of the old one (world, references, cached bytes) may be used."""
+        self._mirror_clear(tab)
+        self._mirror_bump(tab)
+
+    def _mirror_forget(self, tab):
+        self._mirror_clear(tab)
+        tab.mirror_on = False
+
+    def _on_mirror_event(self, session, method, params):
+        with self._lock:
+            tab = self._by_session.get(session)
+        if tab is None:
+            return
+        if method == "Page.frameNavigated":
+            frame = params.get("frame") if isinstance(params.get("frame"), dict) else {}
+            if not frame.get("parentId"):
+                self._mirror_reset(tab)
+        elif method == "Page.navigatedWithinDocument":
+            self._mirror_bump(tab)
+        elif method == "CSS.styleSheetAdded":
+            header = params.get("header") if isinstance(params.get("header"), dict) else {}
+            source, ident = header.get("sourceURL"), header.get("styleSheetId")
+            if (isinstance(source, str) and isinstance(ident, str) and source and
+                    (len(tab.mirror_sheets) < MIRROR_SHEET_CAP or source in tab.mirror_sheets)):
+                tab.mirror_sheets[source[:rb_mirror.URL_MAX]] = ident
+        elif method == "CSS.styleSheetRemoved":
+            ident = params.get("styleSheetId")
+            for source in [k for k, v in tab.mirror_sheets.items() if v == ident]:
+                tab.mirror_sheets.pop(source, None)
+
+    def _mirror_world(self, tab, fresh=False):
+        """Execution context id of the tab's isolated world (created again after a navigation)."""
+        with self._lock:
+            ctx = tab.mirror_ctx
+        if ctx is not None and not fresh:
+            return ctx
+        tree = self._call("Page.getFrameTree", session=tab.session, timeout=PROBE_CDP_TIMEOUT)
+        frame = ((tree.get("frameTree") or {}).get("frame") or {}).get("id")
+        if not isinstance(frame, str) or not frame:
+            raise BrowserError("ページの状態を取得できません")
+        made = self._call("Page.createIsolatedWorld", {"frameId": frame, "worldName": MIRROR_WORLD},
+                          session=tab.session, timeout=PROBE_CDP_TIMEOUT)
+        ctx = made.get("executionContextId")
+        if isinstance(ctx, bool) or not isinstance(ctx, int):
+            raise BrowserError("ページの状態を取得できません")
+        with self._lock:
+            tab.mirror_ctx, tab.mirror_frame = ctx, frame
+        return ctx
+
+    def _mirror_eval(self, tab, expression, timeout=MIRROR_TIMEOUT, await_promise=False):
+        """Value of `expression` evaluated in the isolated world (one retry in a new world)."""
+        for attempt in (0, 1):
+            ctx = self._mirror_world(tab, fresh=attempt == 1)
+            params = {"expression": expression, "contextId": ctx, "returnByValue": True,
+                      "timeout": int(timeout * 1000) - 1000 if timeout > 3 else 2000}
+            if await_promise:
+                params["awaitPromise"] = True
+            try:
+                result = self._call("Runtime.evaluate", params, session=tab.session, timeout=timeout)
+            except BrowserTimeout:
+                raise
+            except BrowserError as error:
+                if attempt == 0 and ("context" in str(error).lower() or "frame" in str(error).lower()):
+                    with self._lock:
+                        tab.mirror_ctx = None
+                    continue
+                raise
+            if result.get("exceptionDetails"):
+                raise BrowserError("ページの複製に失敗しました")
+            return (result.get("result") or {}).get("value")
+        raise BrowserError("ページの複製に失敗しました")
+
+    def _mirror_poll(self, tab):
+        """Reads the DOM change counter; a change bumps mirror_rev (and wakes the meta long-poll)."""
+        try:
+            value = self._mirror_eval(tab, rb_mirror.COUNT_JS, timeout=PROBE_CDP_TIMEOUT)
+            changed = False
+            if value == -1:         # a new document: the observer is not there yet
+                value = self._mirror_eval(tab, rb_mirror.WATCH_JS, timeout=PROBE_CDP_TIMEOUT)
+                changed = True
+        except BrowserError:
+            return
+        if isinstance(value, bool) or not isinstance(value, int):
+            return
+        if changed or value != tab.mirror_seen:
+            tab.mirror_seen = value
+            self._mirror_bump(tab)
+
+    def _mirror_wait(self, tab, rev, deadline):
+        while True:
+            with self._cv:
+                if tab.rev != rev or self._tabs.get(tab.id) is not tab or self._state != "running":
+                    return
+                remaining = deadline - self._clock()
+                if remaining <= 0:
+                    return
+                self._cv.wait(min(remaining, MIRROR_POLL))
+                if tab.rev != rev:
+                    return
+            self._mirror_poll(tab)
+
+    def _mirror_css_enable(self, tab):
+        if tab.mirror_css:
+            return
+        try:
+            self._call("DOM.enable", session=tab.session, timeout=PROBE_CDP_TIMEOUT)
+            self._call("CSS.enable", session=tab.session, timeout=PROBE_CDP_TIMEOUT)
+            tab.mirror_css = True
+        except BrowserError as error:
+            self.log("CSS.enable failed: %s" % error)
+
+    def _mirror_css_text(self, tab, url):
+        sheet = tab.mirror_sheets.get(url)
+        if sheet is None:
+            return None
+        try:
+            text = self._call("CSS.getStyleSheetText", {"styleSheetId": sheet}, session=tab.session,
+                              timeout=PROBE_CDP_TIMEOUT).get("text")
+        except BrowserError:
+            return None
+        return text if isinstance(text, str) and len(text) <= MIRROR_CSS_TEXT_MAX else None
+
+    def mirror(self, ident, full=True, force=False):
+        """Capture of the page for the mirror display (see rb_mirror.assemble); cached per page version."""
+        tab = self._tab(ident)
+        self._touch()
+        tab.mirror_on = True
+        with tab.mirror_lock:
+            self._mirror_poll(tab)
+            with self._lock:
+                rev = tab.mirror_rev
+                cached = tab.mirror_cache
+            if cached is not None and cached["rev"] == rev and not force:
+                debuglog.log("render", "debug", "mirror capture cached", {"tab": tab.id, "rev": rev})
+                return self._mirror_public(tab, cached, full, reused=True)
+            started = time.monotonic()
+            self._mirror_css_enable(tab)
+            try:
+                raw = self._mirror_eval(tab, rb_mirror.serializer_script(tab.client_dpr))
+            except BrowserTimeout:
+                raise BrowserError("ページの複製がタイムアウトしました（重いページでは時間がかかります）") from None
+            js_ms = int((time.monotonic() - started) * 1000)
+            if not isinstance(raw, dict):
+                raise BrowserError("ページを複製できませんでした")
+
+            def register(url, kind):
+                token = tab.mirror_tokens.register(url, kind)
+                return rb_mirror.RES_PATH % (tab.id, token) if token else None
+
+            def register_data(data, mime):
+                token = tab.mirror_tokens.register_data(data, mime, "font")
+                return rb_mirror.RES_PATH % (tab.id, token) if token else None
+            try:
+                capture = rb_mirror.assemble(raw, register, register_data,
+                                             lambda url: self._mirror_css_text(tab, url))
+            except rb_mirror.MirrorError as error:
+                raise BrowserError(str(error)) from None
+            dom = raw.get("domN")
+            if isinstance(dom, int) and not isinstance(dom, bool):
+                tab.mirror_seen = dom
+            capture["rev"] = rev
+            capture["js_ms"] = js_ms
+            capture["resources"] = len(tab.mirror_tokens)
+            capture["ms"] = int((time.monotonic() - started) * 1000)
+            with self._lock:
+                if self._tabs.get(tab.id) is not tab:
+                    raise TabGone("このタブはすでに閉じられています")
+                tab.mirror_cache = capture
+                tab.mirror_doc = None
+            debuglog.log("render", "info", "mirror capture", {
+                "tab": tab.id, "ms": capture["ms"], "js_ms": js_ms, "nodes": capture["nodes"],
+                "html_kb": capture["html_bytes"] // 1024, "css_kb": capture["css_bytes"] // 1024,
+                "res": capture["resources"], "truncated": capture["truncated"]})
+            return self._mirror_public(tab, capture, full, reused=False)
+
+    @staticmethod
+    def _mirror_public(tab, capture, full, reused):
+        result = {
+            "rev": capture["rev"], "url": capture["url"], "title": capture["title"],
+            "truncated": capture["truncated"], "css_truncated": capture["css_truncated"],
+            "doc": "/api/rb/mirror/doc?tab=%s&rev=%d" % (tab.id, capture["rev"]), "reused": reused,
+            "stats": {"nodes": capture["nodes"], "html_bytes": capture["html_bytes"],
+                      "css_bytes": capture["css_bytes"], "res": capture["resources"],
+                      "images": capture["images"], "links": capture["links"], "ms": capture["ms"],
+                      "placeholders": capture["placeholders"]},
+        }
+        if full:
+            result.update(html=capture["html"], css=capture["css"], html_attrs=capture["html_attrs"],
+                          body_attrs=capture["body_attrs"])
+        return result
+
+    def mirror_document(self, ident, rev):
+        """The full HTML document of the capture `rev` (what the sandboxed iframe loads)."""
+        tab = self._tab(ident)
+        if isinstance(rev, bool) or not isinstance(rev, int) or rev < 0:
+            raise BrowserError("revが不正です")
+        with self._lock:
+            capture, doc = tab.mirror_cache, tab.mirror_doc
+        if capture is None or capture["rev"] != rev:
+            raise MirrorGone("この表示は古くなりました。再取得します")
+        if doc is not None and doc[0] == rev:
+            return doc[1]
+        text = rb_mirror.build_document(capture["css"], capture["html"], capture["html_attrs"],
+                                        capture["body_attrs"])
+        with self._lock:
+            if tab.mirror_cache is capture:
+                tab.mirror_doc = (rev, text)
+        return text
+
+    def mirror_release(self, ident):
+        """Leaves the mirror display: free everything it held (here and in the page)."""
+        tab = self._tab(ident)
+        was_on = tab.mirror_on
+        tab.mirror_on = False
+        self._mirror_clear_keep_world(tab)
+        if was_on and tab.mirror_ctx is not None:
+            try:
+                self._mirror_eval(tab, rb_mirror.OFF_JS, timeout=PROBE_CDP_TIMEOUT)
+            except BrowserError:
+                pass
+        if tab.mirror_css:
+            tab.mirror_css = False
+            for method in ("CSS.disable", "DOM.disable"):
+                try:
+                    self._call(method, session=tab.session, timeout=PROBE_CDP_TIMEOUT)
+                except BrowserError:
+                    pass
+        return {"ok": True}
+
+    def _mirror_clear_keep_world(self, tab):
+        ctx, frame = tab.mirror_ctx, tab.mirror_frame
+        self._mirror_clear(tab)
+        tab.mirror_ctx, tab.mirror_frame = ctx, frame
+
+    # ---- mirror resources
+    def _mirror_tree_index(self, tab):
+        """url -> (frame id, resource type, mime type) of the resources the page loaded (cached briefly)."""
+        now = self._clock()
+        cached = tab.mirror_tree
+        if cached is not None and now - cached[0] < MIRROR_TREE_TTL:
+            return cached[1]
+        index = {}
+        try:
+            tree = self._call("Page.getResourceTree", session=tab.session, timeout=PROBE_CDP_TIMEOUT)
+        except BrowserError:
+            return index
+        budget = [64]
+
+        def walk(node):
+            if not isinstance(node, dict) or budget[0] <= 0:
+                return
+            budget[0] -= 1
+            frame = node.get("frame") if isinstance(node.get("frame"), dict) else {}
+            for resource in node.get("resources") if isinstance(node.get("resources"), list) else []:
+                if (isinstance(resource, dict) and isinstance(resource.get("url"), str) and
+                        isinstance(frame.get("id"), str) and len(index) < 20000):
+                    index.setdefault(resource["url"], (frame["id"], resource.get("type"), resource.get("mimeType")))
+            for child in node.get("childFrames") if isinstance(node.get("childFrames"), list) else []:
+                walk(child)
+        walk(tree.get("frameTree"))
+        tab.mirror_tree = (now, index)
+        return index
+
+    @staticmethod
+    def _mirror_cap(kind):
+        return rb_mirror.FONT_MAX_BYTES if kind == "font" else rb_mirror.IMAGE_MAX_BYTES
+
+    def _mirror_from_tree(self, tab, url, kind, cap):
+        found = self._mirror_tree_index(tab).get(url)
+        if found is None or found[1] != ("Font" if kind == "font" else "Image"):
+            return None
+        try:
+            content = self._call("Page.getResourceContent", {"frameId": found[0], "url": url},
+                                 session=tab.session, timeout=PROBE_CDP_TIMEOUT)
+        except BrowserError:
+            return None
+        text = content.get("content")
+        if not isinstance(text, str) or not text:
+            return None
+        if content.get("base64Encoded") is True:
+            if len(text) > cap * 4 // 3 + 8 or not BASE64.match(text):
+                raise rb_mirror.ResourceRefused("大きすぎるか、形式が対応していません")
+            data = base64.b64decode(text)
+        else:
+            data = text.encode("utf-8")
+        if len(data) > cap:
+            raise rb_mirror.ResourceRefused("大きすぎます")
+        return data, found[2]
+
+    def _mirror_from_page(self, tab, url, cap):
+        """fetch() in the isolated world: the page's cookies apply, CORS decides what is readable."""
+        try:
+            value = self._mirror_eval(tab, MIRROR_FETCH_JS % (json.dumps(url), cap),
+                                      timeout=IMAGE_CDP_TIMEOUT, await_promise=True)
+        except BrowserError:
+            return None
+        if not isinstance(value, dict):
+            return None
+        if value.get("err") == "size":
+            raise rb_mirror.ResourceRefused("大きすぎます")
+        text = value.get("d")
+        if value.get("err") or not isinstance(text, str) or not text:
+            return None
+        if len(text) > cap * 4 // 3 + 8 or not BASE64.match(text):
+            return None
+        return base64.b64decode(text), value.get("ct")
+
+    def _mirror_from_network(self, tab, url, cap):
+        """Network.loadNetworkResource: the browser loads it with its cookie jar, CORS does not apply."""
+        frame = tab.mirror_frame
+        if frame is None:
+            return None
+        try:
+            loaded = self._call("Network.loadNetworkResource", {
+                "frameId": frame, "url": url, "options": {"disableCache": False, "includeCredentials": True}},
+                session=tab.session, timeout=IMAGE_CDP_TIMEOUT).get("resource")
+        except BrowserError:
+            return None
+        if not isinstance(loaded, dict) or loaded.get("success") is not True or not isinstance(loaded.get("stream"), str):
+            return None
+        status = loaded.get("httpStatusCode")
+        headers = loaded.get("headers") if isinstance(loaded.get("headers"), dict) else {}
+        content_type = next((v for k, v in headers.items() if str(k).lower() == "content-type"), None)
+        handle, chunks, total = loaded["stream"], [], 0
+        try:
+            while True:
+                part = self._call("IO.read", {"handle": handle, "size": 65536}, session=tab.session,
+                                  timeout=IMAGE_CDP_TIMEOUT)
+                piece = part.get("data") if isinstance(part.get("data"), str) else ""
+                raw = base64.b64decode(piece) if part.get("base64Encoded") is True else piece.encode("latin-1", "replace")
+                total += len(raw)
+                if total > cap:
+                    raise rb_mirror.ResourceRefused("大きすぎます")
+                chunks.append(raw)
+                if part.get("eof") is True or not piece:
+                    break
+        except BrowserError:
+            return None
+        finally:
+            try:
+                self._call("IO.close", {"handle": handle}, session=tab.session, timeout=PROBE_CDP_TIMEOUT)
+            except BrowserError:
+                pass
+        if isinstance(status, int) and not 200 <= status < 300:
+            return None
+        return b"".join(chunks), content_type
+
+    def _mirror_fetch(self, tab, url, kind):
+        cap = self._mirror_cap(kind)
+        for source in (lambda: self._mirror_from_tree(tab, url, kind, cap),
+                       lambda: self._mirror_from_page(tab, url, cap),
+                       lambda: self._mirror_from_network(tab, url, cap)):
+            got = source()
+            if got is not None and got[0]:
+                return got
+        raise ImageUnavailable("リソースを取得できません")
+
+    def mirror_resource(self, ident, token):
+        """(bytes, mime type) of a mirror resource, read through the NAS browser and cached in RAM."""
+        tab = self._tab(ident)
+        if not isinstance(token, str) or not MIRROR_TOKEN.match(token):
+            raise MirrorGone("このリソースは見つかりません")
+        entry = tab.mirror_tokens.get(token)
+        if entry is None:
+            raise MirrorGone("このリソースは見つかりません。読み込み直してください")
+        hit = self._mirror_res.get(tab.id, token)
+        if hit is not None:
+            return hit
+        self._touch()
+        kind = entry["kind"]
+        started = time.monotonic()
+        try:
+            if entry.get("data") is not None:
+                data, mime = rb_mirror.check_resource(kind, entry["data"])
+                self._mirror_res.put(tab.id, token, data, mime)
+                return data, mime
+            with self._lock:
+                event = tab.mirror_flight.get(token)
+                leader = event is None
+                if leader:
+                    event = tab.mirror_flight[token] = threading.Event()
+            if not leader:
+                event.wait(IMAGE_CDP_TIMEOUT * 3)
+                hit = self._mirror_res.get(tab.id, token)
+                if hit is None:
+                    raise ImageUnavailable("リソースを取得できません")
+                return hit
+            try:
+                with tab.mirror_sem:
+                    raw, content_type = self._mirror_fetch(tab, entry["url"], kind)
+                data, mime = rb_mirror.check_resource(kind, raw, content_type)
+                if tab.mirror_tokens.get(token) is entry:      # not cleared by a navigation meanwhile
+                    self._mirror_res.put(tab.id, token, data, mime)
+            finally:
+                with self._lock:
+                    tab.mirror_flight.pop(token, None)
+                event.set()
+        except rb_mirror.ResourceRefused as error:
+            debuglog.log("render", "debug", "mirror resource refused", {"tab": tab.id, "kind": kind})
+            raise ImageRefused(str(error)) from None
+        debuglog.log("render", "debug", "mirror resource", {
+            "tab": tab.id, "kind": kind, "kb": len(data) // 1024, "ms": int((time.monotonic() - started) * 1000)})
+        return data, mime
+
+    # ---- mirror click
+    def mirror_click(self, ident, m, fx=0.5, fy=0.5):
+        """A tap on element `m` of the capture: links answer {href} (the caller navigates), anything
+        else is clicked at its position in the NAS page (a real mouse click, like a tap)."""
+        if isinstance(m, bool) or not isinstance(m, int) or not 0 <= m <= 999999999:
+            raise BrowserError("要素の指定が不正です")
+        for value in (fx, fy):
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not 0 <= value <= 1:
+                raise BrowserError("位置の指定が不正です")
+        tab = self._tab(ident)
+        self._touch()
+        started = time.monotonic()
+        value = self._mirror_eval(tab, rb_mirror.click_script(m, fx, fy), timeout=PROBE_CDP_TIMEOUT)
+        if not isinstance(value, dict):
+            raise BrowserError("クリックできませんでした")
+        if value.get("err"):
+            raise MirrorGone("この要素は見つかりません。再取得します")
+        link = value.get("link")
+        if link is not None:
+            href = rb_mirror.public_http_url(link) if isinstance(link, str) else None
+            if href is None:
+                raise BrowserError("このリンクは開けません")
+            debuglog.log("render", "info", "mirror click", {"tab": tab.id, "m": m, "kind": "link"})
+            return {"ok": True, "navigated": False, "href": href}
+        x, y = value.get("x"), value.get("y")
+        if any(isinstance(v, bool) or not isinstance(v, (int, float)) or v != v for v in (x, y)):
+            raise BrowserError("クリックできませんでした")
+        x = self._number(x, 0, MAX_COORD, "x")
+        y = self._number(y, 0, MAX_COORD, "y")
+        session = tab.session
+        with self._lock:
+            before_url, before_rev = tab.url, tab.rev
+            tab.snap_gen += 1
+        base = {"x": x, "y": y, "button": "left", "clickCount": 1}
+        self._call("Input.dispatchMouseEvent", {"type": "mouseMoved", "x": x, "y": y}, session)
+        self._call("Input.dispatchMouseEvent", dict(base, type="mousePressed", buttons=1), session)
+        self._call("Input.dispatchMouseEvent", dict(base, type="mouseReleased", buttons=0), session)
+        self._refresh_editable(tab)
+        started_nav = self._settle(tab, before_rev)
+        with self._lock:
+            navigated = started_nav or tab.url != before_url
+        debuglog.log("render", "info", "mirror click", {
+            "tab": tab.id, "m": m, "kind": "element", "navigated": navigated,
+            "ms": int((time.monotonic() - started) * 1000)})
+        return {"ok": True, "navigated": navigated, "editable": tab.editable}
 
     # ------------------------------------------------------------ intercepts
     @staticmethod

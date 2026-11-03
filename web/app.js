@@ -34,10 +34,13 @@ const WAITING_MAX = 50;
 const REMOTE_FAST_MODE = "remote-fast";      // fast full-page display (JPEG tiles)
 const REMOTE_LIVE_MODE = "remote-live";      // live screencast (Cloudflare checks, logins)
 const REMOTE_READER_MODE = "remote-reader";  // reader: text rebuilt from validated data
-const REMOTE_MODES = [REMOTE_FAST_MODE, REMOTE_LIVE_MODE, REMOTE_READER_MODE];
-const DISPLAY_OF_MODE = {[REMOTE_FAST_MODE]: "tiles", [REMOTE_LIVE_MODE]: "live", [REMOTE_READER_MODE]: "reader"};
-const MODE_OF_DISPLAY = {tiles: REMOTE_FAST_MODE, live: REMOTE_LIVE_MODE, reader: REMOTE_READER_MODE};
-const DISPLAY_OF_SETTING = {reader: "reader", fast: "tiles", live: "live"};
+const REMOTE_MIRROR_MODE = "remote-mirror";  // mirror: sanitized HTML + CSS copy in a script-less sandboxed iframe
+const REMOTE_MODES = [REMOTE_FAST_MODE, REMOTE_LIVE_MODE, REMOTE_READER_MODE, REMOTE_MIRROR_MODE];
+const DISPLAY_OF_MODE = {[REMOTE_FAST_MODE]: "tiles", [REMOTE_LIVE_MODE]: "live", [REMOTE_READER_MODE]: "reader",
+  [REMOTE_MIRROR_MODE]: "mirror"};
+const MODE_OF_DISPLAY = {tiles: REMOTE_FAST_MODE, live: REMOTE_LIVE_MODE, reader: REMOTE_READER_MODE,
+  mirror: REMOTE_MIRROR_MODE};
+const DISPLAY_OF_SETTING = {reader: "reader", mirror: "mirror", fast: "tiles", live: "live"};
 const RB_TILE_CONCURRENCY = 3;     // tile downloads in flight at once
 const RB_META_WAIT_S = 10;         // long-poll of the tab metadata; its timeout also drives the DOM check
 const RB_INPUT_SNAP_MS = 800;      // new snapshot this long after a key / text input
@@ -63,7 +66,7 @@ const RB_RING_DELAY_MS = 150;       // the press ring appears after this (taps n
 const RB_QUALITY_KEY = "qnapdl.rbquality.v1";
 const RB_QUALITIES = ["speed", "standard", "high"];
 const RB_QUALITY_LABELS = {speed: "速度優先", standard: "標準", high: "高画質"};
-const RB_DISPLAY_LABELS = {reader: "リーダー", tiles: "高速（全体表示）", live: "ライブ"};
+const RB_DISPLAY_LABELS = {reader: "リーダー", mirror: "ミラー", tiles: "高速（全体表示）", live: "ライブ"};
 const RB_PERF_WINDOW_MS = 5000;
 const RB_STREAM_FIRST_MS = 5000;
 const RB_STREAM_ERR_WINDOW_MS = 10000;
@@ -1007,6 +1010,8 @@ async function openRemote(tab, value, commit, opts = {}) {
         vmap: null, vmapRev: -1, vmapTimer: 0, vmapBusy: false, vmapAt: 0, linksRev: -1,
         reader: null, readerBusy: false, readerPending: false, readerAgain: false,
         readerEarly: "", readerFail: null, readerErr: false, tilesFor: "", snapEarly: "", loadUrl: "", loadSince: 0,
+        mirror: null, mirrorBusy: false, mirrorAgain: false, mirrorPending: false, mirrorEarly: "", mirrorFail: null,
+        mirrorAt: 0, mirrorMs: 0, mirrorTimer: 0, mirrorTouch: false, mirrorDeferred: false, mirrorPos: {},
         stream: null, streamFailed: false, perf: {}};
     }
   } catch (e) {
@@ -1034,6 +1039,7 @@ function releaseRemote(tab) {
   dropRemoteImage(rb);
   dropTiles(rb);
   dropReader(rb);
+  dropMirror(rb);
   clearTimeout(rb.vmapTimer);
   state.rbIntercepts = state.rbIntercepts.filter(item => item.tab !== rb.id);
   if (rbPopup.item && rbPopup.item.tab === rb.id) hidePopupToast();
@@ -1079,6 +1085,8 @@ async function rbInput(event) {
     if (r && typeof r.editable === "boolean") setEditable(tab, r.editable, true);
     if ((event.type === "text" || event.type === "key") && tabDisplay(tab) === "tiles") {
       scheduleSnapshot(tab, RB_INPUT_SNAP_MS);
+    } else if ((event.type === "text" || event.type === "key") && tabDisplay(tab) === "mirror") {
+      scheduleMirror(tab, RB_INPUT_SNAP_MS, true);
     }
   } catch (e) {
     if (e.status === 404) remoteLost(tab);
@@ -1106,6 +1114,7 @@ function remoteLost(tab) {
     dropRemoteImage(tab.rb);
     dropTiles(tab.rb);
     dropReader(tab.rb);
+    dropMirror(tab.rb);
     clearTimeout(tab.rb.vmapTimer);
     state.rbIntercepts = state.rbIntercepts.filter(item => item.tab !== tab.rb.id);
     renderIntercept();
@@ -1262,7 +1271,7 @@ function syncChallenge(tab, challenge, loading) {
   const rb = tab.rb;
   if (!rb || rb.autoLive || rb.autoOff === rb.url) return;   // the poll below owns the way back
   if (challengeStep(rb, challenge, loading, Date.now(), userPrefersLive(tab)) === "enter") {
-    if (rb.shown === "tiles" || rb.shown === "reader") flash("確認画面のため一時的にライブ表示にしました");
+    if (rb.shown === "tiles" || rb.shown === "reader" || rb.shown === "mirror") flash("確認画面のため一時的にライブ表示にしました");
     startAutoPoll(tab);
     applyDisplay(tab);
   }
@@ -1566,6 +1575,8 @@ function syncRemotePoll() {
     scheduleViewportLinks(tab, true);      // the link map of the live picture (v0.1.30)
   } else if (mode === "reader") {
     readerLoop(tab, state.rbGen).catch(() => {});
+  } else if (mode === "mirror") {
+    mirrorLoop(tab, state.rbGen).catch(() => {});
   } else {
     tileLoop(tab, state.rbGen).catch(() => {});
   }
@@ -1580,16 +1591,19 @@ function updateRemoteView(tab) {
   const display = live ? tabDisplay(tab) : "tiles";
   const tiles = live && display === "tiles";
   const reader = live && display === "reader";
+  const mirror = live && display === "mirror";
   setShown("tileScroll", tiles);
   setShown("readerScroll", reader);
+  setShown("mirrorWrap", mirror && (mirrorHost.owner === tab.rb || tab.rb.mirrorBusy));
   syncReaderProgress();
-  setShown("tileRefresh", tiles || reader);
+  setShown("tileRefresh", tiles || reader || mirror);
   if (tiles) mountTiles(tab);
   if (reader) mountReader(tab);
   syncSnapProgress();
-  $("remoteImg").hidden = tiles || reader || !live || !$("remoteImg").getAttribute("src");
+  $("remoteImg").hidden = tiles || reader || mirror || !live || !$("remoteImg").getAttribute("src");
   $("remoteIdle").hidden = live && (tiles ? Boolean(tab.rb.view) :
-    reader ? Boolean(tab.rb.reader && tab.rb.reader.data) : !$("remoteImg").hidden);
+    reader ? Boolean(tab.rb.reader && tab.rb.reader.data) :
+    mirror ? Boolean(mirrorHost.owner === tab.rb && tab.rb.mirror) : !$("remoteImg").hidden);
   if (!live || display !== "live") paintLiveBoxes(null);
   // A tab closed to save memory reopens by itself when it is shown again (v0.1.32);
   // the button only appears when that automatic reopen failed.
@@ -1895,6 +1909,11 @@ function perfText(tab = remoteTab()) {
     return "高速(全体表示)・" + quality + " · タイル " + loaded + "/" + tiles.length +
       " · 撮影 " + Math.round(p.snapMs || 0) + " ms · 1枚 " + kb(each);
   }
+  if (display === "mirror") {
+    const m = p.mirror || {};
+    return "ミラー · 要素 " + (m.nodes || 0) + " · HTML " + kb(m.htmlBytes || 0) + " · CSS " + kb(m.cssBytes || 0) +
+      " · 画像 " + (m.images || 0) + " · 取得 " + Math.round(m.ms || 0) + " ms";
+  }
   if (display === "reader") {
     const blocks = rb.reader && rb.reader.data ? rb.reader.data.blocks : [];
     const total = blocks.filter(b => b.t === "img").length;
@@ -1967,17 +1986,17 @@ function displayReason(tab) {
   const rb = tab && tab.rb;
   if (!rb) return "no-rb";
   if (rb.autoLive) return "auto-live(challenge)";
-  if (rb.tilesFor && rb.tilesFor === rb.url) return "reader-failed->tiles";
+  if (rb.tilesFor && rb.tilesFor === rb.url) return "reader-or-mirror-failed->tiles";
   if (DISPLAY_OF_MODE[rememberedMode(hostOf(tab.current || ""))]) return "site-choice";
   return "setting";
 }
 
-// What is shown now: "tiles" (fast), "live" or "reader". A Cloudflare check forces "live" meanwhile.
+// What is shown now: "tiles" (fast), "live", "reader" or "mirror". A Cloudflare check forces "live" meanwhile.
 function tabDisplay(tab) {
   const rb = tab && tab.rb;
   if (!rb) return "tiles";
   if (rb.autoLive) return "live";
-  if (rb.tilesFor && rb.tilesFor === rb.url) return "tiles";   // reader failed on this page (not persisted)
+  if (rb.tilesFor && rb.tilesFor === rb.url) return "tiles";   // reader / mirror failed on this page (not persisted)
   return userDisplay(tab);
 }
 
@@ -1987,7 +2006,7 @@ function setUserDisplay(tab, mode) {
   const host = hostOf(tab.current || "");
   if (host) rememberHostMode(host, MODE_OF_DISPLAY[mode]);
   tab.rb.autoLive = false; tab.rb.autoChip = false;   // a manual choice is respected
-  tab.rb.tilesFor = ""; tab.rb.readerFail = null;
+  tab.rb.tilesFor = ""; tab.rb.readerFail = null; tab.rb.mirrorFail = null;
   renderRemoteHosts();
   applyDisplay(tab);
   flash("表示: " + RB_DISPLAY_LABELS[mode]);
@@ -2006,6 +2025,9 @@ function leaveDisplay(rb, shown) {
     api("/api/rb/snapshot/release", {tab: rb.id}).catch(() => {});
   } else if (shown === "reader") {
     dropReader(rb);
+  } else if (shown === "mirror") {
+    dropMirror(rb);
+    api("/api/rb/mirror/release", {tab: rb.id}).catch(() => {});
   } else {
     clearTimeout(rb.vmapTimer);
     rb.vmap = null; rb.vmapRev = -1; rb.linksRev = -1;
@@ -2403,16 +2425,17 @@ function tileLongPress(tab, clientX, clientY) {
 }
 
 // Pull down at the top of a scroller to refresh (tiles and reader).
-function wirePull(scroller, onRefresh) {
+// `view` is where the touches are heard and `top()` the scroll position (the mirror display listens inside its iframe).
+function wirePull(scroller, onRefresh, view = scroller, top = () => scroller.scrollTop) {
   let startY = null;
-  scroller.addEventListener("touchstart", event => {
-    startY = scroller.scrollTop <= 0 && event.touches.length === 1 ? event.touches[0].clientY : null;
+  view.addEventListener("touchstart", event => {
+    startY = top() <= 0 && event.touches.length === 1 ? event.touches[0].clientY : null;
   }, {passive: true});
-  scroller.addEventListener("touchend", event => {
+  view.addEventListener("touchend", event => {
     const start = startY;
     startY = null;
     if (start === null || !event.changedTouches.length) return;
-    if (event.changedTouches[0].clientY - start > RB_PULL_PX && scroller.scrollTop <= 0) onRefresh();
+    if (event.changedTouches[0].clientY - start > RB_PULL_PX && top() <= 0) onRefresh();
   }, {passive: true});
 }
 
@@ -2472,6 +2495,7 @@ function wireTiles() {
     const tab = remoteTab();
     if (!tab) return;
     if (tabDisplay(tab) === "reader") perform(() => runReader(tab, {keepScroll: true}));
+    else if (tabDisplay(tab) === "mirror") perform(() => runMirror(tab, {force: true, immediate: true}));
     else if (fast()) perform(() => takeSnapshot(tab, {force: true, keepScroll: true}));
   });
   if (typeof ResizeObserver === "function") {
@@ -3837,6 +3861,475 @@ function longPress(clientX, clientY) {
   });
 }
 
+// ---- mirror display (v0.1.39) ----
+// The NAS browser renders the page; the Hub sends a sanitized copy (HTML + CSS, no scripts, every image
+// and font a Hub reference). It is shown in <iframe id="mirrorFrame" sandbox="allow-same-origin">:
+// no script, form, popup or top-navigation permission is granted, so nothing in it can run code,
+// submit a form, open a window or navigate. The iframe's document is /api/rb/mirror/doc (this origin,
+// with its own strict CSP header); later versions of the same page are applied to the iframe's DOM
+// (parsed with DOMParser) and its <style>. This code only listens (taps, long presses, touches): every
+// action goes to the Hub, which validates it again. The page is never given an address of its own.
+const MIRROR_MIN_MS = 1000;           // recaptures are at least this far apart
+const MIRROR_DOC_RE = /^\/api\/rb\/mirror\/doc\?tab=b[0-9]{1,6}&rev=[0-9]{1,12}$/;
+const MIRROR_LOAD_TIMEOUT_MS = 12000;
+const MIRROR_CLICK_REFRESH_MS = 350;  // after a tap that stayed on the page: look again
+const MIRROR_POS_MAX = 40;
+const MIRROR_TOUCH_RESUME_MS = 150;
+const mirrorHost = {owner: null, pageUrl: "", last: null};
+const mirrorWired = new WeakSet();
+
+function mirrorDoc() {
+  try {
+    const doc = $("mirrorFrame").contentDocument;
+    return doc && doc.body && doc.getElementById("mirrorCss") ? doc : null;
+  } catch (e) { return null; }
+}
+
+function mirrorScroller(doc) { return doc.scrollingElement || doc.documentElement; }
+
+function mirrorClosest(node, selector) {
+  return node && node.closest ? node.closest(selector) : null;
+}
+
+// Defensive second check of what the Hub sent: nothing executable or external may be in it.
+function mirrorUnsafe(data) {
+  const markup = [data.html, "<x" + data.html_attrs + ">", "<x" + data.body_attrs + ">"];
+  for (const t of markup) {
+    if (typeof t !== "string") return true;
+    if (/<\s*(script|iframe|object|embed|base|meta|link|form)\b/i.test(t) || /<[^>]*\son[a-z]+\s*=/i.test(t) ||
+        /javascript\s*:/i.test(t)) return true;
+  }
+  const css = data.css;
+  if (typeof css !== "string") return true;
+  return /<\/style|<script|@import|expression\s*\(|javascript\s*:/i.test(css) ||
+    /url\(\s*(?!["']?(?:\/api\/rb\/mirror\/res\?|data:i|#))/i.test(css);
+}
+
+function mirrorPosTop(rb, url) {
+  return rb && rb.mirrorPos && url && Number.isFinite(rb.mirrorPos[url]) ? rb.mirrorPos[url] : 0;
+}
+
+function mirrorRememberTop(rb, url, top) {
+  if (!rb || !url) return;
+  delete rb.mirrorPos[url];
+  rb.mirrorPos[url] = Math.max(0, Math.round(top));       // insertion order = recency
+  const keys = Object.keys(rb.mirrorPos);
+  for (let i = 0; i < keys.length - MIRROR_POS_MAX; i++) delete rb.mirrorPos[keys[i]];
+}
+
+function dropMirror(rb) {
+  clearTimeout(rb.mirrorTimer);
+  rb.mirrorTimer = 0;
+  rb.mirror = null;
+  rb.mirrorAgain = false;
+  rb.mirrorPending = false;
+  rb.mirrorTouch = false;
+  rb.mirrorDeferred = false;
+  if (mirrorHost.owner !== rb) return;
+  mirrorHost.owner = null; mirrorHost.pageUrl = ""; mirrorHost.last = null;
+  const frame = $("mirrorFrame");
+  $("mirrorWrap").hidden = true;
+  frame.removeAttribute("src");
+  try { frame.contentWindow.location.replace("about:blank"); } catch (e) { /* already gone */ }
+}
+
+// Loads the capture's document into the iframe; resolves when it is ready (the Hub's page, not the site's).
+// `cover` keeps another tab's page out of sight while this one loads (the frame must be laid out to load).
+function mirrorLoadDoc(docUrl, cover) {
+  const mf = $("mirrorFrame"), wrap = $("mirrorWrap");
+  wrap.style.visibility = cover ? "hidden" : "";
+  wrap.hidden = false;
+  return new Promise((resolve, reject) => {
+    let done = false;
+    const finish = ok => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      mf.removeEventListener("load", onLoad);
+      if (ok) resolve(); else reject(new Error("ミラー表示を読み込めませんでした"));
+    };
+    const onLoad = () => finish(Boolean(mirrorDoc()));
+    const timer = setTimeout(() => finish(false), MIRROR_LOAD_TIMEOUT_MS);
+    mf.addEventListener("load", onLoad);
+    mf.src = docUrl;
+  });
+}
+
+// The first visible element (below fixed headers) and where it is, to keep the reading place across a swap.
+function mirrorAnchorOf(doc) {
+  const view = doc.defaultView;
+  const x = Math.min(24, Math.max(1, doc.documentElement.clientWidth / 2));
+  for (const y of [6, 90, 180]) {
+    const el = doc.elementFromPoint(x, y);
+    const m = mirrorClosest(el, "[data-m]");
+    if (!m) continue;
+    const pos = view.getComputedStyle(m).position;
+    if (pos === "fixed" || pos === "sticky") continue;
+    return {id: m.getAttribute("data-m"), top: m.getBoundingClientRect().top};
+  }
+  return null;
+}
+
+function mirrorCopyAttrs(from, to) {
+  for (const a of Array.from(to.attributes)) to.removeAttribute(a.name);
+  for (const a of Array.from(from.attributes)) {
+    try {
+      to.setAttribute(a.name, a.value);
+    } catch (e) { /* not a valid name here */ }
+  }
+}
+
+// Replaces the page content of the iframe with a newer capture, keeping the reading position.
+function mirrorMorph(doc, data) {
+  const scroller = mirrorScroller(doc);
+  const before = scroller.scrollTop;
+  const anchor = mirrorAnchorOf(doc);
+  const sheet = doc.getElementById("mirrorCss");
+  if (sheet.textContent !== data.css) sheet.textContent = data.css;
+  // parsed by the iframe's own DOMParser so the iframe's policy (inline styles allowed), not the app's, applies
+  const parsed = new (doc.defaultView.DOMParser)().parseFromString(
+    "<!doctype html><html" + data.html_attrs + "><body" + data.body_attrs + ">" + data.html + "</body></html>",
+    "text/html");
+  mirrorCopyAttrs(parsed.documentElement, doc.documentElement);
+  mirrorCopyAttrs(parsed.body, doc.body);
+  const frag = doc.createDocumentFragment();
+  for (const node of Array.from(parsed.body.childNodes)) frag.appendChild(doc.importNode(node, true));
+  doc.body.replaceChildren(frag);
+  let top = before;
+  if (anchor) {
+    const again = doc.querySelector('[data-m="' + CSS.escape(anchor.id) + '"]');
+    if (again) top = scroller.scrollTop + (again.getBoundingClientRect().top - anchor.top);
+  }
+  scroller.scrollTop = top;
+}
+
+function mirrorFailed(rb, url, empty) {
+  const fail = rb.mirrorFail && rb.mirrorFail.url === url ? rb.mirrorFail : {url, n: 0};
+  fail.n++;
+  rb.mirrorFail = fail;
+  return empty === true || fail.n >= 2;
+}
+
+function mirrorFallback(tab, rb) {
+  rb.tilesFor = rb.url;
+  rb.mirrorFail = null;
+  tab.error = "";
+  dlog("render", "warn", "mirror fallback", {url: hostLabel(rb.url)});
+  toast("このページはミラー表示に対応していないため高速表示にしました");
+  applyDisplay(tab);
+}
+
+async function runMirror(tab, opts = {}) {
+  const rb = tab && tab.rb;
+  if (!rb || tabDisplay(tab) !== "mirror") return;
+  if (rb.mirrorBusy) { rb.mirrorAgain = true; return; }
+  const wait = rb.mirrorAt + Math.max(MIRROR_MIN_MS, rb.mirrorMs * 2) - Date.now();
+  const navigation = !rb.mirror || rb.mirror.pageUrl !== rb.url || mirrorHost.owner !== rb;
+  if (wait > 0 && !opts.immediate && !navigation) { scheduleMirror(tab, wait, opts.force === true); return; }
+  if (rb.mirrorTouch && !navigation) { rb.mirrorDeferred = true; return; }       // never swap under a finger
+  rb.mirrorBusy = true;
+  snapBusy(rb, 1);
+  const url = rb.url;
+  try {
+    const started = performance.now();
+    const doc0 = mirrorDoc();
+    const fresh = navigation || !doc0;
+    const data = await api("/api/rb/mirror", {tab: rb.id, full: !fresh, force: opts.force === true});
+    const elapsed = performance.now() - started;
+    if (tab.rb !== rb || tabDisplay(tab) !== "mirror") return;
+    if (!data || !Number.isFinite(data.rev) || !data.stats || !Number.isFinite(data.stats.nodes)) {
+      throw new Error("ミラーのデータが不正です");
+    }
+    if (data.stats.nodes === 0) {
+      console.error("mirror: 0 nodes", data.url);
+      mirrorFailed(rb, url, true);
+      mirrorFallback(tab, rb);
+      return;
+    }
+    let applied = 0;
+    if (fresh) {
+      if (typeof data.doc !== "string" || !MIRROR_DOC_RE.test(data.doc)) throw new Error("ミラーのデータが不正です");
+      const keep = rb.mirror && rb.mirror.pageUrl === url ? mirrorPosTop(rb, url) : 0;
+      const t0 = performance.now();
+      await mirrorLoadDoc(data.doc, mirrorHost.owner !== rb);
+      if (tab.rb !== rb || tabDisplay(tab) !== "mirror") return;
+      const doc = mirrorDoc();
+      wireMirrorDoc(doc);
+      mirrorScroller(doc).scrollTop = keep || mirrorPosTop(rb, url);
+      mirrorHost.owner = rb; mirrorHost.pageUrl = url; mirrorHost.last = null;
+      $("mirrorWrap").style.visibility = "";
+      applied = performance.now() - t0;
+    } else {
+      if (mirrorUnsafe(data)) {
+        console.error("mirror: refused unsafe content");
+        dlog("render", "error", "mirror unsafe content refused", {});
+        throw new Error("ミラーの内容を安全に表示できません");
+      }
+      const last = mirrorHost.last;
+      if (!last || last.html !== data.html || last.css !== data.css || last.ha !== data.html_attrs || last.ba !== data.body_attrs) {
+        const t0 = performance.now();
+        mirrorMorph(doc0, data);
+        applied = performance.now() - t0;
+        dlog("render", "debug", "mirror morph", {ms: Math.round(applied), rev: data.rev});
+      }
+      mirrorHost.last = {html: data.html, css: data.css, ha: data.html_attrs, ba: data.body_attrs};
+    }
+    const st = data.stats;
+    rb.mirror = {rev: data.rev, pageUrl: url, url: data.url, title: data.title, truncated: data.truncated === true};
+    rb.mirrorAt = Date.now();
+    rb.mirrorMs = Math.min(elapsed, 8000);
+    rb.mirrorPending = false;
+    rb.mirrorFail = null;
+    rb.perf.mirror = {nodes: st.nodes, htmlBytes: st.html_bytes, cssBytes: st.css_bytes, images: st.images,
+      ms: elapsed};
+    dlog("render", "info", "mirror shown", {ms: Math.round(elapsed), apply_ms: Math.round(applied), nodes: st.nodes,
+      html_kb: Math.round(st.html_bytes / 1024), css_kb: Math.round(st.css_bytes / 1024), res: st.res,
+      fresh, reused: data.reused === true});
+    if (data.truncated) flash("長いページのため、途中までを表示しています。");
+    if (tab.error) tab.error = "";
+    updateRemoteView(tab);
+  } catch (e) {
+    if (tab.rb !== rb) return;
+    if (e.status === 404) { remoteLost(tab); return; }
+    console.error("mirror failed:", e);
+    dlog("render", "warn", "mirror failed", {message: String(e && e.message || e).slice(0, 120), status: e.status || 0});
+    if (mirrorFailed(rb, url, false)) { mirrorFallback(tab, rb); return; }
+    if (!mirrorDoc() || mirrorHost.owner !== rb) {
+      tab.error = "ミラー表示を作れませんでした: " + (e && e.message ? e.message : String(e));
+      updateRemoteView(tab);
+    }
+    if (!opts.quiet) toast("ミラー表示を更新できませんでした: " + (e && e.message ? e.message : String(e)), "error");
+  } finally {
+    rb.mirrorBusy = false;
+    snapBusy(rb, -1);
+    if (rb.mirrorAgain && tab.rb === rb) {
+      rb.mirrorAgain = false;
+      runMirror(tab, {quiet: true}).catch(() => {});
+    }
+  }
+}
+
+// Look again after `ms` (after a tap, typed text, or while the minimum gap between captures runs out).
+function scheduleMirror(tab, ms, force) {
+  const rb = tab && tab.rb;
+  if (!rb) return;
+  if (force) rb.mirrorForce = true;
+  if (rb.mirrorTimer) return;
+  rb.mirrorTimer = setTimeout(() => {
+    rb.mirrorTimer = 0;
+    const forced = rb.mirrorForce === true;
+    rb.mirrorForce = false;
+    if (tab.rb !== rb || tabDisplay(tab) !== "mirror" || document.visibilityState !== "visible") return;
+    runMirror(tab, {quiet: true, force: forced, immediate: true}).catch(() => {});
+  }, Math.max(0, ms));
+}
+
+// "run" when a capture is due for this metadata, else "".
+function mirrorAction(rb, meta, now) {
+  const m = rb.mirror;
+  const changed = Boolean(m) && Number.isFinite(meta.mirror_rev) && meta.mirror_rev !== m.rev;
+  if (meta.loading === true) {
+    rb.mirrorPending = true;
+    if (rb.mirrorEarly !== meta.url && loadedLongEnough(rb, meta, now)) {
+      rb.mirrorEarly = meta.url;
+      return "run";
+    }
+    // an ad-heavy page that never finishes loading still changes: follow it after the first early capture
+    return rb.mirrorEarly === meta.url && changed && mirrorHost.owner === rb ? "run" : "";
+  }
+  noteLoadStart(rb, meta, now);
+  if (!m || mirrorHost.owner !== rb || m.pageUrl !== meta.url || rb.mirrorPending || rb.mirrorEarly === meta.url) {
+    rb.mirrorEarly = "";
+    return "run";
+  }
+  return changed ? "run" : "";
+}
+
+async function mirrorLoop(tab, gen) {
+  let fails = 0, first = true;
+  await nextPaint();
+  await nextPaint();
+  if (gen !== state.rbGen || !tab.rb) return;
+  await sendViewport(tab).catch(() => {});
+  while (gen === state.rbGen && tab.rb) {
+    const rb = tab.rb;
+    try {
+      const wait = first ? 0 : rb.loading === true && rb.mirrorEarly !== rb.url ? RB_EARLY_POLL_S : RB_META_WAIT_S;
+      let target = "/api/rb/meta?tab=" + encodeURIComponent(rb.id) + "&wait=" + wait;
+      if (!first && rb.rev !== null) target += "&rev=" + rb.rev;
+      first = false;
+      const res = await fetch(target, {credentials: "same-origin", cache: "no-store"});
+      if (gen !== state.rbGen || tab.rb !== rb) return;
+      if (res.status === 401 && state.authed) {
+        state.authed = false;
+        setTimeout(go, 0);
+        return;
+      }
+      if (res.status === 404) { remoteLost(tab); return; }
+      if (res.status !== 200) throw new Error("HTTP " + res.status);
+      const meta = await res.json();
+      if (gen !== state.rbGen || tab.rb !== rb) return;
+      fails = 0;
+      applyRemoteMeta(tab, Object.assign({}, meta, {seq: rb.seq}));
+      if (gen !== state.rbGen || tab.rb !== rb || tabDisplay(tab) !== "mirror") return;
+      if (mirrorAction(rb, meta, Date.now()) === "run") runMirror(tab, {quiet: true}).catch(() => {});
+    } catch (e) {
+      if (gen !== state.rbGen) return;
+      fails++;
+      if (fails >= RB_MAX_POLL_FAILS) {
+        state.rbPolling = "";
+        state.rbPollMode = "";
+        toast("NASブラウザの画面を取得できません: " + e.message, "error");
+        return;
+      }
+      await delay(1000);
+    }
+  }
+}
+
+// A tap on a link: the NAS browser goes there (the Hub validates the address); the loop captures the new page.
+async function mirrorNavigate(tab, href) {
+  const rb = tab && tab.rb;
+  if (!rb) return;
+  try {
+    await api("/api/rb/navigate", {tab: rb.id, url: href});
+    rb.mirrorPending = true;
+  } catch (e) {
+    if (e.status === 404) remoteLost(tab);
+    else throw e;
+  }
+}
+
+// A tap on anything else: the NAS browser clicks the same element (the Hub finds it by its number).
+async function mirrorClick(tab, el, event) {
+  const rb = tab.rb;
+  const m = Number(el.getAttribute("data-m"));
+  if (!rb || !Number.isInteger(m) || m < 0) return;
+  const box = el.getBoundingClientRect();
+  const unit = (v, lo, size) => size > 0 ? Math.min(1, Math.max(0, (v - lo) / size)) : 0.5;
+  const fx = Math.round(unit(event.clientX, box.left, box.width) * 1000) / 1000;
+  const fy = Math.round(unit(event.clientY, box.top, box.height) * 1000) / 1000;
+  snapBusy(rb, 1);
+  try {
+    const res = await api("/api/rb/mirror/click", {tab: rb.id, m, fx, fy});
+    if (tab.rb !== rb) return;
+    if (typeof res.editable === "boolean") setEditable(tab, res.editable, true);
+    if (res.navigated !== true) scheduleMirror(tab, MIRROR_CLICK_REFRESH_MS, true);
+  } catch (e) {
+    if (tab.rb !== rb) return;
+    if (e.status === 410) {            // the element is gone: the page changed since this copy
+      flash("表示を更新しました。もう一度タップしてください");
+      scheduleMirror(tab, 0, true);
+    } else if (e.status === 404) {
+      remoteLost(tab);
+    } else {
+      toast(e.message, "error");
+    }
+  } finally {
+    snapBusy(rb, -1);
+  }
+}
+
+function mirrorScrollToAnchor(doc, id) {
+  const target = id === "top" ? null : doc.getElementById(id) || doc.getElementsByName(id)[0];
+  if (target) target.scrollIntoView({block: "start"});
+  else if (id === "top" || id === "") mirrorScroller(doc).scrollTop = 0;
+}
+
+// Listeners inside the iframe's document (the parent runs them; the frame itself runs no script).
+function wireMirrorDoc(doc) {
+  if (!doc || mirrorWired.has(doc)) return;
+  mirrorWired.add(doc);
+  const tabNow = () => {
+    const t = remoteTab();
+    return t && t.rb && tabDisplay(t) === "mirror" && mirrorHost.owner === t.rb ? t : null;
+  };
+  const press = {timer: 0, ring: 0, id: null, x: 0, y: 0, el: null, fired: false};
+  const stopPress = () => {
+    clearTimeout(press.timer); clearTimeout(press.ring);
+    press.timer = press.ring = 0;
+    if (!press.fired) hidePressRing();
+  };
+  const offset = () => $("mirrorFrame").getBoundingClientRect();
+  doc.addEventListener("pointerdown", event => {
+    stopPress();
+    press.fired = false;
+    const link = mirrorClosest(event.target, "[data-href]");
+    if (!link || (event.pointerType === "mouse" && event.button !== 0) || !tabNow()) return;
+    press.el = link; press.x = event.clientX; press.y = event.clientY; press.id = event.pointerId;
+    const o = offset();
+    const sx = event.clientX + o.left, sy = event.clientY + o.top;
+    press.ring = setTimeout(() => showPressRing(sx, sy), RB_RING_DELAY_MS);
+    press.timer = setTimeout(() => {
+      press.timer = 0;
+      const tab = tabNow();
+      if (!tab || !press.el) return;
+      press.fired = true;
+      showPressRing(sx, sy);
+      $("remoteRing").classList.add("is-done");
+      setTimeout(() => { hidePressRing(); }, 350);
+      const href = press.el.getAttribute("data-href");
+      perform(() => startProbe(tab, {href}));         // the exact address is known: no hit test needed
+    }, RB_LONGPRESS_MS);
+  });
+  doc.addEventListener("pointermove", event => {
+    if (event.pointerId === press.id && (press.timer || press.ring) &&
+        Math.hypot(event.clientX - press.x, event.clientY - press.y) > RB_LONGPRESS_MOVE_PX) stopPress();
+  });
+  doc.addEventListener("pointerup", stopPress);
+  doc.addEventListener("pointercancel", stopPress);
+  doc.addEventListener("contextmenu", event => { event.preventDefault(); });
+  doc.addEventListener("submit", event => { event.preventDefault(); });
+  // The copy's controls are inert: no focus, no keyboard of their own (typing goes to the NAS browser).
+  doc.addEventListener("mousedown", event => {
+    if (mirrorClosest(event.target, "input,textarea,select")) event.preventDefault();
+  });
+  doc.addEventListener("focusin", event => {
+    const el = event.target;
+    if (el && el.blur && mirrorClosest(el, "input,textarea,select")) el.blur();
+  });
+  doc.addEventListener("click", event => {
+    event.preventDefault();
+    if (press.fired) { press.fired = false; return; }       // the long press already started a probe
+    const tab = tabNow();
+    if (!tab) return;
+    const link = mirrorClosest(event.target, "[data-href]");
+    if (link) { perform(() => mirrorNavigate(tab, link.getAttribute("data-href"))); return; }
+    const frag = mirrorClosest(event.target, "[data-frag]");
+    if (frag) { mirrorScrollToAnchor(doc, frag.getAttribute("data-frag")); return; }
+    const el = mirrorClosest(event.target, "[data-m]");
+    if (el) perform(() => mirrorClick(tab, el, event));
+  });
+  // Native scrolling: remember the place per page, and hold recaptures back while a finger is down.
+  let scrollTick = 0;
+  doc.addEventListener("scroll", () => {
+    if (scrollTick) return;
+    scrollTick = requestAnimationFrame(() => {
+      scrollTick = 0;
+      const owner = mirrorHost.owner;
+      if (owner) mirrorRememberTop(owner, mirrorHost.pageUrl, mirrorScroller(doc).scrollTop);
+    });
+  }, {passive: true});
+  const touching = on => () => {
+    const tab = remoteTab();
+    const rb = tab && tab.rb;
+    if (!rb) return;
+    rb.mirrorTouch = on;
+    if (!on && rb.mirrorDeferred) {
+      rb.mirrorDeferred = false;
+      setTimeout(() => { if (tab.rb === rb) runMirror(tab, {quiet: true}).catch(() => {}); }, MIRROR_TOUCH_RESUME_MS);
+    }
+  };
+  doc.addEventListener("touchstart", touching(true), {passive: true});
+  doc.addEventListener("touchend", touching(false), {passive: true});
+  doc.addEventListener("touchcancel", touching(false), {passive: true});
+  attachFlick(doc);
+  wirePull($("mirrorFrame"), () => {
+    const tab = tabNow();
+    if (tab) perform(() => runMirror(tab, {force: true, immediate: true}));
+  }, doc, () => mirrorScroller(doc).scrollTop);
+}
+
 // ---- parallel long-press probes (v0.1.27) ----
 // Every long press starts its own request at once (the server queues beyond its limits).
 // While probing only the small chip is shown; the sheet appears solely when a finished
@@ -4027,8 +4520,9 @@ function gestureHint(text) {
   hint.hidden = !text;
 }
 
-function wireGestures() {
-  const view = $("remoteView");
+// The flick listener is attached to the remote view and, for the mirror display, inside its iframe
+// (touches in a frame do not bubble to the parent).
+function attachFlick(view) {
   let flick = null;
   view.addEventListener("touchstart", event => {
     flick = null;
@@ -4054,6 +4548,11 @@ function wireGestures() {
     setTimeout(() => gestureHint(""), 600);
     perform(() => stepHistory(tab, dx > 0 ? -1 : 1));
   }, {passive: true});
+}
+
+function wireGestures() {
+  const view = $("remoteView");
+  attachFlick(view);
 
   const bar = document.querySelector(".toolbar");
   let pull = null;
@@ -4334,7 +4833,7 @@ function configureMenu() {
   menu.querySelectorAll("[data-scope='remote']").forEach(n => { n.hidden = !web; });
   const display = tab && tab.rb ? tabDisplay(tab) : "tiles";
   // Picture quality only matters for the fast and live displays (v0.1.36).
-  menu.querySelectorAll("[data-scope='quality']").forEach(n => { n.hidden = !web || display === "reader"; });
+  menu.querySelectorAll("[data-scope='quality']").forEach(n => { n.hidden = !web || display === "reader" || display === "mirror"; });
   menu.querySelectorAll("[data-quality]").forEach(n => {
     n.setAttribute("aria-checked", String(n.dataset.quality === state.rbQuality));
   });
