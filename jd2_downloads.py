@@ -3,6 +3,8 @@
 JD2's rich query response must never be passed to the browser directly:
 it can contain download passwords, URLs, filesystem paths or future fields.
 """
+import posixpath
+
 PAGE_SIZE = 30
 MAX_PAGE = 20
 
@@ -14,7 +16,10 @@ LINK_FIELDS = {
 PACKAGE_FIELDS = {
     "name": True, "bytesLoaded": True, "bytesTotal": True,
     "speed": True, "eta": True, "status": True, "running": True,
-    "finished": True, "childCount": True, "uuid": True
+    "finished": True, "childCount": True, "uuid": True,
+    # saveTo is read to tell flat from subfolder; it never leaves the server
+    # (only a flag and the folder name relative to the download folder do).
+    "saveTo": True
 }
 
 
@@ -52,7 +57,31 @@ def _boolean(value):
     return value if type(value) is bool else None
 
 
-def _normalize(entry, is_package=False):
+def relative_folder(save_to, base):
+    """Browser-safe view of where a package saves, relative to the download folder.
+
+    Returns None when unknown, {"flat": True} when it saves directly into `base`,
+    {"flat": False, "name": <relative name>} for a subfolder. Absolute paths and
+    anything outside `base` are never returned.
+    """
+    if not isinstance(save_to, str) or not isinstance(base, str):
+        return None
+    if not save_to.startswith("/") or not base.startswith("/") or "\x00" in save_to:
+        return None
+    if ".." in save_to.split("/") or ".." in base.split("/"):
+        return None
+    path, folder = posixpath.normpath(save_to), posixpath.normpath(base)
+    if folder == "/":
+        return None
+    if path == folder:
+        return {"flat": True}
+    if not path.startswith(folder + "/"):
+        return None
+    name = "".join(ch for ch in path[len(folder) + 1:] if ch.isprintable())
+    return {"flat": False, "name": name[:120] or "（名称不明）"}
+
+
+def _normalize(entry, is_package=False, base=None):
     if not isinstance(entry, dict):
         raise ValueError("JD2のダウンロード情報の形式が不正です")
     expected_name = "パッケージ" if is_package else "ファイル"
@@ -77,6 +106,7 @@ def _normalize(entry, is_package=False):
     if is_package:
         item["child_count"] = _nonnegative(entry.get("childCount"))
         item["id"] = _uuid(entry.get("uuid"))
+        item["folder"] = relative_folder(entry.get("saveTo"), base)
     else:
         item["host"] = _string(entry.get("host"), 120)
         item["id"] = _uuid(entry.get("uuid"))
@@ -85,7 +115,7 @@ def _normalize(entry, is_package=False):
     return item
 
 
-def snapshot(packages, links, page):
+def snapshot(packages, links, page, base=None):
     check_page(page)
     for value in (packages, links):
         if not isinstance(value, list) or len(value) > PAGE_SIZE:
@@ -94,7 +124,7 @@ def snapshot(packages, links, page):
         "source": "local-readonly",
         "page": page,
         "page_size": PAGE_SIZE,
-        "packages": [_normalize(entry, True) for entry in packages],
+        "packages": [_normalize(entry, True, base) for entry in packages],
         "links": [_normalize(entry) for entry in links],
         "has_more": len(packages) == PAGE_SIZE or len(links) == PAGE_SIZE,
         "notice": "JD2実データの表示です。全体の開始・停止と、項目ごとの開始・停止・削除ができます",

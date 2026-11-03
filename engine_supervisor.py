@@ -29,6 +29,7 @@ import durability
 import engine_components as components
 import jd2_local
 import jd2_policy
+import jd2_transfer
 
 RING_LINES = 300
 MAX_FIRST_RUNS = 6
@@ -39,6 +40,7 @@ RESTART_MAX = 5
 RESTART_WINDOW = 600.0
 BACKOFF = (5.0, 15.0, 30.0, 60.0, 60.0)
 READY_TIMEOUT = 180.0
+FLATTEN_SWEEP_INTERVAL = 60.0
 API_CONFIG = {"deprecatedapienabled": True, "deprecatedapiport": 3128,
               "deprecatedapilocalhostonly": True}
 # Container mode: JD2 must listen on the container's own interface so the Hub
@@ -842,6 +844,7 @@ class EngineManager:
 
     def _supervise(self):
         started = self._now()
+        swept = started
         while not self._stop_evt.is_set():
             exited = self._wait_exit(3.0 if not self._ready else 5.0)
             if self._stop_evt.is_set():
@@ -873,6 +876,9 @@ class EngineManager:
                     return
                 started = self._now()
                 continue
+            if self._ready and self._now() - swept >= FLATTEN_SWEEP_INTERVAL:
+                swept = self._now()
+                self.flatten_sweep()
             if not self._ready:
                 try:
                     revision = self.adapter.core_revision()
@@ -882,6 +888,20 @@ class EngineManager:
                 except jd2_local.LocalUnavailable:
                     if self._now() - started > READY_TIMEOUT and not self._error:
                         self._error = "エンジンの起動確認がタイムアウトしました。RAMログを確認してください"
+
+    def flatten_sweep(self):
+        """Move not-yet-started packages out of per-package subfolders (cheap, 2 calls).
+
+        Returns the number moved; never raises. Only runs against our own running engine."""
+        try:
+            folder = self.store.settings().get("download_dir")
+            if not folder or not self.is_ours_running():
+                return 0
+            moved = jd2_transfer.flatten_waiting(self.adapter, folder)
+        except Exception as error:
+            debuglog.log("jd2", "debug", "フォルダ整理の巡回に失敗", {"error": str(error)[:120]})
+            return 0
+        return moved
 
     def startup(self):
         """Hub start: adopt a surviving engine, or autostart in the background."""
@@ -1256,6 +1276,13 @@ class EngineManager:
         found = self.adapter.set_default_download_folder(folder)
         if not found:
             notes.append("既定の保存先キー(defaultdownloadfolder)が見つからず未設定")
+        try:
+            folder_keys = self.adapter.package_folder_settings(True)
+        except Exception:
+            folder_keys = []
+        if isinstance(folder_keys, list) and folder_keys:
+            fixed = sum(1 for item in folder_keys if item["compliant"])
+            notes.append("パッケージ別フォルダ関連の設定 %d件中 %d件がOFF" % (len(folder_keys), fixed))
         preview = jd2_policy.build_preview(self.adapter)
         if preview["applicable"]:
             jd2_policy.apply_preset(self.adapter, preview)

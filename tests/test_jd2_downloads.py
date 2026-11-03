@@ -8,7 +8,10 @@ class DownloadViewTests(unittest.TestCase):
     def test_readonly_query_fields_exclude_urls_passwords_and_paths(self):
         self.assertFalse({"url", "password", "downloadPassword", "saveTo",
                           "comment"}.intersection(view.LINK_FIELDS))
-        self.assertFalse({"saveTo", "password"}.intersection(view.PACKAGE_FIELDS))
+        # v0.1.47: packages are queried with saveTo to tell flat from subfolder; it is only
+        # reduced to a relative marker (see tests/test_jd2_flatten.py), never passed on.
+        self.assertFalse({"password", "url"}.intersection(view.PACKAGE_FIELDS))
+        self.assertIs(view.PACKAGE_FIELDS["saveTo"], True)
         options = view.query_options(view.LINK_FIELDS, 2)
         self.assertEqual(options[0]["startAt"], 60)
         self.assertEqual(options[0]["maxResults"], 30)

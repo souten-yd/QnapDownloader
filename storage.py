@@ -16,7 +16,6 @@ DEFAULTS = {
     "download_dir": "",
     "auto_start": False,
     "auto_extract": False,
-    "create_package_folders": False,
     "auto_delete": False,
     # v0.1.24: ask JD2 to start downloads right after the Hub sends a link.
     "send_autostart": True,

@@ -14,7 +14,9 @@ import http.client
 import ipaddress
 import json
 import os
+import posixpath
 import re
+import threading
 import time
 import urllib.parse
 
@@ -65,6 +67,15 @@ ALLOWED_CALLS = frozenset((
     ("downloadsV2", "removeLinks"),
     ("downloadcontroller", "forceDownload"),
     ("linkgrabberv2", "removeLinks"),
+    # v0.1.47: keep every package flat in the chosen download folder. The package
+    # queries only read saveTo/uuid; setDownloadDirectory(directory, packageIds) is
+    # JD2's own call (DownloadsAPIV2 / LinkCollectorAPIV2) and is only ever sent
+    # with the Hub's download folder as the directory.
+    ("linkgrabberv2", "queryPackages"),
+    ("linkgrabberv2", "setDownloadDirectory"),
+    ("linkgrabberv2", "queryLinkCrawlerJobs"),
+    ("linkgrabberv2", "isCollecting"),
+    ("downloadsV2", "setDownloadDirectory"),
     # Premium accounts (v0.1.23). Secrets travel in the request line of these
     # calls, so the adapter routes the whole namespace through _call_private.
     ("accountsV2", "listAccounts"),
@@ -78,6 +89,55 @@ ALLOWED_CALLS = frozenset((
 ))
 PRIVATE_NAMESPACE = "accountsV2"
 RAW_ACCOUNT_LIMIT = 5000
+
+
+# ---- flat layout (v0.1.47) ---------------------------------------------------
+FLATTEN_POLL = 0.5          # seconds between LinkGrabber checks after addLinks
+FLATTEN_WINDOW = 15.0       # give up this long after the send
+FLATTEN_QUERY_MAX = 500
+FLATTEN_CHUNK = 50
+FOLDER_THRESHOLD_BIG = 100000
+FOLDER_KEY_SKIP = ("disable", "dont", "without", "avoid", "skip", "ignore", "delete")
+FOLDER_THRESHOLD_WORDS = ("threshold", "count", "minimum", "limit")
+FOLDER_INTERFACES = ("generalsettings", "linkgrabbersettings", "packagizer")
+
+
+def subfolder_of(path, folder):
+    """True when `path` lies strictly inside `folder` (lexical, both absolute, no '..')."""
+    if (not isinstance(path, str) or not isinstance(folder, str) or
+            not path.startswith("/") or not folder.startswith("/") or
+            "\x00" in path or "\x00" in folder or
+            ".." in path.split("/") or ".." in folder.split("/")):
+        return False
+    path, folder = posixpath.normpath(path), posixpath.normpath(folder)
+    return folder != "/" and path.startswith(folder + "/")
+
+
+def classify_folder_key(entry):
+    """(interface, storage, key, value, target) for a JD2 key that makes package
+    subfolders, else None. Only boolean "...subfolder..." keys (-> False) and integer
+    threshold/count style "...subfolder..." keys (-> a very large value) qualify; the
+    type of the listed value must match. No key name is assumed to exist."""
+    interface = entry.get("interfaceName") or entry.get("configInterface")
+    key = entry.get("key")
+    storage = entry.get("storage")
+    if not isinstance(interface, str) or not isinstance(key, str):
+        return None
+    if storage is not None and not isinstance(storage, str):
+        return None
+    lower_i, lower_k = interface.lower(), key.lower()
+    if not any(word in lower_i for word in FOLDER_INTERFACES):
+        return None
+    if any(word in lower_k for word in KEY_EXCLUDE + FOLDER_KEY_SKIP):
+        return None
+    if not ("subfolder" in lower_k or ("packagename" in lower_k and "folder" in lower_k)):
+        return None
+    value = entry.get("value")
+    if type(value) is bool:
+        return interface, storage, key, value, False
+    if type(value) is int and any(word in lower_k for word in FOLDER_THRESHOLD_WORDS):
+        return interface, storage, key, value, max(value, FOLDER_THRESHOLD_BIG)
+    return None
 
 
 class LocalUnavailable(RuntimeError):
@@ -234,6 +294,11 @@ class LocalAdapter:
         self._host = host
         self._timeout = timeout
         self._handles = {}
+        self._flatten_lock = threading.Lock()
+        self._flatten_jobs = []
+        self._flatten_thread = None
+        self._flatten_sleep = time.sleep
+        self._flatten_now = time.monotonic
 
     # -- properties used by controller/transfer
     @property
@@ -462,12 +527,169 @@ class LocalAdapter:
                 return True
         return False
 
-    def list_downloads(self, page=0):
+    def list_downloads(self, page=0, base=None):
         from jd2_downloads import LINK_FIELDS, PACKAGE_FIELDS, query_options, snapshot
         packages = self._call("downloadsV2", "queryPackages",
                               *query_options(PACKAGE_FIELDS, page))
         links = self._call("downloadsV2", "queryLinks", *query_options(LINK_FIELDS, page))
-        return snapshot(packages, links, page)
+        return snapshot(packages, links, page, base)
+
+    # ------------------------------------------------ flat layout (v0.1.47)
+    @staticmethod
+    def _package_ids(entries, destination, extra=None):
+        ids = []
+        for entry in entries:
+            uuid = entry.get("uuid")
+            if (type(uuid) is int and 0 <= uuid < ID_LIMIT and
+                    subfolder_of(entry.get("saveTo"), destination) and
+                    (extra is None or extra(entry))):
+                ids.append(uuid)
+        return ids
+
+    def _package_query(self, namespace, fields):
+        raw = self._call(namespace, "queryPackages",
+                         dict(fields, maxResults=FLATTEN_QUERY_MAX, startAt=0))
+        if not isinstance(raw, list):
+            return []
+        return [entry for entry in raw[:FLATTEN_QUERY_MAX] if isinstance(entry, dict)]
+
+    def _set_directory(self, namespace, destination, ids):
+        for start in range(0, len(ids), FLATTEN_CHUNK):
+            self._call(namespace, "setDownloadDirectory", destination,
+                       ids[start:start + FLATTEN_CHUNK])
+
+    @staticmethod
+    def _flatten_destination(destination):
+        if (not isinstance(destination, str) or not destination.startswith("/") or
+                posixpath.normpath(destination) == "/"):
+            raise LocalUnavailable("保存先が不正です")
+        return posixpath.normpath(destination)
+
+    def flatten_linkgrabber(self, destination):
+        """Packages waiting in the LinkGrabber that would save below `destination`
+        are pointed at `destination` itself. Returns how many were changed."""
+        destination = self._flatten_destination(destination)
+        entries = self._package_query("linkgrabberv2", {
+            "uuid": True, "name": True, "saveTo": True, "childCount": True})
+        ids = self._package_ids(entries, destination)
+        if ids:
+            self._set_directory("linkgrabberv2", destination, ids)
+            debuglog.log("jd2", "info", "LinkGrabberのパッケージ別フォルダを解除", {"packages": len(ids)})
+        return len(ids)
+
+    def flatten_waiting_downloads(self, destination):
+        """Download-list packages that have not started (nothing loaded, not running,
+        not finished) and sit in a subfolder of `destination` are pointed at it.
+        Started or finished packages (their files live in the old folder) and anything
+        outside `destination` are never touched. Returns how many were changed."""
+        destination = self._flatten_destination(destination)
+        entries = self._package_query("downloadsV2", {
+            "uuid": True, "saveTo": True, "bytesLoaded": True,
+            "running": True, "finished": True})
+        ids = self._package_ids(entries, destination, lambda e: (
+            e.get("finished") is False and e.get("running") is False and
+            type(e.get("bytesLoaded")) is int and e.get("bytesLoaded") == 0))
+        if ids:
+            self._set_directory("downloadsV2", destination, ids)
+            debuglog.log("jd2", "info", "待機中パッケージのフォルダをまとめました", {"packages": len(ids)})
+        return len(ids)
+
+    def schedule_flatten(self, destination, add_result=None):
+        """Background, bounded (every 0.5 s for up to 15 s) flattening after addLinks.
+
+        One worker serves all sends; a send while it runs only adds a job. Never raises.
+        """
+        try:
+            destination = self._flatten_destination(destination)
+        except LocalUnavailable:
+            return
+        job_id = add_result.get("id") if isinstance(add_result, dict) else None
+        job = {"destination": destination,
+               "job": job_id if type(job_id) is int and not isinstance(job_id, bool) else None,
+               "deadline": self._flatten_now() + FLATTEN_WINDOW, "done_seen": False}
+        with self._flatten_lock:
+            self._flatten_jobs.append(job)
+            if self._flatten_thread is not None:
+                return
+            thread = threading.Thread(target=self._flatten_worker, daemon=True)
+            self._flatten_thread = thread
+        thread.start()
+
+    def flatten_join(self, timeout=30.0):
+        """Wait for the background worker (tests, shutdown)."""
+        with self._flatten_lock:
+            thread = self._flatten_thread
+        if thread is not None:
+            thread.join(timeout)
+
+    def _flatten_worker(self):
+        while True:
+            with self._flatten_lock:
+                jobs = list(self._flatten_jobs)
+                if not jobs:
+                    self._flatten_thread = None
+                    return
+            try:
+                self._flatten_cycle(jobs)
+            except Exception as error:      # the worker must never die with a stuck slot
+                debuglog.log("jd2", "error", "フォルダ整理に失敗", {"error": str(error)[:120]})
+            self._flatten_sleep(FLATTEN_POLL)
+
+    def _flatten_cycle(self, jobs):
+        for destination in sorted({job["destination"] for job in jobs}):
+            for step in (self.flatten_linkgrabber, self.flatten_waiting_downloads):
+                try:
+                    step(destination)
+                except LocalUnavailable as error:
+                    debuglog.log("jd2", "debug", "フォルダ整理を一時的にスキップ", {"error": str(error)[:120]})
+        now = self._flatten_now()
+        finished = []
+        for job in jobs:
+            if now >= job["deadline"]:
+                finished.append(job)
+            elif self._crawler_done(job["job"]):
+                if job["done_seen"]:
+                    finished.append(job)
+                job["done_seen"] = True     # one more pass after the crawler finished
+        if finished:
+            with self._flatten_lock:
+                self._flatten_jobs = [j for j in self._flatten_jobs if j not in finished]
+
+    def _crawler_done(self, job_id):
+        if job_id is not None:
+            try:
+                raw = self._call("linkgrabberv2", "queryLinkCrawlerJobs", {"jobIds": [job_id]})
+                if isinstance(raw, list):
+                    return not any(isinstance(e, dict) and (e.get("crawling") is True or
+                                                            e.get("checking") is True) for e in raw)
+            except LocalUnavailable:
+                pass
+        try:
+            return self._call("linkgrabberv2", "isCollecting") is False
+        except LocalUnavailable:
+            return False
+
+    def package_folder_settings(self, apply=False):
+        """JD2 keys (General/Linkgrabber/Packagizer settings) that create package
+        subfolders, with the value they should have. With apply=True each one that is
+        not compliant is written and read back. Keys that do not exist are not invented."""
+        report = []
+        for entry in self._config_entries():
+            found = classify_folder_key(entry)
+            if found is None or len(report) >= 20:
+                continue
+            interface, storage, key, value, target = found
+            item = {"interface": interface.rsplit(".", 1)[-1][:80], "key": key[:100],
+                    "current": value, "target": target, "compliant": value == target}
+            if apply and not item["compliant"]:
+                try:
+                    done = self._call("config", "set", interface, storage, key, target) is True
+                    item["current"] = self._call("config", "get", interface, storage, key)
+                    item["compliant"] = done and item["current"] == target
+                except LocalUnavailable:
+                    item["compliant"] = False
+            report.append(item)
+        return report
 
     def add_link(self, url, destination, autostart=False):
         # `autostart` is the per-call flag of addLinks (Hub setting send_autostart);

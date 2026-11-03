@@ -38,7 +38,7 @@ class StorageTests(unittest.TestCase):
 
     def test_defaults_are_safe_and_preserved_on_reopen(self):
         setting = self.s.settings()
-        for field in ("auto_start", "auto_extract", "create_package_folders", "auto_delete"):
+        for field in ("auto_start", "auto_extract", "auto_delete"):
             self.assertIs(setting[field], False)
         target = self.root / "mydownloads"
         target.mkdir()

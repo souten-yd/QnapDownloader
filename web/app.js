@@ -5281,6 +5281,13 @@ function fileRow(item) {
 
 function packageKey(item) { return item.id ? "id:" + item.id : "n:" + item.name; }
 
+// Where a package that is still in a subfolder saves (name relative to the download folder only).
+function folderNote(pkg) {
+  const folder = pkg && pkg.folder;
+  if (!folder || folder.flat !== false || typeof folder.name !== "string") return null;
+  return element("p", "フォルダ: " + folder.name, "download-detail folder-note");
+}
+
 function singleRow(pkg, file) {
   const card = element("article", undefined, "download-card pkg single " + itemState(file));
   const top = element("div", undefined, "pkg-top");
@@ -5295,6 +5302,8 @@ function singleRow(pkg, file) {
   if (bar) top.appendChild(bar);
   const meta = metaText(file, file.host);
   if (meta) top.appendChild(element("p", meta, "download-detail"));
+  const note = folderNote(pkg);
+  if (note) top.appendChild(note);
   card.appendChild(itemSwipe("package", pkg, top));
   return card;
 }
@@ -5324,6 +5333,8 @@ function packageRow(pkg, files) {
   const count = typeof pkg.child_count === "number" ? "ファイル " + pkg.child_count + "件" : "";
   const meta = metaText(pkg, count);
   if (meta) top.appendChild(element("p", meta, "download-detail"));
+  const note = folderNote(pkg);
+  if (note) top.appendChild(note);
   card.appendChild(itemSwipe("package", pkg, top));
   if (open) {
     const box = element("div", undefined, "pkg-files");
@@ -6464,9 +6475,11 @@ async function applyPreset() {
     return;
   }
   const changed = preview.entries.filter(x => x.change);
-  if (!changed.length) { flash("推奨設定からの変更はありません"); return; }
+  const folderKeys = (preview.package_folders || []).filter(x => !x.compliant);
+  if (!changed.length && !folderKeys.length) { flash("推奨設定からの変更はありません"); return; }
   if (!confirm("次のJD2設定をOFFに変更します（既存キューは変更しません）。\n" +
-      changed.map(x => "・" + x.label).join("\n") + "\n適用しますか？")) return;
+      changed.map(x => "・" + x.label).join("\n") +
+      folderKeys.map(x => "\n・パッケージ別フォルダ: " + x.key).join("") + "\n適用しますか？")) return;
   await api("/api/jd2/preset/apply", {confirmed: true});
   swrDrop("engine", "status");
   await Promise.all([loadJd2Status(true), loadEngine(true)]);
@@ -8676,6 +8689,13 @@ function wireSettings() {
     await loadJd2Status(true);
   }));
   $("jd2Preset").addEventListener("click", () => perform(applyPreset));
+  $("flattenNow").addEventListener("click", () => perform(async () => {
+    const out = await api("/api/jd2/flatten", {});
+    const text = out.moved > 0 ? out.moved + "件のパッケージを保存先の直下へ移しました" : "移すパッケージはありません";
+    $("flattenResult").textContent = text;
+    flash(text);
+    state.downloadsSig = "";
+  }));
   $("updateApply").addEventListener("click", () => perform(async () => {
     if (!state.selectedVersion || !confirm(state.selectedVersion + " にQPKGを更新します。サービスが再起動されます。続けますか？")) return;
     const before = await serverVersion();

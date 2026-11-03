@@ -344,7 +344,13 @@
         <div class="set-main"><span class="set-label">現在の保存先</span><span id="selectedFolder" class="set-text path-big">未選択</span></div>
         <button type="button" id="folderChange" class="btn">変更</button>
        </div>
-       <p class="set-text muted">フォルダ作成・自動解凍・自動削除はOFF</p>
+       <p class="set-text muted">パッケージごとのフォルダは作りません（保存先の直下に保存）</p>
+       <p class="set-text muted">自動解凍・自動削除はOFF</p>
+       <div class="set-row">
+        <div class="set-main"><span class="set-label">既存の待機中パッケージをまとめる</span>
+         <span class="set-desc"><span id="flattenResult" class="set-text muted" role="status" aria-live="polite">まだ開始していないパッケージだけを保存先の直下へ移します</span></span></div>
+        <button type="button" id="flattenNow" class="btn small">まとめる</button>
+       </div>
       </div>
 
       <div class="sub" data-sub="send">
