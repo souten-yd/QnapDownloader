@@ -81,7 +81,7 @@ class QpkgContractTests(unittest.TestCase):
         script = (ROOT / "scripts/build-qpkg.sh").read_text()
         for name in ("webapp.py", "ttlcache.py", "state_hub.py", "diskio.py", "debuglog.py", "storage.py", "durability.py",
                      "updater.py", "self_update.py", "jd2_policy.py",
-                     "jd2_control.py", "jd2_local.py", "engine_components.py", "engine_supervisor.py", "container_runtime.py", "jd2_transfer.py", "jd2_downloads.py", "jd2_accounts.py", "runtime_diagnostics.py", "rapidgator_extract.py", "browser_safety.py", "rb_blocklist.py", "rb_resident.py", "rb_mirror.py", "remote_browser.py", "downloader_pid.py", "python3-path", "downloader-diagnose"):
+                     "jd2_control.py", "jd2_local.py", "engine_components.py", "engine_supervisor.py", "container_runtime.py", "jd2_transfer.py", "jd2_downloads.py", "jd2_accounts.py", "runtime_diagnostics.py", "rapidgator_extract.py", "browser_safety.py", "rb_blocklist.py", "rb_resident.py", "rb_mirror.py", "remote_browser.py", "selftest.py", "downloader_pid.py", "python3-path", "downloader-diagnose"):
             with self.subTest(name=name):
                 self.assertIn(name, script)
         self.assertIn('cp -R "$ROOT/web"', script)
@@ -102,3 +102,23 @@ class QpkgContractTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PackageImportClosureTest(unittest.TestCase):
+    """v0.1.45: every local module webapp.py imports (transitively) is copied by build-qpkg.sh."""
+
+    def test_build_copies_every_imported_module(self):
+        import re as _re
+        import subprocess as _sp
+        import tempfile as _tf
+        import shutil as _sh
+        root = Path(__file__).resolve().parents[1]
+        build = (root / "scripts" / "build-qpkg.sh").read_text(encoding="utf-8")
+        listed = _re.search(r'cp "\$ROOT"/\{([^}]*)\} "\$WORK/shared/"', build).group(1).split(",")
+        with _tf.TemporaryDirectory() as tmp:
+            for name in listed:
+                if name.endswith(".py"):
+                    _sh.copy(root / name, Path(tmp) / name)
+            result = _sp.run(["python3", "-I", str(root / "scripts" / "check-package-imports.py"), tmp, "webapp.py"],
+                             capture_output=True, text=True, timeout=60)
+        self.assertEqual(result.returncode, 0, result.stderr)
