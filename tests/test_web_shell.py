@@ -713,7 +713,7 @@ if (out !== want) { console.error(JSON.stringify(out)); process.exit(1); }
         self.assertNotIn('id="clearStaged"', self.html)
         self.assertIn("送信済み・要確認の履歴を削除", self.js)
         self.assertIn("未送信のリンクも含めてすべて削除", self.js)
-        self.assertIn("完了したものを一覧から消す", self.html)
+        self.assertIn("完了・スキップを一覧から消す", self.html)
         self.assertIn("/api/links/clear", self.js)
         self.assertIn("/api/jd2/downloads/cleanup", self.js)
         self.assertIn("保存されたファイルは削除されません", self.js)

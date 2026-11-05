@@ -125,8 +125,15 @@ class DownloadControlTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             ctrl.clear_finished()
         self.assertEqual(adapter.calls, [])
-        self.assertEqual(ctrl.clear_finished(confirmed=True), {"cleared": True})
+        self.assertEqual(ctrl.clear_finished(confirmed=True), {"cleared": True, "skipped_removed": 0})
         self.assertEqual(adapter.calls, ["cleanup"])
+
+    def test_clear_finished_also_removes_existing_skips(self):
+        adapter = LinkGrabberAdapter()
+        adapter.remove_skipped_existing = lambda: adapter.calls.append("skipped") or 3
+        ctrl = jd2_control.JD2Controller(adapter)
+        self.assertEqual(ctrl.clear_finished(confirmed=True), {"cleared": True, "skipped_removed": 3})
+        self.assertEqual(adapter.calls, ["cleanup", "skipped"])
 
     def setUp(self):
         self.adapter = LinkGrabberAdapter()

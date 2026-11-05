@@ -5971,9 +5971,10 @@ async function startWaiting() {
 }
 
 async function clearFinished() {
-  if (!confirm("完了したダウンロードを一覧から削除します。保存されたファイルは削除されません。")) return;
-  await api("/api/jd2/downloads/cleanup", {confirmed: true});
-  flash("完了したものを一覧から消しました");
+  if (!confirm("完了したダウンロードと、ファイルが既にあるためスキップされたものを一覧から削除します。保存されたファイルは削除されません。")) return;
+  const r = await api("/api/jd2/downloads/cleanup", {confirmed: true});
+  const skipped = r && Number.isInteger(r.skipped_removed) ? r.skipped_removed : 0;
+  flash(skipped ? "完了したものと既存スキップ " + skipped + " 件を一覧から消しました" : "完了したものを一覧から消しました");
   state.downloadsFails = 0;
   await loadDownloads(state.downloadsPage);
 }
