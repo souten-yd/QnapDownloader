@@ -490,7 +490,7 @@ class HttpTests(unittest.TestCase):
                                          headers={"Host": "192.168.68.57:17864"})
         with self.client.open(request, timeout=4) as response:
             self.assertEqual(response.status, 200)
-            self.assertEqual(json.load(response)["version"], "0.1.50")
+            self.assertEqual(json.load(response)["version"], "0.1.51")
         with self.client.open(self.url + "/icon.svg", timeout=4) as response:
             self.assertEqual(response.status, 200)
             self.assertEqual(response.headers.get_content_type(), "image/svg+xml")
@@ -1400,7 +1400,7 @@ class HttpTests(unittest.TestCase):
         self.assertFalse(info["supported"])
         code, _ = self.req("/api/update/apply", {"version": "v0.1.8"})
         self.assertEqual(code, 400)
-        self.assertEqual(self.req("/api/health")[1]["version"], "0.1.50")
+        self.assertEqual(self.req("/api/health")[1]["version"], "0.1.51")
         self.assertFalse(self.req("/api/jd2/status")[1]["connected"])
         self.assertEqual(self.req("/api/jd2/update/apply", {"confirmed": True})[0], 400)
         self.assertEqual(self.req("/api/jd2/preset/apply", {"confirmed": True})[0], 400)
@@ -1741,9 +1741,11 @@ class HttpTests(unittest.TestCase):
         with patch.object(self.server.jd2, "_require", return_value=adapter):
             self.assertEqual(self.req("/api/jd2/downloads/cleanup", {})[0], 400)
             adapter.cleanup_finished.assert_not_called()
+            adapter.remove_skipped_existing.return_value = 2
             self.assertEqual(self.req("/api/jd2/downloads/cleanup", {"confirmed": True}),
-                             (200, {"cleared": True}))
+                             (200, {"cleared": True, "skipped_removed": 2}))
             adapter.cleanup_finished.assert_called_once_with()
+            adapter.remove_skipped_existing.assert_called_once_with()
 
     ITEM_POST = (("/api/jd2/items/start", {"kind": "package", "id": "1"}),
                  ("/api/jd2/items/stop", {"kind": "package", "id": "1"}),

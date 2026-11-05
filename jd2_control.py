@@ -208,8 +208,11 @@ class JD2Controller:
         if confirmed is not True:
             raise ValueError("一覧から消すには確認が必要です")
         with self.lock:
-            self._require().cleanup_finished()
-            return {"cleared": True}
+            adapter = self._require()
+            adapter.cleanup_finished()
+            # v0.1.51: also the ones skipped because the file already exists (list only)
+            skipped = adapter.remove_skipped_existing() if hasattr(adapter, "remove_skipped_existing") else 0
+            return {"cleared": True, "skipped_removed": skipped if type(skipped) is int and skipped >= 0 else 0}
 
     def connection_test(self):
         """Explicit read-only probe; never starts an update/download."""

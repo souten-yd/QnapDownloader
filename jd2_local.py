@@ -777,6 +777,35 @@ class LocalAdapter:
         assert CLEANUP_MODE == "REMOVE_LINKS_ONLY"
         self._call("downloadsV2", "cleanup", [], [], CLEANUP_ACTION, CLEANUP_MODE, CLEANUP_SELECTION)
 
+    # v0.1.51: links JD2 skipped because the file already exists ("File already exists",
+    # finalLinkState FAILED_EXISTS). The cleanup actions do not cover them; they are removed from
+    # the list only (removeLinks never touches files).
+    EXISTS_STATE = "FAILED_EXISTS"
+    EXISTS_TEXT = re.compile(r"exist|既に|すでに|存在", re.I)
+
+    def remove_skipped_existing(self):
+        from jd2_downloads import PAGE_SIZE, MAX_PAGE
+        fields = {"uuid": True, "status": True, "skipped": True, "finalLinkState": True, "finished": True}
+        found = []
+        for page in range(MAX_PAGE + 1):
+            batch = self._call("downloadsV2", "queryLinks",
+                               dict(fields, maxResults=PAGE_SIZE, startAt=page * PAGE_SIZE))
+            if not isinstance(batch, list) or not batch:
+                break
+            for link in batch:
+                if not isinstance(link, dict) or type(link.get("uuid")) is not int:
+                    continue
+                state = link.get("finalLinkState")
+                status = link.get("status") if isinstance(link.get("status"), str) else ""
+                if state == self.EXISTS_STATE or (link.get("skipped") is True and self.EXISTS_TEXT.search(status)):
+                    if 0 <= link["uuid"] < ID_LIMIT:
+                        found.append(link["uuid"])
+            if len(batch) < PAGE_SIZE:
+                break
+        for i in range(0, len(found), ITEM_IDS_MAX):
+            self._call("downloadsV2", "removeLinks", found[i:i + ITEM_IDS_MAX], [])
+        return len(found)
+
     @staticmethod
     def _id_list(values):
         if (not isinstance(values, list) or len(values) > ITEM_IDS_MAX or
