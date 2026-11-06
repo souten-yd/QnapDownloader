@@ -520,7 +520,8 @@ class Phone:
     def shot(self, name):
         path = Path(self.out) / ("%s-%s-%s.png" % (self.engine, self.name, name))
         try:
-            self.page.screenshot(path=str(path))
+            # caret="initial": the default caret hiding injects a <style>, which WebKit reports as a CSP error
+            self.page.screenshot(path=str(path), caret="initial", animations="allow")
         except Exception:
             pass
         return path

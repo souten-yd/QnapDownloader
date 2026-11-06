@@ -793,7 +793,6 @@ def downloads_header_layout(ph):
           return {h:r.height,w:r.width,textW:t.width,lh:lh,vw:innerWidth,
                   clear:btn('downloadsClear'),toggle:btn('downloadsToggle'),refresh:btn('downloadsRefresh'),
                   scrollW:document.documentElement.scrollWidth}}""")
-        ph.shot("header-%d" % width)
         assert m["h"] <= m["lh"] * 1.6, "title wraps: %r" % m
         assert m["w"] >= m["textW"] - 1, "title squeezed: %r" % m
         assert m["scrollW"] <= m["vw"] + 1, "horizontal overflow: %r" % m
