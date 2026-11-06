@@ -29,8 +29,13 @@ DEFAULTS = {
     "rb_link_boxes": False,
     # v0.1.38: keep the NAS browser container running with no tabs (starts with the Hub).
     "rb_resident": False,
+    # v0.1.54: keep one blank tab ready so a page opens faster (closed when memory is short or idle) ...
+    "rb_spare_tab": True,
+    # ... and leave text web fonts out of the mirror copy (system fonts show at once; icon fonts stay).
+    "rb_no_webfonts": True,
 }
-BOOL_OPTIONS = ("send_autostart", "block_ads", "probe_autosend", "rb_link_boxes", "rb_resident")
+BOOL_OPTIONS = ("send_autostart", "block_ads", "probe_autosend", "rb_link_boxes", "rb_resident",
+                "rb_spare_tab", "rb_no_webfonts")
 ENUM_OPTIONS = {"rb_default_mode": ("reader", "mirror", "fast", "live")}
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY,value TEXT NOT NULL);

@@ -36,7 +36,10 @@ mirror-menu-toggle（`href="#"` と自ページ宛の2種類のトグルが再�
 reader-cards（ラベル・サイズあり/なし、ページ送りチップ）/ gesture-flick-mirror・tiles、gesture-close-tab（Chromiumのみ: CDPタッチが必要）/
 reload-reattach / challenge-wait-fast・mirror（確認ページはライブに切り替えず「安全性の確認中」を表示、リダイレクト後 6 秒以内に本来のページを選んだ表示で出す・履歴は増えない）/ history-skip-and-first-page（確認ページ・トークン付き重複の履歴を1回で飛ばして戻る、最初のページでは案内のみでアプリの画面は変わらない）/ swipe-diagnostic・swipe-manual（Chromiumのみ: 設定›診断›自己テストの「スワイプだけ確認」「手動で確認」）/
 live-sse-fallback（MJPEGが1バイトも届かない状態を再現: 2.5秒後にSSEへ切替わりフレームが届く・経路を記憶して再読み込み後はMJPEGを触らない）/ live-polling-fallback（MJPEGもSSEも届かない: ポーリングで表示し理由を出す）/ copy-fallback（`navigator.clipboard` が無くても隠しtextarea＋execCommandでコピー）/
-selftest（設定›診断›自己テストを実行して、全項目が終わり、レポートに NAS・端末・ログが入り、URLがホスト名だけになり、テスト用タブが残らない）。
+selftest（設定›診断›自己テストを実行して、全項目が終わり、レポートに NAS・端末・ログが入り、URLがホスト名だけになり、テスト用タブが残らない） / first-load（v0.1.54: 読み込みが終わらない重いページでも本文がミラーに先に出る・段階別の所要時間（作成/遷移/DOM構築/コピー作成と端末側の作成応答〜全体）が揃う・広告等のブロック数が数えられる・最初のコピーが部分コピーで後から全体に置き換わる）。
+
+### 初回読み込みの計測（v0.1.54）
+`python3 tests/e2e/bench_firstload.py --runs 3 [--display mirror|reader] [--cdp-delay-ms 120] [--stats-delay 1.8] [--setting rb_spare_tab=false]` は、タップから本文・先頭画像・全体が端末に出るまでをページ内の20msポーラーで測り、中央値を出します（最初の1回は捨てます）。`--cdp-delay-ms` はNASのChromiumの応答遅延、`--stats-delay` は `docker stats` の所要時間を模擬します（実機のネットワークは再現しません）。このスクリプトとharness.py・fake_docker.pyを古い版に置けば「変更前」も同じ方法で測れます。
 
 ### 実機の自己テスト（v0.1.44）
 GitHubのE2Eでは実機のNAS・iPhone・実サイトを測れないため、アプリ自身に「設定›診断›自己テスト」を持たせている。

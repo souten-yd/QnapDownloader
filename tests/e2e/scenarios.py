@@ -643,3 +643,30 @@ def passkey_login(ph):
     res = ph.post("/api/passkeys/delete", {"id": item["id"]})
     assert res["status"] == 200, res
     cdp.send("WebAuthn.disable")
+
+
+@scenario("first-load", engines=("chromium",))
+def first_load(ph):
+    """v0.1.54: a heavy page whose load event is held back shows its text in the mirror long before it is fully
+    loaded, and every first-load stage is measured (server stages, the phone's marks, blocked ad requests)."""
+    tab = ph.open("/firstload.html?nodes=3000&slowload=6000&ads=6&delay=150")
+    ph.wait(lambda: "E2E" in ph.mirror_text(), 15, "page text in the mirror")
+    rb_tab = ph.env.rb._tabs.get(tab)
+    assert rb_tab is not None and rb_tab.loading, "the page should still be loading when its text is already shown"
+    assert rb_tab.dcl, "the copy was made before DOMContentLoaded was seen"
+    ph.wait(lambda: ph.js("(()=>{const t=activeWebTab();return !!(t&&t.rb&&t.rb.tl&&t.rb.tl.result)})()"), 25,
+            "the first-load result arrived")
+    result = ph.js("activeWebTab().rb.tl.result")
+    stages = {s["id"]: s for s in result["stages"]}
+    for sid in ("create", "navigate", "parse", "capture"):
+        assert stages[sid]["ms"] is not None, "stage %s was not measured: %s" % (sid, result["stages"])
+    client = result["client"]
+    for key in ("created", "choose", "doc", "paint", "full"):
+        assert key in client, "phone mark %s missing: %s" % (key, client)
+    assert client["created"] <= client["choose"] <= client["doc"] <= client["paint"] <= client["full"], client
+    assert result["blocked"] >= 1, "no ad/tracker request was blocked: %s" % result
+    assert result["load_ms"] is None or result["load_ms"] >= stages["parse"]["ms"], result
+    assert result["line"] and "接続・遷移" in result["line"], result.get("line")
+    assert ph.env.rb._tabs[tab].mirror_partials >= 1, "the first copy was not a partial (above the fold) copy"
+    ph.wait(lambda: not (ph.env.rb._tabs[tab].mirror_cache or {}).get("partial", True), 15,
+            "the full copy replaced the partial one")
