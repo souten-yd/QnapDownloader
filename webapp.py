@@ -36,7 +36,7 @@ import ttlcache
 import updater
 import webauthn
 
-VERSION = "0.1.54"
+VERSION = "0.1.55"
 PORT = 17864
 ROOT = Path(__file__).resolve().parent
 FILES = {"/": ("web/index.html", "text/html; charset=utf-8"),

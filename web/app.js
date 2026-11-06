@@ -517,7 +517,14 @@ function settingsRoute(first, second) {
 
 function settingsHash() { return "#/settings/" + (state.lastSection || defaultSection()); }
 
+// v0.1.55: when the app itself changes the location (navigate, a #-link click, the nav buttons) a popstate that
+// lands on another route is a real route change; without a recent app navigation it is a page back (onPopState).
+let appNavAt = -1e9;
+function noteAppNav() { appNavAt = performance.now(); }
+const APP_NAV_MS = 700;
+
 function navigate(hash) {
+  noteAppNav();
   if (location.hash === hash) applyRoute();
   else location.hash = hash;
 }
@@ -3966,6 +3973,13 @@ async function runReader(tab, opts = {}) {
     const data = cleanReaderData(raw);
     if (tab.rb !== rb || tabDisplay(tab) !== "reader") return;
     if (!data) throw new Error("本文を取り出せませんでした");
+    if (data.blocks.length === 0 && rb.loading === true) {
+      // v0.1.55: since v0.1.54 the extraction starts at DOMContentLoaded, when a page may not have its text yet.
+      // Not a failure while it is still loading: the metadata poll runs the reader again when the load ends.
+      dlog("render", "debug", "reader empty while loading", {url: data.url});
+      updateRemoteView(tab);
+      return;
+    }
     if (data.blocks.length === 0) {
       console.error("reader: 0 blocks", data.url);
       readerFailed(rb, rb.url, true);
@@ -4923,6 +4937,22 @@ function claimStep(kind) {
 const flickHandlers = new WeakMap();
 const pullHandlers = {};
 
+// v0.1.55: the nearest ancestor (inside the touched element's own document) that scrolls sideways, or null.
+// A swipe that starts on such an element (a wide table) scrolls it; it is never a back / forward flick.
+function hScroller(target) {
+  try {
+    for (let el = target; el && el.nodeType === 1; el = el.parentElement) {
+      const doc = el.ownerDocument;
+      if (el === doc.body || el === doc.documentElement) break;
+      if (el.scrollWidth > el.clientWidth + 2) {
+        const ox = doc.defaultView.getComputedStyle(el).overflowX;
+        if (ox === "auto" || ox === "scroll" || ox === "overlay") return el;
+      }
+    }
+  } catch (e) { /* no layout: not a scroller */ }
+  return null;
+}
+
 // The flick listener is attached to the remote view and, for the mirror display, inside its iframe
 // (touches in a frame do not bubble to the parent).
 function attachFlick(view) {
@@ -4935,6 +4965,7 @@ function attachFlick(view) {
       gestureTrace("flick.reject", {why: "edge", x: Math.round(t.clientX)});
       return;
     }
+    if (hScroller(event.target)) { gestureTrace("flick.reject", {why: "hscroll", x: Math.round(t.clientX)}); return; }
     flick = {x: t.clientX, y: t.clientY, at: performance.now()};
   };
   const onMove = event => { if (event.touches.length !== 1) flick = null; };
@@ -4974,7 +5005,11 @@ function wireGestures() {
   const onStart = event => {
     pull = null;
     const tab = activeWebTab();
-    if (!tab || event.touches.length !== 1 || event.target.closest("input,textarea,.menu")) return;
+    if (!tab || event.touches.length !== 1 || !event.target.closest) return;
+    // v0.1.55: on a phone the toolbar is mostly the address bar: a pull may start on it while it is not focused
+    // (a tap still focuses it to type; a field that has the keyboard keeps its own touches).
+    const field = event.target.closest("input,textarea");
+    if (event.target.closest(".menu") || (field && (field.id !== "omnibox" || document.activeElement === field))) return;
     pull = {x: event.touches[0].clientX, y: event.touches[0].clientY, armed: false, id: tab.id};
     gestureTrace("pull.start", {});
   };
@@ -4982,7 +5017,10 @@ function wireGestures() {
     if (!pull || event.touches.length !== 1) return;
     const t = event.touches[0];
     const armed = t.clientY - pull.y > GESTURE_CLOSE_PX && Math.abs(t.clientX - pull.x) < 80;
-    if (armed !== pull.armed) { pull.armed = armed; gestureTrace("pull.arm", {armed}); gestureHint(armed ? "離すとタブを閉じます" : ""); }
+    if (armed !== pull.armed) {
+      pull.armed = armed; gestureTrace("pull.arm", {armed}); gestureHint(armed ? "離すとタブを閉じます" : "");
+      if (armed && document.activeElement === $("omnibox")) $("omnibox").blur();     // v0.1.55: no keyboard under a pull
+    }
   };
   const end = () => {
     const p = pull;
@@ -4995,10 +5033,13 @@ function wireGestures() {
   };
   const cancel = () => { pull = null; gestureHint(""); };
   Object.assign(pullHandlers, {start: onStart, move: onMove, end, cancel});
-  bar.addEventListener("touchstart", onStart, {passive: true});
-  bar.addEventListener("touchmove", onMove, {passive: true});
-  bar.addEventListener("touchend", end, {passive: true});
-  bar.addEventListener("touchcancel", cancel, {passive: true});
+  // v0.1.55: the status line right under the toolbar is a pull area too.
+  for (const el of [bar, $("webStatus")]) {
+    el.addEventListener("touchstart", onStart, {passive: true});
+    el.addEventListener("touchmove", onMove, {passive: true});
+    el.addEventListener("touchend", end, {passive: true});
+    el.addEventListener("touchcancel", cancel, {passive: true});
+  }
 }
 
 function wireRemote() {
@@ -5227,6 +5268,19 @@ function keepMirrorFrame() {
   }
 }
 
+// v0.1.55: a page back that landed on an OLDER APP ENTRY (WebKit skips history entries that were pushed without a
+// user gesture, e.g. the guard put again after an async step) must still stay on the web tab: the tab is put back
+// on top of the stack and the NAS page steps back. The hashchange that follows is dropped (nothing changed).
+let skipHashChangeAt = -1e9;
+function onHashChange() {
+  if (performance.now() - skipHashChangeAt < 800 && state.route.view === "tab" && location.hash === "#/tab/" + state.route.tabId) {
+    skipHashChangeAt = -1e9;
+    gestureTrace("hashchange.skip", {});
+    return;
+  }
+  applyRoute();
+}
+
 function onPopState() {
   // The traversal restores the frame's older document a little after popstate: look again a few times.
   for (const ms of [0, 120, 400, 1000]) setTimeout(keepMirrorFrame, ms);
@@ -5236,7 +5290,22 @@ function onPopState() {
   if (!state.authed || r.view !== "tab") { gestureTrace("pop.ignore", {why: "route"}); return; }
   if (history.state && history.state.qdGuard === r.tabId) { gestureTrace("pop.ignore", {why: "guard"}); return; }   // forward onto the guard
   const m = /^#\/tab\/(t\d+)/.exec(location.hash);
-  if (!m || m[1] !== r.tabId) { gestureTrace("pop.ignore", {why: "other-route"}); return; }   // a real route change: hashchange
+  if (!m || m[1] !== r.tabId) {
+    const tab = findTab(r.tabId);
+    if (tab && tab.rb && performance.now() - appNavAt > APP_NAV_MS) {
+      // Not the app's own navigation: the person swiped back. Stay on the tab, step the NAS page back.
+      gestureTrace("pop.stay", {from: location.hash});
+      skipHashChangeAt = performance.now();
+      try { history.pushState({qdGuard: r.tabId}, "", "#/tab/" + r.tabId); gestureTrace("guard.push", {len: history.length}); } catch (e) { /* ignore */ }
+      if (!claimStep("pop")) { gestureTrace("pop.ignore", {why: "dup-flick"}); return; }
+      perform(async () => {
+        try { await stepHistory(tab, -1); } finally { armBackGuard(); }
+      });
+      return;
+    }
+    gestureTrace("pop.ignore", {why: "other-route"});   // a real route change: hashchange
+    return;
+  }
   const tab = findTab(r.tabId);
   if (!tab || !tab.rb) { armBackGuard(); return; }
   if (!claimStep("pop")) { gestureTrace("pop.ignore", {why: "dup-flick"}); armBackGuard(); return; }
@@ -7169,8 +7238,13 @@ function onTabstripKeydown(event) {
 }
 
 function wireShell() {
-  window.addEventListener("hashchange", applyRoute);
+  window.addEventListener("hashchange", onHashChange);
   window.addEventListener("popstate", onPopState);
+  // v0.1.55: a click on an in-app #-link is the app's own navigation (not a page back).
+  document.addEventListener("click", event => {
+    const a = event.target && event.target.closest ? event.target.closest("a[href^='#']") : null;
+    if (a) noteAppNav();
+  }, true);
   // One visibility gate for everything periodic: the state long-poll and the scheduler.
   document.addEventListener("visibilitychange", () => {
     syncStateLoop();
@@ -7186,12 +7260,12 @@ function wireShell() {
   $("navBack").addEventListener("click", () => {
     const tab = activeWebTab();
     if (tab) perform(() => stepHistory(tab, -1));
-    else history.back();
+    else { noteAppNav(); history.back(); }
   });
   $("navForward").addEventListener("click", () => {
     const tab = activeWebTab();
     if (tab) perform(() => stepHistory(tab, 1));
-    else history.forward();
+    else { noteAppNav(); history.forward(); }
   });
   $("navReload").addEventListener("click", () => {
     const tab = activeWebTab();
@@ -8218,7 +8292,7 @@ function swipeCompact(events, cap) {
 function makeSwipeRecorder() {
   const t0 = performance.now();
   const rec = {events: [], counts: {}, routeLeft: false, hintShown: false, flickWhy: "", pending: null, lastMove: -1000,
-    off: [], docs: new WeakSet(), tabHash: swipeDiag ? "#/tab/" + swipeDiag.tab.id : ""};
+    gestures: [], off: [], docs: new WeakSet(), tabHash: swipeDiag ? "#/tab/" + swipeDiag.tab.id : ""};
   const fmt = data => !data ? "" : Object.keys(data).map(k => k + "=" + String(data[k]).replace(/\s+/g, " ")).join(" ").slice(0, 110);
   const push = (e, d) => { if (rec.events.length < 700) rec.events.push({t: Math.round(performance.now() - t0), e, d: fmt(d)}); };
   rec.note = (event, data) => {
@@ -8227,6 +8301,20 @@ function makeSwipeRecorder() {
     if (key === "gesture.hint" && data && data.text) rec.hintShown = true;
     if (key === "flick.reject" && data && data.why) rec.flickWhy = String(data.why);
     if (key === "route" && rec.tabHash && String((data && data.hash) || "") !== rec.tabHash) rec.routeLeft = true;
+    // v0.1.55: a real touch outside the banner starts a gesture; what the app did until the next one belongs to it.
+    const slot = {"step.call": "c", "step.moved": "m", popstate: "p", "flick.accepted": "f", "pop.stay": "s"}[key];
+    if (key === "touch.start" && !(data && data.banner)) {
+      if (rec.gestures.length < 40) rec.gestures.push({c: 0, m: 0, p: 0, f: 0, s: 0, nas: ""});
+    } else if (slot) {
+      // an action with no touch before it (history.back() from code) is its own gesture
+      if (!rec.gestures.length) rec.gestures.push({c: 0, m: 0, p: 0, f: 0, s: 0, nas: ""});
+      rec.gestures[rec.gestures.length - 1][slot]++;
+    } else if (key === "nas" && data && data.page) {
+      for (let i = rec.gestures.length - 1; i >= 0; i--) {         // the page a step led to
+        const a = rec.gestures[i];
+        if (a.c || a.p || a.f) { if (!a.nas) a.nas = String(data.page); break; }
+      }
+    }
     push(key, data);
   };
   const touch = kind => event => {
@@ -8239,8 +8327,10 @@ function makeSwipeRecorder() {
       const p = rec.pending; rec.pending = null;
       rec.note("touch.move", {x: p[0], y: p[1], last: 1});
     }
-    rec.note("touch." + kind, {x, y, tgt: swipeTarget(event.target), edge: x < GESTURE_EDGE_PX || x > window.innerWidth - GESTURE_EDGE_PX ? 1 : 0,
-      trusted: event.isTrusted ? 1 : 0});
+    const info = {x, y, tgt: swipeTarget(event.target), edge: x < GESTURE_EDGE_PX || x > window.innerWidth - GESTURE_EDGE_PX ? 1 : 0,
+      trusted: event.isTrusted ? 1 : 0};
+    if (kind === "start" && event.target && event.target.closest && event.target.closest("#swipeBanner")) info.banner = 1;   // the self-test's own buttons
+    rec.note("touch." + kind, info);
   };
   const pointer = kind => event => {
     if (kind === "move") { const now = performance.now(); if (now - rec.lastMove < 50) return; rec.lastMove = now; }
@@ -8409,7 +8499,24 @@ const SWIPE_AUTO_STEPS = [
   {id: "forward", start: "B", run: async () => { history.forward(); return "history"; }},
   {id: "pull_cancel", start: "B", run: ctx => swipePull(ctx, true)},
   {id: "pull_close", start: "B", run: ctx => swipePull(ctx, false)},
+  // v0.1.55: a pull from the (unfocused) address bar, a sideways flick on a scrolling table, and a page back that
+  // lands on an older app entry (the stack WebKit leaves after skipping entries made without a user gesture).
+  {id: "pull_omnibox", start: "B", run: ctx => swipePull(ctx, true, "omnibox")},
+  {id: "hscroll", start: "B", run: ctx => swipeFlick(ctx, {dx: -150, ms: 150, sel: "#wide"})},
+  {id: "pop_stay", start: "B", run: swipePopStayRun},
 ];
+
+// v0.1.55: the landing on an older app route (WebKit skipped our guard AND the tab's entry): the current entry is turned
+// into another app route and the very popstate the browser would send is dispatched. (A real traversal is not used here:
+// the joint session history also holds the mirror frame's entries, so entry counts are not reliable.) The app then
+// pushes the tab back (history grows by one entry: d.histAdj) and steps the NAS page back.
+async function swipePopStayRun(ctx) {
+  const d = ctx.d, hash = "#/tab/" + d.tab.id;
+  history.replaceState(null, "", d.prevHash === hash ? "#/home" : d.prevHash);
+  d.histAdj = (d.histAdj || 0) + 1;
+  window.dispatchEvent(new PopStateEvent("popstate", {state: null}));
+  return "history";
+}
 
 async function swipeFlick(ctx, o) {
   let env = null;
@@ -8421,14 +8528,37 @@ async function swipeFlick(ctx, o) {
       wired: Boolean(doc && flickHandlers.get(doc)), wrap: !$("mirrorWrap").hidden, owner: mirrorHost.owner === ctx.d.tab.rb});
   }
   if (!env) return "none";
-  const x0 = o.x0 !== undefined ? o.x0 : env.cx - o.dx / 2, y = env.cy;
+  let cx = env.cx;
+  if (o.sel) {                      // start on this element (v0.1.55: a scrolling table); not there in this display: nothing to test
+    // the page's copy may still be arriving: wait for the element (and the document holding it) a moment
+    let el = null;
+    await swipeWaitFor(() => {
+      const e2 = swipeEnv(ctx.d, "view");
+      if (e2 && e2.handlers) env = e2;
+      el = env.target.querySelector ? env.target.querySelector(o.sel) : null;
+      return Boolean(el);
+    }, 4000);
+    if (!el) return "none";
+    const r = el.getBoundingClientRect();
+    env.target = el;
+    cx = r.left + r.width / 2;
+    env.cy = r.top + r.height / 2;
+  }
+  const x0 = o.x0 !== undefined ? o.x0 : cx - o.dx / 2, y = env.cy;
   await swipeDrag(env, x0, y, x0 + o.dx, y, o.ms, o.steps || 6);
   swipeSend(env, "touchend", x0 + o.dx, y);
   return env.how;
 }
 
-async function swipePull(ctx, back) {
+async function swipePull(ctx, back, from) {
   const env = swipeEnv(ctx.d, "toolbar");
+  if (from === "omnibox") {          // v0.1.55: the pull starts on the address bar (not focused)
+    const box = $("omnibox");
+    if (document.activeElement === box) box.blur();
+    const r = box.getBoundingClientRect();
+    env.target = box;
+    env.cx = r.left + r.width / 2; env.cy = r.top + r.height / 2;
+  }
   const x = env.cx, y = env.cy;
   await swipeDrag(env, x, y, x, y + 140, 150, 5);
   await delay(80);
@@ -8472,7 +8602,11 @@ async function swipeRunStep(d, def, answerFn) {
     hint_shown: rec.hintShown, hint_hidden: $("gestureHint").hidden, close_calls: Math.min(100, tab.diag.closeCalls),
     synthetic: synthetic === "touch" || synthetic === "direct" || synthetic === "history" || synthetic === "none" ? synthetic : "",
     flick_why: rec.flickWhy, ms: Math.round(performance.now() - t0)}, ctx.facts);
-  if (answer) facts.answer = answer;
+  if (answer) {
+    facts.answer = answer;
+    facts.gestures = rec.gestures.slice(0, 12);      // v0.1.55: per-gesture results (manual judge)
+    facts.gesture_n = rec.gestures.length;
+  }
   return {id: def.id, facts, counts: rec.counts, raw: rec.events.slice(), display: tabDisplay(tab), synthetic: facts.synthetic};
 }
 
@@ -8563,12 +8697,14 @@ async function swipeAuto(snap) {
       swipeBanner("スワイプの自動確認 " + (i + 1) + "/" + SWIPE_MODES.length, SWIPE_MODE_NAME[name] + "表示で確認しています。画面を触らないでください。");
       await swipeSetMode(d, name);
       const growth0 = history.length;
+      d.histAdj = 0;
       const steps = [];
       for (const def of SWIPE_AUTO_STEPS) {
         if (!swipeAlive(d)) break;
+        if (def.id === "pop_stay" && i !== SWIPE_MODES.length - 1) continue;   // v0.1.55: once, in the last display (it leaves one more history entry)
         steps.push(await swipeRunStep(d, def, null));
       }
-      await swipePost(d, Object.assign(swipeBody(d, name, steps, history.length - growth0, SWIPE_EVENT_CAP), {device: i === 0 ? device : undefined}));
+      await swipePost(d, Object.assign(swipeBody(d, name, steps, history.length - growth0 - d.histAdj, SWIPE_EVENT_CAP), {device: i === 0 ? device : undefined}));
     }
     await api("/api/selftest/swipe", {run_id: d.runId, last: true});
   } catch (e) {
@@ -8584,7 +8720,7 @@ const SWIPE_MANUAL_STEPS = [
   {id: "m_flick_left", start: "A", text: "ページの中央で左へすばやくフリック", want: "期待: 次のページ（ページB）になる"},
   {id: "m_table", start: "B", text: "表の部分を横にスクロール（ゆっくり）", want: "期待: 表が横に動くだけで、ページは戻らない・進まない"},
   {id: "m_edge_forward", start: "B", text: "画面の右端から左へスワイプ（iPhoneの進む操作、ある場合）", want: "期待: 進めるときだけ進む。何も起きなくても構いません"},
-  {id: "m_pull", start: "B", text: "ツールバーを下へ引く（離さずに元へ戻す）", want: "期待: ヒントが出て、戻すと消える。タブは閉じない"},
+  {id: "m_pull", start: "B", text: "画面上部のアドレスバー（またはその下の細い表示行）に指を置いて、下へ引く（離さずに元へ戻す）", want: "期待: ヒントが出て、戻すと消える。タブは閉じない・キーボードは出ない"},
 ];
 
 // Manual: the person's finger, the person's answer.

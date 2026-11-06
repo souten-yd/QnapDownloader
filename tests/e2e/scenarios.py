@@ -482,18 +482,27 @@ def swipe_diagnostic(ph):
     ph.wait(lambda: ph.js("selftestUi.snap&&selftestUi.snap.state") == "done", 200, "swipe diagnostic finished")
     snap = ph.js("selftestUi.snap")
     rows = {c["id"]: c for c in snap["checks"] if c["section"] == "swipe"}
-    steps = ("edge_back", "flick_right", "back_first", "flick_left", "slow_move", "edge_start", "forward", "pull_cancel", "pull_close")
+    steps = ("edge_back", "flick_right", "back_first", "flick_left", "slow_move", "edge_start", "forward", "pull_cancel", "pull_close",
+             "pull_omnibox", "hscroll", "pop_stay")
     for mode in ("mirror", "reader", "tiles"):
         assert "swipe.%s.display" % mode in rows, sorted(rows)
         for step in steps:
             row = rows.get("swipe.%s.%s" % (mode, step))
+            if step == "pop_stay" and mode != "tiles":
+                assert not row, "pop_stay runs in the last display only"
+                continue
             assert row, "missing %s.%s" % (mode, step)
-            assert row["status"] in ("pass", "warn"), "%s.%s: %s | %s | %s" % (mode, step, row["status"], row["value"], row["hint"])
+            # v0.1.55: the scrolling table (#wide) exists only in the mirror copy; the other displays skip that step
+            ok = ("pass", "warn", "skip") if (step == "hscroll" and mode != "mirror") else ("pass", "warn")
+            assert row["status"] in ok, "%s.%s: %s | %s | %s" % (mode, step, row["status"], row["value"], row["hint"])
         hist = rows["swipe.%s.history" % mode]
         assert hist["status"] == "pass", hist
     assert rows["swipe.mirror.edge_back"]["status"] == "pass", rows["swipe.mirror.edge_back"]
     assert rows["swipe.mirror.flick_right"]["status"] == "pass", rows["swipe.mirror.flick_right"]
     assert rows["swipe.mirror.pull_close"]["status"] == "pass", rows["swipe.mirror.pull_close"]
+    for step in ("pull_omnibox", "hscroll"):                       # v0.1.55
+        assert rows["swipe.mirror.%s" % step]["status"] == "pass", rows["swipe.mirror.%s" % step]
+    assert rows["swipe.tiles.pop_stay"]["status"] == "pass", rows["swipe.tiles.pop_stay"]
     _after_swipe(ph, before)
     ph.page.click("#selftestCopy")
     ph.wait(lambda: len(ph.js("selftestUi.text")) > 500, 10, "report text")
@@ -567,6 +576,97 @@ def browser_back_is_page_back(ph):
     # v0.1.52: no fallback to history.back(); the app stays on the tab and tells the user
     assert ph.js("location.hash") == hash_before, "the app left the tab on a back with nothing earlier (%s)" % ph.js("location.hash")
     ph.wait(lambda: "これより前のページはありません" in (ph.js("document.body.innerText") or ""), 5, "first-page toast")
+
+
+# ------------------------------------------------------------------ v0.1.55: real-device swipe findings
+
+@scenario("back-lands-on-older-app-entry", engines=("chromium",), display="mirror")
+def back_lands_on_older_app_entry(ph):
+    """v0.1.55: WebKit may skip our guard entry, so a page back can land on an OLDER APP ENTRY (another route). A back that
+    is not the app's own navigation must still stay on the web tab and step the NAS page back once."""
+    tab = ph.open("/article.html")
+    ph.wait(lambda: "E2E テスト記事" in ph.mirror_text(), 15, "mirror content")
+    ph.post("/api/rb/navigate", {"tab": tab, "url": BASE + "/article2.html"})
+    ph.wait(lambda: ph.env.nas_url(tab).endswith("/article2.html"), 10, "navigated to article2")
+    ph.page.wait_for_timeout(900)                          # past the app-navigation window of opening the tab
+    route = ph.js("location.hash")
+    # [.., tab, guard] -> [.., #/home, tab, guard]: one back would now skip over the guard AND the tab entry (go(-2))
+    ph.js("(()=>{const h=location.hash;history.back();return new Promise(r=>setTimeout(()=>{history.replaceState(null,'','#/home');"
+          "history.pushState(null,'',h);history.pushState({qdGuard:state.route.tabId},'',h);r()},400))})()")
+    ph.page.wait_for_timeout(900)
+    assert ph.js("location.hash") == route and ph.js("state.route.view") == "tab", ph.js("location.hash")
+    ph.js("history.go(-2)")
+    ph.wait(lambda: ph.env.nas_url(tab).endswith("/article.html"), 8, "page back (url=%s)" % ph.env.nas_url(tab))
+    ph.page.wait_for_timeout(1200)
+    assert ph.js("location.hash") == route and ph.js("state.route.view") == "tab", "left the tab: %s" % ph.js("location.hash")
+    assert ph.js("history.state && history.state.qdGuard") == ph.js("state.route.tabId"), "the guard must be put again"
+    assert not ph.js("document.getElementById('view-web').hidden"), "the tab screen must stay shown"
+    # the app's own navigation is still a real route change: Settings from the bottom bar / hash, and back to the tab
+    ph.js("navigate('#/settings/diag')")
+    ph.wait(lambda: ph.js("state.route.view") == "settings", 5, "settings route")
+    ph.js("navigate('#/home')")
+    ph.wait(lambda: ph.js("state.route.view") == "home", 5, "home route by the app's own navigation")
+
+
+@scenario("flick-on-scroller", engines=("chromium",), display="mirror")
+def flick_on_scroller(ph):
+    """v0.1.55: a quick sideways swipe that starts on a horizontally scrolling table scrolls it; it is never back / forward."""
+    tab = ph.open("/article.html")
+    ph.wait(lambda: "E2E テスト記事" in ph.mirror_text(), 15, "mirror content")
+    ph.post("/api/rb/navigate", {"tab": tab, "url": BASE + "/scroller.html"})
+    ph.wait(lambda: ph.env.nas_url(tab).endswith("/scroller.html"), 10, "navigated to scroller")
+    ph.wait(lambda: "E2E 横スクロール" in ph.mirror_text(), 10, "scroller in mirror")
+    ph.page.wait_for_timeout(600)
+    pt = ph.mirror_point("doc=>doc.querySelector('#wide td')")
+    assert pt, "no table in the mirror"
+    _flick_at(ph, pt["x"] + 60, pt["y"], -200)             # quick, would be a forward flick anywhere else
+    _flick_at(ph, pt["x"] - 60, pt["y"], 200)              # and a back flick
+    ph.page.wait_for_timeout(1500)
+    assert ph.env.nas_url(tab).endswith("/scroller.html"), "the table swipe moved the NAS page: %s" % ph.env.nas_url(tab)
+    # the same flick on plain text still goes back
+    p = ph.mirror_point("doc=>doc.querySelector('article p')")
+    _flick_at(ph, 120, p["y"], 200)
+    ph.wait(lambda: ph.env.nas_url(tab).endswith("/article.html"), 8, "flick on text still goes back (%s)" % ph.env.nas_url(tab))
+
+
+def _flick_at(ph, x0, y, dx):
+    ph.cdp_touch([(x0, y, 0), (x0 + dx // 2, y, 40), (x0 + dx, y, 40)])
+    ph.page.wait_for_timeout(700)
+
+
+@scenario("pull-from-omnibox", engines=("chromium",), display="mirror")
+def pull_from_omnibox(ph):
+    """v0.1.55: on a phone the toolbar is mostly the address bar: a pull that starts on the (unfocused) address bar shows the
+    hint, going back up cancels it, pulling all the way closes the tab; a plain tap still focuses it."""
+    tab = ph.open("/article.html")
+    ph.wait(lambda: "E2E テスト記事" in ph.mirror_text(), 15, "mirror content")
+    ph.page.wait_for_timeout(600)
+    box = ph.page.locator("#omnibox").first.bounding_box()
+    x, y = box["x"] + box["width"] / 2, box["y"] + box["height"] / 2
+    assert ph.js("document.activeElement && document.activeElement.id") != "omnibox"
+    cdp = ph.context.new_cdp_session(ph.page)
+    try:
+        cdp.send("Input.dispatchTouchEvent", {"type": "touchStart", "touchPoints": [{"x": x, "y": y}]})
+        for k in range(1, 7):
+            ph.page.wait_for_timeout(25)
+            cdp.send("Input.dispatchTouchEvent", {"type": "touchMove", "touchPoints": [{"x": x, "y": y + k * 25}]})
+        ph.wait(lambda: not ph.js("document.getElementById('gestureHint').hidden"), 3, "hint while pulling from the address bar")
+        assert ph.js("document.activeElement && document.activeElement.id") != "omnibox", "the keyboard must not come up"
+        for k in range(5, -1, -1):
+            cdp.send("Input.dispatchTouchEvent", {"type": "touchMove", "touchPoints": [{"x": x, "y": y + k * 25}]})
+        ph.page.wait_for_timeout(100)
+        assert ph.js("document.getElementById('gestureHint').hidden"), "the hint must go away when the finger returns"
+        cdp.send("Input.dispatchTouchEvent", {"type": "touchEnd", "touchPoints": []})
+    finally:
+        cdp.detach()
+    ph.page.wait_for_timeout(400)
+    assert ph.js("state.tabs.length") == 1 and tab in ph.env.tabs(), "a cancelled pull closed the tab"
+    ph.tap(x, y)                                           # a tap still focuses the address bar
+    ph.page.wait_for_timeout(300)
+    assert ph.js("document.activeElement && document.activeElement.id") == "omnibox", "tap no longer focuses the address bar"
+    ph.js("document.getElementById('omnibox').blur()")
+    ph.cdp_touch([(x, y, 0)] + [(x, y + k * 25, 20) for k in range(1, 8)])
+    ph.wait(lambda: ph.js("state.tabs.length") == 0, 8, "pull from the address bar closes the tab")
 
 
 # ------------------------------------------------------------------ passkeys (v0.1.53)
