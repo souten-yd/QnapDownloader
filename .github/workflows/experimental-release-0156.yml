@@ -42,7 +42,7 @@ jobs:
             exit 1
           fi
           gh release create v0.1.56-rc1 dist/QnapDownloader_0.1.56_x86_64.qpkg dist/SHA256SUMS \
-            --repo "${{ github.repository }}" --target "1c4e8f08fe90ef71cdfeb7e9103ea3c8a640423c" \
+            --repo "${{ github.repository }}" --target "1bab187963943fd09c809d7f5b4d6585feb46da9" \
             --title "QnapDownloader v0.1.56-rc1: Auto-clear options, downloads header on phones" \
             --prerelease \
             --notes "Experimental QNAP x86_64 build. The downloads page title no longer squeezes on phones. Settings › JD2 gains two switches, both off by default: forget links handed to JD2, and clear finished and already-exists downloads automatically (list entries only; files stay)."
