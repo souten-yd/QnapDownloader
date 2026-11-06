@@ -42,7 +42,7 @@ jobs:
             exit 1
           fi
           gh release create v0.1.53-rc1 dist/QnapDownloader_0.1.53_x86_64.qpkg dist/SHA256SUMS \
-            --repo "${{ github.repository }}" --target "b6873f2490646d2dbf82bdef4e7bbb1f4019b9c9" \
+            --repo "${{ github.repository }}" --target "763aa51b6f5e05af39c32c5bc6390f3fb1eec34f" \
             --title "QnapDownloader v0.1.53-rc1: Face ID / Touch ID login with passkeys" \
             --prerelease \
             --notes "Experimental QNAP x86_64 build. Log in with a passkey (Face ID or Touch ID) on the https ts.net address; remembered devices and passkey logins stay signed in across Hub restarts (30 days idle, 90 days max); log out of all devices. Passwords still work."
