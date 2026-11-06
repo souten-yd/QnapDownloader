@@ -1,0 +1,9 @@
+<!doctype html>
+<html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>E2E 横スクロール</title><style>body{font:16px/1.7 sans-serif;margin:0;color:#222;background:#fff}main{padding:12px 14px}p{margin:.8em 0}#wide{overflow-x:auto;width:100%;border:1px solid #888}table{width:1400px}</style></head><body>
+<main><article>
+<h1>E2E 横スクロールの表</h1>
+<p>これはテスト用の記事です。横にスクロールできる表の上でなぞっても、ページは戻る・進むになりません。The quick brown fox jumps over the lazy dog.</p>
+<div id="wide"><table><tr><td>セル1</td><td>セル2</td><td>セル3</td><td>セル4</td><td>セル5</td><td>セル6</td><td>セル7</td><td>セル8</td></tr><tr><td>b1</td><td>b2</td><td>b3</td><td>b4</td><td>b5</td><td>b6</td><td>b7</td><td>b8</td></tr></table></div>
+<p>これはテスト用の記事です。本文はミラー表示で確認されます。The quick brown fox jumps over the lazy dog.</p>
+</article></main>
+<script>fetch("/__beacon?e=load&p="+encodeURIComponent(location.pathname),{cache:"no-store"}).catch(function(){});</script></body></html>

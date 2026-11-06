@@ -585,6 +585,130 @@ class SwipeJudgeTests(unittest.TestCase):
         self.assertEqual(self.judge("pull_close", {}, hint_shown=True, close_calls=0, nas_before="B", nas_after="B")[0], FAIL)
 
 
+class ManualSwipeJudgeTests(unittest.TestCase):
+    """v0.1.55: a real-finger step is judged per gesture (repeated swipes are fine), from the v0.1.54 device report."""
+
+    @staticmethod
+    def g(c=0, m=0, p=0, f=0, s=0, nas=""):
+        return {"c": c, "m": m, "p": p, "f": f, "s": s, "nas": nas}
+
+    def judge(self, step_id, counts, gestures, answer="ok", **facts):
+        base = {"nas_before": "B", "nas_after": "B", "nas_seq": "B", "label": "B", "route_left": False,
+                "synthetic": "", "answer": answer, "gestures": gestures, "gesture_n": len(gestures)}
+        base.update(facts)
+        return selftest.judge_swipe_step(step_id, base, counts)
+
+    def test_flick_right_twice_is_not_a_double_execution(self):
+        # the report: B->A, then a second flick on the first page (step.nomove + toast); user answered OK
+        gestures = [self.g(c=1, m=1, f=1, nas="A"), self.g(c=1, f=1)]
+        counts = {"flick.accepted": 2, "step.call": 2, "step.moved": 1, "step.nomove": 1, "toast": 1}
+        status, value, hints = self.judge("m_flick_right", counts, gestures, nas_before="B", nas_after="A",
+                                          nas_seq="BA", label="A")
+        self.assertEqual((status, hints), (PASS, []))
+        self.assertIn("ジェスチャー 2 回", value)
+        # the user's own NG still fails it
+        status, _, hints = self.judge("m_flick_right", counts, gestures, answer="bad", nas_before="B", nas_after="A",
+                                      nas_seq="BA", label="A")
+        self.assertEqual(status, FAIL)
+        self.assertTrue(any("利用者" in h for h in hints))
+
+    def test_one_gesture_acting_twice_fails(self):
+        gestures = [self.g(c=2, m=2, f=2, nas="A")]
+        status, _, hints = self.judge("m_flick_right", {"flick.accepted": 2, "step.call": 2, "step.moved": 2}, gestures,
+                                      nas_before="B", nas_after="A", nas_seq="BA", label="A")
+        self.assertEqual(status, FAIL)
+        self.assertIn("二重実行", " ".join(hints))
+        # a flick AND a popstate in one gesture
+        status, _, hints = self.judge("m_flick_left", {"flick.accepted": 1, "popstate": 1, "step.call": 1, "step.moved": 1},
+                                      [self.g(c=1, m=1, p=1, f=1, nas="B")], nas_before="A", nas_after="B", nas_seq="AB")
+        self.assertEqual(status, FAIL)
+        # two popstates in one gesture
+        status, _, _ = self.judge("m_edge_back", {"popstate": 2, "step.call": 2, "step.moved": 2, "guard.push": 2},
+                                  [self.g(c=2, m=2, p=2, nas="B")], nas_before="C", nas_after="A", nas_seq="CBA", label="A")
+        self.assertEqual(status, FAIL)
+
+    def test_edge_back_three_swipes(self):
+        # the report: swipes 1 and 2 worked; the 3rd left the tab (route_left, user said NG) -> still FAIL
+        left = [self.g(c=1, m=1, p=1, nas="B"), self.g(c=1, m=1, p=1, nas="A"), self.g(p=1)]
+        counts = {"popstate": 3, "step.call": 2, "step.moved": 2, "guard.push": 3, "pop.ignore": 1, "route": 1}
+        status, _, hints = self.judge("m_edge_back", counts, left, answer="bad", nas_before="C", nas_after="A",
+                                      nas_seq="CBA", label="A", route_left=True)
+        self.assertEqual(status, FAIL)
+        text = " ".join(hints)
+        self.assertIn("タブ画面から離れました", text)
+        self.assertIn("利用者", text)
+        self.assertNotIn("二重実行", text)                   # three separate swipes are not a double execution
+        self.assertNotIn("popstate が3回", text)
+        # the fixed app: the 3rd swipe stays on the tab (pop.stay, step.nomove + toast), the user answers OK
+        stay = [self.g(c=1, m=1, p=1, nas="B"), self.g(c=1, m=1, p=1, nas="A"), self.g(c=1, p=1, s=1)]
+        counts = {"popstate": 3, "step.call": 3, "step.moved": 2, "step.nomove": 1, "guard.push": 3, "pop.stay": 1, "toast": 1}
+        status, value, hints = self.judge("m_edge_back", counts, stay, nas_before="C", nas_after="A", nas_seq="CBA", label="A")
+        self.assertEqual((status, hints), (PASS, []))
+        self.assertIn("ジェスチャー 3 回", value)
+        # the first acting gesture decides the expected page
+        wrong = [self.g(c=1, m=1, p=1, nas="A")]
+        self.assertEqual(self.judge("m_edge_back", {"popstate": 1, "step.call": 1, "step.moved": 1, "guard.push": 1}, wrong,
+                                    nas_before="C", nas_after="A", nas_seq="CA", label="A")[0], FAIL)
+        # no popstate at all (iOS did nothing)
+        self.assertEqual(self.judge("m_edge_back", {}, [], nas_before="C", nas_after="C", nas_seq="C", label="C")[0], FAIL)
+
+    def test_table_scroll(self):
+        # accepted flicks while scrolling a table -> FAIL
+        accepted = [self.g(c=1, m=1, f=1, nas="B"), self.g(c=1, m=1, f=1, nas="C")]
+        status, _, hints = self.judge("m_table", {"flick.accepted": 2, "step.call": 2, "step.moved": 2, "flick.reject": 5},
+                                      accepted, nas_before="B", nas_after="C", nas_seq="BCBC", flick_why="slow", label="C")
+        self.assertEqual(status, FAIL)
+        self.assertIn("フリックとして受理", " ".join(hints))
+        # only hscroll rejects -> PASS (even with many touches)
+        rejects = [self.g(), self.g(), self.g()]
+        status, value, hints = self.judge("m_table", {"flick.reject": 3}, rejects, nas_before="B", nas_after="B",
+                                          nas_seq="B", flick_why="hscroll")
+        self.assertEqual((status, hints), (PASS, []))
+        self.assertIn("ジェスチャー 3 回", value)
+
+    def test_pull_and_forward_and_missing_gestures(self):
+        self.assertEqual(self.judge("m_pull", {}, [self.g()], hint_shown=True, hint_hidden=True, close_calls=0)[0], PASS)
+        self.assertEqual(self.judge("m_pull", {}, [self.g()], hint_shown=False, hint_hidden=True, close_calls=0)[0], FAIL)
+        self.assertEqual(self.judge("m_edge_forward", {"flick.accepted": 2, "step.call": 2, "step.moved": 1},
+                                    [self.g(c=1, m=1, f=1, nas="C"), self.g(c=1, f=1)], nas_before="B", nas_after="C",
+                                    nas_seq="BC", label="C")[0], PASS)
+        self.assertEqual(self.judge("m_flick_left", {}, [], answer="skip")[0], SKIP)
+
+    def test_automatic_rules_stay_strict(self):
+        # an automatic step has no gestures: two accepted flicks are still a double execution
+        status, _, hints = selftest.judge_swipe_step(
+            "flick_right", {"nas_before": "B", "nas_after": "A", "nas_seq": "BA", "label": "A", "synthetic": "touch"},
+            {"flick.accepted": 2, "step.call": 2, "step.moved": 1})
+        self.assertEqual(status, FAIL)
+
+    def test_new_automatic_steps(self):
+        base = {"nas_before": "B", "nas_after": "B", "nas_seq": "B", "label": "B", "synthetic": "touch"}
+        j = lambda step, counts, **f: selftest.judge_swipe_step(step, dict(base, **f), counts)
+        self.assertEqual(j("hscroll", {"flick.reject": 1}, flick_why="hscroll")[0], PASS)
+        self.assertEqual(j("hscroll", {"flick.reject": 1}, flick_why="short")[0], WARN)
+        self.assertEqual(j("hscroll", {"flick.accepted": 1, "step.call": 1, "step.moved": 1}, nas_after="A", nas_seq="BA")[0], FAIL)
+        self.assertEqual(j("hscroll", {}, synthetic="none")[0], SKIP)
+        self.assertEqual(j("pull_omnibox", {}, hint_shown=True, hint_hidden=True, close_calls=0)[0], PASS)
+        self.assertEqual(j("pull_omnibox", {}, hint_shown=False, hint_hidden=True, close_calls=0)[0], FAIL)
+        self.assertEqual(j("pull_omnibox", {}, hint_shown=True, hint_hidden=True, close_calls=1)[0], FAIL)
+        ok = {"popstate": 1, "pop.stay": 1, "step.call": 1, "step.moved": 1, "guard.push": 1}
+        self.assertEqual(j("pop_stay", ok, nas_after="A", nas_seq="BA", label="A", synthetic="history")[0], PASS)
+        self.assertEqual(j("pop_stay", dict(ok, route=1), nas_after="A", nas_seq="BA", label="A", route_left=True)[0], FAIL)
+        self.assertEqual(j("pop_stay", {"popstate": 1, "pop.ignore": 1, "route": 1}, route_left=True)[0], FAIL)
+
+    def test_gestures_are_validated(self):
+        step = swipe_step("m_flick_right", {"flick.accepted": 1}, answer="ok",
+                          gestures=[{"c": 1, "m": 1, "p": 0, "f": 1, "s": 0, "nas": "A"}], gesture_n=1)
+        out = selftest.validate_swipe(swipe_payload("abcdefgh1234", [step]))
+        self.assertEqual(out["mode"]["steps"][0]["facts"]["gestures"][0]["nas"], "A")
+        bad = swipe_step("m_flick_right", {}, answer="ok", gestures=[{"c": "x", "nas": "A"}])
+        with self.assertRaises(ValueError):
+            selftest.validate_swipe(swipe_payload("abcdefgh1234", [bad]))
+        bad = swipe_step("m_flick_right", {}, answer="ok", gestures=[{"nas": "Z"}])
+        with self.assertRaises(ValueError):
+            selftest.validate_swipe(swipe_payload("abcdefgh1234", [bad]))
+
+
 class SwipeValidationTests(unittest.TestCase):
     def test_good_payload_is_accepted_and_strings_cleaned(self):
         step = swipe_step("edge_back", {"popstate": 1})

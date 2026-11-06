@@ -578,6 +578,9 @@ SWIPE_STEPS = (                     # (id, title, page the NAS tab must show whe
     ("forward", "ブラウザの進む（history.forward）", "B"),
     ("pull_cancel", "ツールバーを下へ引いて戻す（閉じない）", "B"),
     ("pull_close", "ツールバーを下へ引いて離す（閉じる）", "B"),
+    ("pull_omnibox", "アドレスバー（フォーカスなし）から下へ引いて戻す（ヒントが出る・閉じない）", "B"),
+    ("hscroll", "横スクロールできる表の上で横にフリック（フリックにならない）", "B"),
+    ("pop_stay", "戻る先が別のアプリ画面でもタブに留まる（履歴スキップ相当）", "B"),
 )
 # The manual (real finger) flow: id, title, start page, and the automatic step whose rules judge it.
 MANUAL_STEPS = (
@@ -586,7 +589,7 @@ MANUAL_STEPS = (
     ("m_flick_left", "ページの中央で左へすばやくフリック", "A", "flick_left"),
     ("m_table", "表の部分を横にスクロール（ゆっくり）", "B", "slow_move"),
     ("m_edge_forward", "画面の右端から左へスワイプ（iPhoneの進む操作、ある場合）", "B", "forward"),
-    ("m_pull", "ツールバーを下へ引く（離さずに戻す）", "B", "pull_cancel"),
+    ("m_pull", "ツールバー（アドレスバー）を下へ引く（離さずに戻す）", "B", "pull_cancel"),
 )
 SWIPE_STEP = {i: (t, page) for i, t, page in SWIPE_STEPS}
 SWIPE_STEP.update({i: (t, page) for i, t, page, _ in MANUAL_STEPS})
@@ -631,6 +634,9 @@ def _judge_swipe(step_id, real_id, facts, counts, manual):
     hints, status = [], PASS
     value = "NAS %s→%s / popstate %d / stepHistory %d(移動%d) / フリック受理 %d" % (
         before, after, n("popstate"), n("step.call"), moved_steps, n("flick.accepted"))
+    gestures = facts.get("gestures") if manual else None
+    if gestures is not None:
+        return _judge_manual(step_id, facts, counts, gestures, value)
 
     def worse(new, hint):
         nonlocal status
@@ -640,7 +646,8 @@ def _judge_swipe(step_id, real_id, facts, counts, manual):
             status = new
     if facts.get("route_left"):
         worse(FAIL, "アプリがタブ画面から離れました（戻る処理のフォールバック history.back が働いた可能性）")
-    if step_id in ("flick_right", "flick_left", "slow_move", "edge_start", "pull_cancel", "pull_close") and synthetic == "none":
+    if step_id in ("flick_right", "flick_left", "slow_move", "edge_start", "pull_cancel", "pull_close", "pull_omnibox",
+                   "hscroll") and synthetic == "none":
         return SKIP, value + " / 入力を作れませんでした", ["この端末では合成タッチ入力を作れず、内部ハンドラの直接呼び出しもできませんでした"]
     expect = {"edge_back": "B", "flick_right": "A", "flick_left": "B"}.get(step_id)
     if step_id == "edge_back":
@@ -678,6 +685,22 @@ def _judge_swipe(step_id, real_id, facts, counts, manual):
         elif n("flick.reject") == 0:
             worse(WARN, "判定ログがありません（入力がハンドラに届いたか不明）")
         expect = start
+    elif step_id == "hscroll":
+        if n("flick.accepted") or n("step.call"):
+            worse(FAIL, "横にスクロールできる表の上のフリックが戻る/進むとして実行されました")
+        elif facts.get("flick_why") != "hscroll":
+            worse(WARN, "横スクロール要素として見分けられていません（拒否の理由: %s）" % (facts.get("flick_why") or "判定ログなし"))
+        expect = start
+    elif step_id == "pop_stay":
+        if n("popstate") == 0:
+            worse(FAIL, "history.back() で popstate が来ませんでした（テスト用の履歴を作れていません）")
+        elif n("pop.stay") == 0:
+            worse(FAIL, "戻り先が別のアプリ画面でしたが、タブに留まる処理（pop.stay）が働きませんでした")
+        if n("pop.stay") and n("step.call") != 1:
+            worse(FAIL, "タブに留まったあとの stepHistory が%d回です（1回のはず）" % n("step.call"))
+        if n("route"):
+            worse(FAIL, "アプリの画面が切り替わりました（route %d回）" % n("route"))
+        expect = "A"
     elif step_id == "forward":
         if n("popstate") >= 2:
             worse(FAIL, "popstate が%d回発生" % n("popstate"))
@@ -685,7 +708,7 @@ def _judge_swipe(step_id, real_id, facts, counts, manual):
             worse(FAIL, "進む操作で想定外のページ（%s）になりました" % after)
         value += "（進めるページ%s）" % ("あり" if after == "C" else "なし")
         expect = after
-    elif step_id == "pull_cancel":
+    elif step_id in ("pull_cancel", "pull_omnibox"):
         if facts.get("hint_shown") is not True:
             worse(FAIL, "下へ引いてもヒントが出ませんでした（touchmove がツールバーに届いていない）")
         if facts.get("hint_hidden") is not True:
@@ -705,7 +728,7 @@ def _judge_swipe(step_id, real_id, facts, counts, manual):
             worse(WARN, "閉じる前のヒントが出ませんでした")
         value = "ヒント表示=%s 閉じる呼び出し=%d（実際には閉じていません）" % (facts.get("hint_shown") is True, calls)
         expect = start
-    if step_id not in ("pull_cancel", "pull_close") and expect and after != expect:
+    if step_id not in ("pull_cancel", "pull_close", "pull_omnibox") and expect and after != expect:
         if after == "":
             worse(FAIL, "NASのページを取得できませんでした")
         elif after == before:
@@ -718,8 +741,87 @@ def _judge_swipe(step_id, real_id, facts, counts, manual):
             worse(FAIL, "想定と違うページ（期待 %s、実際 %s）" % (expect, after))
     elif step_id in ("edge_back", "flick_right", "flick_left") and moved_steps >= 2:
         worse(FAIL, "戻る/進むの二重実行（stepHistory の移動が%d回）" % moved_steps)
-    if status != FAIL and expect and step_id not in ("pull_cancel", "pull_close", "slow_move", "edge_start") \
+    if status != FAIL and expect and step_id not in ("pull_cancel", "pull_close", "pull_omnibox", "slow_move", "edge_start",
+                                                      "hscroll") \
             and label and label != after:
+        worse(WARN, "NASは%sですが表示は%sのままです（画面が更新されていません）" % (after, label))
+    if status != FAIL and step_id == "edge_back" and n("guard.push") == 0:
+        worse(WARN, "戻ったあとにガード用の履歴が積み直されていません（次の戻るが効かない恐れ）")
+    return status, value, hints
+
+
+MANUAL_GESTURE_KEYS = ("c", "m", "p", "f", "s")
+
+
+def _judge_manual(step_id, facts, counts, gestures, value):
+    """v0.1.55: judge a real-finger step per GESTURE (the phone cuts the timeline at each real touch.start outside
+    the self-test banner). Repeating a swipe is fine; only ONE gesture that acts twice is a double execution.
+    gestures: [{c: stepHistory calls, m: moved, p: popstate, f: flick accepted, s: stayed on the tab, nas: page}]."""
+    def n(key):
+        return counts.get(key, 0)
+    start, after, seq = _swipe_pages(facts, step_id)
+    before = facts.get("nas_before") or "?"
+    label = facts.get("label") or ""
+    hints, status = [], PASS
+
+    def worse(new, hint):
+        nonlocal status
+        if hint:
+            hints.append(hint)
+        if new == FAIL or (new == WARN and status == PASS):
+            status = new
+    acting = [g for g in gestures if g.get("c") or g.get("p") or g.get("f")]
+    total = facts.get("gesture_n") or len(gestures)
+    value += " / ジェスチャー %d 回（動作 %d 回）" % (total, len(acting))
+    if facts.get("route_left"):
+        worse(FAIL, "アプリがタブ画面から離れました（戻る処理のフォールバック history.back が働いた可能性）")
+    for i, g in enumerate(gestures, 1):
+        if g.get("c", 0) >= 2 or g.get("m", 0) >= 2 or g.get("p", 0) >= 2 or (g.get("f", 0) and g.get("p", 0)):
+            worse(FAIL, "1回の操作（%d回目）で二重実行（stepHistory %d / 移動 %d / popstate %d / フリック受理 %d）" % (
+                i, g.get("c", 0), g.get("m", 0), g.get("p", 0), g.get("f", 0)))
+    first = acting[0] if acting else None
+    got = (first or {}).get("nas") or ""
+    expect = {"edge_back": "B", "flick_right": "A", "flick_left": "B"}.get(step_id)
+    if step_id == "edge_back":
+        if n("popstate") == 0:
+            worse(FAIL, "エッジスワイプでpopstateが来ない（iOSが戻る操作をしていない）")
+        elif not any(g.get("p") and g.get("c") for g in gestures):
+            worse(FAIL, "popstate は来たが stepHistory が呼ばれていません（onPopStateが戻る処理をしていない）")
+    elif step_id in ("flick_right", "flick_left"):
+        if not any(g.get("f") for g in gestures):
+            worse(FAIL, "フリックが認識されませんでした（理由: %s）" % (facts.get("flick_why") or "判定ログなし"))
+    elif step_id == "slow_move":
+        if any(g.get("f") or g.get("c") for g in gestures):
+            worse(FAIL, "表を動かす操作が戻る/進むとして実行されました（フリックとして受理）")
+        elif n("flick.reject") == 0:
+            worse(WARN, "判定ログがありません（入力がハンドラに届いたか不明）")
+        expect = None
+        if after != start:
+            worse(FAIL, "ページが動きました（期待 %s、実際 %s）" % (start, after))
+    elif step_id == "forward":
+        if after not in (start, "C"):
+            worse(FAIL, "進む操作で想定外のページ（%s）になりました" % after)
+        value += "（進めるページ%s）" % ("あり" if after == "C" else "なし")
+    elif step_id == "pull_cancel":
+        if facts.get("hint_shown") is not True:
+            worse(FAIL, "下へ引いてもヒントが出ませんでした（touchmove がツールバーに届いていない）")
+        if facts.get("hint_hidden") is not True:
+            worse(FAIL, "戻してもヒントが消えませんでした")
+        if facts.get("close_calls", 0):
+            worse(FAIL, "引いて戻しただけでタブを閉じる処理が呼ばれました")
+        return status, "ヒント表示=%s 消去=%s 閉じる呼び出し=%d" % (
+            facts.get("hint_shown") is True, facts.get("hint_hidden") is True, facts.get("close_calls", 0)), hints
+    if expect:
+        if first is None:
+            pass                      # nothing acted: reported above as popstate / flick missing
+        elif not got:
+            worse(FAIL, "NASが動きませんでした（moved:false か、戻る処理が呼ばれていません）")
+        elif got != expect:
+            if "?" in seq or got == "?":
+                worse(FAIL, "確認ページ（チャレンジ）や空白ページの履歴に止まりました（NASが %s と動きました）" % " → ".join(seq))
+            else:
+                worse(FAIL, "最初の操作の結果が想定と違います（期待 %s、実際 %s）" % (expect, got))
+    if status != FAIL and step_id in ("edge_back", "flick_right", "flick_left") and label and label != after:
         worse(WARN, "NASは%sですが表示は%sのままです（画面が更新されていません）" % (after, label))
     if status != FAIL and step_id == "edge_back" and n("guard.push") == 0:
         worse(WARN, "戻ったあとにガード用の履歴が積み直されていません（次の戻るが効かない恐れ）")
@@ -799,6 +901,25 @@ def validate_swipe(payload):
         if facts_raw.get("synthetic", "") not in SWIPE_SYNTHETIC:
             raise ValueError("facts.syntheticが不正です")
         facts["synthetic"] = facts_raw.get("synthetic", "")
+        if facts_raw.get("gestures") is not None:       # v0.1.55: per-gesture results of a manual step
+            gs = facts_raw["gestures"]
+            if not isinstance(gs, list) or len(gs) > 12:
+                raise ValueError("facts.gesturesが不正です")
+            clean = []
+            for g in gs:
+                if not isinstance(g, dict) or g.get("nas", "") not in ("", "A", "B", "C", "?"):
+                    raise ValueError("facts.gesturesが不正です")
+                item = {"nas": g.get("nas", "")}
+                for key in MANUAL_GESTURE_KEYS:
+                    if not _num(g.get(key, 0), 0, 1000) or isinstance(g.get(key, 0), float):
+                        raise ValueError("facts.gesturesが不正です")
+                    item[key] = g.get(key, 0)
+                clean.append(item)
+            facts["gestures"] = clean
+            gn = facts_raw.get("gesture_n", len(clean))
+            if not _num(gn, 0, 1000) or isinstance(gn, float):
+                raise ValueError("facts.gesture_nが不正です")
+            facts["gesture_n"] = gn
         if facts_raw.get("flick_why") is not None:
             facts["flick_why"] = _swipe_str(facts_raw["flick_why"], 60, "facts.flick_why")
         if facts_raw.get("ms") is not None:
