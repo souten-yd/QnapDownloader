@@ -437,8 +437,19 @@ label{display:block;margin:12px 0;color:var(--muted);font-size:13px}
 .waiting-name{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 
 /* ---- v0.1.29: automatic live display chip ---- */
-.auto-live-chip{position:absolute;left:10px;top:10px;z-index:5;min-height:34px;padding:4px 14px;border:0;border-radius:17px;font:inherit;font-size:13px;background:rgba(0,0,0,.65);color:#fff;cursor:pointer}
-.auto-live-chip[hidden]{display:none}
+.chal-status{position:absolute;left:10px;right:10px;top:10px;z-index:5;display:flex;flex-wrap:wrap;gap:8px;align-items:center;padding:6px 14px;border-radius:17px;font-size:13px;background:rgba(0,0,0,.65);color:#fff;pointer-events:none}
+.chal-status[hidden]{display:none}
+.chal-live-btn{pointer-events:auto;min-height:30px;padding:2px 12px;border:0;border-radius:15px;font:inherit;font-size:13px;background:#fff;color:#111;cursor:pointer}
+.chal-live-btn[hidden]{display:none}
+/* ---- v0.1.52: swipe diagnostic banner (in the flow, below the toolbar) ---- */
+.swipe-banner{flex:none;padding:8px 12px;background:var(--surface-2,#eef);border-bottom:2px solid var(--accent,#06c);font-size:13px;line-height:1.4}
+.swipe-banner[hidden]{display:none}
+.swipe-banner-top{display:flex;flex-wrap:wrap;gap:6px 10px;align-items:center;justify-content:space-between}
+.swipe-modes{display:inline-flex;gap:4px}
+.swipe-mode{min-height:30px;padding:2px 10px;border:1px solid var(--border,#999);border-radius:15px;background:transparent;color:inherit;font:inherit;font-size:12px}
+.swipe-mode.is-on{background:var(--accent,#06c);color:#fff;border-color:transparent}
+.swipe-banner-text{margin:4px 0 6px;font-size:14px;font-weight:600}
+.swipe-banner-actions{display:flex;flex-wrap:wrap;gap:6px}
 
 /* ---- v0.1.29: swipe rows, action sheet, multi-select ---- */
 .swipe{position:relative;overflow:hidden;border-radius:8px}

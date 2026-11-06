@@ -541,7 +541,7 @@ function currentViewName() {
 }
 
 function applyRoute() {
-  if (!state.authed) return;
+  if (!state.authed || (swipeDiag && swipeDiag.cleaning)) return;
   const route = parseRoute();
   if (route.redirect) { replaceRoute(route.redirect); return; }
   if (route.view === "tab" && !findTab(route.tabId)) { replaceRoute("#/home"); return; }
@@ -555,6 +555,7 @@ function applyRoute() {
     schedulePaste(0);
     state.route = {view: "links"};
   }
+  gestureTrace("route", {hash: location.hash, view: route.view});
   if (route.view === "tab") { state.lastWebTabId = route.tabId; armBackGuard(); }
   if (route.view === "settings") state.lastSection = route.section;
   closeMenu(false);
@@ -657,15 +658,17 @@ function updateMobileBar() {
     else n.removeAttribute("aria-current");
   });
   const count = $("tabCount");
-  count.textContent = String(state.tabs.length);
-  count.hidden = state.tabs.length === 0;
-  $("mobileBrowse").setAttribute("aria-label", "ブラウズ（Webタブ " + state.tabs.length + "枚）");
+  const shownTabs = state.tabs.filter(t => !t.diag).length;
+  count.textContent = String(shownTabs);
+  count.hidden = shownTabs === 0;
+  $("mobileBrowse").setAttribute("aria-label", "ブラウズ（Webタブ " + shownTabs + "枚）");
 }
 
 function renderWebTabs() {
   const list = $("webTabs");
   list.replaceChildren();
   for (const tab of state.tabs) {
+    if (tab.diag) continue;
     const active = state.route.view === "tab" && state.route.tabId === tab.id;
     const wrap = element("div", undefined, "tab web-tab" + (active ? " active" : ""));
     wrap.setAttribute("role", "presentation");
@@ -882,7 +885,7 @@ function newTabRecord(id) {
 
 function saveTabs() {
   // Only id / url history / index. No tokens, cookies or page data.
-  const data = {v: 1, next: state.nextTabId, tabs: state.tabs.map(t => ({
+  const data = {v: 1, next: state.nextTabId, tabs: state.tabs.filter(t => !t.diag).map(t => ({
     id: t.id, history: t.history.slice(), index: t.index,
     nas: t.rb ? t.rb.id : (t.savedNas || "")}))};   // v0.1.43: the NAS tab is reattached after a reload
   writeSession(TAB_STORAGE_KEY, JSON.stringify(data));
@@ -932,6 +935,11 @@ function closeTab(id) {
   const idx = state.tabs.findIndex(t => t.id === id);
   if (idx < 0) return;
   const tab = state.tabs[idx];
+  if (tab.diag && tab.diag.stubClose) {       // v0.1.52: the swipe diagnostic only checks that a close was asked for
+    tab.diag.closeCalls++;
+    gestureTrace("pull.close", {stub: true});
+    return;
+  }
   if (tab.history.length) {
     state.closed.push({history: tab.history.slice(), index: tab.index});
     while (state.closed.length > MAX_CLOSED_TABS) state.closed.shift();
@@ -977,8 +985,7 @@ function newRbRecord(id, tab) {
   return {id, seq: 0, url: "", title: "", width: 0, height: 0,
     loading: true, links: [], linksTimer: 0, blocked: null,
     rev: null, icptSeen: 0, present: 0, vp: "", popups: 0,
-    shown: "", autoLive: false, autoSince: 0, autoClean: 0, autoChip: false,
-    autoBusy: false, autoOff: "", view: null, snap: null, snapKey: "", snapBusy: false,
+    shown: "", chal: null, view: null, snap: null, snapKey: "", snapBusy: false,
     snapAgain: null, snapTimer: 0, busy: 0, scrollTop: 0, owner: tab,
     vmap: null, vmapRev: -1, vmapTimer: 0, vmapBusy: false, vmapAt: 0, linksRev: -1,
     reader: null, readerBusy: false, readerPending: false, readerAgain: false,
@@ -1071,6 +1078,7 @@ function releaseRemote(tab) {
   tab.rb = null;
   if (!rb) return;
   clearTimeout(rb.linksTimer);
+  if (rb.chal) clearTimeout(rb.chal.timer);
   if (state.rbPolling === rb.id) { state.rbPolling = ""; state.rbPollMode = ""; state.rbGen++; }
   dropRemoteImage(rb);
   dropTiles(rb);
@@ -1151,6 +1159,7 @@ function resetTabsAfterCrash() {
 
 function remoteLost(tab) {
   if (tab.rb) {
+    if (tab.rb.chal) clearTimeout(tab.rb.chal.timer);
     dropRemoteImage(tab.rb);
     dropTiles(tab.rb);
     dropReader(tab.rb);
@@ -1243,7 +1252,6 @@ function applyRemoteMeta(tab, f) {
   const loading = f.loading === true;
   if (url !== rb.url) {
     rb.url = url;
-    rb.autoOff = "";
     changed = true;
     if (url.startsWith("https://") && url.length <= 2048) {
       tab.current = url;
@@ -1265,94 +1273,76 @@ function applyRemoteMeta(tab, f) {
   if (Number.isFinite(f.intercepts) && f.intercepts > rb.icptSeen) {
     fetchIntercepts(tab).catch(() => {});
   }
-  if (typeof f.challenge === "boolean") syncChallenge(tab, f.challenge, loading);
+  if (typeof f.challenge === "boolean") syncChallenge(tab, f.challenge);
   if (Number.isFinite(f.linksRev)) noteLinksRev(tab, f.linksRev);
   if (url !== "" && changed) applyDisplay(tab);
   if (changed) updateChrome();
 }
 
-// Cloudflare checks and logins need the live screencast. The switch is automatic and
-// temporary (rb.autoLive, never written to the per-host mode map); a dedicated poll of
-// /api/rb/meta brings the tab back to 高速 after two clean checks of a finished page.
-const AUTO_POLL_MS = 1000;
-const AUTO_CLEAN_NEEDED = 2;
-const AUTO_TIMEOUT_MS = 90000;
-const AUTO_SETTLE_MS = 3000;
-const AUTO_SETTLE_MOVED_MS = 1000;
+// v0.1.52: a Cloudflare check page is not shown (no automatic switch to the live screencast, no spinner
+// to watch). The tab keeps the display the user chose, a small status line says that the check is running,
+// and the real page is rendered as soon as the check is gone. Only when the check is still there after
+// CHAL_BUTTON_MS a button lets the user operate the check page in the live display, for that page only;
+// the way back is applyDisplay (no history entry is ever added).
+const CHAL_BUTTON_MS = 25000;
 
-// Pure state step (unit-tested in node). Returns "enter" | "return" | "chip" | null.
-function challengeStep(rb, challenge, loading, now, userLive, moved = false) {
-  if (!rb.autoLive) {
-    if (challenge && !userLive) {
-      rb.autoLive = true; rb.autoSince = now; rb.autoClean = 0; rb.autoChip = false; rb.autoQuiet = 0;
-      rb.autoUrl = rb.url;
-      return "enter";
-    }
-    return null;
-  }
-  if (challenge) {
-    rb.autoClean = 0; rb.autoQuiet = 0;
-    if (!rb.autoChip && now - rb.autoSince >= AUTO_TIMEOUT_MS) { rb.autoChip = true; return "chip"; }
-    return null;
-  }
-  // Ad-heavy pages never finish "loading": 3 s after the check page is gone counts as settled (v0.1.37).
-  if (!rb.autoQuiet) rb.autoQuiet = now;
-  // v0.1.43: once the check page has gone to another address, one clean look is enough.
-  if (loading && now - rb.autoQuiet < (moved ? AUTO_SETTLE_MOVED_MS : AUTO_SETTLE_MS)) { rb.autoClean = 0; return null; }
-  rb.autoClean++;
-  if (rb.autoClean >= (moved ? 1 : AUTO_CLEAN_NEEDED)) {
-    rb.autoLive = false; rb.autoClean = 0; rb.autoChip = false;
-    return "return";
-  }
-  return null;
+// True while the NAS page is a check page that must not be rendered.
+function challengeHold(tab) {
+  const rb = tab && tab.rb;
+  return Boolean(rb && rb.chal && !rb.chal.live);
 }
 
-function userPrefersLive(tab) {
-  return userDisplay(tab) === "live";
-}
-
-function syncChallenge(tab, challenge, loading) {
+function syncChallenge(tab, challenge) {
   const rb = tab.rb;
-  if (!rb || rb.autoLive || rb.autoOff === rb.url) return;   // the poll below owns the way back
-  if (challengeStep(rb, challenge, loading, Date.now(), userPrefersLive(tab)) === "enter") {
-    if (rb.shown === "tiles" || rb.shown === "reader" || rb.shown === "mirror") flash("確認画面のため一時的にライブ表示にしました");
-    startAutoPoll(tab);
-    applyDisplay(tab);
-  }
-}
-
-function startAutoPoll(tab) { sched.kick(); }   // the scheduler task "rb-auto" does the polling
-
-async function autoPollTick(tab, rb) {
-  if (tab.rb !== rb || !rb.autoLive) return;
-  if (document.visibilityState !== "visible" || activeWebTab() !== tab || rb.autoBusy) return;
-  rb.autoBusy = true;
-  try {
-    const res = await fetch("/api/rb/meta?tab=" + encodeURIComponent(rb.id) + "&wait=0",
-      {credentials: "same-origin", cache: "no-store"});
-    if (res.status !== 200 || tab.rb !== rb || !rb.autoLive) return;
-    const meta = await res.json();
-    if (tab.rb !== rb || !rb.autoLive) return;
-    const moved = typeof meta.url === "string" && Boolean(rb.autoUrl) && meta.url !== rb.autoUrl;
-    const step = challengeStep(rb, meta.challenge === true, meta.loading === true, Date.now(), false, moved);
-    if (step === "return") {
-      applyDisplay(tab);   // tiles again: the tile loop takes a fresh snapshot on start
-    } else if (step === "chip") {
-      updateRemoteView(tab);
+  if (!rb) return;
+  if (challenge) {
+    if (!rb.chal) {
+      rb.chal = {since: Date.now(), live: false, button: false, timer: 0};
+      rb.chal.timer = setTimeout(() => {
+        if (tab.rb !== rb || !rb.chal) return;
+        rb.chal.button = true;
+        updateChallengeUi(tab);
+      }, CHAL_BUTTON_MS);
+      dlog("render", "info", "challenge hold", {});
+      gestureTrace("challenge.hold", {});
+      updateChallengeUi(tab);
     }
-  } catch (e) {
-    /* transient: the next tick tries again */
-  } finally {
-    rb.autoBusy = false;
+    return;
   }
+  if (!rb.chal) return;
+  const was = rb.chal;
+  clearTimeout(was.timer);
+  rb.chal = null;
+  dlog("render", "info", "challenge gone", {live: was.live});
+  gestureTrace("challenge.gone", {live: was.live});
+  updateChallengeUi(tab);
+  if (was.live) { applyDisplay(tab); return; }      // back to the chosen display
+  renderNow(tab);
 }
 
-// 「高速表示に戻す」 after the 90 s safety timeout: back to 高速, and no automatic
-// switch again for this address.
-function returnToFast(tab) {
+// The real page, in the chosen display, right away (the loops' own early-start rules take over after this).
+function renderNow(tab) {
   const rb = tab && tab.rb;
   if (!rb) return;
-  rb.autoLive = false; rb.autoChip = false; rb.autoClean = 0; rb.autoOff = rb.url;
+  const mode = tabDisplay(tab);
+  if (mode === "mirror") { rb.mirrorPending = true; runMirror(tab, {quiet: true, force: true, immediate: true}).catch(() => {}); }
+  else if (mode === "reader") runReader(tab, {quiet: true}).catch(() => {});
+  else if (mode === "tiles") takeSnapshot(tab, {force: true, keepScroll: true, quiet: true}).catch(() => {});
+}
+
+function updateChallengeUi(tab) {
+  const rb = tab && tab.rb;
+  const on = Boolean(rb && rb.chal && !rb.chal.live && activeWebTab() === tab);
+  setShown("chalStatus", on);
+  setShown("chalLiveBtn", on && rb.chal.button === true);
+}
+
+// 「確認画面を操作する」: the live display for this check only; leaving it is automatic (syncChallenge).
+function chalGoLive(tab) {
+  const rb = tab && tab.rb;
+  if (!rb || !rb.chal) return;
+  rb.chal.live = true;
+  updateChallengeUi(tab);
   applyDisplay(tab);
 }
 
@@ -1834,7 +1824,7 @@ function updateRemoteView(tab) {
   if (!live) $("remoteIdle").hidden = blocked;
   $("remoteIdleText").textContent = "画面を待っています…";
   setShown("remoteLoading", Boolean(tab.loading));
-  setShown("autoLiveChip", live && tab.rb.autoLive === true && tab.rb.autoChip === true);
+  updateChallengeUi(tab);
   const count = live ? tab.rb.links.length : 0;
   setShown("remoteLinks", count > 0);
   $("remoteLinks").textContent = "リンク " + count + "件";
@@ -2195,6 +2185,7 @@ let tileNear = null, tileFar = null;
 
 // The display the user chose: the site's remembered choice, else the Settings default (高速).
 function userDisplay(tab) {
+  if (tab.diag && tab.diag.mode) return tab.diag.mode;     // v0.1.52 swipe diagnostic: its own display mode
   const remembered = DISPLAY_OF_MODE[rememberedMode(hostOf(tab.current || ""))];
   if (remembered) return remembered;
   const setting = state.settings && state.settings.rb_default_mode;
@@ -2205,7 +2196,7 @@ function userDisplay(tab) {
 function displayReason(tab) {
   const rb = tab && tab.rb;
   if (!rb) return "no-rb";
-  if (rb.autoLive) return "auto-live(challenge)";
+  if (rb.chal && rb.chal.live) return "challenge-live(user)";
   if (rb.tilesFor && rb.tilesFor === rb.url) return "reader-or-mirror-failed->tiles";
   if (DISPLAY_OF_MODE[rememberedMode(hostOf(tab.current || ""))]) return "site-choice";
   return "setting";
@@ -2215,7 +2206,7 @@ function displayReason(tab) {
 function tabDisplay(tab) {
   const rb = tab && tab.rb;
   if (!rb) return "tiles";
-  if (rb.autoLive) return "live";
+  if (rb.chal && rb.chal.live) return "live";
   if (rb.tilesFor && rb.tilesFor === rb.url) return "tiles";   // reader / mirror failed on this page (not persisted)
   return userDisplay(tab);
 }
@@ -2225,7 +2216,7 @@ function setUserDisplay(tab, mode) {
   if (!tab || !tab.rb || !RB_DISPLAY_LABELS[mode]) return;
   const host = hostOf(tab.current || "");
   if (host) rememberHostMode(host, MODE_OF_DISPLAY[mode]);
-  tab.rb.autoLive = false; tab.rb.autoChip = false;   // a manual choice is respected
+  if (tab.rb.chal) tab.rb.chal.live = false;           // a manual choice is respected
   tab.rb.tilesFor = ""; tab.rb.readerFail = null; tab.rb.mirrorFail = null;
   renderRemoteHosts();
   applyDisplay(tab);
@@ -2444,7 +2435,7 @@ const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
 // tiles of the new one are decoded, so the screen never goes blank.
 async function takeSnapshot(tab, opts = {}) {
   const rb = tab && tab.rb;
-  if (!rb || tabDisplay(tab) !== "tiles") return;
+  if (!rb || tabDisplay(tab) !== "tiles" || challengeHold(tab)) return;
   if (rb.snapBusy) {
     const again = rb.snapAgain || {};
     rb.snapAgain = {force: again.force === true || opts.force === true,
@@ -3852,7 +3843,7 @@ function readerFallback(tab, rb) {
 
 async function runReader(tab, opts = {}) {
   const rb = tab && tab.rb;
-  if (!rb || tabDisplay(tab) !== "reader") return;
+  if (!rb || tabDisplay(tab) !== "reader" || challengeHold(tab)) return;
   if (rb.readerBusy) { rb.readerAgain = true; return; }
   rb.readerBusy = true;
   snapBusy(rb, 1);
@@ -4251,7 +4242,7 @@ function mirrorFallback(tab, rb) {
 
 async function runMirror(tab, opts = {}) {
   const rb = tab && tab.rb;
-  if (!rb || tabDisplay(tab) !== "mirror") return;
+  if (!rb || tabDisplay(tab) !== "mirror" || challengeHold(tab)) return;
   if (rb.mirrorBusy) { rb.mirrorAgain = true; return; }
   const wait = rb.mirrorAt + Math.max(MIRROR_MIN_MS, rb.mirrorMs * 2) - Date.now();
   const navigation = !rb.mirror || rb.mirror.pageUrl !== rb.url || mirrorHost.owner !== rb;
@@ -4552,6 +4543,7 @@ function wireMirrorDoc(doc) {
     handleTap(event);
   });
   function handleTap(event) {
+    gestureTrace("mirror.tap", {type: event.type});
     if (probe) { probe.tap(event); return; }
     const tab = tabNow();
     if (!tab) return;
@@ -4592,6 +4584,7 @@ function wireMirrorDoc(doc) {
   doc.addEventListener("touchend", touching(false), {passive: true});
   doc.addEventListener("touchcancel", touching(false), {passive: true});
   attachFlick(doc);
+  if (swipeRec) swipeRec.hookDoc(doc);
   wirePull($("mirrorFrame"), () => {
     const tab = tabNow();
     if (tab) perform(() => runMirror(tab, {force: true, immediate: true}));
@@ -4786,36 +4779,71 @@ function gestureHint(text) {
   const hint = $("gestureHint");
   hint.textContent = text || "";
   hint.hidden = !text;
+  gestureTrace("gesture.hint", {text: text || ""});
 }
+
+// v0.1.52 swipe diagnostic hook: a no-op unless a diagnostic is recording (swipeRec is set).
+let swipeRec = null;
+function gestureTrace(event, data) {
+  if (swipeRec) swipeRec.note(event, data);
+}
+
+// A flick on the page and a browser back (popstate) that arrive together are one gesture: the first one
+// to ask takes the step, the other within STEP_DEDUP_MS is dropped (v0.1.52).
+const STEP_DEDUP_MS = 400;
+const stepClaim = {at: 0, kind: ""};
+function claimStep(kind) {
+  const now = performance.now();
+  if (stepClaim.kind && stepClaim.kind !== kind && now - stepClaim.at < STEP_DEDUP_MS) return false;
+  stepClaim.at = now;
+  stepClaim.kind = kind;
+  return true;
+}
+
+// The handlers are kept so that the swipe diagnostic can feed them when synthetic TouchEvents cannot be built.
+const flickHandlers = new WeakMap();
+const pullHandlers = {};
 
 // The flick listener is attached to the remote view and, for the mirror display, inside its iframe
 // (touches in a frame do not bubble to the parent).
 function attachFlick(view) {
   let flick = null;
-  view.addEventListener("touchstart", event => {
+  const onStart = event => {
     flick = null;
-    if (event.touches.length !== 1) return;
+    if (event.touches.length !== 1) { gestureTrace("flick.reject", {why: "multi"}); return; }
     const t = event.touches[0];
-    if (t.clientX < GESTURE_EDGE_PX || t.clientX > window.innerWidth - GESTURE_EDGE_PX) return;
+    if (t.clientX < GESTURE_EDGE_PX || t.clientX > window.innerWidth - GESTURE_EDGE_PX) {
+      gestureTrace("flick.reject", {why: "edge", x: Math.round(t.clientX)});
+      return;
+    }
     flick = {x: t.clientX, y: t.clientY, at: performance.now()};
-  }, {passive: true});
-  view.addEventListener("touchmove", event => { if (event.touches.length !== 1) flick = null; }, {passive: true});
-  view.addEventListener("touchend", event => {
+  };
+  const onMove = event => { if (event.touches.length !== 1) flick = null; };
+  const onEnd = event => {
     const f = flick;
     flick = null;
     if (!f || event.changedTouches.length !== 1) return;
     const t = event.changedTouches[0];
-    const dx = t.clientX - f.x, dy = t.clientY - f.y;
-    if (performance.now() - f.at > GESTURE_FLICK_MS || Math.abs(dx) < GESTURE_FLICK_PX || Math.abs(dx) < 2.5 * Math.abs(dy)) return;
-    if (!$("readerViewer").hidden) return;                 // the image viewer swipes between images
+    const dx = t.clientX - f.x, dy = t.clientY - f.y, dt = performance.now() - f.at;
+    const info = {dx: Math.round(dx), dy: Math.round(dy), dt: Math.round(dt)};
+    if (dt > GESTURE_FLICK_MS) { gestureTrace("flick.reject", Object.assign({why: "slow"}, info)); return; }
+    if (Math.abs(dx) < GESTURE_FLICK_PX) { gestureTrace("flick.reject", Object.assign({why: "short"}, info)); return; }
+    if (Math.abs(dx) < 2.5 * Math.abs(dy)) { gestureTrace("flick.reject", Object.assign({why: "diagonal"}, info)); return; }
+    if (!$("readerViewer").hidden) { gestureTrace("flick.reject", Object.assign({why: "viewer"}, info)); return; }   // the image viewer swipes between images
     const tab = activeWebTab();
-    if (!tab || !tab.rb) return;
+    if (!tab || !tab.rb) { gestureTrace("flick.reject", Object.assign({why: "no-tab"}, info)); return; }
+    if (!claimStep("flick")) { gestureTrace("flick.reject", Object.assign({why: "dup-pop"}, info)); return; }
     state.gestureAt = Date.now();
+    gestureTrace("flick.accepted", Object.assign({dir: dx > 0 ? "back" : "forward"}, info));
     dlog("ui", "info", "gesture", {kind: dx > 0 ? "back" : "forward"});
     gestureHint(dx > 0 ? "← 戻る" : "進む →");
     setTimeout(() => gestureHint(""), 600);
     perform(() => stepHistory(tab, dx > 0 ? -1 : 1));
-  }, {passive: true});
+  };
+  flickHandlers.set(view, {start: onStart, move: onMove, end: onEnd});
+  view.addEventListener("touchstart", onStart, {passive: true});
+  view.addEventListener("touchmove", onMove, {passive: true});
+  view.addEventListener("touchend", onEnd, {passive: true});
 }
 
 function wireGestures() {
@@ -4824,28 +4852,34 @@ function wireGestures() {
 
   const bar = document.querySelector(".toolbar");
   let pull = null;
-  bar.addEventListener("touchstart", event => {
+  const onStart = event => {
     pull = null;
     const tab = activeWebTab();
     if (!tab || event.touches.length !== 1 || event.target.closest("input,textarea,.menu")) return;
     pull = {x: event.touches[0].clientX, y: event.touches[0].clientY, armed: false, id: tab.id};
-  }, {passive: true});
-  bar.addEventListener("touchmove", event => {
+    gestureTrace("pull.start", {});
+  };
+  const onMove = event => {
     if (!pull || event.touches.length !== 1) return;
     const t = event.touches[0];
     const armed = t.clientY - pull.y > GESTURE_CLOSE_PX && Math.abs(t.clientX - pull.x) < 80;
-    if (armed !== pull.armed) { pull.armed = armed; gestureHint(armed ? "離すとタブを閉じます" : ""); }
-  }, {passive: true});
+    if (armed !== pull.armed) { pull.armed = armed; gestureTrace("pull.arm", {armed}); gestureHint(armed ? "離すとタブを閉じます" : ""); }
+  };
   const end = () => {
     const p = pull;
     pull = null;
     gestureHint("");
+    gestureTrace("pull.end", {armed: Boolean(p && p.armed)});
     if (!p || !p.armed) return;
     const tab = activeWebTab();
     if (tab && tab.id === p.id) { dlog("ui", "info", "gesture", {kind: "close"}); closeTab(tab.id); }
   };
+  const cancel = () => { pull = null; gestureHint(""); };
+  Object.assign(pullHandlers, {start: onStart, move: onMove, end, cancel});
+  bar.addEventListener("touchstart", onStart, {passive: true});
+  bar.addEventListener("touchmove", onMove, {passive: true});
   bar.addEventListener("touchend", end, {passive: true});
-  bar.addEventListener("touchcancel", () => { pull = null; gestureHint(""); }, {passive: true});
+  bar.addEventListener("touchcancel", cancel, {passive: true});
 }
 
 function wireRemote() {
@@ -4978,7 +5012,7 @@ function wireRemote() {
     tab.error = ""; tab.reopenAt = 0;
     updateRemoteView(tab);
   });
-  $("autoLiveChip").addEventListener("click", () => returnToFast(activeWebTab()));
+  $("chalLiveBtn").addEventListener("click", () => chalGoLive(activeWebTab()));
   document.addEventListener("visibilitychange", syncRemotePoll);
   wireTiles();
   wireReader();
@@ -5014,20 +5048,41 @@ async function rbInputFor(tab, event) {
   }
 }
 
+// A browser back / forward of the NAS page (one page per gesture: the Hub skips redirects and check pages).
+// Nothing to go back to is told in one short toast; it never leaves the tab (v0.1.52).
 async function stepHistory(tab, delta) {
-  if (tab.rb) return rbInputFor(tab, {type: delta < 0 ? "back" : "forward"});
-  return null;
+  if (!tab.rb) return null;
+  gestureTrace("step.call", {delta});
+  let res = null;
+  try {
+    res = await rbInputFor(tab, {type: delta < 0 ? "back" : "forward"});
+  } catch (e) {
+    gestureTrace("step.error", {msg: String(e && e.message || e).slice(0, 40)});
+    throw e;
+  }
+  if (res && res.moved === false) {
+    gestureTrace("step.nomove", {});
+    gestureTrace("toast", {delta});
+    flash(delta < 0 ? "これより前のページはありません" : "これより先のページはありません");
+  } else if (res) {
+    gestureTrace("step.moved", {skipped: res.skipped || 0});
+  }
+  return res;
 }
 
 // v0.1.50: on a web page, the browser's own back (the iOS edge swipe in the home-screen app) goes
 // back in THAT page, like Safari. A guard entry with the same address sits on top of the tab's
-// history entry; popping it means "back": the NAS tab steps back and the guard is put again. When
-// the page has nothing to go back to, the back continues to the previous screen of the app.
+// history entry; popping it means "back": the NAS tab steps back and the guard is put again.
+// v0.1.52: when the page has nothing earlier the guard is just put again (a toast says so): the app
+// never leaves the tab by a page back. Only the display switches (auto-live, mirror reloads) never push.
 function armBackGuard() {
   const r = state.route;
   if (r.view !== "tab" || !findTab(r.tabId)) return;
   if (history.state && history.state.qdGuard === r.tabId) return;
-  try { history.pushState({qdGuard: r.tabId}, "", location.hash); } catch (e) { /* ignore */ }
+  try {
+    history.pushState({qdGuard: r.tabId}, "", location.hash);
+    gestureTrace("guard.push", {len: history.length});
+  } catch (e) { /* ignore */ }
 }
 
 // Session history also restores the frame's address of the entry being returned to; put the
@@ -5036,27 +5091,38 @@ function keepMirrorFrame() {
   const mf = $("mirrorFrame");
   const doc = mf && mf.dataset.doc;
   if (!doc || $("mirrorWrap").hidden) return;
+  // v0.1.52: a document that is loaded again has none of the app's listeners: wire it when it is ready.
+  const rewire = () => { try { const d = mirrorDoc(); if (d && d.body) wireMirrorDoc(d); } catch (e) { /* ignore */ } };
   try {
     const want = new URL(doc, location.href).href;
-    if (mf.contentWindow.location.href !== want) mf.contentWindow.location.replace(want);
+    if (mf.contentWindow.location.href !== want) {
+      mf.addEventListener("load", rewire, {once: true});
+      mf.contentWindow.location.replace(want);
+      gestureTrace("mirror.reload", {});
+    }
   } catch (e) {
-    try { mf.contentWindow.location.replace(new URL(doc, location.href).href); } catch (e2) { /* ignore */ }
+    try {
+      mf.addEventListener("load", rewire, {once: true});
+      mf.contentWindow.location.replace(new URL(doc, location.href).href);
+    } catch (e2) { /* ignore */ }
   }
 }
 
 function onPopState() {
-  setTimeout(keepMirrorFrame, 0);
+  // The traversal restores the frame's older document a little after popstate: look again a few times.
+  for (const ms of [0, 120, 400, 1000]) setTimeout(keepMirrorFrame, ms);
   const r = state.route;
-  if (!state.authed || r.view !== "tab") return;
-  if (history.state && history.state.qdGuard === r.tabId) return;      // forward onto the guard
+  gestureTrace("popstate", {hash: location.hash, guard: (history.state && history.state.qdGuard) || "-", len: history.length});
+  if (swipeDiag && swipeDiag.cleaning) return;
+  if (!state.authed || r.view !== "tab") { gestureTrace("pop.ignore", {why: "route"}); return; }
+  if (history.state && history.state.qdGuard === r.tabId) { gestureTrace("pop.ignore", {why: "guard"}); return; }   // forward onto the guard
   const m = /^#\/tab\/(t\d+)/.exec(location.hash);
-  if (!m || m[1] !== r.tabId) return;                                   // a real route change: hashchange
+  if (!m || m[1] !== r.tabId) { gestureTrace("pop.ignore", {why: "other-route"}); return; }   // a real route change: hashchange
   const tab = findTab(r.tabId);
-  if (!tab || !tab.rb) { history.back(); return; }
+  if (!tab || !tab.rb) { armBackGuard(); return; }
+  if (!claimStep("pop")) { gestureTrace("pop.ignore", {why: "dup-flick"}); armBackGuard(); return; }
   perform(async () => {
-    const res = await stepHistory(tab, -1);
-    if (res && res.moved === false) { history.back(); return; }        // nothing earlier in this page
-    armBackGuard();
+    try { await stepHistory(tab, -1); } finally { armBackGuard(); }
   });
 }
 
@@ -6899,10 +6965,6 @@ const sched = {
 function registerTasks() {
   sched.add("downloads", AUTO_REFRESH_MS, downloadsTaskWanted,
     () => loadDownloads(state.downloadsPage, {auto: true}));
-  sched.add("rb-auto", AUTO_POLL_MS, () => {
-    const tab = activeWebTab();
-    return Boolean(tab && tab.rb && tab.rb.autoLive);
-  }, () => { const tab = activeWebTab(); return tab && tab.rb ? autoPollTick(tab, tab.rb) : null; });
   sched.add("disk", DISK_REFRESH_MS, diagVisible, loadDisk);
   sched.add("rb-mem", 5000, browserSectionVisible, () => loadBrowserStatus(true));
   sched.add("debug-view", DEBUG_VIEW_MS, () => dbgView.open && !dbgView.paused, () => pollDebugView(false));
@@ -7739,6 +7801,460 @@ function wireDiagnostics() {
 }
 
 // ---- Settings › 診断 › 自己テスト (v0.1.44)
+// ---------------------------------------------------------------------------------------------------
+// v0.1.52 swipe diagnostic (Settings › 診断 › 自己テスト). The Hub holds an internal fixture tab at
+// A → (check page) → A?token → B → C; this page shows it in the normal tab view and
+//  - automatic: feeds the app's own handlers synthetic input (history.back/forward, TouchEvents on the
+//    display, a toolbar pull) in each display mode and records what the app and the NAS did;
+//  - manual: the person swipes with a real finger and answers できた / 違う / スキップ.
+// Only measurements are sent (POST /api/selftest/swipe); the Hub judges. Everything is undone at the end.
+// ---------------------------------------------------------------------------------------------------
+const SWIPE_HOST = "selftest.example.com";
+const SWIPE_EVENT_CAP = 60;
+const SWIPE_PAYLOAD_MAX = 58000;
+const SWIPE_AUTO_BUDGET_MS = 105000;     // no new display mode is started after this long
+const SWIPE_MODES = ["mirror", "reader", "tiles"];
+const SWIPE_MODE_NAME = {mirror: "ミラー", reader: "リーダー", tiles: "高速"};
+let swipeDiag = null;                    // {tab, runId, prevHash, cleaning, aborted, manual, mode}
+
+function swipeLetter(url) {
+  try {
+    const u = new URL(url);
+    const m = u.hostname === SWIPE_HOST ? /^\/swipe\/([abc])$/.exec(u.pathname) : null;
+    return m ? m[1].toUpperCase() : "?";
+  } catch (e) { return "?"; }
+}
+
+function swipeTarget(el) {
+  if (!el || !el.tagName) return "-";
+  const holder = el.closest ? el.closest("[id]") : null;
+  const cls = typeof el.className === "string" && el.className ? "." + el.className.split(/\s+/)[0] : "";
+  return ((holder && holder.id ? "#" + holder.id + ">" : "") + el.tagName.toLowerCase() + cls).slice(0, 40);
+}
+
+function swipeCompact(events, cap) {
+  let list = events;
+  if (list.length > cap) list = list.filter(e => !/\.move$/.test(e.e));
+  if (list.length > cap) {
+    const head = Math.floor(cap / 3);
+    list = list.slice(0, head).concat([{t: list[head].t, e: "trunc", d: "n=" + (list.length - cap)}], list.slice(list.length - (cap - head - 1)));
+  }
+  return list.map(e => ({t: e.t, e: e.e, d: e.d}));
+}
+
+// Records everything the app and the page saw during one step. gestureTrace() feeds note().
+function makeSwipeRecorder() {
+  const t0 = performance.now();
+  const rec = {events: [], counts: {}, routeLeft: false, hintShown: false, flickWhy: "", pending: null, lastMove: -1000,
+    off: [], docs: new WeakSet(), tabHash: swipeDiag ? "#/tab/" + swipeDiag.tab.id : ""};
+  const fmt = data => !data ? "" : Object.keys(data).map(k => k + "=" + String(data[k]).replace(/\s+/g, " ")).join(" ").slice(0, 110);
+  const push = (e, d) => { if (rec.events.length < 700) rec.events.push({t: Math.round(performance.now() - t0), e, d: fmt(d)}); };
+  rec.note = (event, data) => {
+    const key = String(event).replace(/[^a-z0-9_.]/g, "_").slice(0, 31);
+    rec.counts[key] = (rec.counts[key] || 0) + 1;
+    if (key === "gesture.hint" && data && data.text) rec.hintShown = true;
+    if (key === "flick.reject" && data && data.why) rec.flickWhy = String(data.why);
+    if (key === "route" && rec.tabHash && String((data && data.hash) || "") !== rec.tabHash) rec.routeLeft = true;
+    push(key, data);
+  };
+  const touch = kind => event => {
+    const t = (event.changedTouches && event.changedTouches[0]) || (event.touches && event.touches[0]) || {};
+    const x = Math.round(t.clientX), y = Math.round(t.clientY), now = performance.now();
+    if (kind === "move") {
+      if (now - rec.lastMove < 50) { rec.pending = [x, y, event]; return; }
+      rec.lastMove = now; rec.pending = null;
+    } else if (rec.pending) {
+      const p = rec.pending; rec.pending = null;
+      rec.note("touch.move", {x: p[0], y: p[1], last: 1});
+    }
+    rec.note("touch." + kind, {x, y, tgt: swipeTarget(event.target), edge: x < GESTURE_EDGE_PX || x > window.innerWidth - GESTURE_EDGE_PX ? 1 : 0,
+      trusted: event.isTrusted ? 1 : 0});
+  };
+  const pointer = kind => event => {
+    if (kind === "move") { const now = performance.now(); if (now - rec.lastMove < 50) return; rec.lastMove = now; }
+    rec.note("pointer." + kind, {x: Math.round(event.clientX), y: Math.round(event.clientY), id: event.pointerId});
+  };
+  const listen = (target, type, fn) => { target.addEventListener(type, fn, {capture: true, passive: true}); rec.off.push(() => target.removeEventListener(type, fn, {capture: true})); };
+  rec.hookDoc = doc => {
+    if (!doc || rec.docs.has(doc)) return;
+    rec.docs.add(doc);
+    for (const k of ["start", "move", "end", "cancel"]) listen(doc, "touch" + k, touch(k));
+    for (const k of ["down", "move", "up", "cancel"]) listen(doc, "pointer" + k, pointer(k));
+  };
+  for (const k of ["start", "move", "end", "cancel"]) listen(document, "touch" + k, touch(k));
+  const onHash = () => rec.note("hashchange", {hash: location.hash, len: history.length});
+  window.addEventListener("hashchange", onHash);
+  rec.off.push(() => window.removeEventListener("hashchange", onHash));
+  rec.stop = () => { for (const off of rec.off) off(); rec.off = []; if (swipeRec === rec) swipeRec = null; };
+  rec.compact = cap => swipeCompact(rec.events, cap);
+  swipeRec = rec;
+  try { rec.hookDoc(mirrorDoc()); } catch (e) { /* no mirror document */ }
+  return rec;
+}
+
+// NAS page letters seen while a step runs (the page the NAS browser is on, from /api/rb/meta).
+function swipePoll(rbId) {
+  const p = {seq: [], last: "", stop: false, changedAt: performance.now()};
+  let firstDone;
+  p.first = new Promise(resolve => { firstDone = resolve; });
+  (async () => {
+    while (!p.stop) {
+      try {
+        const res = await fetch("/api/rb/meta?tab=" + encodeURIComponent(rbId) + "&wait=0", {credentials: "same-origin", cache: "no-store"});
+        if (res.ok) {
+          const letter = swipeLetter((await res.json()).url);
+          if (letter !== p.last) { p.last = letter; p.seq.push(letter); p.changedAt = performance.now(); gestureTrace("nas", {page: letter}); }
+        }
+      } catch (e) { /* the next sample */ }
+      firstDone();
+      await delay(100);
+    }
+  })();
+  return p;
+}
+
+function swipeLabel(tab) {
+  let text = "";
+  try {
+    const mode = tabDisplay(tab);
+    if (mode === "mirror") { const d = mirrorDoc(); text = d && d.body ? (d.body.innerText || d.body.textContent || "") : ""; }
+    else if (mode === "reader") text = ($("readerTitle").textContent || "") + " " + ($("readerBody").textContent || "");
+    else text = (tab.rb && tab.rb.title) || "";
+  } catch (e) { text = ""; }
+  const m = /ページ\s*([ABC])/.exec(text);
+  return m ? m[1] : "";
+}
+
+async function swipeWaitFor(test, ms) {
+  const end = performance.now() + ms;
+  for (;;) {
+    let ok = false;
+    try { ok = await test(); } catch (e) { ok = false; }
+    if (ok) return true;
+    if (performance.now() >= end || (swipeDiag && swipeDiag.aborted)) return false;
+    await delay(100);
+  }
+}
+
+function swipeAlive(d) {
+  const snap = selftestUi.snap;
+  return !d.aborted && Boolean(snap && snap.run_id === d.runId && snap.state === "running");
+}
+
+async function swipeNasLetter(d) {
+  const meta = await api("/api/rb/meta?tab=" + encodeURIComponent(d.tab.rb.id) + "&wait=0");
+  return swipeLetter(meta.url);
+}
+
+async function swipeEnsureRoute(d) {
+  const tab = d.tab;
+  if (!(state.route.view === "tab" && state.route.tabId === tab.id)) { navigate("#/tab/" + tab.id); await delay(300); }
+  if (!(history.state && history.state.qdGuard === tab.id)) armBackGuard();
+}
+
+// The step's starting page: the Hub puts the NAS tab there, then the display must show it.
+async function swipeEnsureStart(d, letter) {
+  await swipeEnsureRoute(d);
+  if ((await swipeNasLetter(d)) !== letter) {
+    await api("/api/selftest/swipe/goto", {run_id: d.runId, page: letter});
+    await swipeWaitFor(async () => (await swipeNasLetter(d)) === letter, 6000);
+  }
+  await swipeWaitFor(() => swipeLabel(d.tab) === letter, 8000);
+  await delay(650);            // longer than the flick / popstate de-duplication window
+}
+
+async function swipeSetMode(d, mode) {
+  const tab = d.tab;
+  d.mode = mode;
+  tab.diag.mode = mode;
+  const rb = tab.rb;
+  rb.tilesFor = ""; rb.readerFail = null; rb.mirrorFail = null;
+  await swipeEnsureRoute(d);
+  applyDisplay(tab);
+  await swipeWaitFor(() => swipeLabel(tab) !== "", 10000);
+  document.querySelectorAll("[data-swipe-mode]").forEach(b => b.classList.toggle("is-on", b.dataset.swipeMode === mode));
+  await delay(400);
+}
+
+// ---- synthetic input -------------------------------------------------------------------------
+function swipeEnv(d, kind) {
+  const tab = d.tab, mode = tabDisplay(tab);
+  if (kind === "toolbar") {
+    const bar = document.querySelector(".toolbar"), r = bar.getBoundingClientRect();
+    return {win: window, target: bar, handlers: pullHandlers, cx: window.innerWidth / 2, cy: r.top + r.height / 2, how: ""};
+  }
+  if (mode === "mirror") {
+    const doc = mirrorDoc();
+    if (!doc || !doc.body) return null;
+    return {win: doc.defaultView, target: doc.body, handlers: flickHandlers.get(doc),
+      cx: doc.documentElement.clientWidth / 2, cy: doc.documentElement.clientHeight / 2, how: ""};
+  }
+  const view = $("remoteView");
+  const target = {reader: $("readerScroll"), tiles: $("tileScroll"), live: $("remoteStage")}[mode] || view;
+  const r = target.getBoundingClientRect();
+  return {win: window, target, handlers: flickHandlers.get(view), cx: r.left + r.width / 2, cy: r.top + r.height / 2, how: ""};
+}
+
+// A TouchEvent where the browser lets us build one; else the very same internal handler is called directly.
+function swipeSend(env, type, x, y) {
+  if (env.how !== "direct") {
+    try {
+      const w = env.win;
+      const point = new w.Touch({identifier: 91, target: env.target, clientX: x, clientY: y, pageX: x, pageY: y, screenX: x, screenY: y});
+      const list = type === "touchend" ? [] : [point];
+      env.target.dispatchEvent(new w.TouchEvent(type, {bubbles: true, cancelable: true, composed: true,
+        touches: list, targetTouches: list, changedTouches: [point], view: w}));
+      env.how = "touch";
+      return;
+    } catch (e) {
+      if (env.how === "touch") throw e;
+      env.how = "direct";
+    }
+  }
+  const h = env.handlers;
+  const fn = h && (type === "touchstart" ? h.start : type === "touchmove" ? h.move : h.end);
+  if (!fn) { env.how = "none"; return; }
+  const point = {clientX: x, clientY: y};
+  gestureTrace("touch." + type.slice(5), {x: Math.round(x), y: Math.round(y), direct: 1});
+  fn({touches: type === "touchend" ? [] : [point], changedTouches: [point], target: env.target, isTrusted: false});
+}
+
+async function swipeDrag(env, x0, y0, x1, y1, ms, steps, begin = true) {
+  if (begin) swipeSend(env, "touchstart", x0, y0);
+  for (let i = 1; i <= steps; i++) {
+    await delay(ms / steps);
+    swipeSend(env, "touchmove", x0 + (x1 - x0) * i / steps, y0 + (y1 - y0) * i / steps);
+  }
+}
+
+const SWIPE_AUTO_STEPS = [
+  {id: "edge_back", start: "C", run: async () => { history.back(); return "history"; }},
+  {id: "flick_right", start: "B", run: ctx => swipeFlick(ctx, {dx: 150, ms: 150})},
+  {id: "back_first", start: "A", run: async () => { history.back(); return "history"; }},
+  {id: "flick_left", start: "A", run: ctx => swipeFlick(ctx, {dx: -150, ms: 150})},
+  {id: "slow_move", start: "B", run: ctx => swipeFlick(ctx, {dx: 150, ms: 1000, steps: 10})},
+  {id: "edge_start", start: "B", run: ctx => swipeFlick(ctx, {dx: 150, ms: 150, x0: 8})},
+  {id: "forward", start: "B", run: async () => { history.forward(); return "history"; }},
+  {id: "pull_cancel", start: "B", run: ctx => swipePull(ctx, true)},
+  {id: "pull_close", start: "B", run: ctx => swipePull(ctx, false)},
+];
+
+async function swipeFlick(ctx, o) {
+  let env = null;
+  await swipeWaitFor(() => { env = swipeEnv(ctx.d, "view"); return Boolean(env && env.handlers); }, 4000);   // the mirror document may be swapping
+  if (!env || !env.handlers) {
+    let doc = null;
+    try { doc = mirrorDoc(); } catch (e) { doc = null; }
+    gestureTrace("input.none", {mode: tabDisplay(ctx.d.tab), doc: Boolean(doc), body: Boolean(doc && doc.body),
+      wired: Boolean(doc && flickHandlers.get(doc)), wrap: !$("mirrorWrap").hidden, owner: mirrorHost.owner === ctx.d.tab.rb});
+  }
+  if (!env) return "none";
+  const x0 = o.x0 !== undefined ? o.x0 : env.cx - o.dx / 2, y = env.cy;
+  await swipeDrag(env, x0, y, x0 + o.dx, y, o.ms, o.steps || 6);
+  swipeSend(env, "touchend", x0 + o.dx, y);
+  return env.how;
+}
+
+async function swipePull(ctx, back) {
+  const env = swipeEnv(ctx.d, "toolbar");
+  const x = env.cx, y = env.cy;
+  await swipeDrag(env, x, y, x, y + 140, 150, 5);
+  await delay(80);
+  if (back) {
+    await swipeDrag(env, x, y + 140, x, y + 20, 100, 3, false);       // the same finger goes back up
+    await delay(60);
+    ctx.facts.hint_hidden = $("gestureHint").hidden;
+  }
+  swipeSend(env, "touchend", x, back ? y + 20 : y + 140);
+  return env.how;
+}
+
+// One step: starting page, recording, the action (automatic) or the person's answer (manual), settling, facts.
+async function swipeRunStep(d, def, answerFn) {
+  const tab = d.tab;
+  await swipeEnsureStart(d, def.start);
+  tab.diag.closeCalls = 0;
+  const rec = makeSwipeRecorder();
+  const poller = swipePoll(tab.rb.id);
+  await poller.first;
+  const t0 = performance.now();
+  const ctx = {d, facts: {}};
+  rec.note("step.begin", {id: def.id, mode: tabDisplay(tab)});
+  let synthetic = "", answer = "";
+  try {
+    if (answerFn) answer = await answerFn(def);
+    else synthetic = (await def.run(ctx)) || "";
+    await delay(750);
+    const end = performance.now() + 2500;
+    while (performance.now() < end && performance.now() - poller.changedAt < 500) await delay(100);
+    const want = poller.last;
+    if (want === "A" || want === "B" || want === "C") await swipeWaitFor(() => swipeLabel(tab) === want, 2500);
+  } finally {
+    poller.stop = true;
+    rec.stop();
+  }
+  const seq = poller.seq.join("").slice(0, 16);
+  const facts = Object.assign({
+    nas_before: poller.seq[0] || "?", nas_after: poller.last || "?", nas_seq: seq, label: swipeLabel(tab),
+    route_left: rec.routeLeft || !(state.route.view === "tab" && state.route.tabId === tab.id),
+    hint_shown: rec.hintShown, hint_hidden: $("gestureHint").hidden, close_calls: Math.min(100, tab.diag.closeCalls),
+    synthetic: synthetic === "touch" || synthetic === "direct" || synthetic === "history" || synthetic === "none" ? synthetic : "",
+    flick_why: rec.flickWhy, ms: Math.round(performance.now() - t0)}, ctx.facts);
+  if (answer) facts.answer = answer;
+  return {id: def.id, facts, counts: rec.counts, raw: rec.events.slice(), display: tabDisplay(tab), synthetic: facts.synthetic};
+}
+
+function swipeBody(d, name, steps, growth, cap) {
+  const last = steps[steps.length - 1];
+  return {run_id: d.runId, mode: {name, display: last ? last.display : "", synthetic: swipeSyntheticOf(steps),
+    history_growth: growth, steps: steps.map(s => ({id: s.id, facts: s.facts, counts: s.counts, events: swipeCompact(s.raw, cap)}))},
+    last: false};
+}
+
+function swipeSyntheticOf(steps) {
+  const kinds = steps.map(s => s.synthetic).filter(k => k === "touch" || k === "direct" || k === "none");
+  return kinds.includes("none") ? "none" : kinds.includes("direct") ? "direct" : kinds.includes("touch") ? "touch" : "history";
+}
+
+async function swipePost(d, body) {
+  for (const cap of [SWIPE_EVENT_CAP, 36, 20, 10]) {
+    if (body.mode) for (const s of body.mode.steps) s.events = swipeCompact(s.events, cap);
+    if (JSON.stringify(body).length <= SWIPE_PAYLOAD_MAX) break;
+  }
+  await api("/api/selftest/swipe", body);
+}
+
+// ---- tab, banner, clean-up --------------------------------------------------------------------
+async function swipeBegin(snap, manual) {
+  const prevHash = location.hash || "#/home";
+  const tab = newTabRecord("t" + state.nextTabId++);
+  const url = "https://" + SWIPE_HOST + "/swipe/c";
+  tab.history = [url]; tab.index = 0; tab.current = url;
+  tab.diag = {mode: null, closeCalls: 0, stubClose: true};
+  tab.rb = newRbRecord(snap.tab, tab);
+  state.tabs.push(tab);
+  const d = {tab, runId: snap.run_id, prevHash, cleaning: false, aborted: false, manual, mode: ""};
+  swipeDiag = d;
+  history.replaceState(null, "", "#/tab/" + tab.id);       // the diagnostic tab takes the place of this screen's entry
+  applyRoute();
+  await delay(300);
+  return d;
+}
+
+async function swipeEnd(d) {
+  d.cleaning = true;
+  if (swipeRec) swipeRec.stop();
+  swipeRec = null;
+  setShown("swipeBanner", false);
+  const tab = d.tab, idx = state.tabs.indexOf(tab);
+  tab.diag.stubClose = false;
+  tab.token++;
+  releaseRemote(tab);
+  if (idx >= 0) state.tabs.splice(idx, 1);
+  if (state.lastWebTabId === tab.id) state.lastWebTabId = null;
+  gestureHint("");
+  if (history.state && history.state.qdGuard === tab.id) {         // take the guard entry off the stack
+    await new Promise(resolve => {
+      const done = () => { window.removeEventListener("popstate", done); clearTimeout(timer); resolve(); };
+      const timer = setTimeout(done, 800);
+      window.addEventListener("popstate", done);
+      history.back();
+    });
+  }
+  history.replaceState(null, "", d.prevHash);
+  d.cleaning = false;
+  swipeDiag = null;
+  applyRoute();
+  renderWebTabs();
+  updateChrome();
+}
+
+function swipeBanner(step, text) {
+  $("swipeBannerStep").textContent = step;
+  $("swipeBannerText").textContent = text;
+  setShown("swipeBanner", true);
+}
+
+async function swipeFailPost(d, error) {
+  try { await api("/api/selftest/swipe", {run_id: d.runId, last: true, error: String(error && error.message || error).slice(0, 150)}); } catch (e) { /* the Hub ends the wait */ }
+}
+
+// Automatic: every display mode, every step; one POST per mode and a final one.
+async function swipeAuto(snap) {
+  const d = await swipeBegin(snap, false);
+  try {
+    const started = performance.now();
+    const device = selftestDevice();
+    swipeBanner("スワイプの自動確認", "アプリのスワイプ処理へ合成した入力を流しています。画面を触らないでください。");
+    for (const [i, name] of SWIPE_MODES.entries()) {
+      if (!swipeAlive(d) || (i > 0 && performance.now() - started > SWIPE_AUTO_BUDGET_MS)) break;
+      swipeBanner("スワイプの自動確認 " + (i + 1) + "/" + SWIPE_MODES.length, SWIPE_MODE_NAME[name] + "表示で確認しています。画面を触らないでください。");
+      await swipeSetMode(d, name);
+      const growth0 = history.length;
+      const steps = [];
+      for (const def of SWIPE_AUTO_STEPS) {
+        if (!swipeAlive(d)) break;
+        steps.push(await swipeRunStep(d, def, null));
+      }
+      await swipePost(d, Object.assign(swipeBody(d, name, steps, history.length - growth0, SWIPE_EVENT_CAP), {device: i === 0 ? device : undefined}));
+    }
+    await api("/api/selftest/swipe", {run_id: d.runId, last: true});
+  } catch (e) {
+    await swipeFailPost(d, e);
+  } finally {
+    await swipeEnd(d).catch(() => {});
+  }
+}
+
+const SWIPE_MANUAL_STEPS = [
+  {id: "m_edge_back", start: "C", text: "画面の左端から右へスワイプ（iPhoneの戻る操作）", want: "期待: 1つ前のページ（ページB）になり、アプリは同じタブ画面のまま"},
+  {id: "m_flick_right", start: "B", text: "ページの中央で右へすばやくフリック", want: "期待: 1つ前のページ（ページA）になる"},
+  {id: "m_flick_left", start: "A", text: "ページの中央で左へすばやくフリック", want: "期待: 次のページ（ページB）になる"},
+  {id: "m_table", start: "B", text: "表の部分を横にスクロール（ゆっくり）", want: "期待: 表が横に動くだけで、ページは戻らない・進まない"},
+  {id: "m_edge_forward", start: "B", text: "画面の右端から左へスワイプ（iPhoneの進む操作、ある場合）", want: "期待: 進めるときだけ進む。何も起きなくても構いません"},
+  {id: "m_pull", start: "B", text: "ツールバーを下へ引く（離さずに元へ戻す）", want: "期待: ヒントが出て、戻すと消える。タブは閉じない"},
+];
+
+// Manual: the person's finger, the person's answer.
+async function swipeManual(snap) {
+  const d = await swipeBegin(snap, true);
+  let pending = null;
+  const wire = (id, value) => { $(id).onclick = () => { if (pending) { const r = pending; pending = null; r(value); } }; };
+  wire("swipeOk", "ok"); wire("swipeBad", "bad"); wire("swipeSkip", "skip");
+  $("swipeAbort").onclick = () => { d.aborted = true; if (pending) { const r = pending; pending = null; r("skip"); } api("/api/selftest/cancel", {}).catch(() => {}); };
+  document.querySelectorAll("[data-swipe-mode]").forEach(b => {
+    b.onclick = () => { if (!d.aborted) swipeSetMode(d, b.dataset.swipeMode).catch(() => {}); };
+  });
+  try {
+    const device = selftestDevice();
+    const first = SWIPE_MODES.includes(tabDisplay(d.tab)) ? tabDisplay(d.tab) : "mirror";
+    swipeBanner("スワイプの確認（手動）", "準備しています…");
+    $("swipeOk").disabled = $("swipeBad").disabled = $("swipeSkip").disabled = true;
+    await swipeSetMode(d, first);
+    const byMode = {};
+    for (const [i, def] of SWIPE_MANUAL_STEPS.entries()) {
+      if (!swipeAlive(d)) break;
+      $("swipeOk").disabled = $("swipeBad").disabled = $("swipeSkip").disabled = true;
+      swipeBanner("手順 " + (i + 1) + "/" + SWIPE_MANUAL_STEPS.length + "（準備中）", "ページを準備しています…");
+      const result = await swipeRunStep(d, def, async () => {
+        swipeBanner("手順 " + (i + 1) + "/" + SWIPE_MANUAL_STEPS.length, def.text + "　" + def.want);
+        $("swipeOk").disabled = $("swipeBad").disabled = $("swipeSkip").disabled = false;
+        return new Promise(resolve => { pending = resolve; });
+      });
+      (byMode[d.mode] = byMode[d.mode] || []).push(result);
+    }
+    let n = 0;
+    for (const name of SWIPE_MODES) {
+      if (byMode[name] && swipeAlive(d)) await swipePost(d, Object.assign(swipeBody(d, name, byMode[name], 0, SWIPE_EVENT_CAP), {device: n++ === 0 ? device : undefined}));
+    }
+    await api("/api/selftest/swipe", {run_id: d.runId, last: true});
+  } catch (e) {
+    await swipeFailPost(d, e);
+  } finally {
+    await swipeEnd(d).catch(() => {});
+  }
+}
+
 // One button: the Hub measures the NAS, the NAS browser and built-in test pages (selftest.py), and while it
 // waits this page measures ITS OWN side on the same internal fixture tab (reader / mirror / tiles / live)
 // in an off-screen container that never touches the user's tabs or displays. Everything is RAM only; the
@@ -7766,7 +8282,9 @@ function wireSelftest() {
   const saved = readLocal(SELFTEST_URLS_KEY);
   if (saved) $("selftestUrls").value = saved.slice(0, 2000);
   $("selftestUrls").addEventListener("input", () => writeLocal(SELFTEST_URLS_KEY, $("selftestUrls").value.slice(0, 2000)));
-  $("selftestRun").addEventListener("click", () => perform(selftestStart));
+  $("selftestRun").addEventListener("click", () => perform(() => selftestStart()));
+  $("selftestSwipe").addEventListener("click", () => perform(() => selftestStart({only: "swipe", client: false, urls: []})));
+  $("selftestManual").addEventListener("click", () => perform(() => selftestStart({only: "swipe_manual", client: false, urls: []})));
   $("selftestCancel").addEventListener("click", () => perform(async () => {
     $("selftestCancel").disabled = true;
     await api("/api/selftest/cancel", {});
@@ -7776,7 +8294,7 @@ function wireSelftest() {
   $("selftestSave").addEventListener("click", () => perform(selftestSave));
 }
 
-async function selftestStart() {
+async function selftestStart(extra = {}) {
   const lines = selftestUrlLines();
   if (lines.length > 5) throw new Error("実サイトのURLは最大5件です");
   const urls = [];
@@ -7786,7 +8304,7 @@ async function selftestStart() {
   writeLocal(SELFTEST_URLS_KEY, $("selftestUrls").value.slice(0, 2000));
   $("selftestRun").disabled = true;
   try {
-    const r = await api("/api/selftest/start", {urls, viewport: selftestViewport(), client: true});
+    const r = await api("/api/selftest/start", Object.assign({urls, viewport: selftestViewport(), client: true, swipe: true}, extra));
     selftestUi.runId = r.run_id;
     writeSession(SELFTEST_RUN_KEY, r.run_id);       // only the page that started a run measures its own side
     selftestUi.rev = -1;
@@ -7833,6 +8351,11 @@ async function selftestWatch() {
         selftestUi.clientRun = snap.run_id;
         selftestClient(snap).catch(() => {});
       }
+      if (snap.state === "running" && snap.phase === "swipe" && snap.tab && selftestUi.swipeRun !== snap.run_id &&
+          readSession(SELFTEST_RUN_KEY) === snap.run_id) {
+        selftestUi.swipeRun = snap.run_id;
+        (snap.swipe_kind === "manual" ? swipeManual : swipeAuto)(snap).catch(() => {});
+      }
       if (snap.state !== "running") return;
     }
   } finally {
@@ -7846,6 +8369,7 @@ function renderSelftest(snap) {
   selftestUi.snap = snap;
   const running = snap.state === "running";
   $("selftestRun").disabled = running;
+  for (const id of ["selftestSwipe", "selftestManual"]) $(id).disabled = running;
   setShown("selftestCancel", running);
   $("selftestCancel").disabled = false;
   const state = $("selftestState");

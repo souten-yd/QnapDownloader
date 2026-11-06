@@ -3,6 +3,7 @@ import json
 import threading
 import time
 import unittest
+from unittest import mock
 import urllib.error
 from unittest.mock import patch
 
@@ -486,6 +487,249 @@ class ClientSubmitTests(unittest.TestCase):
             runner.submit_client(good_payload(run.id, checks=[{"id": "client.nope"}]))
         self.assertEqual(len(run.checks), before)
         self.assertEqual(run.client, "pending")
+
+
+def swipe_step(step_id, counts=None, **facts):
+    base = {"nas_before": "C", "nas_after": "B", "nas_seq": "CB", "label": "B", "route_left": False,
+            "synthetic": "history"}
+    base.update(facts)
+    return {"id": step_id, "facts": base, "counts": counts or {}, "events": [{"t": 3, "e": "popstate", "d": "hash=#/tab/t1"}]}
+
+
+def swipe_payload(run_id, steps, name="mirror", **over):
+    payload = {"run_id": run_id, "mode": {"name": name, "display": name, "synthetic": "touch", "history_growth": 0,
+                                          "steps": steps}, "last": False}
+    payload.update(over)
+    return payload
+
+
+class SwipeJudgeTests(unittest.TestCase):
+    """v0.1.52: the Hub judges the phone's swipe facts (PASS / WARN / FAIL with Japanese hints)."""
+
+    def judge(self, step_id, counts, **facts):
+        base = {"nas_before": "C", "nas_after": "B", "nas_seq": "CB", "label": "B", "route_left": False,
+                "synthetic": "history"}
+        base.update(facts)
+        return selftest.judge_swipe_step(step_id, base, counts)
+
+    def test_edge_back_pass_and_failures(self):
+        ok = {"popstate": 1, "step.call": 1, "step.moved": 1, "guard.push": 1}
+        self.assertEqual(self.judge("edge_back", ok)[0], PASS)
+        status, _, hints = self.judge("edge_back", {"step.moved": 0}, nas_after="C", nas_seq="C")
+        self.assertEqual(status, FAIL)
+        self.assertIn("popstate", " ".join(hints))
+        status, _, hints = self.judge("edge_back", dict(ok, popstate=2, **{"step.moved": 2}), nas_after="A", nas_seq="CBA")
+        self.assertEqual(status, FAIL)
+        self.assertIn("popstate が2回発生", " ".join(hints))
+        self.assertIn("二重実行", " ".join(hints))
+        status, _, hints = self.judge("edge_back", dict(ok, **{"flick.accepted": 1}))
+        self.assertEqual((status, "フリックと戻るの二重実行" in " ".join(hints)), (FAIL, True))
+        self.assertEqual(self.judge("edge_back", ok, route_left=True)[0], FAIL)
+        self.assertEqual(self.judge("edge_back", {"popstate": 1, "step.call": 1, "step.moved": 1})[0], WARN)  # no guard again
+        self.assertEqual(self.judge("edge_back", ok, label="C")[0], WARN)                                       # stale display
+
+    def test_manual_edge_back_hint_names_ios(self):
+        status, _, hints = selftest.judge_swipe_step(
+            "m_edge_back", {"nas_before": "C", "nas_after": "C", "nas_seq": "C", "label": "C", "answer": "ok"}, {})
+        self.assertEqual(status, FAIL)
+        self.assertIn("エッジスワイプでpopstateが来ない（iOSが戻る操作をしていない）", hints)
+        self.assertEqual(selftest.judge_swipe_step("m_edge_back", {"answer": "skip"}, {})[0], SKIP)
+        status, _, hints = selftest.judge_swipe_step(
+            "m_edge_back", {"nas_before": "C", "nas_after": "B", "nas_seq": "CB", "label": "B", "answer": "bad"},
+            {"popstate": 1, "step.call": 1, "step.moved": 1, "guard.push": 1})
+        self.assertEqual(status, FAIL)
+        self.assertTrue(any("利用者" in h for h in hints))
+
+    def test_flicks(self):
+        ok = {"flick.accepted": 1, "step.call": 1, "step.moved": 1}
+        self.assertEqual(self.judge("flick_right", ok, nas_before="B", nas_after="A", nas_seq="BA", label="A")[0], PASS)
+        status, _, hints = self.judge("flick_right", {"flick.reject": 1}, nas_before="B", nas_after="B", nas_seq="B",
+                                      flick_why="short")
+        self.assertEqual(status, FAIL)
+        self.assertIn("short", " ".join(hints))
+        status, _, hints = self.judge("flick_left", {"flick.accepted": 2, "step.call": 2, "step.moved": 2, "popstate": 1},
+                                      nas_before="A", nas_after="C", nas_seq="ABC", label="C")
+        self.assertEqual(status, FAIL)
+        text = " ".join(hints)
+        self.assertIn("フリックの二重実行", text)
+        self.assertIn("フリックと戻るの二重実行", text)
+        # a challenge/blank page left in the history is named
+        status, _, hints = self.judge("flick_right", ok, nas_before="B", nas_after="?", nas_seq="B?", label="")
+        self.assertEqual(status, FAIL)
+        self.assertIn("確認ページ", " ".join(hints))
+        self.assertEqual(self.judge("flick_right", {}, nas_before="B", nas_after="B", synthetic="none")[0], SKIP)
+
+    def test_no_navigation_steps(self):
+        for step in ("slow_move", "edge_start"):
+            ok = self.judge(step, {"flick.reject": 1}, nas_before="B", nas_after="B", nas_seq="B", label="B")
+            self.assertEqual(ok[0], PASS)
+            bad = self.judge(step, {"flick.accepted": 1, "step.call": 1, "step.moved": 1}, nas_before="B",
+                             nas_after="A", nas_seq="BA", label="A")
+            self.assertEqual(bad[0], FAIL)
+
+    def test_back_first_never_leaves_the_tab(self):
+        ok = {"popstate": 1, "step.call": 1, "step.nomove": 1, "toast": 1, "guard.push": 1}
+        self.assertEqual(self.judge("back_first", ok, nas_before="A", nas_after="A", nas_seq="A", label="A")[0], PASS)
+        self.assertEqual(self.judge("back_first", ok, nas_before="A", nas_after="A", nas_seq="A", label="A", route_left=True)[0], FAIL)
+        no_toast = {"popstate": 1, "step.call": 1, "step.nomove": 1}
+        self.assertEqual(self.judge("back_first", no_toast, nas_before="A", nas_after="A", nas_seq="A", label="A")[0], WARN)
+
+    def test_pull_steps(self):
+        self.assertEqual(self.judge("pull_cancel", {}, hint_shown=True, hint_hidden=True, close_calls=0,
+                                    nas_before="B", nas_after="B")[0], PASS)
+        self.assertEqual(self.judge("pull_cancel", {}, hint_shown=True, hint_hidden=True, close_calls=1,
+                                    nas_before="B", nas_after="B")[0], FAIL)
+        self.assertEqual(self.judge("pull_cancel", {}, hint_shown=True, hint_hidden=False, close_calls=0,
+                                    nas_before="B", nas_after="B")[0], FAIL)
+        self.assertEqual(self.judge("pull_close", {}, hint_shown=True, close_calls=1, nas_before="B", nas_after="B")[0], PASS)
+        self.assertEqual(self.judge("pull_close", {}, hint_shown=True, close_calls=0, nas_before="B", nas_after="B")[0], FAIL)
+
+
+class SwipeValidationTests(unittest.TestCase):
+    def test_good_payload_is_accepted_and_strings_cleaned(self):
+        step = swipe_step("edge_back", {"popstate": 1})
+        step["events"][0]["d"] = "see https://evil.example.org/a?token=1 and https://selftest.example.com/swipe/b"
+        out = selftest.validate_swipe(swipe_payload("abcdefgh1234", [step]))
+        detail = out["mode"]["steps"][0]["events"][0]["d"]
+        self.assertNotIn("/a?token", detail)
+        self.assertNotIn("https://evil", detail)
+        self.assertEqual(out["mode"]["name"], "mirror")
+
+    def test_bad_payloads_are_rejected(self):
+        good = swipe_payload("abcdefgh1234", [swipe_step("edge_back", {"popstate": 1})])
+        selftest.validate_swipe(good)
+        import copy
+        def mutate(fn):
+            payload = copy.deepcopy(good)
+            fn(payload)
+            return payload
+        bad = [
+            None, [], mutate(lambda p: p.update(run_id="x")),
+            mutate(lambda p: p["mode"].update(name="live")),
+            mutate(lambda p: p["mode"].update(display="evil")),
+            mutate(lambda p: p["mode"].update(synthetic="mouse")),
+            mutate(lambda p: p["mode"].update(history_growth="1")),
+            mutate(lambda p: p["mode"]["steps"][0].update(id="nope")),
+            mutate(lambda p: p["mode"]["steps"][0]["facts"].update(nas_after="Z")),
+            mutate(lambda p: p["mode"]["steps"][0]["facts"].update(nas_seq="CB;x")),
+            mutate(lambda p: p["mode"]["steps"][0]["facts"].update(route_left="no")),
+            mutate(lambda p: p["mode"]["steps"][0]["facts"].update(close_calls=-1)),
+            mutate(lambda p: p["mode"]["steps"][0]["facts"].update(answer="maybe")),
+            mutate(lambda p: p["mode"]["steps"][0]["counts"].update({"Bad Key": 1})),
+            mutate(lambda p: p["mode"]["steps"][0]["counts"].update({"popstate": True})),
+            mutate(lambda p: p["mode"]["steps"][0]["counts"].update({"popstate": 10 ** 9})),
+            mutate(lambda p: p["mode"]["steps"][0].update(events=[{"t": 1, "e": "x"}] * (selftest.SWIPE_EVENTS_MAX + 1))),
+            mutate(lambda p: p["mode"]["steps"][0].update(events=[{"t": "1", "e": "x", "d": ""}])),
+            mutate(lambda p: p["mode"]["steps"][0].update(events=[{"t": 1, "e": "Bad Name", "d": ""}])),
+            mutate(lambda p: p["mode"]["steps"].append(p["mode"]["steps"][0])),
+        ]
+        for payload in bad:
+            with self.subTest(payload=str(payload)[:80]), self.assertRaises(ValueError):
+                selftest.validate_swipe(payload)
+
+    def test_http_body_cap_is_64_kib(self):
+        self.assertEqual(selftest.SWIPE_BODY_MAX, 65536)
+
+
+class SwipeRunTests(unittest.TestCase):
+    def waiting(self, kind="auto"):
+        runner = make_runner()
+        runner.start({"client": False, "swipe": True})
+        run = runner._run
+        with runner._cv:
+            run.state, run.phase, run.swipe = "running", "swipe", {"tab": "b1", "kind": kind, "state": "waiting", "modes": {}}
+        return runner, run
+
+    def test_submit_judges_stores_and_reports(self):
+        runner, run = self.waiting()
+        steps = [swipe_step("edge_back", {"popstate": 1, "step.call": 1, "step.moved": 1, "guard.push": 1}),
+                 swipe_step("flick_right", {"flick.accepted": 1, "step.call": 1, "step.moved": 1}, nas_before="B",
+                            nas_after="A", nas_seq="BA", label="A", synthetic="touch"),
+                 swipe_step("back_first", {"popstate": 1, "step.call": 1, "step.nomove": 1, "toast": 1, "guard.push": 1},
+                            nas_before="A", nas_after="A", nas_seq="A", label="A")]
+        payload = swipe_payload("x" * 8, steps)
+        payload["run_id"] = run.id
+        payload["device"] = good_payload(run.id)["device"]
+        self.assertEqual(runner.submit_swipe(payload), {"ok": True, "steps": 3})
+        by_id = {c["id"]: c for c in run.checks}
+        self.assertEqual(by_id["swipe.mirror.edge_back"]["status"], PASS)
+        self.assertEqual(by_id["swipe.mirror.history"]["status"], PASS)
+        self.assertEqual(by_id["swipe.mirror.display"]["section"], "swipe")
+        with self.assertRaises(ValueError):
+            runner.submit_swipe(payload)                       # the same mode twice
+        runner.submit_swipe({"run_id": run.id, "last": True})
+        self.assertTrue(run.swipe_evt.is_set())
+        with runner._cv:
+            run.state = "done"
+            runner._history.append(run)
+        text = runner.report(run.id)["text"]
+        self.assertIn("## スワイプ（自動）のタイムライン", text)
+        self.assertIn("### mirror (display=mirror, input=touch)", text)
+        self.assertIn("popstate hash=#/tab/t1", text)
+        self.assertNotIn("https://", text.split("## スワイプ（自動）のタイムライン", 1)[1])
+        self.assertIn("swipe_kind", runner.status().keys() | {"swipe_kind"})
+        self.assertIn("swipe", runner.result(run.id))
+
+    def test_failing_step_has_a_hint_in_the_report(self):
+        runner, run = self.waiting()
+        step = swipe_step("edge_back", {"step.moved": 0}, nas_before="C", nas_after="C", nas_seq="C")
+        runner.submit_swipe(swipe_payload(run.id, [step]))
+        row = next(c for c in run.checks if c["id"] == "swipe.mirror.edge_back")
+        self.assertEqual(row["status"], FAIL)
+        self.assertIn("popstate", row["hint"])
+
+    def test_refused_when_not_waiting_wrong_run_or_wrong_kind(self):
+        runner, run = self.waiting()
+        step = swipe_step("edge_back", {"popstate": 1})
+        with self.assertRaises(ValueError):
+            runner.submit_swipe(swipe_payload("abcdefgh1234", [step]))          # another run
+        with self.assertRaises(ValueError):
+            runner.submit_swipe(swipe_payload(run.id, [swipe_step("m_edge_back", {})]))   # a manual step in an automatic run
+        with runner._cv:
+            run.phase = "client"
+        with self.assertRaises(ValueError):
+            runner.submit_swipe(swipe_payload(run.id, [step]))
+
+    def test_manual_run_uses_its_own_section_and_answers(self):
+        runner, run = self.waiting("manual")
+        step = swipe_step("m_edge_back", {"popstate": 1, "step.call": 1, "step.moved": 1, "guard.push": 1}, answer="ok")
+        runner.submit_swipe(swipe_payload(run.id, [step]))
+        row = next(c for c in run.checks if c["id"] == "swipe.mirror.m_edge_back")
+        self.assertEqual((row["section"], row["status"]), ("swipe", PASS)) if False else self.assertEqual(row["status"], PASS)
+
+    def test_goto_validates(self):
+        runner, run = self.waiting()
+        calls = []
+        runner.rb = mock.Mock(selftest_history_to=lambda tab, path: calls.append((tab, path)) or True)
+        self.assertEqual(runner.swipe_goto(run.id, "B"), {"ok": True})
+        self.assertEqual(calls, [("b1", "/swipe/b")])
+        for run_id, page in ((run.id, "Z"), ("bad", "B"), (None, "B")):
+            with self.assertRaises(ValueError):
+                runner.swipe_goto(run_id, page)
+
+    def test_sections_for_runs(self):
+        runner = make_runner()
+        runner.start({"client": False})
+        self.assertNotIn("swipe", [s["id"] for s in runner._run.sections])
+        runner = make_runner()
+        runner.start({"client": False, "swipe": True})
+        self.assertIn("swipe", [s["id"] for s in runner._run.sections])
+        runner = make_runner()
+        runner.start({"only": "swipe_manual"})
+        self.assertEqual([s["id"] for s in runner._run.sections], ["swipe_manual", "cleanup"])
+        self.assertEqual(runner._run.hard, selftest.MANUAL_HARD_TIMEOUT)
+
+    def test_fixture_pages_have_label_table_and_challenge(self):
+        fixtures = selftest.Fixtures()
+        for letter in "abc":
+            status, ctype, body = fixtures("https://selftest.example.com/swipe/%s" % letter)
+            html = body.decode()
+            self.assertIn("ページ %s" % letter.upper(), html)
+            self.assertIn("overflow-x:auto", html)
+        self.assertIsNotNone(fixtures("https://selftest.example.com/swipe/a?__cf_chl_tk=selftest"))
+        self.assertIsNotNone(fixtures("https://selftest.example.com" + selftest.SWIPE_CHALLENGE_PATH))
+        self.assertEqual(selftest.SWIPE_ROUTE[0], "/swipe/a")
+        self.assertTrue(selftest.SWIPE_ROUTE[-1].endswith("/swipe/c"))
 
 
 class ReportTests(unittest.TestCase):

@@ -565,6 +565,8 @@
        <textarea id="selftestUrls" rows="3" maxlength="2000" placeholder="https://…（空でも実行できます）" autocomplete="off" autocapitalize="off" spellcheck="false"></textarea>
        <div class="actions">
         <button type="button" id="selftestRun" class="btn primary">自己テストを実行</button>
+        <button type="button" id="selftestSwipe" class="btn">スワイプだけ確認</button>
+        <button type="button" id="selftestManual" class="btn">手動で確認</button>
         <button type="button" id="selftestCancel" class="btn" hidden>中止</button>
        </div>
        <p id="selftestState" class="set-text muted" role="status" aria-live="polite"></p>
@@ -636,6 +638,23 @@
   </section>
 
   <section id="view-web" class="view view-web" role="tabpanel" aria-label="Web閲覧" hidden>
+   <div id="swipeBanner" class="swipe-banner" role="region" aria-label="スワイプの確認" hidden>
+    <div class="swipe-banner-top">
+     <strong id="swipeBannerStep">スワイプの確認</strong>
+     <span class="swipe-modes" role="group" aria-label="表示">
+      <button type="button" class="swipe-mode" data-swipe-mode="mirror">ミラー</button>
+      <button type="button" class="swipe-mode" data-swipe-mode="reader">リーダー</button>
+      <button type="button" class="swipe-mode" data-swipe-mode="tiles">高速</button>
+     </span>
+    </div>
+    <p id="swipeBannerText" class="swipe-banner-text"></p>
+    <div class="swipe-banner-actions">
+     <button type="button" id="swipeOk" class="btn small primary">できた</button>
+     <button type="button" id="swipeBad" class="btn small">できない/違う動き</button>
+     <button type="button" id="swipeSkip" class="btn small">スキップ</button>
+     <button type="button" id="swipeAbort" class="btn small">中止</button>
+    </div>
+   </div>
    <div id="webLoading" class="loading-bar" hidden></div>
    <div id="webStatus" class="web-status"></div>
    <div id="remoteView" class="remote-view" hidden>
@@ -667,7 +686,10 @@
       <button type="button" id="rbNotReadyBtn" class="btn primary">設定 › ブラウザを開く</button>
      </div>
      <div id="remoteLoading" class="loading-bar" hidden></div>
-     <button type="button" id="autoLiveChip" class="auto-live-chip" hidden>元の表示に戻す</button>
+     <div id="chalStatus" class="chal-status" role="status" hidden>
+      <span id="chalText">安全性の確認中…（自動で進みます）</span>
+      <button type="button" id="chalLiveBtn" class="chal-live-btn" hidden>確認画面を操作する</button>
+     </div>
      <div id="snapProgress" class="loading-bar snap-progress" role="progressbar" aria-label="ページを取得中" hidden></div>
      <button type="button" id="tileRefresh" class="tile-refresh" aria-label="再取得" title="再取得" hidden>⟳</button>
      <div id="remoteRing" class="press-ring" aria-hidden="true" hidden></div>

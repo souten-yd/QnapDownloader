@@ -122,7 +122,8 @@ class SelfTestClientTests(unittest.TestCase):
     def test_client_uses_only_the_selftest_endpoints_it_needs(self):
         used = set(re.findall(r'"(/api/selftest/[a-z]+)', JS))
         self.assertEqual(used, {"/api/selftest/status", "/api/selftest/start", "/api/selftest/cancel",
-                                "/api/selftest/client", "/api/selftest/report", "/api/selftest/results"})
+                                "/api/selftest/client", "/api/selftest/report", "/api/selftest/results",
+                                "/api/selftest/swipe"})  # + /swipe/goto (v0.1.52)
 
     def test_urls_are_remembered_only_through_the_guarded_storage_helpers(self):
         self.assertIn("writeLocal(SELFTEST_URLS_KEY", JS)
@@ -172,7 +173,7 @@ class LinksAndTimersTests(unittest.TestCase):
         for call in re.finditer(r'api\("/api/(engine|rb)/status"\)', JS):
             before = JS[max(0, call.start() - 400):call.start()]
             self.assertNotRegex(before, r"setTimeout\(\w*Tick")
-        self.assertEqual(len(re.findall(r"sched\.add\(", JS)), 9)
+        self.assertEqual(len(re.findall(r"sched\.add\(", JS)), 8)   # v0.1.52: the Cloudflare rb-auto poll is gone
         self.assertIn('document.visibilityState !== "visible"', JS[JS.index("const sched = {"):])
         self.assertIn("/api/state?rev=", JS)
 

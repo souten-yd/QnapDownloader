@@ -35,7 +35,7 @@ import state_hub
 import ttlcache
 import updater
 
-VERSION = "0.1.51"
+VERSION = "0.1.52"
 PORT = 17864
 ROOT = Path(__file__).resolve().parent
 FILES = {"/": ("web/index.html", "text/html; charset=utf-8"),
@@ -429,7 +429,8 @@ def server_state_hub(server):
 RB_QUIET_POSTS = ("/api/debug/log", "/api/diag/diskio/start", "/api/diag/diskio/stop", "/api/rb/input", "/api/rb/viewport", "/api/rb/snapshot", "/api/rb/snapshot/release",
                   "/api/rb/tap-page", "/api/rb/reader", "/api/rb/probe", "/api/rb/intercepts/open",
                   "/api/rb/mirror", "/api/rb/mirror/click", "/api/rb/mirror/release",
-                  "/api/selftest/start", "/api/selftest/cancel", "/api/selftest/client")
+                  "/api/selftest/start", "/api/selftest/cancel", "/api/selftest/client",
+                  "/api/selftest/swipe", "/api/selftest/swipe/goto")
 
 
 GZIP_MIN = 1024
@@ -634,6 +635,8 @@ class Handler(BaseHTTPRequestHandler):
             maximum = DEBUG_BODY_MAX
         if path == "/api/selftest/client":
             maximum = selftest.CLIENT_BODY_MAX
+        if path == "/api/selftest/swipe":
+            maximum = selftest.SWIPE_BODY_MAX
         if not 0 <= size <= maximum:
             raise ValueError("リクエストが大きすぎます")
         value = json.loads(self.rfile.read(size))
@@ -1346,7 +1349,9 @@ class Handler(BaseHTTPRequestHandler):
                         checked_urls.append({"url": checked})
                 try:
                     run_id = server_selftest(self.server).start({
-                        "urls": checked_urls, "viewport": body.get("viewport"), "client": body.get("client", True)})
+                        "urls": checked_urls, "viewport": body.get("viewport"), "client": body.get("client", True),
+                        "swipe": body.get("swipe") is True,
+                        "only": body.get("only") if body.get("only") in ("swipe", "swipe_manual") else ""})
                 except selftest.Busy as exc:
                     return self.reject(str(exc), 409)
                 return self.send_data(202, {"run_id": run_id})
@@ -1354,6 +1359,10 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_data(200, {"cancelled": server_selftest(self.server).cancel()})
             if path == "/api/selftest/client":
                 return self.send_data(200, server_selftest(self.server).submit_client(body))
+            if path == "/api/selftest/swipe":
+                return self.send_data(200, server_selftest(self.server).submit_swipe(body))
+            if path == "/api/selftest/swipe/goto":
+                return self.send_data(200, server_selftest(self.server).swipe_goto(body.get("run_id"), body.get("page")))
             if path == "/api/diag/diskio/start":
                 return self.send_data(200, server_diskio(self.server).start())
             if path == "/api/diag/diskio/stop":

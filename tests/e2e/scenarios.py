@@ -325,28 +325,75 @@ def reload_reattach(ph):
         "page loaded %d times after reload" % (ph.env.fx.count("/article.html") - opens_before)
 
 
-AUTO_LIVE_BUDGET_S = 6.0
+CHALLENGE_BUDGET_S = 6.0
 
 
-def _auto_live(ph, start_display):
+def _challenge_wait(ph, display):
+    """v0.1.52: a check page is never shown and never switches to live; the status line says it is running and the
+    real page appears in the chosen display right after the redirect, without adding a history entry."""
     tab = ph.open("/challenge.html?s=4", wait_tab=True)
-    ph.wait(lambda: ph.display() == "live", 8, "auto-live entered for the challenge page")
-    ph.wait(lambda: ph.env.fx.times.get("/after-challenge.html"), 12, "the challenge page redirected")
+    ph.wait(lambda: ph.js("(()=>{const t=activeWebTab();return !!(t&&t.rb&&t.rb.chal)})()"), 10, "the check is held")
+    history_len = ph.js("history.length")
+    hash_ = ph.js("location.hash")
+    assert "安全性の確認中" in ph.js("document.getElementById('chalStatus').textContent")
+    assert ph.js("!document.getElementById('chalStatus').hidden")
+    assert ph.js("document.getElementById('chalLiveBtn').hidden"), "the live button must not show before 25 s"
+    deadline = time.monotonic() + 14
+    while not ph.env.fx.times.get("/after-challenge.html"):
+        assert ph.display() == display, "display became %s while the check ran (want %s)" % (ph.display(), display)
+        if display == "mirror":
+            assert "Checking your browser" not in ph.mirror_text(), "the check page itself was rendered"
+        assert time.monotonic() < deadline, "the check page never redirected"
+        ph.page.wait_for_timeout(200)
     redirected = ph.env.fx.times["/after-challenge.html"]
-    ph.wait(lambda: ph.display() == start_display, AUTO_LIVE_BUDGET_S + 2, "display back to %s" % start_display)
+    if display == "mirror":
+        ph.wait(lambda: "確認が終わりました" in ph.mirror_text(), CHALLENGE_BUDGET_S + 2, "real page in the mirror")
+    else:
+        ph.wait(lambda: ph.js("(()=>{const t=activeWebTab();return !!(t&&t.rb&&!t.rb.chal&&t.rb.view&&"
+                              "t.rb.url.endsWith('/after-challenge.html'))})()"), CHALLENGE_BUDGET_S + 2, "real page as tiles")
     took = time.monotonic() - redirected
-    assert took <= AUTO_LIVE_BUDGET_S, "returned %.1fs after the redirect (budget %.1fs)" % (took, AUTO_LIVE_BUDGET_S)
+    assert took <= CHALLENGE_BUDGET_S, "real page %.1fs after the redirect (budget %.1fs)" % (took, CHALLENGE_BUDGET_S)
+    assert ph.display() == display
+    assert ph.js("document.getElementById('chalStatus').hidden")
+    assert ph.js("history.length") == history_len, "history entries were added during the check"
+    assert ph.js("location.hash") == hash_ and ph.js("state.route.view") == "tab"
     return took
 
 
-@scenario("auto-live-fast", display="fast")
-def auto_live_fast(ph):
-    ph.log("returned %.1fs after redirect" % _auto_live(ph, "tiles"))
+@scenario("challenge-wait-fast", display="fast")
+def challenge_wait_fast(ph):
+    ph.log("real page %.1fs after redirect" % _challenge_wait(ph, "tiles"))
 
 
-@scenario("auto-live-mirror", display="mirror")
-def auto_live_mirror(ph):
-    ph.log("returned %.1fs after redirect" % _auto_live(ph, "mirror"))
+@scenario("challenge-wait-mirror", display="mirror")
+def challenge_wait_mirror(ph):
+    ph.log("real page %.1fs after redirect" % _challenge_wait(ph, "mirror"))
+
+
+@scenario("history-skip-and-first-page", engines=("chromium",), display="mirror")
+def history_skip_and_first_page(ph):
+    """v0.1.52: A -> B -> B?token (check redirect) -> C. One back from C lands on B, one more on A; the app stays on the
+    tab route; at the first page a toast says so and nothing else moves (no fall back to the previous app screen)."""
+    tab = ph.open("/article.html")
+    ph.wait(lambda: "E2E テスト記事" in ph.mirror_text(), 15, "mirror content")
+    for path in ("/article2.html", "/article2.html?__cf_chl_tk=abc", "/long1.html"):
+        ph.post("/api/rb/navigate", {"tab": tab, "url": BASE + path})
+        ph.wait(lambda: ph.env.nas_url(tab).endswith(path), 10, "navigated to " + path)
+        ph.page.wait_for_timeout(500)
+    route = ph.js("location.hash")
+    ph.js("history.back()")
+    ph.wait(lambda: ph.env.nas_url(tab).endswith("/article2.html"), 8, "one back skips the token entry (%s)" % ph.env.nas_url(tab))
+    ph.page.wait_for_timeout(900)
+    assert ph.js("location.hash") == route and ph.js("state.route.view") == "tab"
+    ph.js("history.back()")
+    ph.wait(lambda: ph.env.nas_url(tab).endswith("/article.html"), 8, "second back reaches the first page")
+    ph.page.wait_for_timeout(900)
+    ph.js("history.back()")                           # nothing earlier: toast, no route change, no NAS move
+    ph.wait(lambda: "これより前のページはありません" in ph.js("document.body.innerText"), 8, "toast at the first page")
+    ph.page.wait_for_timeout(900)
+    assert ph.js("location.hash") == route and ph.js("state.route.view") == "tab", ph.js("location.hash")
+    assert ph.env.nas_url(tab).endswith("/article.html")
+    assert ph.js("history.state && history.state.qdGuard") == ph.js("state.route.tabId"), "the guard must be put again"
 
 
 # ------------------------------------------------------------------ self-test (v0.1.44)
@@ -363,7 +410,7 @@ def selftest(ph):
     ph.wait(lambda: ph.js("!!(selftestUi.snap&&selftestUi.snap.state==='running')"), 10, "run started")
     # while it runs the progress list is shown and cancel is offered
     assert ph.js("!document.getElementById('selftestProgress').hidden")
-    ph.wait(lambda: ph.js("selftestUi.snap&&selftestUi.snap.state") == "done", 170, "self-test finished")
+    ph.wait(lambda: ph.js("selftestUi.snap&&selftestUi.snap.state") == "done", 250, "self-test finished")
     snap = ph.js("selftestUi.snap")
     checks = {c["id"]: c for c in snap["checks"]}
     builtin = [c for c in snap["checks"] if c["section"] == "builtin"]
@@ -400,10 +447,87 @@ def selftest(ph):
                    "client.secure"):
         assert needle in text, "report lacks %r" % needle
     assert "a.example.com" in text and "/article.html" not in text, "real-site URLs must be reduced to the host by default"
-    assert text.count("\n") < 400
+    # v0.1.52: the report also holds the automatic swipe section with its timelines
+    assert text.count("\n") < 1200, "report too long: %d lines" % text.count("\n")
     # a second click while idle starts a new run only after this one is over; cancel is hidden now
     assert ph.js("document.getElementById('selftestCancel').hidden")
     assert not ph.js("document.getElementById('selftestRun').disabled")
+
+
+def _run_swipe_button(ph, button, timeout):
+    ph.js("(r)=>{location.hash=r}", "#/settings/diag/selftest")
+    ph.wait(lambda: ph.js("(()=>{const b=document.getElementById('%s');return !!b&&b.offsetParent!==null})()" % button),
+            10, "button " + button)
+    before_hash = ph.js("location.hash")
+    ph.page.click("#" + button)
+    ph.wait(lambda: ph.js("!!(selftestUi.snap&&selftestUi.snap.state==='running')"), 10, "run started")
+    return before_hash
+
+
+def _after_swipe(ph, before_hash):
+    assert ph.js("location.hash") == before_hash, "route not restored: %s" % ph.js("location.hash")
+    assert ph.js("state.tabs.filter(t=>t.diag).length") == 0 and ph.js("document.getElementById('swipeBanner').hidden")
+    assert ph.js("swipeRec === null && swipeDiag === null")
+    assert ph.env.rb.selftest_tabs() == [] and ph.env.tabs() == {}, "tabs left behind"
+    assert ph.js("document.getElementById('gestureHint').hidden")
+
+
+@scenario("swipe-diagnostic", engines=("chromium",))
+def swipe_diagnostic(ph):
+    """設定›診断›自己テスト›「スワイプだけ確認」: the app's own handlers get synthetic input in mirror / reader / fast and the Hub
+    judges what happened; the route, the tab list and the NAS tabs are restored."""
+    before = _run_swipe_button(ph, "selftestSwipe", 60)
+    ph.wait(lambda: ph.js("selftestUi.snap&&selftestUi.snap.phase") == "swipe", 30, "swipe phase")
+    ph.wait(lambda: ph.js("!document.getElementById('swipeBanner').hidden"), 20, "banner")
+    ph.wait(lambda: ph.js("selftestUi.snap&&selftestUi.snap.state") == "done", 200, "swipe diagnostic finished")
+    snap = ph.js("selftestUi.snap")
+    rows = {c["id"]: c for c in snap["checks"] if c["section"] == "swipe"}
+    steps = ("edge_back", "flick_right", "back_first", "flick_left", "slow_move", "edge_start", "forward", "pull_cancel", "pull_close")
+    for mode in ("mirror", "reader", "tiles"):
+        assert "swipe.%s.display" % mode in rows, sorted(rows)
+        for step in steps:
+            row = rows.get("swipe.%s.%s" % (mode, step))
+            assert row, "missing %s.%s" % (mode, step)
+            assert row["status"] in ("pass", "warn"), "%s.%s: %s | %s | %s" % (mode, step, row["status"], row["value"], row["hint"])
+        hist = rows["swipe.%s.history" % mode]
+        assert hist["status"] == "pass", hist
+    assert rows["swipe.mirror.edge_back"]["status"] == "pass", rows["swipe.mirror.edge_back"]
+    assert rows["swipe.mirror.flick_right"]["status"] == "pass", rows["swipe.mirror.flick_right"]
+    assert rows["swipe.mirror.pull_close"]["status"] == "pass", rows["swipe.mirror.pull_close"]
+    _after_swipe(ph, before)
+    ph.page.click("#selftestCopy")
+    ph.wait(lambda: len(ph.js("selftestUi.text")) > 500, 10, "report text")
+    text = ph.js("selftestUi.text")
+    for needle in ("## スワイプ（自動）", "swipe.mirror.edge_back", "touch.start", "popstate", "step.moved", "flick.accepted",
+                   "guard.push", "### mirror", "### reader", "### tiles"):
+        assert needle in text, "report lacks %r" % needle
+    assert "https://" not in text.split("## スワイプ（自動）のタイムライン", 1)[1].split("## debug log", 1)[0]
+    assert len(text) < 400000
+
+
+@scenario("swipe-manual", engines=("chromium",))
+def swipe_manual(ph):
+    """「手動で確認」: banner with answer buttons; step 1 is done with the browser back, the rest are skipped."""
+    before = _run_swipe_button(ph, "selftestManual", 60)
+    ph.wait(lambda: ph.js("selftestUi.snap&&selftestUi.snap.phase") == "swipe", 30, "swipe phase")
+    ph.wait(lambda: ph.js("!document.getElementById('swipeBanner').hidden&&!document.getElementById('swipeOk').disabled"), 40, "first step ready")
+    assert "手順 1/6" in ph.js("document.getElementById('swipeBannerStep').textContent")
+    ph.shot("banner")
+    ph.js("history.back()")
+    ph.page.wait_for_timeout(1500)
+    ph.page.click("#swipeOk")
+    for number in range(2, 7):
+        ph.wait(lambda: ph.js("(()=>{const e=document.getElementById('swipeBannerStep').textContent;"
+                              "return e.startsWith('手順 %d/6')&&!e.includes('準備中')&&!document.getElementById('swipeSkip').disabled})()" % number),
+                40, "step %d ready" % number)
+        ph.page.click("#swipeSkip")
+    ph.wait(lambda: ph.js("selftestUi.snap&&selftestUi.snap.state") == "done", 60, "manual check finished")
+    snap = ph.js("selftestUi.snap")
+    rows = {c["id"]: c for c in snap["checks"] if c["section"] == "swipe_manual"}
+    first = [c for c in rows.values() if c["id"].endswith(".m_edge_back")]
+    assert first and first[0]["status"] == "pass", rows
+    assert len([c for c in rows.values() if c["status"] == "skip"]) == 5, rows
+    _after_swipe(ph, before)
 
 
 @scenario("omnibox-touch-type")
@@ -424,7 +548,7 @@ def omnibox_touch_type(ph):
 
 @scenario("browser-back-is-page-back")
 def browser_back_is_page_back(ph):
-    """The browser's own back (iOS edge swipe) on a web page goes back in the page, then leaves (v0.1.50)."""
+    """The browser's own back (iOS edge swipe) on a web page goes back in the page, then stays with a toast (v0.1.52)."""
     tab = ph.open("/article.html")
     ph.wait(lambda: "E2E テスト記事" in ph.mirror_text(), 15, "mirror content")
     ph.post("/api/rb/navigate", {"tab": tab, "url": BASE + "/article2.html"})
@@ -440,4 +564,6 @@ def browser_back_is_page_back(ph):
     ph.js("history.back()")               # the page has nothing earlier now: the app's previous screen
     ph.page.wait_for_timeout(1500)
     ph.log("after 2nd back: hash=%s state=%s nas=%s" % (ph.js("location.hash"), ph.js("JSON.stringify(history.state)"), ph.env.nas_url(tab)))
-    ph.wait(lambda: ph.js("location.hash") != hash_before, 8, "second back leaves the tab")
+    # v0.1.52: no fallback to history.back(); the app stays on the tab and tells the user
+    assert ph.js("location.hash") == hash_before, "the app left the tab on a back with nothing earlier (%s)" % ph.js("location.hash")
+    ph.wait(lambda: "これより前のページはありません" in (ph.js("document.body.innerText") or ""), 5, "first-page toast")

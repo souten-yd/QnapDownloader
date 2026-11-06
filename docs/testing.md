@@ -34,7 +34,7 @@ python3 tests/e2e/run.py --engines chromium,webkit --out /tmp/e2e
 settings-routes / display-reader・mirror・tiles・live / mirror-tap-link（クリックを止めたiOS相当のタップ・遷移後スクロール0）/
 mirror-menu-toggle（`href="#"` と自ページ宛の2種類のトグルが再読み込みにならない）/ mirror-dynamic / mirror-security（CSP・スクリプト不実行）/
 reader-cards（ラベル・サイズあり/なし、ページ送りチップ）/ gesture-flick-mirror・tiles、gesture-close-tab（Chromiumのみ: CDPタッチが必要）/
-reload-reattach / auto-live-fast・mirror（リダイレクト後 6 秒以内に元の表示へ）/
+reload-reattach / challenge-wait-fast・mirror（確認ページはライブに切り替えず「安全性の確認中」を表示、リダイレクト後 6 秒以内に本来のページを選んだ表示で出す・履歴は増えない）/ history-skip-and-first-page（確認ページ・トークン付き重複の履歴を1回で飛ばして戻る、最初のページでは案内のみでアプリの画面は変わらない）/ swipe-diagnostic・swipe-manual（Chromiumのみ: 設定›診断›自己テストの「スワイプだけ確認」「手動で確認」）/
 live-sse-fallback（MJPEGが1バイトも届かない状態を再現: 2.5秒後にSSEへ切替わりフレームが届く・経路を記憶して再読み込み後はMJPEGを触らない）/ live-polling-fallback（MJPEGもSSEも届かない: ポーリングで表示し理由を出す）/ copy-fallback（`navigator.clipboard` が無くても隠しtextarea＋execCommandでコピー）/
 selftest（設定›診断›自己テストを実行して、全項目が終わり、レポートに NAS・端末・ログが入り、URLがホスト名だけになり、テスト用タブが残らない）。
 
@@ -46,6 +46,15 @@ GitHubのE2Eでは実機のNAS・iPhone・実サイトを測れないため、�
 結果はHubのRAMに直近5件だけ残り、ディスクへは書かない。上限は4分で、中止・エラー時もテスト用タブと一時的に入れたデバッグログを元に戻す。
 
 未対応: 長押しのhosterプローブ（`rapidgator.net` 等の実ドメインが必要でフィクスチャに向けられないため）。
+
+### スワイプの確認（v0.1.52）
+「スワイプがおかしい」を実機で再現するために、自己テストにスワイプの確認を持たせている（`selftest.py` が判定、`web/app.js` の `swipeAuto` / `swipeManual` が端末側）。
+iOSの端スワイプそのものは合成できないが、アプリ側の処理は合成入力で試せる。**自動**（通常の自己テストの「スワイプ（自動）」、または「スワイプだけ確認」）は、
+Hubが内部テスト用タブに A → 確認ページ → A?__cf_chl_tk → B → C の履歴を作り、端末がそのタブを実際のタブ画面で開いて、ミラー・リーダー・高速の各表示で
+`history.back()`（端スワイプ相当）・最初のページでの戻る・中央の左右フリック（`new Touch`/`TouchEvent`、作れなければ同じ内部ハンドラを直接呼ぶ）・ゆっくりした動き・画面端からの動き・
+`history.forward()`・ツールバーを下へ引く/離す（タブを閉じる処理は記録だけで実行しない）を流し、NASのページ・route・popstate・stepHistory・履歴の長さを記録する。
+**手動**（「手動で確認」）は同じ記録・判定・レポートで、バナーの指示に従って実際の指でスワイプし「できた／できない・違う動き／スキップ」を答える。
+結果は通常の自己テストと同じレポート（`## スワイプ（自動）` / `## スワイプ（手動）` とタイムライン）に入り、「結果をコピー」で貼れる。`gestureTrace(event, data)` は記録中以外は何もしない。
 
 ### シナリオの追加方法
 1. 必要なら `tests/e2e/fixtures/<name>.html` を追加する（`/<name>.html` で配信される。ページ内スクリプトは
