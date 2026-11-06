@@ -783,10 +783,11 @@ class LocalAdapter:
     EXISTS_STATE = "FAILED_EXISTS"
     EXISTS_TEXT = re.compile(r"exist|既に|すでに|存在", re.I)
 
-    def remove_skipped_existing(self):
+    def _scan_links(self):
+        """(finished_count, ids of "already exists" skips) from the link list (paged, read-only)."""
         from jd2_downloads import PAGE_SIZE, MAX_PAGE
         fields = {"uuid": True, "status": True, "skipped": True, "finalLinkState": True, "finished": True}
-        found = []
+        found, finished = [], 0
         for page in range(MAX_PAGE + 1):
             batch = self._call("downloadsV2", "queryLinks",
                                dict(fields, maxResults=PAGE_SIZE, startAt=page * PAGE_SIZE))
@@ -795,6 +796,8 @@ class LocalAdapter:
             for link in batch:
                 if not isinstance(link, dict) or type(link.get("uuid")) is not int:
                     continue
+                if link.get("finished") is True:
+                    finished += 1
                 state = link.get("finalLinkState")
                 status = link.get("status") if isinstance(link.get("status"), str) else ""
                 if state == self.EXISTS_STATE or (link.get("skipped") is True and self.EXISTS_TEXT.search(status)):
@@ -802,9 +805,25 @@ class LocalAdapter:
                         found.append(link["uuid"])
             if len(batch) < PAGE_SIZE:
                 break
+        return finished, found
+
+    def remove_skipped_existing(self):
+        found = self._scan_links()[1]
         for i in range(0, len(found), ITEM_IDS_MAX):
             self._call("downloadsV2", "removeLinks", found[i:i + ITEM_IDS_MAX], [])
         return len(found)
+
+    def sweep_finished(self):
+        """v0.1.56: automatic version of the "clear finished/skipped" button.
+
+        One read-only query when nothing is finished; only then the same two list-only calls the
+        button makes (cleanup_finished + remove_skipped_existing). Files are never touched.
+        Returns (finished_seen, skipped_removed); (0, 0) when there was nothing to clear."""
+        finished, exists = self._scan_links()
+        if not finished and not exists:
+            return 0, 0
+        self.cleanup_finished()
+        return finished, self.remove_skipped_existing()
 
     @staticmethod
     def _id_list(values):

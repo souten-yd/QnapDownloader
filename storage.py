@@ -33,9 +33,12 @@ DEFAULTS = {
     "rb_spare_tab": True,
     # ... and leave text web fonts out of the mirror copy (system fonts show at once; icon fonts stay).
     "rb_no_webfonts": True,
+    # v0.1.56: both OFF. Forget Links-tab rows once JD2 took them; clear finished/skipped JD2 entries.
+    "auto_clear_links": False,
+    "auto_clear_downloads": False,
 }
 BOOL_OPTIONS = ("send_autostart", "block_ads", "probe_autosend", "rb_link_boxes", "rb_resident",
-                "rb_spare_tab", "rb_no_webfonts")
+                "rb_spare_tab", "rb_no_webfonts", "auto_clear_links", "auto_clear_downloads")
 ENUM_OPTIONS = {"rb_default_mode": ("reader", "mirror", "fast", "live")}
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY,value TEXT NOT NULL);
@@ -365,6 +368,20 @@ class Store:
         with self._guard, self.connect() as db:
             removed = db.execute("DELETE FROM link_intents WHERE state IN (%s)" %
                                  ",".join("?" * len(states)), states).rowcount
+            if removed:
+                db.execute("UPDATE meta SET value=value+1 WHERE key='revision'")
+        return removed
+
+    def remove_sent_links(self, identifier=None):
+        """v0.1.56: option auto_clear_links. Delete Hub rows whose hand-off to JD2 succeeded
+        (state 'sent'; never staged / sending / uncertain), one row or all. Returns the count."""
+        if self.settings().get("auto_clear_links") is not True:
+            return 0
+        sql, args = "DELETE FROM link_intents WHERE state='sent'", ()
+        if identifier is not None:
+            sql, args = sql + " AND id=?", (identifier,)
+        with self._guard, self.connect() as db:
+            removed = db.execute(sql, args).rowcount
             if removed:
                 db.execute("UPDATE meta SET value=value+1 WHERE key='revision'")
         return removed

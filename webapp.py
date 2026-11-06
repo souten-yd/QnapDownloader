@@ -36,7 +36,7 @@ import ttlcache
 import updater
 import webauthn
 
-VERSION = "0.1.55"
+VERSION = "0.1.56"
 PORT = 17864
 ROOT = Path(__file__).resolve().parent
 FILES = {"/": ("web/index.html", "text/html; charset=utf-8"),
@@ -283,7 +283,25 @@ def send_link(server, ident=None, url=None, dedupe=False):
             store.finish_send(ident, "uncertain")
             raise ValueError("JD2への送信結果が不明です。JD2で確認してください") from None
         store.finish_send(ident, "sent")
+        schedule_sent_removal(store, ident)
     return outcome
+
+
+LINK_AUTOREMOVE_DELAY = 6.0
+
+
+def schedule_sent_removal(store, ident):
+    """v0.1.56: with auto_clear_links, forget the row a few seconds after JD2 took it (the
+    list shows "送信済み" meanwhile). Server-side, so it works with the app closed; the
+    supervisor sweep catches anything a restart lost."""
+    try:
+        if store.settings().get("auto_clear_links") is not True:
+            return
+        timer = threading.Timer(LINK_AUTOREMOVE_DELAY, store.remove_sent_links, (ident,))
+        timer.daemon = True
+        timer.start()
+    except Exception:
+        pass
 
 
 def auto_send_link(server, url):
@@ -1726,6 +1744,7 @@ def main():
     server.updates = self_update.UpdateManager(data, ROOT, VERSION, "x86_64", args.port)
     server.engine = engine_supervisor.EngineManager(data, store)
     server.jd2 = jd2_control.JD2Controller(server.engine.adapter)
+    server.engine.sweep_lock = server.jd2.lock    # v0.1.56: auto-clear shares the JD2 serialization
     server.accounts = jd2_accounts.AccountService()
     server.rb = remote_browser.RemoteBrowser(
         server.engine.runtime, ROOT / "container" / "browser")

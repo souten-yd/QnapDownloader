@@ -6410,6 +6410,10 @@ async function sendLinks(links, opts = {}) {
   }
   swrDrop("links");
   await loadQueue(true);
+  // v0.1.56: the Hub forgets sent rows a few seconds later (auto_clear_links): refresh the list then
+  if (state.settings && state.settings.auto_clear_links === true) {
+    setTimeout(() => { swrDrop("links"); loadQueue(true).catch(() => {}); }, 7500);
+  }
   const dupText = opts.skipped ? "・" + opts.skipped + "件は重複のためスキップ" : "";
   flashCount("sent", sent, n => n + "件を" + (sendAutostartOn() ? "JD2へ送り、ダウンロードを開始しました" :
     "JD2のLinkGrabberへ送りました（ダウンロードは未開始）") + dupText);
@@ -6516,6 +6520,8 @@ function renderDownloadDir(s) {
   state.settings = s;
   $("sendAutostart").checked = s.send_autostart !== false;
   $("probeAutosend").checked = s.probe_autosend !== false;
+  $("autoClearLinks").checked = s.auto_clear_links === true;           // v0.1.56
+  $("autoClearDownloads").checked = s.auto_clear_downloads === true;   // v0.1.56
   $("blockAds").checked = s.block_ads !== false;
   $("rbDefaultMode").value = DISPLAY_OF_SETTING[s.rb_default_mode] ? s.rb_default_mode : "fast";
   $("rbLinkBoxes").checked = s.rb_link_boxes === true;
@@ -9637,6 +9643,19 @@ function wireBrowser() {
       await saveOption("probe_autosend", $("probeAutosend").checked);
       flash($("probeAutosend").checked ? "長押しで見つかったリンクを自動でJD2へ送ります" : "長押しの結果はシートで確認します");
     } catch (e) { $("probeAutosend").checked = !$("probeAutosend").checked; throw e; }
+  }));
+  // v0.1.56: both default OFF
+  $("autoClearLinks").addEventListener("change", () => perform(async () => {
+    try {
+      await saveOption("auto_clear_links", $("autoClearLinks").checked);
+      flash($("autoClearLinks").checked ? "JD2へ送れたリンクを自動で消します" : "送ったリンクは一覧に残します");
+    } catch (e) { $("autoClearLinks").checked = !$("autoClearLinks").checked; throw e; }
+  }));
+  $("autoClearDownloads").addEventListener("change", () => perform(async () => {
+    try {
+      await saveOption("auto_clear_downloads", $("autoClearDownloads").checked);
+      flash($("autoClearDownloads").checked ? "完了・スキップしたダウンロードを自動で消します（ファイルは残ります）" : "完了・スキップは手動で消します");
+    } catch (e) { $("autoClearDownloads").checked = !$("autoClearDownloads").checked; throw e; }
   }));
   $("sendAutostart").addEventListener("change", () => perform(async () => {
     try {

@@ -269,8 +269,16 @@ label{display:block;margin:12px 0;color:var(--muted);font-size:13px}
 .section-head h2{margin:22px 0 8px}
 .page-head{flex-wrap:nowrap;min-height:40px}
 .page-head h1{margin:0;flex:1;min-width:0}
+.page-head h1{white-space:nowrap;flex-shrink:0}
+.page-head.head-wrap{flex-wrap:wrap}
+.page-head.head-wrap .head-tools{flex:1 1 auto;flex-wrap:wrap;justify-content:flex-end;min-width:0}
+.page-head h1{flex:1 0 auto}
 .head-tools{display:flex;align-items:center;gap:4px;flex:none;white-space:nowrap}
 .head-tools .muted{font-size:12px}
+
+/* v0.1.56 */
+.btn-short{display:none}
+@media (max-width:759px){.btn-short{display:inline}}
 
 /* home */
 .onboarding h2{margin:0 0 8px}
@@ -331,6 +339,10 @@ label{display:block;margin:12px 0;color:var(--muted);font-size:13px}
 .about-list{padding-left:20px;margin:8px 0}
 @media (max-width:759px){
   .page-head h1{font-size:18px}
+  /* v0.1.56: downloads header: title never squeezes; tools wrap onto their own row */
+  .page-head.head-wrap .head-tools{flex:1 1 100%;justify-content:flex-start;white-space:normal}
+  .page-head.head-wrap .head-tools .muted{margin-right:auto}
+  .btn-long{display:none}
   .head-tools .icon-btn{width:36px;height:36px}
   .engine-actions{width:100%}
   .engine-actions .btn{flex:1}

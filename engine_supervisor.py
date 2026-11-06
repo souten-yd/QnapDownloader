@@ -38,6 +38,7 @@ TERM_WAIT = 30.0
 KILL_WAIT = 5.0
 RESTART_MAX = 5
 RESTART_WINDOW = 600.0
+AUTO_CLEAR_INTERVAL = 45.0     # v0.1.56: seconds between automatic finished/skipped sweeps
 BACKOFF = (5.0, 15.0, 30.0, 60.0, 60.0)
 READY_TIMEOUT = 180.0
 API_CONFIG = {"deprecatedapienabled": True, "deprecatedapiport": 3128,
@@ -196,6 +197,8 @@ class EngineManager:
         self._avail = None
         self._leftover_cache = None
         self.adapter = jd2_local.LocalAdapter(self)
+        self._auto_clear_at = -AUTO_CLEAR_INTERVAL    # v0.1.56
+        self.sweep_lock = threading.RLock()           # webapp sets it to the JD2 controller lock
         self._saved = None
         self._state = self._load_state()
 
@@ -878,6 +881,8 @@ class EngineManager:
                 continue
             if self._ready and not self._packagizer_checked:
                 self.check_packagizer()       # once per engine run (no periodic sweep: v0.1.49)
+            if self._ready:
+                self.auto_sweep()
             if not self._ready:
                 try:
                     revision = self.adapter.core_revision()
@@ -902,6 +907,32 @@ class EngineManager:
         except Exception as error:
             debuglog.log("jd2", "debug", "Packagizerの確認に失敗", {"error": str(error)[:120]})
             return None
+
+    def auto_sweep(self):
+        """v0.1.56: periodic housekeeping while the engine runs, at most once per AUTO_CLEAR_INTERVAL.
+
+        option auto_clear_downloads: drop finished / "already exists" entries from JD2's list (same
+        calls as the clear button; list only, files stay; one read-only query when nothing is done).
+        option auto_clear_links: forget Hub link rows already handed to JD2 (state "sent" only).
+        Returns (finished, skipped) removed from JD2; never raises."""
+        now = self._now()
+        if now - self._auto_clear_at < AUTO_CLEAR_INTERVAL:
+            return (0, 0)
+        self._auto_clear_at = now
+        try:
+            settings = self.store.settings()
+            if settings.get("auto_clear_links") is True:
+                self.store.remove_sent_links()
+            if settings.get("auto_clear_downloads") is not True or not self.is_ours_running():
+                return (0, 0)
+            with self.sweep_lock:
+                done = self.adapter.sweep_finished()
+            if done[0] or done[1]:
+                debuglog.log("engine", "debug", "完了・スキップの自動消去", {"finished": done[0], "skipped": done[1]})
+            return done
+        except Exception as error:
+            debuglog.log("engine", "debug", "完了・スキップの自動消去に失敗", {"error": str(error)[:120]})
+            return (0, 0)
 
     def flatten_sweep(self):
         """Move not-yet-started packages out of per-package subfolders (cheap, 2 calls).
