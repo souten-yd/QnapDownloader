@@ -561,6 +561,45 @@ def looks_like_challenge(url, title):
     return (any(t in title for t in CHALLENGE_TITLES) or
             CHALLENGE_URL in (url or "").lower())
 
+def is_challenge_url(url):
+    """True for the address of a Cloudflare interstitial history entry (v0.1.52).
+
+    The check page itself lives under /cdn-cgi/challenge-platform/ (or /cdn-cgi/challenge...), and the
+    redirect that follows it keeps the original address with a __cf_chl_* query token. A browser back that
+    lands on either shows the check again, so history stepping skips them (history_target)."""
+    try:
+        parts = urlsplit(url or "")
+    except ValueError:
+        return False
+    return (CHALLENGE_URL in parts.path.lower() or "/cdn-cgi/challenge-platform/" in parts.path.lower() or
+            "__cf_chl" in parts.query.lower())
+
+
+def history_target(entries, index, step):
+    """(entry id, skipped) a browser back (step -1) / forward (+1) should go to, or None.
+
+    Walks from the current entry in the direction of `step` and takes the first entry that is http(s),
+    whose address without the #fragment differs from the current page's, and that is not a Cloudflare
+    interstitial (is_challenge_url). `skipped` counts the entries passed over (redirects, checks,
+    duplicates), so one gesture is one page."""
+    if not isinstance(entries, list) or not isinstance(index, int) or not 0 <= index < len(entries):
+        return None
+    current = entries[index] if isinstance(entries[index], dict) else {}
+    here = current.get("url") if isinstance(current.get("url"), str) else ""
+    here = here.split("#", 1)[0]
+    skipped, i = 0, index + step
+    while 0 <= i < len(entries):
+        entry = entries[i] if isinstance(entries[i], dict) else {}
+        url = entry.get("url") if isinstance(entry.get("url"), str) else ""
+        if (isinstance(entry.get("id"), int) and not isinstance(entry.get("id"), bool) and
+                url.lower().startswith(("http://", "https://")) and url.split("#", 1)[0] != here and
+                not is_challenge_url(url)):
+            return entry["id"], skipped
+        skipped += 1
+        i += step
+    return None
+
+
 LINKS_JS = (
     "(function(){var o=[],s=new Set(),l=document.querySelectorAll('a[href]');"
     "for(var i=0;i<l.length&&o.length<%d;i++){var h=l[i].href;"
@@ -2153,6 +2192,31 @@ class RemoteBrowser:
             return value if isinstance(value, (int, float)) and not isinstance(value, bool) else None
         return None
 
+    def selftest_history_to(self, ident, path):
+        """Puts a fixture tab back on the history entry for `path` (no challenge token); True when it moved
+        or was already there. Used by the swipe diagnostic to give each step its starting page."""
+        tab = self._tab(ident)
+        if tab.fixture is None or not isinstance(path, str) or not path.startswith("/") or "//" in path:
+            raise BrowserError("セルフテスト用のタブではありません")
+        history = self._call("Page.getNavigationHistory", session=tab.session)
+        entries, index = history.get("entries"), history.get("currentIndex")
+        want = SELFTEST_ORIGIN + path
+        if not isinstance(entries, list) or not isinstance(index, int):
+            return False
+        for i in sorted(range(len(entries)), key=lambda k: abs(k - index)):
+            entry = entries[i] if isinstance(entries[i], dict) else {}
+            url = entry.get("url") if isinstance(entry.get("url"), str) else ""
+            if url == want and isinstance(entry.get("id"), int):
+                if i == index:
+                    return True
+                self._touch()
+                with self._lock:
+                    tab.blocked = None
+                    tab.snap_gen += 1
+                self._call("Page.navigateToHistoryEntry", {"entryId": entry["id"]}, session=tab.session)
+                return True
+        return False
+
     def selftest_goto(self, ident, path):
         """Navigates a fixture tab to another page of the virtual site (nothing else is accepted)."""
         tab = self._tab(ident)
@@ -2855,19 +2919,12 @@ class RemoteBrowser:
             self._call("Page.reload", session=session)
         else:
             history = self._call("Page.getNavigationHistory", session=session)
-            entries, index = history.get("entries"), history.get("currentIndex")
-            step = -1 if kind == "back" else 1
-            if (not isinstance(entries, list) or not isinstance(index, int) or
-                    not 0 <= index + step < len(entries)):
+            target = history_target(history.get("entries"), history.get("currentIndex"),
+                                    -1 if kind == "back" else 1)
+            if target is None:
                 return {"ok": True, "moved": False}
-            target = entries[index + step] if isinstance(entries[index + step], dict) else {}
-            entry = target.get("id")
-            # v0.1.50: the blank page a tab starts on is not a page to go back to.
-            target_url = target.get("url") if isinstance(target.get("url"), str) else ""
-            if not isinstance(entry, int) or not target_url.lower().startswith(("http://", "https://")):
-                return {"ok": True, "moved": False}
-            self._call("Page.navigateToHistoryEntry", {"entryId": entry}, session=session)
-            return {"ok": True, "moved": True, "editable": tab.editable}
+            self._call("Page.navigateToHistoryEntry", {"entryId": target[0]}, session=session)
+            return {"ok": True, "moved": True, "skipped": target[1], "editable": tab.editable}
         return {"ok": True, "editable": tab.editable}
 
     def _refresh_editable(self, tab):

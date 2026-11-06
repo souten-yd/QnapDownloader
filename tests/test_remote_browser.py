@@ -678,6 +678,54 @@ class ScreencastTests(BrowserBase):
         self.assertEqual(len(self.ws.calls("Page.startScreencast")), 2)
 
 
+class HistoryTargetTests(unittest.TestCase):
+    """v0.1.52: back / forward step over redirect, Cloudflare check and duplicate entries in one gesture."""
+
+    @staticmethod
+    def entries(*urls):
+        return [{"id": 10 + i, "url": u} for i, u in enumerate(urls)]
+
+    def test_challenge_urls(self):
+        for url in ("https://x.example/cdn-cgi/challenge-platform/h/b/orchestrate/chl_page/v1",
+                    "https://x.example/page?__cf_chl_tk=abc", "https://x.example/page?a=1&__cf_chl_rt_tk=z"):
+            self.assertTrue(rb.is_challenge_url(url), url)
+        for url in ("https://x.example/page", "https://x.example/cdn-cgi/trace", "", None):
+            self.assertFalse(rb.is_challenge_url(url), url)
+
+    def test_back_skips_challenge_and_token_entries(self):
+        e = self.entries("https://a.example/A", "https://a.example/cdn-cgi/challenge-platform/h/b/x",
+                         "https://a.example/A?__cf_chl_tk=t", "https://a.example/B")
+        self.assertEqual(rb.history_target(e, 3, -1), (10, 2))
+
+    def test_duplicates_and_fragments_are_skipped(self):
+        e = self.entries("https://a.example/A", "https://a.example/B", "https://a.example/B", "https://a.example/B#x")
+        self.assertEqual(rb.history_target(e, 3, -1), (10, 2))
+        self.assertEqual(rb.history_target(e, 0, 1), (11, 0))
+
+    def test_about_blank_start_is_never_a_target(self):
+        e = self.entries("about:blank", "https://a.example/A")
+        self.assertIsNone(rb.history_target(e, 1, -1))
+        e = self.entries("about:blank", "https://a.example/A", "https://a.example/B")
+        self.assertEqual(rb.history_target(e, 2, -1), (11, 0))
+        self.assertIsNone(rb.history_target(e, 1, -1))
+
+    def test_forward_is_symmetric(self):
+        e = self.entries("https://a.example/A", "https://a.example/cdn-cgi/challenge-platform/h/b/x",
+                         "https://a.example/A?__cf_chl_tk=t", "https://a.example/B", "https://a.example/C")
+        self.assertEqual(rb.history_target(e, 0, 1), (13, 2))
+        self.assertEqual(rb.history_target(e, 3, 1), (14, 0))
+        self.assertIsNone(rb.history_target(e, 4, 1))
+
+    def test_only_challenge_entries_ahead_means_no_move(self):
+        e = self.entries("https://a.example/A", "https://a.example/cdn-cgi/challenge-platform/h/b/x")
+        self.assertIsNone(rb.history_target(e, 0, 1))
+
+    def test_bad_input(self):
+        for args in ((None, 0, -1), ([], 0, -1), ([{"id": 1, "url": "https://a/"}], 5, -1), ("x", 0, 1)):
+            self.assertIsNone(rb.history_target(*args))
+        self.assertIsNone(rb.history_target([{"id": True, "url": "https://a/x"}, {"url": "https://a/y"}], 1, -1))
+
+
 class InputTests(BrowserBase):
     def setUp(self):
         super().setUp()
@@ -740,6 +788,16 @@ class InputTests(BrowserBase):
         self.assertEqual(self.rb.send_input("b1", {"type": "back"}), {"ok": True, "moved": False})
         self.rb.send_input("b1", {"type": "reload"})
         self.assertEqual(len(self.ws.calls("Page.reload")), 1)
+
+    def test_send_input_walks_over_challenge_entries(self):
+        self.ws.history = {"currentIndex": 3, "entries": [
+            {"id": 1, "url": "https://a.example/A"}, {"id": 2, "url": "https://a.example/cdn-cgi/challenge-platform/h/b/x"},
+            {"id": 3, "url": "https://a.example/A?__cf_chl_tk=t"}, {"id": 4, "url": "https://a.example/B"}]}
+        result = self.rb.send_input("b1", {"type": "back"})
+        self.assertEqual((result["moved"], result["skipped"]), (True, 2))
+        self.assertEqual(self.ws.calls("Page.navigateToHistoryEntry")[-1]["params"], {"entryId": 1})
+        self.ws.history = {"currentIndex": 0, "entries": self.ws.history["entries"][:1]}
+        self.assertEqual(self.rb.send_input("b1", {"type": "back"}), {"ok": True, "moved": False})
 
     def test_validation_rejects_bad_types_and_ranges(self):
         bad = [

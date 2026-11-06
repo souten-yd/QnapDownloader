@@ -959,12 +959,13 @@ eq(JSON.parse(store[RB_LIVE_PREF_KEY]), {t: "sse", mjpegAt: 5}, "merge");
         self.assertIn("RB_META_WAIT_S = 10", self.js)
 
     def test_v0128_cloudflare_challenge_switches_to_live_and_back(self):
-        self.assertIn("function syncChallenge(tab, challenge, loading)", self.js)
+        # v0.1.52: no automatic live switch any more: the check page is held (not rendered) in the chosen display.
+        self.assertIn("function syncChallenge(tab, challenge)", self.js)
         self.assertIn("X-Frame-Challenge", self.js)
-        # v0.1.29: the way back is a dedicated poll with two clean checks (challengeStep).
-        self.assertIn("function challengeStep(rb, challenge, loading, now, userLive, moved = false)", self.js)
-        self.assertIn("AUTO_CLEAN_NEEDED = 2", self.js)
-        self.assertIn("if (rb.autoLive) return \"live\";", self.js)
+        self.assertIn("function challengeHold(tab)", self.js)
+        self.assertIn('if (rb.chal && rb.chal.live) return "live";', self.js)
+        for gone in ("function challengeStep", "autoPollTick", "returnToFast", "rb-auto", "autoLiveChip", "AUTO_CLEAN_NEEDED"):
+            self.assertNotIn(gone, self.js)
 
     def test_v0131_node_behaviour_of_early_read_errors_and_fallback(self):
         if shutil.which("node") is None:
@@ -988,6 +989,7 @@ console.error = (...a) => logs.push(a.join(" "));
 const toast = (m, k) => toasts.push([m, k || "success"]);
 let applied = 0, apiResult = null, apiError = null;
 const applyDisplay = () => { applied++; };
+const challengeHold = () => false;
 const updateRemoteView = () => {};
 const remoteLost = () => {};
 const snapBusy = () => {};
@@ -1096,28 +1098,29 @@ const rememberedMode = h => host.mode;
 const tab = rb => ({rb, current: "https://example.com/a"});
 const eq = (a, b, m) => { if (a !== b) { console.error(m + ": " + a + " != " + b); process.exit(1); } };
 eq(tabDisplay(null), "tiles", "no rb");
-eq(tabDisplay(tab({autoLive: false})), "tiles", "default is the fast display");
+eq(tabDisplay(tab({})), "tiles", "default is the fast display");
 // the Settings default applies where the site has no explicit choice (plain "remote" or none)
 state.settings = {rb_default_mode: "reader"};
-eq(tabDisplay(tab({autoLive: false})), "reader", "settings: reader");
+eq(tabDisplay(tab({})), "reader", "settings: reader");
 host.mode = "remote";
-eq(tabDisplay(tab({autoLive: false})), "reader", "plain remote follows the setting");
+eq(tabDisplay(tab({})), "reader", "plain remote follows the setting");
 state.settings = {rb_default_mode: "live"};
-eq(tabDisplay(tab({autoLive: false})), "live", "settings: live");
+eq(tabDisplay(tab({})), "live", "settings: live");
 state.settings = {rb_default_mode: "bogus"};
-eq(tabDisplay(tab({autoLive: false})), "tiles", "unknown setting -> fast");
+eq(tabDisplay(tab({})), "tiles", "unknown setting -> fast");
 // a per-host choice overrides the setting
 state.settings = {rb_default_mode: "reader"};
 host.mode = "remote-fast";
-eq(tabDisplay(tab({autoLive: false})), "tiles", "host: fast beats reader");
+eq(tabDisplay(tab({})), "tiles", "host: fast beats reader");
 host.mode = "remote-live";
-eq(tabDisplay(tab({autoLive: false})), "live", "host: live");
+eq(tabDisplay(tab({})), "live", "host: live");
 state.settings = {rb_default_mode: "fast"};
 host.mode = "remote-reader";
-eq(tabDisplay(tab({autoLive: false})), "reader", "host: reader beats fast");
-eq(userDisplay(tab({autoLive: true})), "reader", "userDisplay ignores the automatic switch");
+eq(tabDisplay(tab({})), "reader", "host: reader beats fast");
+eq(userDisplay(tab({chal: {live: true}})), "reader", "userDisplay ignores the check's live switch");
 // a Cloudflare check forces live meanwhile, whatever the choice
-eq(tabDisplay(tab({autoLive: true})), "live", "challenge forces live");
+eq(tabDisplay(tab({chal: {live: true}})), "live", "the user's 確認画面を操作する shows live");
+eq(tabDisplay(tab({chal: {live: false}})), tabDisplay(tab({})), "a held check keeps the chosen display");
 // hit testing: inside, near (<= 28), outside, ties
 const links = [{x: 10, y: 100, w: 50, h: 20, href: "a"}, {x: 30, y: 105, w: 50, h: 20, href: "b"}];
 eq(pickLink(links, 11, 101).href, "a", "inside the first box only");
@@ -1194,54 +1197,162 @@ class ItemActionStaticTests(unittest.TestCase):
         for token in ("innerHTML", "outerHTML", "insertAdjacentHTML"):
             self.assertNotIn(token, self.js)
 
-    def test_auto_live_is_never_persisted_and_has_a_manual_way_back(self):
-        a = self.js.index("function challengeStep")
+    def test_challenge_hold_is_never_persisted_and_live_is_user_initiated(self):
+        a = self.js.index("const CHAL_BUTTON_MS")
         b = self.js.index("// The stage is the viewer")
         region = self.js[a:b]
         self.assertNotIn("rememberHostMode", region)
-        self.assertIn("returnToFast", region)
-        self.assertIn('id="autoLiveChip"', self.html)
-        self.assertIn("元の表示に戻す", self.html)
-        self.assertIn("wait=0", region)
-        self.assertIn("document.visibilityState", region)
+        self.assertNotIn("history.", region)                 # no history side effects at all
+        self.assertNotIn("pushState", region)
+        self.assertIn("chalGoLive", region)
+        self.assertIn('id="chalLiveBtn"', self.html)
+        self.assertIn("確認画面を操作する", self.html)
+        self.assertIn("安全性の確認中…（自動で進みます）", self.html)
+        self.assertIn("CHAL_BUTTON_MS = 25000", region)
 
     @unittest.skipUnless(shutil.which("node"), "node not installed")
-    def test_challenge_step_logic(self):
-        a = self.js.index("const AUTO_POLL_MS")
-        b = self.js.index("function userPrefersLive")
-        script = self.js[a:b] + """
+    def test_challenge_hold_logic(self):
+        a = self.js.index("const CHAL_BUTTON_MS")
+        b = self.js.index("// The stage is the viewer")
+        script = """
+const timers = [], calls = [];
+const setTimeout = (fn, ms) => { timers.push([fn, ms]); return timers.length; };
+const clearTimeout = () => {};
+const dlog = () => {}, gestureTrace = () => {};
+const shown = {};
+const setShown = (id, on) => { shown[id] = on; };
+const activeWebTab = () => TAB;
+const applyDisplay = () => calls.push("applyDisplay");
+const tabDisplay = () => MODE;
+const runMirror = async () => { calls.push("mirror"); }, runReader = async () => { calls.push("reader"); };
+const takeSnapshot = async () => { calls.push("tiles"); };
+let MODE = "mirror";
+""" + self.js[a:b] + """
 const assert = require("assert");
-const mk = () => ({autoLive: false, autoSince: 0, autoClean: 0, autoChip: false});
-let rb = mk();
-assert.strictEqual(challengeStep(rb, false, false, 0, false), null);
-assert.strictEqual(challengeStep(rb, true, false, 1000, false), "enter");
-assert.ok(rb.autoLive);
-// one clean check is not enough; a challenge in between resets the count
-assert.strictEqual(challengeStep(rb, false, false, 2500, false), null);
-assert.strictEqual(challengeStep(rb, true, false, 4000, false), null);
-assert.strictEqual(challengeStep(rb, false, false, 5500, false), null);
-// clean but still loading does not count
-assert.strictEqual(challengeStep(rb, false, true, 7000, false), null);
-assert.strictEqual(rb.autoClean, 0);
-assert.strictEqual(challengeStep(rb, false, false, 8500, false), null);
-assert.strictEqual(challengeStep(rb, false, false, 10000, false), "return");
-assert.ok(!rb.autoLive && !rb.autoChip);
-// a manual live choice is never taken over
-rb = mk();
-assert.strictEqual(challengeStep(rb, true, false, 0, true), null);
-assert.ok(!rb.autoLive);
-// chip after the 90 s safety timeout, once; live stays; a later clean page still returns
-rb = mk();
-challengeStep(rb, true, false, 0, false);
-assert.strictEqual(challengeStep(rb, true, false, 89000, false), null);
-assert.strictEqual(challengeStep(rb, true, false, 90000, false), "chip");
-assert.strictEqual(challengeStep(rb, true, false, 95000, false), null);
-assert.ok(rb.autoLive && rb.autoChip);
-challengeStep(rb, false, false, 96000, false);
-assert.strictEqual(challengeStep(rb, false, false, 97500, false), "return");
+const TAB = {rb: {chal: null, mirrorPending: false}};
+syncChallenge(TAB, false);
+assert.strictEqual(TAB.rb.chal, null);
+syncChallenge(TAB, true);                              // held: the chosen display stays, status line on
+assert.ok(challengeHold(TAB));
+assert.strictEqual(shown.chalStatus, true);
+assert.strictEqual(shown.chalLiveBtn, false);
+assert.strictEqual(timers[0][1], 25000);
+timers[0][0]();                                        // 25 s later: the button appears
+assert.strictEqual(shown.chalLiveBtn, true);
+syncChallenge(TAB, false);                             // gone: the real page is rendered at once, in mirror
+assert.ok(!challengeHold(TAB));
+assert.deepStrictEqual(calls, ["mirror"]);
+assert.strictEqual(shown.chalStatus, false);
+for (const mode of ["reader", "tiles"]) {
+  calls.length = 0; MODE = mode;
+  syncChallenge(TAB, true); syncChallenge(TAB, false);
+  assert.deepStrictEqual(calls, [mode]);
+}
+// the user's live switch: back through applyDisplay (the chosen display), nothing rendered by hand
+calls.length = 0; MODE = "mirror";
+syncChallenge(TAB, true);
+chalGoLive(TAB);
+assert.ok(TAB.rb.chal.live && !challengeHold(TAB));
+assert.deepStrictEqual(calls, ["applyDisplay"]);
+syncChallenge(TAB, false);
+assert.deepStrictEqual(calls, ["applyDisplay", "applyDisplay"]);
 """
         result = subprocess.run(["node", "-e", script], capture_output=True, text=True, timeout=20)
         self.assertEqual(result.returncode, 0, result.stderr)
+
+
+class SwipeDiagnosticStaticTests(unittest.TestCase):
+    """v0.1.52: the swipe self-test (automatic and manual) and the gesture hooks."""
+
+    root = Path(__file__).resolve().parents[1] / "web"
+    js = (root / "app.js").read_text(encoding="utf-8")
+    html = (root / "index.html").read_text(encoding="utf-8")
+
+    def test_buttons_and_banner_exist(self):
+        for ident, text in (("selftestSwipe", "スワイプだけ確認"), ("selftestManual", "手動で確認"), ("swipeOk", "できた"),
+                            ("swipeBad", "できない/違う動き"), ("swipeSkip", "スキップ"), ("swipeBanner", "")):
+            self.assertIn('id="%s"' % ident, self.html)
+            if text:
+                self.assertIn(text, self.html)
+        # the banner sits in the web view, above the page and below the toolbar (it is not an overlay)
+        view = self.html[self.html.index('id="view-web"'):]
+        self.assertLess(view.index('id="swipeBanner"'), view.index('id="remoteView"'))
+        self.assertIn("swipe: true", self.js)                 # the normal run includes the automatic section
+        self.assertIn('only: "swipe"', self.js)
+        self.assertIn('only: "swipe_manual"', self.js)
+
+    def test_hooks_are_present_where_the_behaviour_happens(self):
+        def body(name):
+            start = self.js.index(name)
+            return self.js[start:start + 4500]
+        for func, events in (("function attachFlick(", ("flick.accepted", "flick.reject")),
+                             ("function wireGestures()", ("pull.arm", "pull.end", "pull.start")),
+                             ("function onPopState()", ("popstate", "pop.ignore")),
+                             ("function armBackGuard()", ("guard.push",)),
+                             ("async function stepHistory(", ("step.call", "step.moved", "step.nomove")),
+                             ("function handleTap(", ("mirror.tap",)),
+                             ("function applyRoute()", ("route",))):
+            if func == "function handleTap(":
+                text = self.js[self.js.index(func):self.js.index(func) + 300]
+            else:
+                text = body(func)
+            for event in events:
+                self.assertIn('gestureTrace("%s"' % event, text, func + " lacks " + event)
+
+    def test_trace_is_a_noop_unless_recording(self):
+        if shutil.which("node") is None:
+            self.skipTest("node missing")
+        a = self.js.index("let swipeRec = null;")
+        b = self.js.index("// A flick on the page and a browser back")
+        script = self.js[a:b] + """
+const assert = require("assert");
+let hits = 0;
+gestureTrace("popstate", {a: 1});                       // nothing recording: must not throw or record
+swipeRec = {note: (e, d) => { hits++; assert.strictEqual(e, "popstate"); }};
+gestureTrace("popstate", {a: 1});
+assert.strictEqual(hits, 1);
+swipeRec = null;
+gestureTrace("popstate");
+assert.strictEqual(hits, 1);
+"""
+        result = subprocess.run(["node", "-e", script], capture_output=True, text=True, timeout=20)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_flick_and_popstate_are_one_step_and_back_never_leaves_the_tab(self):
+        a = self.js.index("function onPopState()")
+        pop = self.js[a:a + 1800]
+        self.assertNotIn("history.back()", pop)               # never a fall back to the previous app screen
+        self.assertIn('claimStep("pop")', pop)
+        self.assertIn('claimStep("flick")', self.js)
+        self.assertIn("STEP_DEDUP_MS = 400", self.js)
+        step = self.js[self.js.index("async function stepHistory("):][:1400]
+        self.assertIn("これより前のページはありません", step)
+        self.assertIn("これより先のページはありません", step)
+
+    def test_claim_step_logic(self):
+        if shutil.which("node") is None:
+            self.skipTest("node missing")
+        a = self.js.index("const STEP_DEDUP_MS")
+        b = self.js.index("// The handlers are kept so that")
+        script = "let now = 0; const performance = {now: () => now};\n" + self.js[a:b] + """
+const assert = require("assert");
+assert.ok(claimStep("flick"));
+now = 200; assert.ok(!claimStep("pop"), "a popstate right after a flick is the same gesture");
+now = 300; assert.ok(claimStep("flick"), "the same kind is not suppressed");
+now = 800; assert.ok(claimStep("pop"), "later it is a new gesture");
+"""
+        result = subprocess.run(["node", "-e", script], capture_output=True, text=True, timeout=20)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_diagnostic_always_cleans_up_and_never_persists_its_tab(self):
+        a = self.js.index("async function swipeEnd(d)")
+        end = self.js[a:a + 1700]
+        for needle in ("swipeRec.stop()", 'setShown("swipeBanner", false)', "releaseRemote(tab)", "state.tabs.splice",
+                       "history.replaceState(null, \"\", d.prevHash)", "applyRoute()", "swipeDiag = null"):
+            self.assertIn(needle, end)
+        self.assertEqual(self.js.count("await swipeEnd(d)"), 2)           # automatic and manual: in finally
+        self.assertIn("filter(t => !t.diag)", self.js)                    # saveTabs
+        self.assertIn("tab.diag.stubClose", self.js)                       # the pull never closes a real tab
 
 
 if __name__ == "__main__":
@@ -1429,7 +1540,7 @@ class GestureAndAutoLiveTest(unittest.TestCase):
         self.assertIn("stepHistory(tab, dx > 0 ? -1 : 1)", app)
         self.assertIn("GESTURE_EDGE_PX", app)             # screen edges stay with iOS
         self.assertIn("離すとタブを閉じます", app)
-        self.assertIn("now - rb.autoQuiet < (moved ? AUTO_SETTLE_MOVED_MS : AUTO_SETTLE_MS)", app)
+        self.assertIn("function claimStep(kind)", app)          # v0.1.52: a flick and a popstate are one step
         rb = (Path(__file__).resolve().parents[1] / "remote_browser.py").read_text(encoding="utf-8")
         self.assertIn("innerText)||'').length<400", rb)
 
@@ -1471,7 +1582,7 @@ class ReturnFasterTest(unittest.TestCase):
         self.assertIn("async function reattachRemote(tab)", app)
         self.assertIn("nas: t.rb ? t.rb.id", app)
         self.assertIn("tab.opening && tab.opening.url === url", app)
-        self.assertIn("moved ? 1 : AUTO_CLEAN_NEEDED", app)
+        self.assertIn("function renderNow(tab)", app)           # v0.1.52: the real page right after a check
         self.assertIn("self._settle(tab, before_rev, wait_load=False)", rb)
 
 

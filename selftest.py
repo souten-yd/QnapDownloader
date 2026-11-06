@@ -38,6 +38,12 @@ LOG_CATEGORIES = ("rb", "render", "engine", "http")
 DEBUG_ENABLE = ("rb", "render", "engine", "http", "net")
 STATUS_WAIT_MAX = 20.0
 CLIENT_BODY_MAX = 32768        # bytes of the phone's POST (enforced by the HTTP handler)
+SWIPE_BODY_MAX = 65536         # v0.1.52: bytes of one swipe-diagnostic POST (one per display mode)
+SWIPE_WAIT = 75.0              # how long the server waits for the phone's swipe diagnostic
+SWIPE_EVENTS_MAX = 80          # timeline events accepted per step
+SWIPE_REPORT_LINES = 60        # timeline lines printed per non-passing step in the report
+SWIPE_REPORT_PASS_LINES = 14   # ... and per passing step
+SWIPE_REPORT_BYTES = 90000     # the swipe part of the report text is cut here
 DEFAULT_VIEWPORT = (390, 844, 3.0)
 MIB = 1024 * 1024
 
@@ -45,7 +51,9 @@ PASS, WARN, FAIL, SKIP = "pass", "warn", "fail", "skip"
 STATUSES = (PASS, WARN, FAIL, SKIP)
 
 SECTIONS = (("env", "環境"), ("browser", "NASブラウザ起動"), ("builtin", "内蔵テストページ"),
-            ("client", "この端末（スマホ）"), ("sites", "実サイト"), ("cleanup", "後片付け"))
+            ("client", "この端末（スマホ）"), ("swipe", "スワイプ（自動）"), ("swipe_manual", "スワイプ（手動）"),
+            ("sites", "実サイト"),
+            ("cleanup", "後片付け"))
 SECTION_LABEL = dict(SECTIONS)
 
 # ---------------------------------------------------------------------------------------- thresholds
@@ -136,6 +144,9 @@ HINTS = {
     "site.live": "スクロールで動きを作ってもライブ表示のフレームレートが低いです。画質を速度優先にしてください。",
     "cleanup.tabs": "セルフテスト用のタブが閉じられていません。NASブラウザを停止して再起動してください。",
     "cleanup.disk": "テスト中にHubがディスクへ多く書き込みました。デバッグログやDBの書き込みを確認してください。",
+    "swipe.missing": "端末側のスワイプ確認の結果が届きませんでした（画面を閉じた・通信が切れた等）。もう一度実行してください。",
+    "swipe.display": "要求した表示に切り替わりませんでした（リーダー抽出に失敗すると高速表示になります）。そのモードの判定は参考値です。",
+    "swipe.history": "表示の切り替えや戻る操作でブラウザの履歴が増えました。戻る操作が何度も必要になる原因です。この結果を開発者へ送ってください。",
     "run.error": "セルフテストが途中で例外になりました。この結果を開発者へ送ってください。",
     "run.timeout": "4分の上限に達したため途中で終了しました。NASの負荷が高い可能性があります。",
 }
@@ -219,7 +230,28 @@ def _article_body(extra=""):
             '<main><article>%s%s</article></main>' % ("".join(parts), extra))
 
 
+def _swipe_page(letter):
+    """v0.1.52 swipe fixture: a huge label, article-like text (the reader accepts it) and a wide table."""
+    rows = "".join("<tr>%s</tr>" % "".join("<td>%s%d-%d</td>" % (letter, r, c) for c in range(1, 13))
+                   for r in range(1, 4))
+    para = "<p>%s</p>" % _PARA
+    return _page(
+        "ページ %s" % letter,
+        '<main><article><h1 style="font-size:64px;margin:.2em 0">ページ %s</h1>%s'
+        '<div id="wide" style="overflow-x:auto;width:100%%;border:1px solid #888"><table style="width:1400px">%s</table></div>'
+        '%s</article></main>' % (letter, para * 3, rows, para * 3))
+
+
+SWIPE_LETTERS = ("A", "B", "C")
+SWIPE_CHALLENGE_PATH = "/cdn-cgi/challenge-platform/h/b/swipe"
+SWIPE_ROUTE = ("/swipe/a", SWIPE_CHALLENGE_PATH, "/swipe/a?__cf_chl_tk=selftest", "/swipe/b", "/swipe/c")
 PAGES = {
+    SWIPE_CHALLENGE_PATH: _page(
+        "しばらくお待ちください…",
+        '<main><h1>安全性を確認しています</h1><p>これはセルフテスト用の偽の確認ページです（履歴に確認ページが残る状況の再現）。</p></main>'),
+    "/swipe/a": _swipe_page("A"),
+    "/swipe/b": _swipe_page("B"),
+    "/swipe/c": _swipe_page("C"),
     "/article": _page("セルフテスト記事", _article_body()),
     "/menu": _page(
         "セルフテスト メニュー",
@@ -442,14 +474,8 @@ def _fmt(value):
     return ("%d" % value) if float(value).is_integer() else ("%.1f" % value)
 
 
-def validate_client(payload):
-    """Validated copy of the phone's POST body, or ValueError. Strings are cleaned (credentials, URLs)."""
-    if not isinstance(payload, dict):
-        raise ValueError("端末側の結果が不正です")
-    run_id = payload.get("run_id")
-    if not isinstance(run_id, str) or not RUN_ID.match(run_id):
-        raise ValueError("run_idが不正です")
-    device_raw = payload.get("device")
+def _validate_device(device_raw):
+    """Validated copy of the phone's device facts, or ValueError."""
     if not isinstance(device_raw, dict):
         raise ValueError("deviceが不正です")
     device = {}
@@ -480,6 +506,17 @@ def validate_client(payload):
             raise ValueError("device.flagsが不正です")
         flags[key] = value if isinstance(value, (bool, int)) else _short(value, 40)
     device["flags"] = flags
+    return device
+
+
+def validate_client(payload):
+    """Validated copy of the phone's POST body, or ValueError. Strings are cleaned (credentials, URLs)."""
+    if not isinstance(payload, dict):
+        raise ValueError("端末側の結果が不正です")
+    run_id = payload.get("run_id")
+    if not isinstance(run_id, str) or not RUN_ID.match(run_id):
+        raise ValueError("run_idが不正です")
+    device = _validate_device(payload.get("device"))
     checks_raw = payload.get("checks")
     if not isinstance(checks_raw, list) or len(checks_raw) > 24:
         raise ValueError("checksが不正です")
@@ -518,6 +555,277 @@ def validate_client(payload):
     return {"run_id": run_id, "device": device, "checks": checks}
 
 
+# ------------------------------------------------------------------------ swipe diagnostic (v0.1.52)
+# The phone feeds its own gesture handlers synthetic input (history.back(), touch events, a toolbar pull)
+# while the Hub holds a fixture tab at A -> B -> C. The phone sends what it saw (facts, event counts, a
+# compact timeline); every judgement is made here, from those numbers only.
+SWIPE_MODES = ("mirror", "reader", "tiles")
+SWIPE_MODE_LABEL = {"mirror": "ミラー", "reader": "リーダー", "tiles": "高速"}
+SWIPE_STEPS = (                     # (id, title, page the NAS tab must show when the step starts)
+    ("edge_back", "ブラウザの戻る（iOSの端スワイプ相当 history.back）", "C"),
+    ("flick_right", "ページ中央で右へフリック（戻る・確認ページを飛ばす）", "B"),
+    ("back_first", "最初のページでブラウザの戻る（アプリの前の画面へ戻らない）", "A"),
+    ("flick_left", "ページ中央で左へフリック（進む・確認ページを飛ばす）", "A"),
+    ("slow_move", "ゆっくり横へ動かす（フリックにならない）", "B"),
+    ("edge_start", "画面の端から横へ動かす（フリックにならない）", "B"),
+    ("forward", "ブラウザの進む（history.forward）", "B"),
+    ("pull_cancel", "ツールバーを下へ引いて戻す（閉じない）", "B"),
+    ("pull_close", "ツールバーを下へ引いて離す（閉じる）", "B"),
+)
+# The manual (real finger) flow: id, title, start page, and the automatic step whose rules judge it.
+MANUAL_STEPS = (
+    ("m_edge_back", "画面の左端から右へスワイプ（iPhoneの戻る操作）", "C", "edge_back"),
+    ("m_flick_right", "ページの中央で右へすばやくフリック", "B", "flick_right"),
+    ("m_flick_left", "ページの中央で左へすばやくフリック", "A", "flick_left"),
+    ("m_table", "表の部分を横にスクロール（ゆっくり）", "B", "slow_move"),
+    ("m_edge_forward", "画面の右端から左へスワイプ（iPhoneの進む操作、ある場合）", "B", "forward"),
+    ("m_pull", "ツールバーを下へ引く（離さずに戻す）", "B", "pull_cancel"),
+)
+SWIPE_STEP = {i: (t, page) for i, t, page in SWIPE_STEPS}
+SWIPE_STEP.update({i: (t, page) for i, t, page, _ in MANUAL_STEPS})
+SWIPE_BASE = {i: base for i, _, _, base in MANUAL_STEPS}
+SWIPE_ANSWERS = ("", "ok", "bad", "skip")
+MANUAL_HARD_TIMEOUT = 600.0    # the real-finger flow takes a person minutes
+SWIPE_SYNTHETIC = ("touch", "direct", "history", "none", "")
+SWIPE_EVENT_NAME = re.compile(r"[a-z][a-z0-9_.]{0,31}\Z")
+SWIPE_PATH = re.compile(r"/swipe/[abc]\Z")
+
+
+def _swipe_pages(facts, step_id):
+    start = SWIPE_STEP[step_id][1]
+    return start, facts.get("nas_after") or "?", facts.get("nas_seq") or ""
+
+
+def judge_swipe_step(step_id, facts, counts):
+    """(status, value, [hints]) for one swipe step from the phone's facts and event counts.
+
+    A manual step (real finger) is judged by the rules of its automatic twin, then the user's answer is applied."""
+    manual = step_id in SWIPE_BASE
+    base = SWIPE_BASE.get(step_id, step_id)
+    answer = facts.get("answer", "")
+    facts = dict(facts, nas_before=facts.get("nas_before", ""))
+    if answer == "skip":
+        return SKIP, "利用者がスキップしました", []
+    status, value, hints = _judge_swipe(base, step_id, facts, counts, manual)
+    if answer == "bad":
+        hints.append("利用者が「できない/違う動き」と回答しました")
+        status = FAIL
+    return status, value, hints
+
+
+def _judge_swipe(step_id, real_id, facts, counts, manual):
+    def n(key):
+        return counts.get(key, 0)
+    start, after, seq = _swipe_pages(facts, step_id)
+    before = facts.get("nas_before") or "?"
+    label = facts.get("label") or ""
+    synthetic = facts.get("synthetic") or ""
+    moved_steps = n("step.moved")
+    hints, status = [], PASS
+    value = "NAS %s→%s / popstate %d / stepHistory %d(移動%d) / フリック受理 %d" % (
+        before, after, n("popstate"), n("step.call"), moved_steps, n("flick.accepted"))
+
+    def worse(new, hint):
+        nonlocal status
+        if hint:
+            hints.append(hint)
+        if new == FAIL or (new == WARN and status == PASS):
+            status = new
+    if facts.get("route_left"):
+        worse(FAIL, "アプリがタブ画面から離れました（戻る処理のフォールバック history.back が働いた可能性）")
+    if step_id in ("flick_right", "flick_left", "slow_move", "edge_start", "pull_cancel", "pull_close") and synthetic == "none":
+        return SKIP, value + " / 入力を作れませんでした", ["この端末では合成タッチ入力を作れず、内部ハンドラの直接呼び出しもできませんでした"]
+    expect = {"edge_back": "B", "flick_right": "A", "flick_left": "B"}.get(step_id)
+    if step_id == "edge_back":
+        if n("popstate") == 0:
+            worse(FAIL, "エッジスワイプでpopstateが来ない（iOSが戻る操作をしていない）" if manual else
+                  "history.back() で popstate が来ませんでした（ガード用の履歴がない、またはブラウザが戻る操作を止めた）")
+        elif n("popstate") >= 2:
+            worse(FAIL, "popstate が%d回発生（1回のはず）" % n("popstate"))
+        if n("flick.accepted"):
+            worse(FAIL, "フリックと戻るの二重実行（戻る操作中にフリックも受理された）")
+        if n("popstate") and n("step.call") == 0:
+            worse(FAIL, "popstate は来たが stepHistory が呼ばれていません（onPopStateが戻る処理をしていない）")
+    elif step_id == "back_first":
+        if n("popstate") == 0:
+            worse(FAIL, "history.back() で popstate が来ませんでした（ガード用の履歴がない）")
+        if moved_steps:
+            worse(FAIL, "最初のページなのにNASが戻りました")
+        if n("pop.leave"):
+            worse(FAIL, "戻れないのにアプリの前の画面へ戻ろうとしました（history.back のフォールバック）")
+        if n("toast") == 0:
+            worse(WARN, "「これより前のページはありません」の案内が出ていません")
+        expect = "A"
+    elif step_id in ("flick_right", "flick_left"):
+        if n("flick.accepted") == 0:
+            worse(FAIL, "フリックが認識されませんでした（理由: %s）" % (facts.get("flick_why") or "判定ログなし"))
+        elif n("flick.accepted") >= 2 or n("step.call") >= 2:
+            worse(FAIL, "フリックの二重実行（受理 %d 回 / stepHistory %d 回）" % (n("flick.accepted"), n("step.call")))
+        if n("popstate"):
+            worse(FAIL if moved_steps >= 2 else WARN,
+                  "フリックと戻るの二重実行（フリック中に popstate が%d回発生）" % n("popstate"))
+    elif step_id in ("slow_move", "edge_start"):
+        if n("flick.accepted") or n("step.call"):
+            worse(FAIL, "フリックではない動きが戻る/進むとして実行されました（%s）" %
+                  ("ゆっくりでも受理" if step_id == "slow_move" else "画面の端でも受理"))
+        elif n("flick.reject") == 0:
+            worse(WARN, "判定ログがありません（入力がハンドラに届いたか不明）")
+        expect = start
+    elif step_id == "forward":
+        if n("popstate") >= 2:
+            worse(FAIL, "popstate が%d回発生" % n("popstate"))
+        if after not in (start, "C"):
+            worse(FAIL, "進む操作で想定外のページ（%s）になりました" % after)
+        value += "（進めるページ%s）" % ("あり" if after == "C" else "なし")
+        expect = after
+    elif step_id == "pull_cancel":
+        if facts.get("hint_shown") is not True:
+            worse(FAIL, "下へ引いてもヒントが出ませんでした（touchmove がツールバーに届いていない）")
+        if facts.get("hint_hidden") is not True:
+            worse(FAIL, "戻してもヒントが消えませんでした")
+        if facts.get("close_calls", 0):
+            worse(FAIL, "引いて戻しただけでタブを閉じる処理が呼ばれました")
+        value = "ヒント表示=%s 消去=%s 閉じる呼び出し=%d" % (
+            facts.get("hint_shown") is True, facts.get("hint_hidden") is True, facts.get("close_calls", 0))
+        expect = start
+    elif step_id == "pull_close":
+        calls = facts.get("close_calls", 0)
+        if calls == 0:
+            worse(FAIL, "引いて離してもタブを閉じる処理が呼ばれませんでした")
+        elif calls >= 2:
+            worse(FAIL, "タブを閉じる処理が%d回呼ばれました" % calls)
+        if facts.get("hint_shown") is not True:
+            worse(WARN, "閉じる前のヒントが出ませんでした")
+        value = "ヒント表示=%s 閉じる呼び出し=%d（実際には閉じていません）" % (facts.get("hint_shown") is True, calls)
+        expect = start
+    if step_id not in ("pull_cancel", "pull_close") and expect and after != expect:
+        if after == "":
+            worse(FAIL, "NASのページを取得できませんでした")
+        elif after == before:
+            worse(FAIL, "NASが動きませんでした（moved:false か、戻る処理が呼ばれていません）")
+        elif "?" in seq or after == "?":
+            worse(FAIL, "確認ページ（チャレンジ）や空白ページの履歴に止まりました（NASが %s と動きました）" % " → ".join(seq))
+        elif moved_steps >= 2 or len(seq) >= 3:
+            worse(FAIL, "戻る/進むの二重実行（NASが %s と動きました）" % " → ".join(seq))
+        else:
+            worse(FAIL, "想定と違うページ（期待 %s、実際 %s）" % (expect, after))
+    elif step_id in ("edge_back", "flick_right", "flick_left") and moved_steps >= 2:
+        worse(FAIL, "戻る/進むの二重実行（stepHistory の移動が%d回）" % moved_steps)
+    if status != FAIL and expect and step_id not in ("pull_cancel", "pull_close", "slow_move", "edge_start") \
+            and label and label != after:
+        worse(WARN, "NASは%sですが表示は%sのままです（画面が更新されていません）" % (after, label))
+    if status != FAIL and step_id == "edge_back" and n("guard.push") == 0:
+        worse(WARN, "戻ったあとにガード用の履歴が積み直されていません（次の戻るが効かない恐れ）")
+    return status, value, hints
+
+
+def _swipe_str(value, limit, name):
+    if not isinstance(value, str):
+        raise ValueError("%sが不正です" % name)
+    text = re.sub(r"https?://(?!selftest\.example\.com(?:[/\s:]|\Z))\S*", "<url>", _short(value, limit * 2), flags=re.I)
+    return text[:limit]
+
+
+def validate_swipe(payload):
+    """Validated copy of one swipe POST (one display mode), or ValueError. Strings cleaned, URLs reduced."""
+    if not isinstance(payload, dict):
+        raise ValueError("スワイプ結果が不正です")
+    run_id = payload.get("run_id")
+    if not isinstance(run_id, str) or not RUN_ID.match(run_id):
+        raise ValueError("run_idが不正です")
+    out = {"run_id": run_id, "last": payload.get("last") is True}
+    if payload.get("error") is not None:
+        out["error"] = _swipe_str(payload["error"], 160, "error")
+    if payload.get("device") is not None:
+        out["device"] = _validate_device(payload["device"])
+    mode = payload.get("mode")
+    if mode is None:
+        out["mode"] = None
+        return out
+    if not isinstance(mode, dict) or mode.get("name") not in SWIPE_MODES:
+        raise ValueError("modeが不正です")
+    display = mode.get("display")
+    if display not in SWIPE_MODES + ("live", ""):
+        raise ValueError("mode.displayが不正です")
+    synthetic = mode.get("synthetic", "")
+    if synthetic not in SWIPE_SYNTHETIC:
+        raise ValueError("mode.syntheticが不正です")
+    growth = mode.get("history_growth")
+    if growth is not None and (not isinstance(growth, int) or isinstance(growth, bool) or not -50 <= growth <= 50):
+        raise ValueError("mode.history_growthが不正です")
+    steps_raw = mode.get("steps")
+    if not isinstance(steps_raw, list) or len(steps_raw) > len(SWIPE_STEPS) + 1:
+        raise ValueError("stepsが不正です")
+    steps, seen = [], set()
+    for raw in steps_raw:
+        if not isinstance(raw, dict) or raw.get("id") not in SWIPE_STEP or raw["id"] in seen:
+            raise ValueError("steps.idが不正です")
+        seen.add(raw["id"])
+        step = {"id": raw["id"]}
+        facts_raw = raw.get("facts")
+        if not isinstance(facts_raw, dict):
+            raise ValueError("factsが不正です")
+        facts = {}
+        for key in ("nas_before", "nas_after", "label"):
+            value = facts_raw.get(key, "")
+            if value not in ("", "A", "B", "C", "?"):
+                raise ValueError("facts.%sが不正です" % key)
+            facts[key] = value
+        seq = facts_raw.get("nas_seq", "")
+        if not isinstance(seq, str) or not re.fullmatch(r"[ABC?]{0,16}", seq):
+            raise ValueError("facts.nas_seqが不正です")
+        facts["nas_seq"] = seq
+        for key in ("route_left", "hint_shown", "hint_hidden"):
+            value = facts_raw.get(key)
+            if value is not None and not isinstance(value, bool):
+                raise ValueError("facts.%sが不正です" % key)
+            if value is not None:
+                facts[key] = value
+        if facts_raw.get("close_calls") is not None:
+            if not _num(facts_raw["close_calls"], 0, 100) or isinstance(facts_raw["close_calls"], float):
+                raise ValueError("facts.close_callsが不正です")
+            facts["close_calls"] = facts_raw["close_calls"]
+        if facts_raw.get("answer", "") not in SWIPE_ANSWERS:
+            raise ValueError("facts.answerが不正です")
+        if facts_raw.get("answer"):
+            facts["answer"] = facts_raw["answer"]
+        if facts_raw.get("synthetic", "") not in SWIPE_SYNTHETIC:
+            raise ValueError("facts.syntheticが不正です")
+        facts["synthetic"] = facts_raw.get("synthetic", "")
+        if facts_raw.get("flick_why") is not None:
+            facts["flick_why"] = _swipe_str(facts_raw["flick_why"], 60, "facts.flick_why")
+        if facts_raw.get("ms") is not None:
+            if not _num(facts_raw["ms"], 0, 600000):
+                raise ValueError("facts.msが不正です")
+            facts["ms"] = facts_raw["ms"]
+        step["facts"] = facts
+        counts_raw = raw.get("counts")
+        if not isinstance(counts_raw, dict) or len(counts_raw) > 48:
+            raise ValueError("countsが不正です")
+        counts = {}
+        for key, value in counts_raw.items():
+            if (not isinstance(key, str) or not SWIPE_EVENT_NAME.match(key) or isinstance(value, bool) or
+                    not isinstance(value, int) or not 0 <= value <= 100000):
+                raise ValueError("countsが不正です")
+            counts[key] = value
+        step["counts"] = counts
+        events_raw = raw.get("events", [])
+        if not isinstance(events_raw, list) or len(events_raw) > SWIPE_EVENTS_MAX:
+            raise ValueError("eventsが不正です")
+        events = []
+        for ev in events_raw:
+            if (not isinstance(ev, dict) or not _num(ev.get("t"), 0, 600000) or isinstance(ev.get("t"), float) or
+                    not isinstance(ev.get("e"), str) or not SWIPE_EVENT_NAME.match(ev["e"])):
+                raise ValueError("eventsの要素が不正です")
+            detail = ev.get("d", "")
+            events.append({"t": ev["t"], "e": ev["e"], "d": _swipe_str(detail, 120, "events.d")})
+        step["events"] = events
+        steps.append(step)
+    out["mode"] = {"name": mode["name"], "display": display, "synthetic": synthetic, "steps": steps,
+                   "history_growth": growth}
+    return out
+
+
 # -------------------------------------------------------------------------------------- the run
 class Run:
     def __init__(self, run_id, options, t0, wall):
@@ -529,7 +837,13 @@ class Run:
         self.phase = "env"
         self.rev = 1
         self.checks = []
-        self.sections = [{"id": i, "label": l, "status": "pending", "n": 0} for i, l in SECTIONS]
+        only = options.get("only") if options.get("only") in ("swipe", "swipe_manual") else ""
+        self.sections = [{"id": i, "label": l, "status": "pending", "n": 0} for i, l in SECTIONS
+                         if (i in (only, "cleanup") if only else (i not in ("swipe", "swipe_manual") or
+                                                      (i == "swipe" and options.get("swipe") is True)))]
+        self.swipe = None               # v0.1.52: {"tab", "kind", "state", "modes": {mode: [step results]}}
+        self.hard = MANUAL_HARD_TIMEOUT if options.get("only") == "swipe_manual" else HARD_TIMEOUT
+        self.swipe_evt = threading.Event()
         self.tab = None
         self.device = None
         self.client = "pending"          # pending | received | none
@@ -587,7 +901,10 @@ class SelfTest:
                 urls.append({"url": item["url"], "host": _host(item["url"])})
             viewport = sanitize_viewport(options.get("viewport")) if options.get("viewport") else DEFAULT_VIEWPORT
             run = Run(secrets.token_urlsafe(9), {"urls": urls, "viewport": viewport,
-                                                 "client": options.get("client", True) is not False},
+                                                 "client": options.get("client", True) is not False,
+                                                 "swipe": options.get("swipe") is True or options.get("only") == "swipe",
+                                                 "only": options.get("only") if options.get("only") in (
+                                                     "swipe", "swipe_manual") else ""},
                       self._clock(), self._wall())
             self._run = run
             self._cv.notify_all()
@@ -604,6 +921,7 @@ class SelfTest:
                 return False
             run.cancel.set()
             run.client_evt.set()
+            run.swipe_evt.set()
             run.current = "中止しています…"
             self._bump(run)
         return True
@@ -667,6 +985,43 @@ class SelfTest:
             self._bump(run)
         return {"ok": True, "checks": len(data["checks"])}
 
+    def submit_swipe(self, payload):
+        """One display mode of the phone's swipe diagnostic (validated by validate_swipe); judged here."""
+        data = validate_swipe(payload)
+        with self._cv:
+            self._expire_locked()
+            run = self._run
+            if run is None or run.id != data["run_id"] or run.state != "running":
+                raise ValueError("このセルフテストは進行中ではありません")
+            if run.phase != "swipe" or run.swipe is None or run.swipe["state"] != "waiting":
+                raise ValueError("スワイプの結果を受け付けられる段階ではありません")
+            if data.get("device") and not run.device:
+                run.device = data["device"]
+            mode = data.get("mode")
+            if mode is not None:
+                if mode["name"] in run.swipe["modes"]:
+                    raise ValueError("このモードの結果はすでに受け取っています")
+                self._swipe_judge_locked(run, mode)
+            if data.get("error"):
+                self._add_locked(run, "swipe", "swipe.error", "スワイプの自動確認（端末側のエラー）", FAIL,
+                                 data["error"], hint_key="client.error")
+            if data["last"] or data.get("error"):
+                run.swipe["state"] = "received"
+                run.swipe_evt.set()
+            self._bump(run)
+        return {"ok": True, "steps": 0 if mode is None else len(mode["steps"])}
+
+    def swipe_goto(self, run_id, page):
+        """Puts the fixture tab back on page A, B or C of its history (the step's starting point)."""
+        if page not in SWIPE_LETTERS or not isinstance(run_id, str) or not RUN_ID.match(run_id):
+            raise ValueError("パラメータが不正です")
+        with self._cv:
+            run = self._run
+            if run is None or run.id != run_id or run.state != "running" or run.phase != "swipe" or not run.swipe:
+                raise ValueError("スワイプの確認中ではありません")
+            tab = run.swipe["tab"]
+        return {"ok": bool(self.rb.selftest_history_to(tab, "/swipe/" + page.lower()))}
+
     # --------------------------------------------------------------------------- internals
     def _find(self, run_id):
         if run_id is None:
@@ -680,10 +1035,11 @@ class SelfTest:
 
     def _expire_locked(self):
         run = self._run
-        if run is not None and run.state == "running" and self._clock() - run.t0 > HARD_TIMEOUT + 15.0:
+        if run is not None and run.state == "running" and self._clock() - run.t0 > run.hard + 15.0:
             # The worker is stuck in a blocking call: end the run for the viewer anyway.
             run.cancel.set()
             run.client_evt.set()
+            run.swipe_evt.set()
             self._finish_locked(run, "timeout")
 
     def _bump(self, run):
@@ -693,7 +1049,7 @@ class SelfTest:
     def _guard(self, run):
         if run.cancel.is_set():
             raise Cancelled()
-        if self._clock() - run.t0 > HARD_TIMEOUT:
+        if self._clock() - run.t0 > run.hard:
             raise RunTimeout()
 
     def _wait(self, run, seconds):
@@ -766,6 +1122,46 @@ class SelfTest:
         self._history.append(run)
         self._bump(run)
 
+    def _swipe_report_lines(self, run):
+        """The timelines of the swipe diagnostic (cut at SWIPE_REPORT_BYTES)."""
+        dev = run.device or {}
+        manual = run.swipe["kind"] == "manual"
+        lines = ["", ("## スワイプ（手動）のタイムライン / swipe timelines (real fingers, answers by the user)" if manual else
+                      "## スワイプ（自動）のタイムライン / swipe timelines (synthetic input fed to the app's own handlers)"),
+                 "device: standalone=%s viewport=%sx%s dpr=%s touch=%s | ua=%s" % (
+                     dev.get("standalone", "?"), dev.get("width", "?"), dev.get("height", "?"), dev.get("dpr", "?"),
+                     dev.get("touch", "?"), dev.get("ua", "?"))]
+        tag = {PASS: "PASS", WARN: "WARN", FAIL: "FAIL", SKIP: "SKIP"}
+        size = sum(len(x) + 1 for x in lines)
+        cut = False
+        for name in SWIPE_MODES:
+            mode = run.swipe["modes"].get(name)
+            if not mode:
+                continue
+            lines.append("### %s (display=%s, input=%s)" % (name, mode["display"], mode["synthetic"] or "?"))
+            for step in mode["steps"]:
+                limit = SWIPE_REPORT_PASS_LINES if step["status"] == PASS else SWIPE_REPORT_LINES
+                f = step["facts"]
+                block = ["  [%s] %s | %s" % (tag[step["status"]], step["id"], step["value"]),
+                         "      facts: nas %s>%s seq=%s label=%s route_left=%s%s | counts: %s" % (
+                             f.get("nas_before") or "?", f.get("nas_after") or "?", f.get("nas_seq") or "-",
+                             f.get("label") or "-", f.get("route_left", "?"),
+                             (" flick_why=%s" % f["flick_why"]) if f.get("flick_why") else "",
+                             " ".join("%s=%d" % kv for kv in sorted(step["counts"].items())) or "-")]
+                if step["hint"]:
+                    block.append("      ヒント: %s" % step["hint"])
+                block.extend(_swipe_timeline(step, limit))
+                added = sum(len(x) + 1 for x in block)
+                if size + added > SWIPE_REPORT_BYTES:
+                    cut = True
+                    break
+                lines.extend(block)
+                size += added
+            if cut:
+                lines.append("  … (レポートの大きさの上限でここまで)")
+                break
+        return lines
+
     # ------------------------------------------------------------------------------ the thread
     def _main(self, run):
         state = "done"
@@ -773,6 +1169,9 @@ class SelfTest:
         try:
             self._debug_on(run)
             run.io_before = self._io_totals()
+            if run.options["only"]:
+                self._swipe_only(run, fixtures)
+                return
             usable = self._section_env(run)
             if usable:
                 self._section_browser(run, fixtures)
@@ -1041,6 +1440,13 @@ class SelfTest:
         # real sites (the fixture tab is closed first: memory)
         self._close_quiet(tab)
         run.tab = None
+        if run.options["swipe"]:
+            if run.client == "received":
+                self._swipe_phase(run, fixtures)
+            else:
+                self._add(run, "swipe", "swipe.skipped", "スワイプの自動確認", SKIP,
+                          "端末側の結果が届かなかったため省略しました")
+                self._leave(run, "swipe", skipped=True)
         self._sites(run)
 
     @staticmethod
@@ -1368,6 +1774,104 @@ class SelfTest:
                       "%d 秒待ちましたが結果が届きませんでした" % CLIENT_WAIT, "結果が届くこと")
         self._leave(run, sec)
 
+    # ------------------------------------------------------------ swipe (automatic, on the phone)
+    def _swipe_only(self, run, fixtures):
+        reason = None
+        try:
+            reason = self.rb.memory_reason()
+        except Exception as error:
+            reason = _short(str(error), 100)
+        if reason:
+            self._add(run, self._swipe_section(run), "swipe.start", "スワイプの確認", FAIL, reason[:200],
+                      hint_key="env.guard")
+            self._leave(run, self._swipe_section(run))
+            return
+        self._swipe_phase(run, fixtures)
+
+    @staticmethod
+    def _swipe_section(run):
+        return "swipe_manual" if run.options["only"] == "swipe_manual" else "swipe"
+
+    def _swipe_phase(self, run, fixtures):
+        """Opens the A -> (check page) -> A?token -> B -> C fixture tab, waits for the phone's diagnostic, always
+        closes the tab. The same phase serves the automatic and the manual (real finger) flow."""
+        rb = self.rb
+        sec = self._swipe_section(run)
+        manual = sec == "swipe_manual"
+        self._enter(run, sec, "スワイプを確認しています")
+        tab = None
+        try:
+            try:
+                created = rb.open_tab(self._origin() + SWIPE_ROUTE[0], selftest={"fixture": fixtures})
+            except Exception as error:
+                self._add(run, sec, "swipe.start", "スワイプの確認（テスト用タブ）", FAIL, _short(str(error), 160),
+                          hint_key="browser.start")
+                return
+            tab = created["id"]
+            width, height, dpr = run.options["viewport"]
+            try:
+                rb.set_viewport(tab, width, height, dpr)
+            except Exception:
+                pass
+            for path in SWIPE_ROUTE:
+                if path != SWIPE_ROUTE[0]:
+                    rb.selftest_goto(tab, path)
+                if self._wait_loaded(run, tab, path) is None:
+                    self._add(run, sec, "swipe.start", "スワイプの確認（テスト用ページ）", FAIL,
+                              "%s を読み込めませんでした" % path.split("?")[0], hint_key="builtin.ready")
+                    return
+            with self._cv:
+                run.tab = tab
+                run.swipe = {"tab": tab, "kind": "manual" if manual else "auto", "state": "waiting", "modes": {}}
+                run.phase = "swipe"
+                run.current = "この端末でスワイプを確認しています"
+                self._bump(run)
+            end = self._clock() + (run.hard - 30.0 if manual else SWIPE_WAIT)
+            while not run.swipe_evt.is_set():
+                self._guard(run)
+                if self._clock() >= end:
+                    break
+                run.swipe_evt.wait(0.25)
+            self._guard(run)
+            with self._cv:
+                got = run.swipe["state"] == "received"
+                run.swipe["state"] = "closed"
+            if not got:
+                self._add(run, sec, "swipe.missing", "スワイプの確認", WARN,
+                          "待ちましたが結果が届きませんでした", "結果が届くこと", hint_key="swipe.missing")
+        finally:
+            if tab is not None:
+                self._close_quiet(tab)
+            run.tab = None
+            self._leave(run, sec)
+
+    def _swipe_judge_locked(self, run, mode):
+        sec = "swipe_manual" if run.swipe["kind"] == "manual" else "swipe"
+        name, label = mode["name"], SWIPE_MODE_LABEL[mode["name"]]
+        shown = mode["display"] or "?"
+        self._add_locked(run, sec, "swipe.%s.display" % name, "【%s】実際の表示" % label,
+                         PASS if shown == name else WARN,
+                         "表示: %s（入力: %s）" % (SWIPE_MODE_LABEL.get(shown, shown), mode["synthetic"] or "?"),
+                         "要求した表示になること", hint_key="swipe.display")
+        results = []
+        for step in mode["steps"]:
+            if (step["id"] in SWIPE_BASE) != (run.swipe["kind"] == "manual"):
+                raise ValueError("steps.idがこの確認方法のものではありません")
+            title = SWIPE_STEP[step["id"]][0]
+            status, value, hints = judge_swipe_step(step["id"], step["facts"], step["counts"])
+            hint = " / ".join(hints)
+            self._add_locked(run, sec, "swipe.%s.%s" % (name, step["id"]), "【%s】%s" % (label, title),
+                             status, value, extra={"hint": hint if status in (WARN, FAIL) else ""})
+            results.append({"id": step["id"], "title": title, "status": status, "value": value, "hint": hint,
+                            "facts": step["facts"], "counts": step["counts"], "events": step["events"]})
+        growth = mode.get("history_growth")
+        if growth is not None:
+            self._add_locked(run, sec, "swipe.%s.history" % name, "【%s】履歴の増え方（表示切替・戻る）" % label,
+                             PASS if growth == 0 else FAIL, "履歴 +%d" % growth, "増えないこと（ガードは1つだけ）",
+                             hint_key="swipe.history")
+        run.swipe["modes"][name] = {"display": shown, "synthetic": mode["synthetic"], "steps": results,
+                                    "history_growth": growth}
+
     # ----------------------------------------------------------------- section 5: real sites
     def _sites(self, run):
         urls = run.options["urls"]
@@ -1605,14 +2109,17 @@ class SelfTest:
         data = {"rev": run.rev, "run_id": run.id, "state": run.state, "phase": run.phase,
                 "current": run.current, "elapsed_ms": elapsed, "started": int(run.started),
                 "sections": [dict(s) for s in run.sections], "checks": checks,
-                "summary": self._summary(run), "tab": run.tab if run.phase == "client" else None,
+                "summary": self._summary(run), "tab": run.tab if run.phase in ("client", "swipe") else None,
                 "viewport": {"width": run.options["viewport"][0], "height": run.options["viewport"][1],
                              "dpr": run.options["viewport"][2]},
+                "swipe_kind": run.swipe["kind"] if run.swipe else None,
                 "client": run.client, "history": [self._summary(r) for r in reversed(self._history)]}
         if full:
             data["info"] = dict(run.info)
             data["device"] = dict(run.device) if run.device else None
             data["log"] = list(run.log)
+            if run.swipe:
+                data["swipe"] = {"modes": run.swipe["modes"]}
         return data
 
     def _report_text(self, run, include_urls):
@@ -1661,11 +2168,21 @@ class SelfTest:
                     tag[c["status"]], c["id"], site, c["name"], c["value"], c["threshold"] or "-"))
                 if c["hint"]:
                     lines.append("      改善のヒント: %s" % c["hint"])
+        if run.swipe and run.swipe["modes"]:
+            lines.extend(self._swipe_report_lines(run))
         lines.append("")
         lines.append("## debug log (last %d lines: %s; times are UTC)" % (LOG_TAIL, "/".join(LOG_CATEGORIES)))
         lines.extend(run.log or ["(none)"])
         lines.append("== end ==")
         return "\n".join(lines)
+
+
+def _swipe_timeline(step, limit):
+    events = step["events"]
+    out = ["      +%dms %s %s" % (ev["t"], ev["e"], ev["d"]) for ev in events[:limit]]
+    if len(events) > limit:
+        out.append("      … (他 %d 件)" % (len(events) - limit))
+    return out
 
 
 def format_log(entry):
