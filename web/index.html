@@ -52,12 +52,25 @@
  </section>
  <section id="login" class="card auth-card" hidden>
   <h2>管理者ログイン</h2>
+  <button id="passkeyLogin" type="button" class="btn primary passkey-login" hidden>顔認証でログイン</button>
+  <p id="passkeyLoginHint" class="set-text muted" role="status" hidden></p>
   <form id="loginForm">
    <label>パスワード<input id="password" type="password" autocomplete="current-password"></label>
+   <div class="set-row remember-line"><div class="set-main"><span class="set-label">この端末を記憶する</span> <span class="set-text">ログインを30日保ちます</span></div><label class="switch" for="loginRemember"><input type="checkbox" id="loginRemember" role="switch" aria-label="この端末を記憶する"><span class="switch-track" aria-hidden="true"></span></label></div>
    <button id="loginButton" type="submit" class="btn primary">ログイン</button>
   </form>
  </section>
 </div>
+
+<aside id="passkeyOffer" class="card passkey-offer" role="dialog" aria-labelledby="passkeyOfferTitle" hidden>
+ <h2 id="passkeyOfferTitle">次回から顔認証でログインしますか？</h2>
+ <p class="muted">この端末のFace ID／Touch IDを登録すると、パスワードを入力せずに入れます。</p>
+ <div class="copy-row">
+  <button type="button" id="passkeyOfferYes" class="btn small primary">顔認証を登録</button>
+  <button type="button" id="passkeyOfferLater" class="btn small">あとで</button>
+  <button type="button" id="passkeyOfferNever" class="btn small">表示しない</button>
+ </div>
+</aside>
 
 <div id="app" class="shell" hidden>
  <!-- Tab strip (desktop). Pinned admin tabs + closable web tabs. -->
@@ -530,6 +543,25 @@
         <pre id="updateLog" class="update-log">開くと表示します</pre>
        </details>
        <p class="set-text muted">QPKGとして導入した環境のみ更新できます（JD2本体はJD2の「エンジン」）</p>
+      </div>
+
+      <div class="sub" data-sub="login">
+       <h2>ログイン</h2>
+       <div class="card">
+        <p id="passkeyUnavailable" class="set-text notice" role="note" hidden><span id="passkeyUnavailableText">顔認証は https://…ts.net で開いたときだけ使えます</span> <a id="passkeyHttpsLink" href="#" hidden>httpsで開く</a></p>
+        <p class="muted">Face ID／Touch IDでログインできます。パスワードも使えます。</p>
+        <div id="passkeyList" class="items"></div>
+        <div class="copy-row">
+         <input id="passkeyLabel" type="text" maxlength="40" placeholder="名前（例: iPhone）" aria-label="パスキーの名前" autocomplete="off">
+         <button type="button" id="passkeyRegister" class="btn small primary">この端末で顔認証を登録</button>
+        </div>
+        <p id="passkeyStatus" class="set-text muted" role="status" aria-live="polite"></p>
+       </div>
+       <div class="card">
+        <details class="fold"><summary>ログインを保つ期間</summary><p class="muted">「この端末を記憶する」で入った端末とパスキーでログインした端末は、30日間操作がなければ（最長90日）まで、Hubの再起動や更新後もログインしたままです。それ以外のパスワードログインは8時間です。</p></details>
+        <p id="sessionCount" class="set-text muted"></p>
+        <button type="button" id="revokeAll" class="btn small">すべての端末からログアウト</button>
+       </div>
       </div>
 
       <div class="sub" data-sub="about">

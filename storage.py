@@ -60,6 +60,26 @@ auto_send INTEGER NOT NULL DEFAULT 0,
 popup TEXT NOT NULL DEFAULT 'ask' CHECK(popup IN ('ask','allow','block')),
 block_ads INTEGER NOT NULL DEFAULT 1);
 """
+# v0.1.53: passkeys (public keys only) and sessions (SHA-256 of the session id only; the raw id exists
+# only in the browser cookie). hub_text holds small Hub-owned strings: the stable WebAuthn user handle
+# and the last seen Tailscale name.
+PASSKEY_SCHEMA = """
+CREATE TABLE IF NOT EXISTS passkeys(id INTEGER PRIMARY KEY AUTOINCREMENT,
+credential_id BLOB NOT NULL UNIQUE,public_key BLOB NOT NULL,alg INTEGER NOT NULL,
+sign_count INTEGER NOT NULL DEFAULT 0,label TEXT NOT NULL,rp_id TEXT NOT NULL,
+transports TEXT NOT NULL DEFAULT '',created_at REAL NOT NULL,last_used_at REAL);
+CREATE TABLE IF NOT EXISTS hub_text(key TEXT PRIMARY KEY,value TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS sessions(id_hash TEXT PRIMARY KEY,created_at REAL NOT NULL,
+last_seen REAL NOT NULL,idle_seconds INTEGER NOT NULL,absolute_seconds INTEGER NOT NULL,
+method TEXT NOT NULL);
+"""
+MAX_PASSKEYS = 10
+SESSION_SHORT = 8 * 3600                 # password login without "remember this device": fixed 8 h
+SESSION_IDLE = 30 * 86400                # remembered / passkey sessions: idle timeout ...
+SESSION_ABSOLUTE = 90 * 86400            # ... and absolute lifetime
+SESSION_TOUCH_INTERVAL = 3600            # last_seen is written at most hourly (HDD writes)
+SESSION_LIMIT = 128
+SESSION_METHODS = ("password", "passkey")
 MAX_SITE_RULES = 200
 POPUP_POLICIES = ("ask", "allow", "block")
 HOST_LABEL = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\Z")
@@ -92,9 +112,11 @@ class Store:
                 if db.execute("PRAGMA quick_check").fetchone()[0] != "ok":
                     raise RuntimeError("設定DBの整合性に異常があります")
             db.executescript(SHARE_SCHEMA)
+            db.executescript(PASSKEY_SCHEMA)
             db.executescript(SITE_RULES_SCHEMA)
             self._upgrade_site_rules(db)
         self._rules = None
+        self._sessions = {}      # id_hash -> row cache; every change goes through this process
         if fresh:
             marker.write_text("v1\n", encoding="utf-8")
             os.chmod(marker, 0o600)
@@ -451,3 +473,187 @@ class Store:
             with self._guard, self.connect() as db:
                 db.execute("UPDATE share_tokens SET last_used_at=? WHERE id=?", (now, ident))
         return ident
+
+    # ---- sessions (v0.1.53) -------------------------------------------------------------------
+    @staticmethod
+    def _session_hash(raw):
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def csrf_token(raw):
+        """CSRF token derived from the session id (HMAC), so the database never holds it."""
+        return hmac.new(raw.encode("utf-8"), b"qdl-csrf-v1", hashlib.sha256).hexdigest()
+
+    @staticmethod
+    def session_expiry(created, last_seen, idle, absolute):
+        return min(created + absolute, last_seen + idle)
+
+    def session_hash(self, raw):
+        return self._session_hash(raw) if isinstance(raw, str) and 1 <= len(raw) <= 200 else ""
+
+    def create_session(self, method="password", remember=False, now=None):
+        """Create a session. Returns (raw_id, csrf, max_age). Only the hash of raw_id is stored."""
+        if method not in SESSION_METHODS:
+            raise ValueError("unknown session method")
+        now = time.time() if now is None else now
+        idle, absolute = (SESSION_IDLE, SESSION_ABSOLUTE) if remember else (SESSION_SHORT, SESSION_SHORT)
+        raw = secrets.token_urlsafe(32)
+        digest = self._session_hash(raw)
+        with self._guard, self.connect() as db:
+            for row in db.execute("SELECT id_hash,created_at,last_seen,idle_seconds,absolute_seconds FROM sessions"):
+                if self.session_expiry(row[1], row[2], row[3], row[4]) <= now:
+                    db.execute("DELETE FROM sessions WHERE id_hash=?", (row[0],))
+                    self._sessions.pop(row[0], None)
+            while db.execute("SELECT COUNT(*) FROM sessions").fetchone()[0] >= SESSION_LIMIT:
+                oldest = db.execute("SELECT id_hash FROM sessions ORDER BY last_seen LIMIT 1").fetchone()[0]
+                db.execute("DELETE FROM sessions WHERE id_hash=?", (oldest,))
+                self._sessions.pop(oldest, None)
+            db.execute("INSERT INTO sessions VALUES(?,?,?,?,?,?)", (digest, now, now, idle, absolute, method))
+        self._sessions[digest] = (now, now, idle, absolute, method)
+        return raw, self.csrf_token(raw), int(min(idle, absolute))
+
+    def lookup_session(self, raw, now=None):
+        """The live session for a raw cookie value, else None.
+
+        Returns {"hash", "csrf", "method", "remember", "max_age", "touched"}. A remembered session's
+        last_seen is advanced at most once per SESSION_TOUCH_INTERVAL ("touched" then asks the caller to
+        re-issue the cookie with the new Max-Age); short sessions are never written.
+        """
+        digest = self.session_hash(raw)
+        if not digest:
+            return None
+        now = time.time() if now is None else now
+        with self._guard:
+            row = self._sessions.get(digest)
+            if row is None:
+                with self.connect() as db:
+                    found = db.execute("SELECT created_at,last_seen,idle_seconds,absolute_seconds,method "
+                                       "FROM sessions WHERE id_hash=?", (digest,)).fetchone()
+                if found is None:
+                    return None
+                row = self._sessions[digest] = tuple(found)
+                if len(self._sessions) > 4 * SESSION_LIMIT:
+                    self._sessions = {digest: row}
+            created, last_seen, idle, absolute, method = row
+            if self.session_expiry(created, last_seen, idle, absolute) <= now or now < created - 60:
+                self._drop_session(digest)
+                return None
+            remember = absolute > SESSION_SHORT
+            touched = False
+            if remember and now - last_seen >= SESSION_TOUCH_INTERVAL:
+                with self.connect() as db:
+                    db.execute("UPDATE sessions SET last_seen=? WHERE id_hash=?", (now, digest))
+                row = self._sessions[digest] = (created, now, idle, absolute, method)
+                last_seen, touched = now, True
+            remaining = int(self.session_expiry(created, last_seen, idle, absolute) - now)
+        return {"hash": digest, "csrf": self.csrf_token(raw), "method": method, "remember": remember,
+                "max_age": max(0, remaining), "touched": touched}
+
+    def _drop_session(self, digest):
+        self._sessions.pop(digest, None)
+        with self.connect() as db:
+            db.execute("DELETE FROM sessions WHERE id_hash=?", (digest,))
+
+    def revoke_session(self, raw):
+        digest = self.session_hash(raw)
+        if digest:
+            with self._guard:
+                self._drop_session(digest)
+
+    def revoke_all_sessions(self):
+        with self._guard, self.connect() as db:
+            count = db.execute("DELETE FROM sessions").rowcount
+            self._sessions.clear()
+        return count
+
+    def session_count(self):
+        with self.connect() as db:
+            return db.execute("SELECT COUNT(*) FROM sessions").fetchone()[0]
+
+    # ---- passkeys (v0.1.53): public keys only ---------------------------------------------------
+    def hub_text(self, key):
+        with self.connect() as db:
+            row = db.execute("SELECT value FROM hub_text WHERE key=?", (key,)).fetchone()
+        return row[0] if row else None
+
+    def set_hub_text(self, key, value):
+        """Write only when the value changed (no routine HDD writes)."""
+        if self.hub_text(key) == value:
+            return
+        with self._guard, self.connect() as db:
+            db.execute("INSERT INTO hub_text VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                       (key, value))
+
+    def passkey_user_handle(self):
+        """Random 16-byte WebAuthn user handle, created once and then stable."""
+        with self._guard:
+            current = self.hub_text("passkey_user_handle")
+            if current is None:
+                current = secrets.token_bytes(16).hex()
+                self.set_hub_text("passkey_user_handle", current)
+        return bytes.fromhex(current)
+
+    @staticmethod
+    def _passkey_row(row):
+        return dict(id=row[0], label=row[1], rp_id=row[2], created_at=row[3], last_used_at=row[4])
+
+    def passkeys(self, rp_id=None):
+        query = "SELECT id,label,rp_id,created_at,last_used_at FROM passkeys"
+        args = ()
+        if rp_id is not None:
+            query += " WHERE rp_id=?"
+            args = (rp_id,)
+        with self.connect() as db:
+            return [self._passkey_row(r) for r in db.execute(query + " ORDER BY id", args)]
+
+    def passkey_credentials(self, rp_id):
+        """[(credential_id, transports)] for excludeCredentials."""
+        with self.connect() as db:
+            return [(bytes(r[0]), r[1]) for r in
+                    db.execute("SELECT credential_id,transports FROM passkeys WHERE rp_id=? ORDER BY id", (rp_id,))]
+
+    @staticmethod
+    def _label(value):
+        if not isinstance(value, str) or not 1 <= len(value.strip()) <= 40 or \
+                any(ord(ch) < 32 for ch in value):
+            raise ValueError("名前は1～40文字にしてください")
+        return value.strip()
+
+    def add_passkey(self, credential_id, public_key, alg, sign_count, label, rp_id, transports=""):
+        label = self._label(label)
+        with self._guard, self.connect() as db:
+            if db.execute("SELECT COUNT(*) FROM passkeys").fetchone()[0] >= MAX_PASSKEYS:
+                raise ValueError("登録できるパスキーは%d個までです。不要なものを削除してください" % MAX_PASSKEYS)
+            try:
+                cur = db.execute("INSERT INTO passkeys(credential_id,public_key,alg,sign_count,label,rp_id,"
+                                 "transports,created_at) VALUES(?,?,?,?,?,?,?,?)",
+                                 (credential_id, public_key, alg, sign_count, label, rp_id, transports, time.time()))
+            except sqlite3.IntegrityError:
+                raise ValueError("このパスキーはすでに登録されています")
+            return cur.lastrowid
+
+    def passkey_by_credential(self, credential_id, rp_id):
+        with self.connect() as db:
+            row = db.execute("SELECT id,public_key,alg,sign_count FROM passkeys WHERE credential_id=? AND rp_id=?",
+                             (credential_id, rp_id)).fetchone()
+        return dict(id=row[0], public_key=bytes(row[1]), alg=row[2], sign_count=row[3]) if row else None
+
+    def passkey_used(self, identifier, sign_count):
+        with self._guard, self.connect() as db:
+            db.execute("UPDATE passkeys SET last_used_at=?,sign_count=? WHERE id=?",
+                       (time.time(), sign_count, identifier))
+
+    def rename_passkey(self, identifier, label):
+        if type(identifier) is not int or identifier <= 0:
+            raise ValueError("パスキーIDが不正です")
+        label = self._label(label)
+        with self._guard, self.connect() as db:
+            if db.execute("UPDATE passkeys SET label=? WHERE id=?", (label, identifier)).rowcount != 1:
+                raise ValueError("パスキーが見つかりません")
+
+    def delete_passkey(self, identifier):
+        if type(identifier) is not int or identifier <= 0:
+            raise ValueError("パスキーIDが不正です")
+        with self._guard, self.connect() as db:
+            if db.execute("DELETE FROM passkeys WHERE id=?", (identifier,)).rowcount != 1:
+                raise ValueError("パスキーが見つかりません")

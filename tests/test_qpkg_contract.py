@@ -79,7 +79,7 @@ class QpkgContractTests(unittest.TestCase):
 
     def test_all_imported_modules_are_packaged(self):
         script = (ROOT / "scripts/build-qpkg.sh").read_text()
-        for name in ("webapp.py", "ttlcache.py", "state_hub.py", "diskio.py", "debuglog.py", "storage.py", "durability.py",
+        for name in ("webapp.py", "webauthn.py", "ttlcache.py", "state_hub.py", "diskio.py", "debuglog.py", "storage.py", "durability.py",
                      "updater.py", "self_update.py", "jd2_policy.py",
                      "jd2_control.py", "jd2_local.py", "engine_components.py", "engine_supervisor.py", "container_runtime.py", "jd2_transfer.py", "jd2_downloads.py", "jd2_accounts.py", "runtime_diagnostics.py", "rapidgator_extract.py", "browser_safety.py", "rb_blocklist.py", "rb_resident.py", "rb_mirror.py", "remote_browser.py", "selftest.py", "downloader_pid.py", "python3-path", "downloader-diagnose"):
             with self.subTest(name=name):

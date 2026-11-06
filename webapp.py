@@ -34,8 +34,9 @@ import selftest
 import state_hub
 import ttlcache
 import updater
+import webauthn
 
-VERSION = "0.1.52"
+VERSION = "0.1.53"
 PORT = 17864
 ROOT = Path(__file__).resolve().parent
 FILES = {"/": ("web/index.html", "text/html; charset=utf-8"),
@@ -50,8 +51,14 @@ FILES = {"/": ("web/index.html", "text/html; charset=utf-8"),
 # That response carries its own, stricter policy (rb_mirror.DOC_CSP_HEADER). External pages are never framed.
 CSP = ("default-src 'none'; img-src 'self' data: blob:; script-src 'self'; style-src 'self'; "
        "connect-src 'self'; frame-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'")
-SESSIONS = {}
 FAILED = {}
+PASSKEY_BEGIN = {}     # per-address passkey login/begin timestamps (RAM only)
+PASSKEY_BEGIN_LIMIT, PASSKEY_BEGIN_WINDOW = 30, 300
+PASSKEY_BODY_MAX = 32768
+PASSKEY_TRANSPORTS = ("internal", "hybrid", "usb", "nfc", "ble", "smart-card")
+PASSKEY_UNAVAILABLE = "顔認証は https://…ts.net で開いたときだけ使えます"
+PASSKEY_LOGIN_FAILED = "顔認証でログインできませんでした。パスワードでログインしてください"
+TS_NAME_KEY = "tailscale_name"
 SHARE_FAILED = {}    # per-address failed share-token attempts (RAM only)
 SHARE_RATE = {}      # token id -> request timestamps (RAM only)
 SHARE_FAIL_LIMIT, SHARE_FAIL_WINDOW = 20, 300
@@ -415,6 +422,32 @@ def server_selftest(server):
     return runner
 
 
+def server_challenges(server):
+    """Per-server single-use WebAuthn challenges (RAM only)."""
+    challenges = getattr(server, "challenges", None)
+    if challenges is None:
+        with SESSION_LOCK:
+            challenges = getattr(server, "challenges", None)
+            if challenges is None:
+                challenges = server.challenges = webauthn.Challenges()
+    return challenges
+
+
+def passkey_rp_name_ok(name):
+    """Host names a passkey may be bound to: a *.ts.net MagicDNS name, or a dotted DNS name the admin
+    listed in DOWNLOADER_ALLOWED_HOSTS (TLS reverse proxy). Never IP addresses or short names."""
+    if tailscale_name(name):
+        return True
+    try:
+        ipaddress.ip_address(name)
+        return False
+    except ValueError:
+        pass
+    configured = os.environ.get("DOWNLOADER_ALLOWED_HOSTS", "")
+    return ("." in name and LABEL.fullmatch(name.split(".")[0]) is not None and
+            name in {item.strip().lower() for item in configured.split(",") if item.strip()})
+
+
 def server_state_hub(server):
     hub = getattr(server, "state_hub", None)
     if hub is None:
@@ -591,22 +624,48 @@ class Handler(BaseHTTPRequestHandler):
         except ValueError:
             return False
 
-    def session(self):
+    def session_cookie(self):
+        """The raw session cookie value (never logged or echoed), or ''."""
         jar = http.cookies.SimpleCookie()
         try:
             jar.load(self.headers.get("Cookie", ""))
         except http.cookies.CookieError:
+            return ""
+        return jar["qdl_session"].value if "qdl_session" in jar else ""
+
+    def session(self):
+        raw = self.session_cookie()
+        data = self.server.store.lookup_session(raw) if raw else None
+        if data and data["touched"]:
+            self.set_cookie(raw, data["max_age"])     # sliding idle window: Max-Age follows the server
+        return data
+
+    def passkey_context(self):
+        """(rp_id, origin) this request may use for passkeys, or None.
+
+        Production: HTTPS only (request_is_https: loopback peer + X-Forwarded-Proto/ts.net Host), and the
+        Host must be a *.ts.net name (or a listed DNS name). The origin is "https://" + Host exactly.
+        `server.passkey_test_hosts` (set only by the hidden --test-passkey-host flag) lets the E2E suite
+        use http://localhost; it is empty in every normal run.
+        """
+        host = self.headers.get("Host", "")
+        if not host or not self.check_host():
             return None
-        sid = jar["qdl_session"].value if "qdl_session" in jar else ""
-        with SESSION_LOCK:
-            data = SESSIONS.get(sid)
-            if data and data["until"] > time.time():
-                return data
-            SESSIONS.pop(sid, None)
+        try:
+            hostname = (urlsplit("http://" + host).hostname or "").lower()
+        except ValueError:
+            return None
+        if not hostname or hostname.endswith("."):
+            return None
+        if hostname in getattr(self.server, "passkey_test_hosts", ()) and loopback_peer(self.client_address[0]):
+            return hostname, "http://" + host.lower()
+        if request_is_https(self.client_address[0], self.headers) and passkey_rp_name_ok(hostname):
+            return hostname, "https://" + host.lower()
         return None
 
     def authorize(self, write=False):
         data = self.session()
+        self._session_data = data
         if not data:
             self.reject("管理者ログインが必要です", 401)
             return False
@@ -629,6 +688,8 @@ class Handler(BaseHTTPRequestHandler):
         size = int(self.headers.get("Content-Length", "-1"))
         path = urlsplit(self.path).path
         maximum = 72000 if path in ("/api/rapidgator/extract", "/api/share") else 16384
+        if path.startswith("/api/passkeys/"):
+            maximum = PASSKEY_BODY_MAX
         if path.startswith("/api/accounts/"):
             maximum = ACCOUNT_BODY_MAX
         if path == "/api/debug/log":
@@ -748,13 +809,22 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_data(200, {"configured": self.store.has_admin()})
         if path == "/api/session":
             data = self.session()
+            context = self.passkey_context()
             return self.send_data(200, {"authenticated": bool(data),
                              "csrf": data["csrf"] if data else None,
                              "tailnet": tailnet_peer(self.client_address[0]),
-                             "https": request_is_https(self.client_address[0], self.headers)})
+                             "https": request_is_https(self.client_address[0], self.headers),
+                             "passkey": {"available": context is not None,
+                                         "registered": len(self.store.passkeys(context[0])) if context else 0}})
         if not self.authorize():
             return
         try:
+            if path == "/api/passkeys":
+                context = self.passkey_context()
+                return self.send_data(200, {
+                    "items": self.store.passkeys(), "max": storage.MAX_PASSKEYS,
+                    "available": context is not None, "rp_id": context[0] if context else None,
+                    "https_url": self.https_url(), "sessions": self.store.session_count()})
             if path == "/api/status":
                 return self.send_data(200, {"version": VERSION, "configured": self.store.has_admin(),
                     "settings_revision": self.store.revision(),
@@ -1030,6 +1100,157 @@ class Handler(BaseHTTPRequestHandler):
             return self.reject(str(exc))
         self.reject("APIが存在しません", 404)
 
+    def note_failed(self, address, attempts):
+        with SESSION_LOCK:
+            # Bound the per-address retry tracker against memory abuse.
+            if address not in FAILED and len(FAILED) >= 256:
+                oldest = min(FAILED, key=lambda key: FAILED[key][-1] if FAILED[key] else 0)
+                FAILED.pop(oldest, None)
+            FAILED[address] = attempts + [time.time()]
+
+    def remember_tailscale_name(self):
+        """Remember the *.ts.net name this (authenticated) HTTPS request used, for the switch-to-https link."""
+        context = self.passkey_context()
+        if context and tailscale_name(context[0]) and context[1].startswith("https://"):
+            try:
+                self.store.set_hub_text(TS_NAME_KEY, context[1][len("https://"):])
+            except (OSError, sqlite3.Error):
+                pass
+
+    def https_url(self):
+        name = self.store.hub_text(TS_NAME_KEY)
+        if name and tailscale_name(host_name(name)):
+            return "https://" + name + "/"
+        return None
+
+    def start_session(self, method, remember):
+        raw, csrf, age = self.store.create_session(method, remember)
+        self.set_cookie(raw, age)
+        self.remember_tailscale_name()
+        return self.send_data(200, {"ok": True, "csrf": csrf, "remember": remember, "max_age": age})
+
+    # ---- passkeys (v0.1.53) ----------------------------------------------------------------------
+    def require_passkey_context(self):
+        context = self.passkey_context()
+        if context is None:
+            raise ValueError(PASSKEY_UNAVAILABLE)
+        return context
+
+    @staticmethod
+    def passkey_text(body, key, maximum=2048):
+        value = body.get(key)
+        if not isinstance(value, str) or len(value) > maximum:
+            raise webauthn.WebAuthnError("リクエストの形式が不正です")
+        return value
+
+    def passkey_register_begin(self):
+        rp_id, origin = self.require_passkey_context()
+        challenge = server_challenges(self.server).issue("create", self._session_data["hash"], rp_id, origin)
+        exclude = []
+        for credential_id, transports in self.store.passkey_credentials(rp_id):
+            entry = {"type": "public-key", "id": webauthn.b64url_encode(credential_id)}
+            if transports:
+                entry["transports"] = transports.split(",")
+            exclude.append(entry)
+        return self.send_data(200, {
+            "challenge": challenge, "rp": {"id": rp_id, "name": "QnapDownloader"},
+            "user": {"id": webauthn.b64url_encode(self.store.passkey_user_handle()), "name": "admin",
+                     "displayName": "管理者"},
+            "pubKeyCredParams": [{"type": "public-key", "alg": webauthn.ALG_ES256},
+                                 {"type": "public-key", "alg": webauthn.ALG_RS256}],
+            "authenticatorSelection": {"residentKey": "required", "requireResidentKey": True,
+                                       "userVerification": "required", "authenticatorAttachment": "platform"},
+            "attestation": "none", "excludeCredentials": exclude, "timeout": 120000})
+
+    def passkey_register_finish(self, body):
+        rp_id, origin = self.require_passkey_context()
+        raw_id = webauthn.b64url_decode(self.passkey_text(body, "id", 1400), webauthn.CREDENTIAL_ID_MAX)
+        if "rawId" in body and webauthn.b64url_decode(
+                self.passkey_text(body, "rawId", 1400), webauthn.CREDENTIAL_ID_MAX) != raw_id:
+            raise webauthn.WebAuthnError("資格情報IDが一致しません")
+        client_data = webauthn.b64url_decode(self.passkey_text(body, "clientDataJSON", 6000), 4096)
+        attestation = webauthn.b64url_decode(self.passkey_text(body, "attestationObject", 12000), 8192)
+        transports = body.get("transports", [])
+        if not isinstance(transports, list) or len(transports) > 8:
+            raise webauthn.WebAuthnError("リクエストの形式が不正です")
+        kept = [t for t in transports if t in PASSKEY_TRANSPORTS]
+        label = body.get("label") if body.get("label") not in (None, "") else "このデバイス"
+        self.store._label(label)       # a bad label is a 400 before the challenge is used up
+        result = webauthn.verify_registration(server_challenges(self.server), self._session_data["hash"],
+                                              rp_id, origin, client_data, attestation, raw_id)
+        identifier = self.store.add_passkey(result["credential_id"], result["public_key"], result["alg"],
+                                            result["sign_count"], label, rp_id, ",".join(dict.fromkeys(kept)))
+        self.remember_tailscale_name()
+        return self.send_data(201, {"id": identifier})
+
+    def passkey_login_blocked(self, address):
+        with SESSION_LOCK:
+            attempts = [t for t in FAILED.get(address, []) if time.time() - t < 300]
+        return attempts
+
+    def passkey_login_begin(self):
+        address = self.client_address[0]
+        context = self.passkey_context()
+        if context is None:
+            return self.reject(PASSKEY_UNAVAILABLE, 400)
+        with SESSION_LOCK:
+            now = time.time()
+            if len(self.passkey_login_blocked(address)) >= 10:
+                return self.reject("ログイン試行が多すぎます", 429)
+            if address not in PASSKEY_BEGIN and len(PASSKEY_BEGIN) >= 256:
+                PASSKEY_BEGIN.pop(min(PASSKEY_BEGIN, key=lambda key: PASSKEY_BEGIN[key][-1]), None)
+            hits = [t for t in PASSKEY_BEGIN.get(address, []) if now - t < PASSKEY_BEGIN_WINDOW]
+            if len(hits) >= PASSKEY_BEGIN_LIMIT:
+                PASSKEY_BEGIN[address] = hits
+                return self.reject("ログイン試行が多すぎます", 429)
+            PASSKEY_BEGIN[address] = hits + [now]
+        if not self.store.passkeys(context[0]):
+            return self.reject("この接続先に登録されたパスキーがありません", 404)
+        challenge = server_challenges(self.server).issue("get", "", context[0], context[1])
+        return self.send_data(200, {"challenge": challenge, "rpId": context[0], "timeout": 120000,
+                                    "userVerification": "required", "allowCredentials": []})
+
+    def passkey_login_finish(self, body):
+        address = self.client_address[0]
+        attempts = self.passkey_login_blocked(address)
+        if len(attempts) >= 10:
+            return self.reject("ログイン試行が多すぎます", 429)
+        context = self.passkey_context()
+        if context is None:
+            return self.reject(PASSKEY_UNAVAILABLE, 400)
+        rp_id, origin = context
+        try:
+            raw_id = webauthn.b64url_decode(self.passkey_text(body, "id", 1400), webauthn.CREDENTIAL_ID_MAX)
+            client_data = webauthn.b64url_decode(self.passkey_text(body, "clientDataJSON", 6000), 4096)
+            auth_data = webauthn.b64url_decode(self.passkey_text(body, "authenticatorData", 6000), 4096)
+            signature = webauthn.b64url_decode(self.passkey_text(body, "signature", 1400), 1024)
+            handle = body.get("userHandle")
+            handle = webauthn.b64url_decode(handle, 64) if isinstance(handle, str) and handle else b""
+            credential = self.store.passkey_by_credential(raw_id, rp_id)
+            if credential is None:
+                # Burn the challenge anyway so a probe cannot reuse it.
+                try:
+                    challenge = webauthn.parse_client_data(client_data, "webauthn.get", origin)
+                    server_challenges(self.server).consume(challenge, "get", "", rp_id, origin)
+                except webauthn.WebAuthnError:
+                    pass
+                raise webauthn.WebAuthnError("未登録のパスキーです")
+            if handle and not hmac.compare_digest(handle, self.store.passkey_user_handle()):
+                raise webauthn.WebAuthnError("ユーザーが一致しません")
+            new_count = webauthn.verify_assertion(server_challenges(self.server), "", rp_id, origin,
+                                                  credential, client_data, auth_data, signature)
+        except webauthn.WebAuthnError as exc:
+            runtime_diagnostics.event("login_failed")
+            if isinstance(exc, webauthn.SignCountError):
+                runtime_diagnostics.event("passkey_counter_rejected")
+                debuglog.log("app", "warn", "passkey signature counter did not increase", {"passkey": credential["id"]})
+            self.note_failed(address, attempts)
+            return self.reject(PASSKEY_LOGIN_FAILED, 401)
+        with SESSION_LOCK:
+            FAILED.pop(address, None)
+        self.store.passkey_used(credential["id"], new_count)
+        return self.start_session("passkey", True)
+
     def send_staged_link(self, ident=None, url=None):
         return send_link(self.server, ident=ident, url=url)
 
@@ -1138,37 +1359,38 @@ class Handler(BaseHTTPRequestHandler):
                         return self.reject("ログイン試行が多すぎます", 429)
                 if not self.store.check_password(body.get("password")):
                     runtime_diagnostics.event("login_failed")
-                    with SESSION_LOCK:
-                        # Bound the per-address retry tracker against memory abuse.
-                        if address not in FAILED and len(FAILED) >= 256:
-                            oldest = min(FAILED, key=lambda key: FAILED[key][-1] if FAILED[key] else 0)
-                            FAILED.pop(oldest, None)
-                        FAILED[address] = attempts + [time.time()]
+                    self.note_failed(address, attempts)
                     return self.reject("パスワードが正しくありません", 401)
+                remember = body.get("remember", False)
+                if not isinstance(remember, bool):
+                    raise ValueError("rememberは真偽値で指定してください")
                 with SESSION_LOCK:
                     FAILED.pop(address, None)
-                    now = time.time()
-                    for key, data in list(SESSIONS.items()):
-                        if data["until"] <= now:
-                            SESSIONS.pop(key, None)
-                    if len(SESSIONS) >= 128:
-                        oldest = min(SESSIONS, key=lambda key: SESSIONS[key]["until"])
-                        SESSIONS.pop(oldest, None)
-                    sid = secrets.token_urlsafe(32)
-                    csrf = secrets.token_urlsafe(32)
-                    SESSIONS[sid] = {"csrf": csrf, "until": now+8*3600}
-                self.set_cookie(sid, 8*3600)
-                return self.send_data(200, {"ok": True, "csrf": csrf})
+                return self.start_session("password", remember)
+            if path == "/api/passkeys/login/begin":
+                return self.passkey_login_begin()
+            if path == "/api/passkeys/login/finish":
+                return self.passkey_login_finish(body)
             if not self.authorize(write=True):
                 return
             if path == "/api/logout":
-                jar = http.cookies.SimpleCookie()
-                jar.load(self.headers.get("Cookie", ""))
-                with SESSION_LOCK:
-                    if "qdl_session" in jar:
-                        SESSIONS.pop(jar["qdl_session"].value, None)
+                self.store.revoke_session(self.session_cookie())
                 self.set_cookie("", 0)
                 return self.send_data(200, {"ok": True})
+            if path == "/api/sessions/revoke-all":
+                count = self.store.revoke_all_sessions()
+                self.set_cookie("", 0)
+                return self.send_data(200, {"ok": True, "revoked": count})
+            if path == "/api/passkeys/register/begin":
+                return self.passkey_register_begin()
+            if path == "/api/passkeys/register/finish":
+                return self.passkey_register_finish(body)
+            if path == "/api/passkeys/rename":
+                self.store.rename_passkey(body.get("id"), body.get("label"))
+                return self.send_data(200, {"ok": True})
+            if path == "/api/passkeys/delete":
+                self.store.delete_passkey(body.get("id"))
+                return self.send_data(200, {"deleted": True})
             if path == "/api/settings/folder":
                 chosen = checked_directory(body.get("path"))
                 if not os.access(chosen, os.W_OK):
@@ -1474,6 +1696,8 @@ def main():
     parser.add_argument("--port", type=int, default=PORT)
     parser.add_argument("--lan", action="store_true", help="Serve private LAN IPs; never port-forward to the Internet")
     parser.add_argument("--secure-cookie", action="store_true", help="For TLS reverse proxy deployments")
+    parser.add_argument("--test-passkey-host", choices=("localhost",), default=None,
+                        help="TEST ONLY (E2E): allow passkeys on http://localhost; never use in production")
     parser.add_argument("--data-dir", default=os.environ.get("DOWNLOADER_DATA_DIR", "./runtime"))
     args = parser.parse_args()
     data = Path(args.data_dir).resolve()
@@ -1483,6 +1707,7 @@ def main():
     server.store = store
     server.data_dir = data
     server.secure_cookies = args.secure_cookie
+    server.passkey_test_hosts = frozenset([args.test_passkey_host] if args.test_passkey_host else [])
     remove_legacy_setup_token(data)
     server.updates = self_update.UpdateManager(data, ROOT, VERSION, "x86_64", args.port)
     server.engine = engine_supervisor.EngineManager(data, store)

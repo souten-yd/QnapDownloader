@@ -10,7 +10,8 @@ from pathlib import Path
 
 _EVENTS = deque(maxlen=64)
 _EVENTS_LOCK = threading.Lock()
-_VALID_EVENTS = frozenset(("web_started", "login_failed", "diagnostic_requested"))
+_VALID_EVENTS = frozenset(("web_started", "login_failed", "diagnostic_requested",
+                           "passkey_counter_rejected"))
 
 
 def event(kind):
