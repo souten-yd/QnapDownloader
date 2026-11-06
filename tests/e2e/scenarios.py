@@ -6,7 +6,7 @@ Phone input is always touch (Playwright touchscreen / CDP touch), never mouse cl
 """
 import time
 
-from harness import BASE, Skip
+from harness import BASE, PASSWORD, Skip
 
 SCENARIOS = []
 
@@ -567,3 +567,76 @@ def browser_back_is_page_back(ph):
     # v0.1.52: no fallback to history.back(); the app stays on the tab and tells the user
     assert ph.js("location.hash") == hash_before, "the app left the tab on a back with nothing earlier (%s)" % ph.js("location.hash")
     ph.wait(lambda: "これより前のページはありません" in (ph.js("document.body.innerText") or ""), 5, "first-page toast")
+
+
+# ------------------------------------------------------------------ passkeys (v0.1.53)
+
+@scenario("passkey-login", engines=("chromium",))
+def passkey_login(ph):
+    """Register a (virtual, CDP) platform passkey in Settings, log out everywhere, log in with it.
+
+    http://localhost is a secure context, so WebAuthn works there; the Hub only allows rp id "localhost"
+    because the E2E app sets passkey_test_hosts (production accepts only https *.ts.net hosts).
+    """
+    page = ph.page
+    local = ph.env.url.replace("127.0.0.1", "localhost")
+    cdp = ph.context.new_cdp_session(page)
+    cdp.send("WebAuthn.enable")
+    cdp.send("WebAuthn.addVirtualAuthenticator", {"options": {
+        "protocol": "ctap2", "transport": "internal", "hasResidentKey": True, "hasUserVerification": True,
+        "isUserVerified": True, "automaticPresenceSimulation": True}})
+    page.on("dialog", lambda dialog: dialog.accept())
+    page.goto(local)
+    ph.wait(lambda: page.locator("#password").is_visible(), 15, "login form on localhost")
+    assert ph.js("window.isSecureContext === true")
+    assert not page.locator("#passkeyLogin").is_visible(), "no passkey yet: no face-login button"
+    page.fill("#password", PASSWORD)
+    assert page.locator("#loginRemember").is_visible()
+    page.click("#loginButton")
+    ph.wait(lambda: ph.js("state.authed === true"), 10, "password login on localhost")
+    ph.csrf = ph.js("fetch('/api/session').then(r=>r.json()).then(j=>j.csrf)")
+    # register from Settings > System > Login
+    page.evaluate("()=>{location.hash='#/settings/system/login'}")
+    ph.wait(lambda: page.locator("#passkeyRegister").is_visible() and not page.locator("#passkeyRegister").is_disabled(),
+            10, "register button enabled")
+    page.fill("#passkeyLabel", "E2Eテスト")
+    page.click("#passkeyRegister")
+    ph.wait(lambda: "E2Eテスト" in page.locator("#passkeyList").inner_text(), 15, "passkey listed")
+    listing = ph.js("fetch('/api/passkeys').then(r=>r.json())")
+    assert len(listing["items"]) == 1 and listing["items"][0]["rp_id"] == "localhost", listing
+    # log out of every device. The login screen then offers the face-login button, and where conditional
+    # mediation is available (Chrome with the virtual authenticator) it may sign in by itself at once.
+    old = [c for c in ph.context.cookies() if c["name"] == "qdl_session" and c["domain"].lstrip(".") == "localhost"][0]["value"]
+    page.click("#revokeAll")
+    cookie_now = lambda: ([c["value"] for c in ph.context.cookies() if c["name"] == "qdl_session" and c["domain"].lstrip(".") == "localhost"] or [""])[0]
+    ph.wait(lambda: cookie_now() != old, 15, "session replaced or cleared by revoke-all")
+    ph.wait(lambda: page.locator("#passkeyLogin").is_visible() or ph.js("state.authed === true"), 15,
+            "login screen (or automatic conditional sign-in) after revoke-all")
+    if not ph.js("state.authed === true"):
+        try:
+            page.click("#passkeyLogin", timeout=2000)
+        except Exception:
+            assert ph.js("state.authed === true"), "button vanished without a login"   # autofill won the race
+    ph.wait(lambda: ph.js("state.authed === true"), 15, "passkey login")
+    ph.log("conditional UI signed in automatically" if page.locator("#passkeyLogin").count() and
+           not page.locator("#login").is_visible() else "")
+    fresh = [c for c in ph.context.cookies() if c["name"] == "qdl_session" and c["domain"].lstrip(".") == "localhost"][0]["value"]
+    assert fresh != old, "revoke-all must have replaced the session"
+    cookie = [c for c in ph.context.cookies() if c["name"] == "qdl_session" and c["domain"].lstrip(".") == "localhost"][0]
+    days = (cookie["expires"] - time.time()) / 86400
+    assert 29 < days <= 30.01, "passkey sessions last 30 days (got %.2f)" % days
+    # the explicit button (mediation "optional"): disable the autofill path first so it cannot sign in by itself
+    ph.csrf = ph.js("fetch('/api/session').then(r=>r.json()).then(j=>j.csrf)")
+    ph.js("()=>{window.startConditionalLogin = async () => {}}")
+    assert ph.post("/api/sessions/revoke-all", {})["status"] == 200
+    ph.js("()=>{state.authed = false; return go()}")
+    ph.wait(lambda: page.locator("#passkeyLogin").is_visible(), 10, "face-login button")
+    assert ph.js("state.authed === false")
+    page.click("#passkeyLogin")
+    ph.wait(lambda: ph.js("state.authed === true"), 15, "login with the button")
+    # clean up the credential so later scenarios start clean
+    ph.csrf = ph.js("fetch('/api/session').then(r=>r.json()).then(j=>j.csrf)")
+    item = ph.js("fetch('/api/passkeys').then(r=>r.json())")["items"][0]
+    res = ph.post("/api/passkeys/delete", {"id": item["id"]})
+    assert res["status"] == 200, res
+    cdp.send("WebAuthn.disable")

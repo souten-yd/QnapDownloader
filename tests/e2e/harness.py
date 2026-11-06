@@ -213,6 +213,8 @@ class Env:
         server.engine = engine_supervisor.EngineManager(root, self.store)
         server.jd2 = jd2_control.JD2Controller(server.engine.adapter)
         server.secure_cookies = False
+        # TEST ONLY (same as the hidden --test-passkey-host flag): the passkey scenario uses http://localhost.
+        server.passkey_test_hosts = frozenset(["localhost"])
         ctx = root / "ctx"
         ctx.mkdir()
         (ctx / "Dockerfile").write_text("FROM x\n")

@@ -364,7 +364,7 @@ const eq = (a, b, m) => { if (JSON.stringify(a) !== JSON.stringify(b)) { console
         self.assertEqual(order, ["jd2", "browser", "connection", "system", "diag"])
         subs = re.findall(r'data-sub="(\w+)"', self.html)
         self.assertEqual(subs, ["engine", "accounts", "storage", "send", "nas", "rules", "bookmarks",
-                                "https", "share", "updates", "about", "selftest", "tools", "disk", "debug"])
+                                "https", "share", "updates", "login", "about", "selftest", "tools", "disk", "debug"])
         self.assertRegex(self.js, r"AUTO_REFRESH_MS\s*=\s*5000\b")
         self.assertNotIn("BADGE_REFRESH_MS", self.js)
         self.assertRegex(self.js, r"PASTE_DEBOUNCE_MS\s*=\s*400\b")

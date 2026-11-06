@@ -30,7 +30,7 @@ class SettingsStructureTests(unittest.TestCase):
         for section, subs in (("jd2", ["engine", "accounts", "storage", "send"]),
                               ("browser", ["nas", "rules", "bookmarks"]),
                               ("connection", ["https", "share"]),
-                              ("system", ["updates", "about"]),
+                              ("system", ["updates", "login", "about"]),
                               ("diag", ["selftest", "tools", "disk", "debug"])):
             block = re.search(r'data-section="%s" hidden>(.*?)</section>' % section, body, re.S).group(1)
             self.assertEqual(re.findall(r'data-sub="(\w+)"', block), subs)

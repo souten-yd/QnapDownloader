@@ -100,7 +100,7 @@ const DEBUG_VIEW_MAX = 1000;
 const DISK_REFRESH_MS = 10000;     // disk write table (the Hub samples every 10 s)
 const SETTINGS_SECTIONS = ["jd2", "browser", "connection", "system", "diag"];
 const SETTINGS_SUBS = {jd2: ["engine", "accounts", "storage", "send"], browser: ["nas", "rules", "bookmarks"],
-  connection: ["https", "share"], system: ["updates", "about"], diag: ["selftest", "tools", "disk", "debug"]};
+  connection: ["https", "share"], system: ["updates", "login", "about"], diag: ["selftest", "tools", "disk", "debug"]};
 // Old one-section routes land on their new place.
 const SETTINGS_REDIRECTS = {engine: "jd2/engine", accounts: "jd2/accounts", storage: "jd2/storage",
   https: "connection/https", share: "connection/share", bookmarks: "browser/bookmarks",
@@ -6378,12 +6378,239 @@ async function enterSettings(route, force = false) {
     await swr("share-tokens", "/api/share/tokens", renderShareDevices, {force});
   } else if (section === "system") {
     await updateStatus(force);
+    await swr("passkeys", "/api/passkeys", renderPasskeys, {force});
   } else if (section === "diag") {
     renderDebugCard();
     loadDisk().catch(() => {});
     selftestAttach().catch(() => {});
   }
   scrollToSub(route);
+}
+
+// ---- Passkeys: Face ID / Touch ID login (v0.1.53)
+const FACE_OFFER_KEY = "qdl.faceOffer";
+const PASSKEY_RENEW_MS = 100000;      // server challenges live 120 s: renew the conditional request before that
+
+function b64uToBuf(text) {
+  const padded = String(text).replace(/-/g, "+").replace(/_/g, "/") + "===".slice((String(text).length + 3) % 4);
+  const raw = atob(padded);
+  const out = new Uint8Array(raw.length);
+  for (let i = 0; i < raw.length; i++) out[i] = raw.charCodeAt(i);
+  return out.buffer;
+}
+
+function bufToB64u(buffer) {
+  const bytes = new Uint8Array(buffer);
+  let raw = "";
+  for (let i = 0; i < bytes.length; i++) raw += String.fromCharCode(bytes[i]);
+  return btoa(raw).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+function passkeysSupported() {
+  return window.isSecureContext === true && typeof window.PublicKeyCredential === "function" &&
+    !!(navigator.credentials && navigator.credentials.get && navigator.credentials.create);
+}
+
+function passkeyError(e) {
+  const name = e && e.name;
+  if (name === "NotAllowedError" || name === "AbortError") return new Error("顔認証がキャンセルされたか、時間切れでした");
+  if (name === "InvalidStateError") return new Error("この端末のパスキーはすでに登録されています");
+  if (name === "NotSupportedError" || name === "SecurityError") {
+    return new Error("この接続では顔認証を使えません。https://…ts.net で開いてください");
+  }
+  return e instanceof Error ? e : new Error("顔認証に失敗しました");
+}
+
+async function registerPasskey(label) {
+  if (!passkeysSupported()) throw new Error("顔認証は https://…ts.net で開いたときだけ使えます");
+  const opts = await api("/api/passkeys/register/begin", {});
+  const publicKey = {
+    challenge: b64uToBuf(opts.challenge), rp: opts.rp, timeout: opts.timeout,
+    user: {id: b64uToBuf(opts.user.id), name: opts.user.name, displayName: opts.user.displayName},
+    pubKeyCredParams: opts.pubKeyCredParams, authenticatorSelection: opts.authenticatorSelection,
+    attestation: opts.attestation,
+    excludeCredentials: (opts.excludeCredentials || []).map(c => ({type: c.type, id: b64uToBuf(c.id),
+      transports: c.transports}))
+  };
+  let credential;
+  try { credential = await navigator.credentials.create({publicKey}); } catch (e) { throw passkeyError(e); }
+  if (!credential) throw new Error("顔認証を登録できませんでした");
+  const r = credential.response;
+  return api("/api/passkeys/register/finish", {
+    id: credential.id, rawId: bufToB64u(credential.rawId), clientDataJSON: bufToB64u(r.clientDataJSON),
+    attestationObject: bufToB64u(r.attestationObject),
+    transports: typeof r.getTransports === "function" ? r.getTransports() : [], label});
+}
+
+let passkeyAbort = null;
+let passkeyRenewTimer = 0;
+
+function abortPasskeyLogin() {
+  clearTimeout(passkeyRenewTimer);
+  passkeyRenewTimer = 0;
+  if (passkeyAbort) { try { passkeyAbort.abort(); } catch (e) { /* ignore */ } }
+  passkeyAbort = null;
+}
+
+// mediation "optional": the Face ID sheet (button). "conditional": passkey autofill on the password field;
+// it waits silently, so errors are swallowed and the request is renewed before the server challenge expires.
+async function passkeyLogin(mediation) {
+  if (!passkeysSupported()) throw new Error("顔認証は https://…ts.net で開いたときだけ使えます");
+  abortPasskeyLogin();
+  const controller = new AbortController();
+  passkeyAbort = controller;
+  const quiet = mediation === "conditional";
+  if (quiet) schedulePasskeyRenew();
+  try {
+    const opts = await api("/api/passkeys/login/begin", {});
+    const request = {publicKey: {challenge: b64uToBuf(opts.challenge), rpId: opts.rpId, timeout: opts.timeout,
+      userVerification: opts.userVerification, allowCredentials: []}, signal: controller.signal};
+    if (quiet) request.mediation = "conditional";
+    let credential;
+    try { credential = await navigator.credentials.get(request); } catch (e) {
+      if (quiet) return;
+      throw passkeyError(e);
+    }
+    if (!credential || controller.signal.aborted) return;
+    const r = credential.response;
+    let result;
+    try {
+      result = await api("/api/passkeys/login/finish", {
+        id: credential.id, clientDataJSON: bufToB64u(r.clientDataJSON),
+        authenticatorData: bufToB64u(r.authenticatorData), signature: bufToB64u(r.signature),
+        userHandle: r.userHandle ? bufToB64u(r.userHandle) : null});
+    } catch (e) {
+      if (quiet) { schedulePasskeyRenew(); return; }
+      throw e;
+    }
+    passkeyAbort = null;
+    state.csrf = result.csrf;
+    state.offerPasskey = false;
+    $("password").value = "";
+    await go();
+  } catch (e) {
+    if (quiet) return;
+    throw e;
+  } finally {
+    if (passkeyAbort === controller && !quiet) passkeyAbort = null;
+  }
+}
+
+function schedulePasskeyRenew() {
+  clearTimeout(passkeyRenewTimer);
+  passkeyRenewTimer = setTimeout(() => {
+    if (state.authed || $("login").hidden) return;
+    startConditionalLogin().catch(() => {});
+  }, PASSKEY_RENEW_MS);
+}
+
+async function startConditionalLogin() {
+  const pk = window.PublicKeyCredential;
+  if (!passkeysSupported() || typeof pk.isConditionalMediationAvailable !== "function") return;
+  if (!(await pk.isConditionalMediationAvailable())) return;
+  // not awaited by the caller: this promise stays pending until the user picks a passkey or it is aborted
+  await passkeyLogin("conditional");
+}
+
+function prepareLoginScreen() {
+  abortPasskeyLogin();
+  $("loginRemember").checked = state.https === true;
+  const usable = passkeysSupported() && state.passkey && state.passkey.available && state.passkey.registered > 0;
+  setShown("passkeyLogin", usable);
+  const hint = $("passkeyLoginHint");
+  const secureNote = !passkeysSupported() && state.https !== true && location.protocol === "http:" ? 
+    "顔認証は https://…ts.net で開いたときだけ使えます" : "";
+  hint.textContent = secureNote;
+  hint.hidden = !secureNote;
+  $("password").setAttribute("autocomplete", usable ? "username webauthn" : "current-password");
+  if (usable) startConditionalLogin().catch(() => {});
+}
+
+function isIosDevice() {
+  return /iPhone|iPad|iPod/.test(navigator.userAgent) ||
+    (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
+}
+
+// After the first password login over HTTPS on an iPhone without a passkey: ask once.
+function maybeOfferPasskey() {
+  if (!state.offerPasskey) return;
+  state.offerPasskey = false;
+  if (!passkeysSupported() || !isIosDevice() || state.https !== true) return;
+  if (!state.passkey || !state.passkey.available || state.passkey.registered > 0) return;
+  if (readLocal(FACE_OFFER_KEY) === "done") return;
+  setShown("passkeyOffer", true);
+}
+
+function renderPasskeys(data) {
+  const secure = passkeysSupported() && data.available === true;
+  setShown("passkeyUnavailable", !secure);
+  $("passkeyRegister").disabled = !secure;
+  const link = $("passkeyHttpsLink");
+  if (!secure && typeof data.https_url === "string" && data.https_url.startsWith("https://") &&
+      location.origin + "/" !== data.https_url) {
+    link.href = data.https_url;
+    link.hidden = false;
+  } else {
+    link.hidden = true;
+  }
+  const items = Array.isArray(data.items) ? data.items : [];
+  const nodes = [];
+  if (!items.length) nodes.push(element("p", "登録したパスキーはありません。", "empty-state"));
+  for (const item of items) {
+    const box = element("div", undefined, "item");
+    box.appendChild(element("b", item.label));
+    box.appendChild(element("span", "登録 " + formatTime(item.created_at) + " · 最終使用 " +
+      (item.last_used_at ? formatTime(item.last_used_at) : "未使用")));
+    const rename = element("button", "名前変更", "btn small");
+    rename.type = "button";
+    rename.addEventListener("click", () => perform(async () => {
+      const label = prompt("パスキーの名前", item.label);
+      if (label === null) return;
+      await api("/api/passkeys/rename", {id: item.id, label});
+      swrDrop("passkeys");
+      await swr("passkeys", "/api/passkeys", renderPasskeys, {force: true});
+    }));
+    const del = element("button", "削除", "btn small");
+    del.type = "button";
+    del.addEventListener("click", () => perform(async () => {
+      if (!confirm("「" + item.label + "」を削除します。この顔認証ではログインできなくなります。よろしいですか？")) return;
+      await api("/api/passkeys/delete", {id: item.id});
+      swrDrop("passkeys");
+      await swr("passkeys", "/api/passkeys", renderPasskeys, {force: true});
+    }));
+    box.append(rename, del);
+    nodes.push(box);
+  }
+  $("passkeyList").replaceChildren(...nodes);
+  $("sessionCount").textContent = typeof data.sessions === "number" ?
+    "ログイン中の端末（セッション）: " + data.sessions + "台" : "";
+}
+
+async function registerPasskeyFromSettings() {
+  const input = $("passkeyLabel");
+  const label = input.value.trim() || (isIosDevice() ? "iPhone" : "このデバイス");
+  $("passkeyStatus").textContent = "顔認証の確認を待っています…";
+  try {
+    await registerPasskey(label);
+    input.value = "";
+    flash("顔認証を登録しました");
+  } finally {
+    $("passkeyStatus").textContent = "";
+  }
+  swrDrop("passkeys");
+  await swr("passkeys", "/api/passkeys", renderPasskeys, {force: true});
+}
+
+async function revokeAllSessions() {
+  if (!confirm("すべての端末（この端末を含む）からログアウトします。パスキーは残ります。よろしいですか？")) return;
+  for (const tab of state.tabs) releaseRemote(tab);
+  await api("/api/sessions/revoke-all", {});
+  swrDrop("passkeys");
+  writeSession(TAB_STORAGE_KEY, null);
+  writeSession(SHELL_KEY, null);
+  history.replaceState(null, "", "#/home");
+  state.csrf = "";
+  await go();
 }
 
 // ---- HTTPS / iPhone share (v0.1.13)
@@ -6748,9 +6975,11 @@ async function go() {
     state.csrf = session.csrf || "";
     state.https = session.https === true;
     state.tailnet = session.tailnet === true;
+    state.passkey = session.passkey || {available: false, registered: 0};
     updateLanWarning(session.tailnet === true, state.https);
     if (session.authenticated) {
       state.authed = true;
+      abortPasskeyLogin();
       setShown("authArea", false);
       setShown("app", true);
       initShellState();
@@ -6764,7 +6993,9 @@ async function go() {
       setShown("authArea", true);
       setShown("setup", !boot.configured);
       setShown("login", boot.configured);
+      if (boot.configured) prepareLoginScreen();
     }
+    if (session.authenticated) maybeOfferPasskey();
   } catch (e) {
     toast(e.message, "error");
   }
@@ -6892,11 +7123,28 @@ function wireAuth() {
   $("loginForm").addEventListener("submit", event => {
     event.preventDefault();
     perform(async () => {
-      const r = await api("/api/login", {password: $("password").value});
+      abortPasskeyLogin();
+      const r = await api("/api/login", {password: $("password").value, remember: $("loginRemember").checked});
       state.csrf = r.csrf;
+      state.offerPasskey = true;       // a password login: maybe suggest a passkey once (maybeOfferPasskey)
       $("password").value = "";
       await go();
     });
+  });
+  $("passkeyLogin").addEventListener("click", () => perform(() => passkeyLogin("optional")));
+  $("passkeyRegister").addEventListener("click", () => perform(() => registerPasskeyFromSettings()));
+  $("revokeAll").addEventListener("click", () => perform(revokeAllSessions));
+  $("passkeyOfferYes").addEventListener("click", () => perform(async () => {
+    writeLocal(FACE_OFFER_KEY, "done");
+    setShown("passkeyOffer", false);
+    await registerPasskey("このデバイス");
+    flash("顔認証を登録しました。次回から「顔認証でログイン」が使えます");
+    swrDrop("passkeys");
+  }));
+  $("passkeyOfferLater").addEventListener("click", () => setShown("passkeyOffer", false));
+  $("passkeyOfferNever").addEventListener("click", () => {
+    writeLocal(FACE_OFFER_KEY, "done");
+    setShown("passkeyOffer", false);
   });
 }
 
