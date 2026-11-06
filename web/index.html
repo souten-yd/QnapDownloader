@@ -177,12 +177,12 @@
 
   <section id="view-downloads" class="view" role="tabpanel" aria-label="ダウンロード" hidden>
    <div class="page">
-    <div class="page-head">
+    <div class="page-head head-wrap">
      <h1>ダウンロード</h1>
      <span class="head-tools">
       <span id="downloadsUpdated" class="muted" role="status"></span>
       <button type="button" id="downloadsToggle" class="btn small" title="JD2のダウンロードを開始／停止" hidden>開始</button>
-      <button type="button" id="downloadsClear" class="btn small" title="完了したもの・既にあってスキップしたものをJD2の一覧から消します（ファイルは消えません）" hidden>完了・スキップを一覧から消す</button>
+      <button type="button" id="downloadsClear" class="btn small" title="完了したもの・既にあってスキップしたものをJD2の一覧から消します（ファイルは消えません）" hidden><span class="btn-long">完了・スキップを一覧から消す</span><span class="btn-short">完了・スキップを消す</span></button>
       <button type="button" id="downloadsRefresh" class="icon-btn small" aria-label="今すぐ更新" title="今すぐ更新"><svg class="icon" aria-hidden="true"><use href="#i-reload"/></svg></button>
      </span>
     </div>
@@ -379,6 +379,18 @@
          <span class="set-desc"><span class="set-text">NASブラウザの長押しで見つかったリンクを送ります</span>
           <details class="hint"><summary aria-label="詳しい説明"> ⓘ</summary><p>ONのとき、長押しでRapidgatorのリンクが見つかると確認なしでJD2へ送ります（送信済みのリンクは除外）。JD2へ送れない状態や送信に失敗したときは、従来どおりシートを開きます。</p></details></span></div>
         <label class="switch" for="probeAutosend"><input type="checkbox" id="probeAutosend" role="switch" aria-label="長押しで見つかったリンクを自動でJD2へ送る"><span class="switch-track" aria-hidden="true"></span></label>
+       </div>
+       <div class="set-row">
+        <div class="set-main"><span class="set-label">JD2へ送ったリンクを自動で消す</span>
+         <span class="set-desc"><span class="set-text">リンクタブから、JD2へ渡せたリンクを数秒後に消します</span>
+          <details class="hint"><summary aria-label="詳しい説明">ⓘ</summary><p>ONのとき、JD2への送信に成功したリンクをリンクタブの一覧から自動で消します（数秒は「送信済み」と表示）。未送信・送信中・結果不明のリンクは消しません。JD2側のダウンロードやファイルには影響しません。</p></details></span></div>
+        <label class="switch" for="autoClearLinks"><input type="checkbox" id="autoClearLinks" role="switch" aria-label="JD2へ送ったリンクを自動で消す"><span class="switch-track" aria-hidden="true"></span></label>
+       </div>
+       <div class="set-row">
+        <div class="set-main"><span class="set-label">完了・スキップしたダウンロードを自動で消す</span>
+         <span class="set-desc"><span class="set-text">ダウンロードタブの完了・スキップ済みを一覧から消します</span>
+          <details class="hint"><summary aria-label="詳しい説明">ⓘ</summary><p>ONのとき、JD2が動いていれば約1分ごとに、完了したものと「既にあるファイル」でスキップしたものをJD2の一覧から消します（「完了・スキップを一覧から消す」と同じ処理）。実行中・待機・失敗・一時停止は消さず、保存したファイルも消えません。</p></details></span></div>
+        <label class="switch" for="autoClearDownloads"><input type="checkbox" id="autoClearDownloads" role="switch" aria-label="完了・スキップしたダウンロードを自動で消す"><span class="switch-track" aria-hidden="true"></span></label>
        </div>
       </div>
      </section>

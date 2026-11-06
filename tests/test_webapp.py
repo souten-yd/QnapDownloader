@@ -491,7 +491,7 @@ class HttpTests(unittest.TestCase):
                                          headers={"Host": "192.168.68.57:17864"})
         with self.client.open(request, timeout=4) as response:
             self.assertEqual(response.status, 200)
-            self.assertEqual(json.load(response)["version"], "0.1.55")
+            self.assertEqual(json.load(response)["version"], "0.1.56")
         with self.client.open(self.url + "/icon.svg", timeout=4) as response:
             self.assertEqual(response.status, 200)
             self.assertEqual(response.headers.get_content_type(), "image/svg+xml")
@@ -1401,7 +1401,7 @@ class HttpTests(unittest.TestCase):
         self.assertFalse(info["supported"])
         code, _ = self.req("/api/update/apply", {"version": "v0.1.8"})
         self.assertEqual(code, 400)
-        self.assertEqual(self.req("/api/health")[1]["version"], "0.1.55")
+        self.assertEqual(self.req("/api/health")[1]["version"], "0.1.56")
         self.assertFalse(self.req("/api/jd2/status")[1]["connected"])
         self.assertEqual(self.req("/api/jd2/update/apply", {"confirmed": True})[0], 400)
         self.assertEqual(self.req("/api/jd2/preset/apply", {"confirmed": True})[0], 400)
@@ -1464,6 +1464,16 @@ class HttpTests(unittest.TestCase):
         code, body = self.req("/api/rb/site-rules", {"host": "extra.example.com", "auto_send": True})
         self.assertEqual(code, 400)
         self.assertIn("200", body["error"])
+
+    def test_auto_clear_options_default_off_and_round_trip(self):
+        self.login()
+        settings = self.req("/api/settings")[1]
+        self.assertEqual((settings["auto_clear_links"], settings["auto_clear_downloads"]), (False, False))
+        code, saved = self.req("/api/settings/options", {"auto_clear_links": True, "auto_clear_downloads": True})
+        self.assertEqual((code, saved["auto_clear_links"], saved["auto_clear_downloads"]), (200, True, True))
+        self.assertIs(storage.Store(self.root).settings()["auto_clear_downloads"], True)
+        self.assertEqual(self.req("/api/settings/options", {"auto_clear_links": "yes"})[0], 400)
+        self.assertIs(self.req("/api/settings/options", {"auto_clear_links": False})[1]["auto_clear_links"], False)
 
     def test_settings_options_toggle_persists_and_rejects_everything_else(self):
         self.login()

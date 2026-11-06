@@ -770,3 +770,39 @@ def first_load(ph):
     assert ph.env.rb._tabs[tab].mirror_partials >= 1, "the first copy was not a partial (above the fold) copy"
     ph.wait(lambda: not (ph.env.rb._tabs[tab].mirror_cache or {}).get("partial", True), 15,
             "the full copy replaced the partial one")
+
+
+# ------------------------------------------------------------------ v0.1.56: downloads header layout
+
+@scenario("downloads-header-layout")
+def downloads_header_layout(ph):
+    """At phone width the Downloads title stays on one line (v0.1.55 squeezed it to 3 lines) and the
+    header buttons stay tappable; the auto-clear switches are in settings and default OFF."""
+    ph.js("()=>{location.hash='#/downloads'}")
+    ph.wait(lambda: ph.js("!!document.querySelector('#view-downloads:not([hidden]) h1')"), 8, "downloads view")
+    # JD2 is not running in the harness: reveal the header controls the way a running engine does
+    ph.js("()=>{for(const id of ['downloadsToggle','downloadsClear','downloadsUpdated','downloadsRefresh'])$(id).hidden=false;"
+          "$('downloadsUpdated').textContent='更新: 08:08:42'}")
+    for width, height in ((390, 844), (430, 873), (1280, 800)):
+        ph.page.set_viewport_size({"width": width, "height": height})
+        ph.page.wait_for_timeout(250)
+        m = ph.js("""()=>{const h=document.querySelector('#view-downloads h1'), r=h.getBoundingClientRect();
+          const range=document.createRange(); range.selectNodeContents(h); const t=range.getBoundingClientRect();
+          const lh=parseFloat(getComputedStyle(h).lineHeight)||parseFloat(getComputedStyle(h).fontSize)*1.4;
+          const btn=id=>{const b=$(id).getBoundingClientRect();return {w:b.width,h:b.height,l:b.left,r:b.right,t:b.top}};
+          return {h:r.height,w:r.width,textW:t.width,lh:lh,vw:innerWidth,
+                  clear:btn('downloadsClear'),toggle:btn('downloadsToggle'),refresh:btn('downloadsRefresh'),
+                  scrollW:document.documentElement.scrollWidth}}""")
+        ph.shot("header-%d" % width)
+        assert m["h"] <= m["lh"] * 1.6, "title wraps: %r" % m
+        assert m["w"] >= m["textW"] - 1, "title squeezed: %r" % m
+        assert m["scrollW"] <= m["vw"] + 1, "horizontal overflow: %r" % m
+        for key in ("clear", "toggle", "refresh"):
+            b = m[key]
+            assert b["h"] >= 28 and b["w"] >= 28 and b["l"] >= 0 and b["r"] <= m["vw"] + 1, "%s not tappable: %r" % (key, b)
+        if width < 760:
+            assert m["clear"]["t"] > m["h"], "buttons should sit below the title on a phone: %r" % m
+    # the settings switches exist and default OFF
+    ph.js("()=>{location.hash='#/settings/jd2'}")
+    ph.wait(lambda: ph.js("!!$('autoClearLinks')"), 8, "settings")
+    assert ph.js("()=>$('autoClearLinks').checked===false&&$('autoClearDownloads').checked===false")
