@@ -26,6 +26,7 @@ from urllib.parse import parse_qs, urlsplit
 import container_runtime as cr
 import debuglog
 import diskio
+import rb_firstload
 import rb_resident
 
 HARD_TIMEOUT = 240.0           # seconds for the whole run
@@ -115,6 +116,8 @@ HINTS = {
     "builtin.mirror:slow": "ミラーのコピーが遅いです。NASのCPU負荷を確認し、重いサイトでは高速表示やリーダー表示を使ってください。",
     "builtin.mirror:large": "このサイトはリーダー表示が向いています（ミラーのデータが大きいです）。",
     "builtin.mirror_safe": "ミラーの出力にスクリプトやイベント属性が残っています。安全上の問題なので、すぐ開発者へ報告してください。",
+    "builtin.first_load": "初回読み込みのどこかが遅いです（内訳の遅い段階を見てください）。",
+    "site.first_load": "このサイトの初回読み込みのどこかが遅いです（内訳の遅い段階を見てください）。",
     "builtin.menu": "JSメニュー（href=\"#\"のトグル）の操作がNASのページに届かないか、ページが再読み込みされました。この結果を開発者へ送ってください。",
     "builtin.dynamic": "ページが後から書き換わる内容がミラーに反映されませんでした。この結果を開発者へ送ってください。",
     "builtin.tiles": "高速表示（タイル）の取得が遅いか失敗しました。NASのCPU負荷を確認してください。",
@@ -150,6 +153,10 @@ HINTS = {
     "run.error": "セルフテストが途中で例外になりました。この結果を開発者へ送ってください。",
     "run.timeout": "4分の上限に達したため途中で終了しました。NASの負荷が高い可能性があります。",
 }
+
+for _sid, _text in rb_firstload.HINTS.items():
+    HINTS["builtin.first_load:" + _sid] = _text
+    HINTS["site.first_load:" + _sid] = _text
 
 CLIENT_NAMES = {
     "client.storage": "localStorage",
@@ -1553,6 +1560,7 @@ class SelfTest:
             raise
         except Exception as error:
             self._add(run, sec, "builtin.mirror", "ミラーのコピー", FAIL, _short(str(error), 160))
+        self._first_load_check(run, tab, sec, "builtin.first_load", "初回読み込みの内訳", "builtin.first_load")
         # JS dropdown
         self._menu_check(run, tab, fixtures)
         # page that changes itself
@@ -1561,6 +1569,28 @@ class SelfTest:
         self._tiles_check(run, tab)
         # meta long-poll + screencast
         self._meta_and_fps(run, tab)
+
+    def _first_load_check(self, run, tab, section, cid, name, hint_key, extra=None):
+        """v0.1.54: where the first load of this page spent its time (stages from rb_firstload, each with its
+        own threshold and hint). Skipped quietly when the browser object has no timeline."""
+        method = getattr(self.rb, "first_load", None)
+        if method is None:
+            return
+        try:
+            data = method(tab, stages=rb_firstload.SELFTEST_STAGES, capture_kind="mirror")
+        except (Cancelled, RunTimeout):
+            raise
+        except Exception:
+            return
+        if not data:
+            return
+        rows = data["stages"]
+        status = rb_firstload.worst(rows)
+        bad = [r for r in rows if r["status"] in (WARN, FAIL)]
+        variant = max(bad, key=lambda r: r["ms"])["id"] if bad else None
+        threshold = " / ".join("%s <= %.1fs" % (r["label"], r["warn_ms"] / 1000.0) for r in rows)
+        self._add(run, section, cid, name, status if status != "skip" else SKIP, rb_firstload.line(data), threshold,
+                  hint_key=hint_key, variant=variant, extra=extra)
 
     def _menu_check(self, run, tab, fixtures):
         rb, sec = self.rb, "builtin"
@@ -1962,6 +1992,7 @@ class SelfTest:
                                lambda: self._m_reader(tab))
             self._site_measure(run, base + "mirror", label + " ミラー", "site.mirror", extra,
                                lambda: self._m_mirror(tab))
+            self._first_load_check(run, tab, sec, base + "first_load", label + " 初回読み込みの内訳", "site.first_load", extra)
             self._site_measure(run, base + "tiles", label + " 高速表示", "site.tiles", extra,
                                lambda: self._m_tiles(tab))
             self._step(run, "%s のライブ表示を測っています" % item["host"])

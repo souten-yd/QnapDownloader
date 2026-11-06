@@ -990,7 +990,7 @@ function newRbRecord(id, tab) {
     vmap: null, vmapRev: -1, vmapTimer: 0, vmapBusy: false, vmapAt: 0, linksRev: -1,
     reader: null, readerBusy: false, readerPending: false, readerAgain: false,
     readerEarly: "", readerFail: null, readerErr: false, tilesFor: "", snapEarly: "", loadUrl: "", loadSince: 0,
-    mirror: null, mirrorBusy: false, mirrorAgain: false, mirrorPending: false, mirrorEarly: "", mirrorFail: null,
+    mirror: null, mirrorBusy: false, mirrorAgain: false, mirrorPending: false, mirrorEarly: "", mirrorFail: null, mirrorFollow: false, tl: null,
     mirrorAt: 0, mirrorMs: 0, mirrorTimer: 0, mirrorTouch: false, mirrorDeferred: false, mirrorPos: {},
     stream: null, streamFailed: false, perf: {}};
 }
@@ -1018,8 +1018,98 @@ async function reattachRemote(tab) {
   }
 }
 
+// ---- first-load timeline (v0.1.54): milliseconds since the tap, sent once to the Hub (POST
+// /api/rb/firstload), which merges them with its own stages, logs them (category render) and answers the
+// breakdown line shown in the speed overlay.
+function tlStart(rb, t0, createdAt) {
+  rb.tl = {t0, marks: {}, sent: false, result: null};
+  if (createdAt) tlMark(rb, "created", createdAt);
+}
+
+function tlMark(rb, name, at) {
+  const tl = rb && rb.tl;
+  if (!tl || tl.sent || name in tl.marks) return;
+  tl.marks[name] = Math.max(0, Math.round((at || performance.now()) - tl.t0));
+}
+
+function tlFlush(rb) {
+  const tl = rb && rb.tl;
+  if (!tl || tl.sent) return;
+  tl.sent = true;
+  api("/api/rb/firstload", {tab: rb.id, marks: tl.marks}).then(data => {
+    if (rb.tl !== tl || !data || typeof data.line !== "string") return;
+    tl.result = data;
+    dlog("render", "info", "first load line", {line: data.line.slice(0, 200)});
+    if (state.rbPerf) renderPerf();
+  }).catch(() => {});
+}
+
+// Mirror: the document of the copy was parsed (`doc`), the images in the first screen are in (`paint`, or 1 s
+// later at the latest), the images up to three screens down are in (`full`, 15 s cap).
+function tlWatchMirror(rb, doc) {
+  const tl = rb && rb.tl;
+  if (!tl || tl.sent || tl.watching) return;
+  tl.watching = true;
+  tlMark(rb, "doc");
+  const view = doc.defaultView;
+  const height = (view && view.innerHeight) || 800;
+  const began = performance.now();
+  const waiting = limit => Array.from(doc.images).filter(img => {
+    if (img.complete) return false;
+    const r = img.getBoundingClientRect();
+    return r.bottom > 0 && r.top < limit;
+  }).length;
+  const painted = () => {
+    if (rb.tl !== tl || tl.sent || mirrorDoc() !== doc) return;
+    if (!waiting(height) || performance.now() - began >= 1000) { tlMark(rb, "paint"); loaded(); return; }
+    setTimeout(painted, 40);
+  };
+  const loaded = () => {
+    if (rb.tl !== tl || tl.sent || mirrorDoc() !== doc) return;
+    if (!waiting(height * 3) || performance.now() - began >= 15000) { tlMark(rb, "full"); tlFlush(rb); return; }
+    setTimeout(loaded, 150);
+  };
+  painted();
+}
+
+// Reader: the text is on screen (`doc`); the pictures in the first screen are in, or 1 s (`paint`); ...(`full`).
+function tlWatchReader(rb) {
+  const tl = rb && rb.tl;
+  if (!tl || tl.sent || tl.watching) return;
+  tl.watching = true;
+  tlMark(rb, "doc");
+  const scroller = $("readerScroll");
+  const height = scroller.clientHeight || 800;
+  const began = performance.now();
+  const waiting = limit => Array.from($("readerBody").querySelectorAll(".reader-fig")).filter(f => {
+    if (f.classList.contains("is-loaded") || f.classList.contains("is-failed")) return false;
+    const r = f.getBoundingClientRect(), top = scroller.getBoundingClientRect().top;
+    return r.bottom > top && r.top < top + limit;
+  }).length;
+  const painted = () => {
+    if (rb.tl !== tl || tl.sent) return;
+    if (!waiting(height) || performance.now() - began >= 1000) { tlMark(rb, "paint"); loaded(); return; }
+    setTimeout(painted, 40);
+  };
+  const loaded = () => {
+    if (rb.tl !== tl || tl.sent) return;
+    if (!waiting(height * 3) || performance.now() - began >= 15000) { tlMark(rb, "full"); tlFlush(rb); return; }
+    setTimeout(loaded, 150);
+  };
+  painted();
+}
+
+function firstLoadLine(rb) {
+  const tl = rb && rb.tl;
+  if (tl && tl.result) return tl.result.line;
+  if (tl && !tl.sent) return "計測中";
+  return "";
+}
+
 async function openRemote(tab, value, commit, opts = {}) {
   ensureRemote();
+  const tapAt = performance.now();
+  let madeAt = 0;
   const token = ++tab.token;
   tab.error = "";
   tab.notReady = false;
@@ -1051,6 +1141,7 @@ async function openRemote(tab, value, commit, opts = {}) {
     }
     if (!tab.rb) {
       const made = await api("/api/rb/tabs", {url});
+      madeAt = performance.now();
       if (token !== tab.token || !state.tabs.includes(tab)) {
         api("/api/rb/tabs/close", {id: made.id}).catch(() => {});
         return;
@@ -1066,6 +1157,7 @@ async function openRemote(tab, value, commit, opts = {}) {
   tab.loading = false;
   tab.rb.seq = 0;
   tab.rb.rev = null;
+  tlStart(tab.rb, tapAt, madeAt);
   saveTabs();
   swrDrop("rb-status");
   refreshAfterTabChange();
@@ -1092,15 +1184,22 @@ function releaseRemote(tab) {
   api("/api/rb/tabs/close", {id: rb.id}).catch(() => {});
 }
 
+// Registers an openRemote() promise as the tab's open in flight, so that a second caller asking for the same URL
+// (restore, autoReopen, route changes) gets this promise instead of opening again (v0.1.43, v0.1.54).
+function trackOpening(tab, url, promise) {
+  tab.opening = {url, promise};
+  const clear = () => { if (tab.opening && tab.opening.promise === promise) tab.opening = null; };
+  promise.then(clear, clear);
+  return promise;
+}
+
 // (Re)open the current URL of the tab in the NAS browser.
 async function openInRemote(tab) {
   const url = tab.current || (tab.history.length ? tab.history[tab.index] : "");
   if (!url) return;
   // v0.1.43: several callers (restore, autoReopen, route changes) may ask at once: one open only.
   if (tab.opening && tab.opening.url === url) return tab.opening.promise;
-  const promise = openRemote(tab, url, u => { tab.history[tab.index] = u; });
-  tab.opening = {url, promise};
-  try { await promise; } finally { if (tab.opening && tab.opening.promise === promise) tab.opening = null; }
+  await trackOpening(tab, url, openRemote(tab, url, u => { tab.history[tab.index] = u; }));
 }
 
 function remoteTab() {
@@ -2105,6 +2204,13 @@ function recordPerf(bytes, latency) {
   while (state.rbPerfSamples.length && state.rbPerfSamples[0].t < cutoff) state.rbPerfSamples.shift();
 }
 
+// The overlay text: the display's speed line, then (v0.1.54) the first-load breakdown of this tab's newest open.
+function perfLine(tab = remoteTab()) {
+  const first = firstLoadLine(tab && tab.rb);
+  const text = perfText(tab);
+  return first ? text + "\n初回: " + first : text;
+}
+
 function perfText(tab = remoteTab()) {
   const rb = tab && tab.rb;
   const p = (rb && rb.perf) || {};
@@ -2147,7 +2253,7 @@ function perfText(tab = remoteTab()) {
 }
 
 function renderPerf() {
-  $("perfOverlay").textContent = perfText();
+  $("perfOverlay").textContent = perfLine();
 }
 
 function setPerf(on) {
@@ -3752,6 +3858,7 @@ function renderReaderBody(rb) {
   dlog("render", "info", "reader render", {ms: Math.round(performance.now() - renderStart), blocks: data.blocks.length});
   if (data.truncated) frag.appendChild(element("p", "長いページのため、途中までを表示しています。", "reader-empty"));
   body.appendChild(frag);
+  tlWatchReader(rb);          // v0.1.54: first-load timeline (the text is on screen)
 }
 
 // The reader container is shared by all remote tabs; only its owner's content is built.
@@ -3784,9 +3891,12 @@ function noteLoadStart(rb, meta, now) {
   }
 }
 
-function loadedLongEnough(rb, meta, now) {
+// v0.1.54: the reader and the mirror start at DOMContentLoaded (meta.dcl, from the NAS browser's own event)
+// instead of waiting for the 3 s timer; the timer stays for pages that never report it.
+function loadedLongEnough(rb, meta, now, eventDriven) {
   noteLoadStart(rb, meta, now);
-  return meta.loading === true && now - rb.loadSince >= RB_EARLY_LOAD_MS;
+  if (meta.loading !== true) return false;
+  return (eventDriven === true && meta.dcl === true) || now - rb.loadSince >= RB_EARLY_LOAD_MS;
 }
 
 // "run" when the reader should be fetched for this metadata, else "". When it ran while loading it
@@ -3794,7 +3904,7 @@ function loadedLongEnough(rb, meta, now) {
 function readerAction(rb, meta, now) {
   if (meta.loading === true) {
     rb.readerPending = true;
-    if (rb.readerEarly !== meta.url && loadedLongEnough(rb, meta, now)) {
+    if (rb.readerEarly !== meta.url && loadedLongEnough(rb, meta, now, true)) {
       rb.readerEarly = meta.url;
       return "run";
     }
@@ -3898,6 +4008,7 @@ async function runReader(tab, opts = {}) {
 // the reader data is fetched again.
 async function readerLoop(tab, gen) {
   let fails = 0, first = true;
+  tlMark(tab.rb, "choose");
   await nextPaint();
   await nextPaint();
   if (gen !== state.rbGen || !tab.rb) return;
@@ -4138,6 +4249,7 @@ function dropMirror(rb) {
   rb.mirrorPending = false;
   rb.mirrorTouch = false;
   rb.mirrorDeferred = false;
+  rb.mirrorFollow = false;
   if (mirrorHost.owner !== rb) return;
   mirrorHost.owner = null; mirrorHost.pageUrl = ""; mirrorHost.last = null;
   const frame = $("mirrorFrame");
@@ -4255,7 +4367,7 @@ async function runMirror(tab, opts = {}) {
     const started = performance.now();
     const doc0 = mirrorDoc();
     const fresh = navigation || !doc0;
-    const data = await api("/api/rb/mirror", {tab: rb.id, full: !fresh, force: opts.force === true});
+    const data = await api("/api/rb/mirror", {tab: rb.id, full: !fresh, force: opts.force === true, partial: fresh});
     const elapsed = performance.now() - started;
     if (tab.rb !== rb || tabDisplay(tab) !== "mirror") return;
     if (!data || !Number.isFinite(data.rev) || !data.stats || !Number.isFinite(data.stats.nodes)) {
@@ -4280,6 +4392,7 @@ async function runMirror(tab, opts = {}) {
       mirrorHost.owner = rb; mirrorHost.pageUrl = url; mirrorHost.last = null;
       $("mirrorWrap").style.visibility = "";
       applied = performance.now() - t0;
+      tlWatchMirror(rb, doc);
     } else {
       if (mirrorUnsafe(data)) {
         console.error("mirror: refused unsafe content");
@@ -4306,9 +4419,10 @@ async function runMirror(tab, opts = {}) {
     rb.mirrorMs = Math.min(elapsed, 8000);
     rb.mirrorPending = false;
     rb.mirrorFail = null;
+    rb.mirrorFollow = data.partial === true;        // v0.1.54: a first copy of a big page is complete only near the top
     rb.perf.mirror = {nodes: st.nodes, htmlBytes: st.html_bytes, cssBytes: st.css_bytes, images: st.images,
       ms: elapsed};
-    dlog("render", "info", "mirror shown", {ms: Math.round(elapsed), apply_ms: Math.round(applied), nodes: st.nodes,
+    dlog("render", "info", "mirror shown", {partial: data.partial === true, ms: Math.round(elapsed), apply_ms: Math.round(applied), nodes: st.nodes,
       html_kb: Math.round(st.html_bytes / 1024), css_kb: Math.round(st.css_bytes / 1024), res: st.res,
       fresh, reused: data.reused === true});
     if (data.truncated) flash("長いページのため、途中までを表示しています。");
@@ -4331,6 +4445,10 @@ async function runMirror(tab, opts = {}) {
     if (rb.mirrorAgain && tab.rb === rb) {
       rb.mirrorAgain = false;
       runMirror(tab, {quiet: true}).catch(() => {});
+    }
+    if (rb.mirrorFollow && tab.rb === rb) {
+      rb.mirrorFollow = false;
+      runMirror(tab, {quiet: true, force: true, immediate: true}).catch(() => {});
     }
   }
 }
@@ -4356,7 +4474,7 @@ function mirrorAction(rb, meta, now) {
   const changed = Boolean(m) && Number.isFinite(meta.mirror_rev) && meta.mirror_rev !== m.rev;
   if (meta.loading === true) {
     rb.mirrorPending = true;
-    if (rb.mirrorEarly !== meta.url && loadedLongEnough(rb, meta, now)) {
+    if (rb.mirrorEarly !== meta.url && loadedLongEnough(rb, meta, now, true)) {
       rb.mirrorEarly = meta.url;
       return "run";
     }
@@ -4373,6 +4491,7 @@ function mirrorAction(rb, meta, now) {
 
 async function mirrorLoop(tab, gen) {
   let fails = 0, first = true;
+  tlMark(tab.rb, "choose");
   await nextPaint();
   await nextPaint();
   if (gen !== state.rbGen || !tab.rb) return;
@@ -5136,7 +5255,10 @@ async function openWebUrl(value) {
   pushHistory(fresh, url);
   saveTabs();
   navigate("#/tab/" + fresh.id);
-  await openRemote(fresh, url, u => { fresh.history[fresh.index] = u; }, {validated: true});
+  // v0.1.54: the route change above makes autoReopen() ask for the same page a moment later; registering this
+  // open as "in flight" (as openInRemote does) keeps it to ONE NAS tab instead of two (the second used to wait
+  // behind the first and then be closed again).
+  await trackOpening(fresh, url, openRemote(fresh, url, u => { fresh.history[fresh.index] = u; }, {validated: true}));
 }
 
 // -------------------------------------------------------------- omnibox
@@ -6328,6 +6450,8 @@ function renderDownloadDir(s) {
   $("blockAds").checked = s.block_ads !== false;
   $("rbDefaultMode").value = DISPLAY_OF_SETTING[s.rb_default_mode] ? s.rb_default_mode : "fast";
   $("rbLinkBoxes").checked = s.rb_link_boxes === true;
+  $("rbSpareTab").checked = s.rb_spare_tab !== false;
+  $("rbNoWebfonts").checked = s.rb_no_webfonts !== false;
   $("rbResident").checked = s.rb_resident === true;
   renderResidentQuick(s.rb_resident === true);
   $("selectedFolder").textContent = s.download_dir || "未選択";
@@ -9353,6 +9477,18 @@ function wireBrowser() {
       renderDownloadDir(state.settings || {});
       throw e;
     }
+  }));
+  $("rbSpareTab").addEventListener("change", () => perform(async () => {
+    try {
+      await saveOption("rb_spare_tab", $("rbSpareTab").checked);
+      flash($("rbSpareTab").checked ? "予備タブを用意します" : "予備タブをやめました");
+    } catch (e) { $("rbSpareTab").checked = !$("rbSpareTab").checked; throw e; }
+  }));
+  $("rbNoWebfonts").addEventListener("change", () => perform(async () => {
+    try {
+      await saveOption("rb_no_webfonts", $("rbNoWebfonts").checked);
+      flash($("rbNoWebfonts").checked ? "ミラー表示でWebフォントを使いません（次の取得から）" : "ミラー表示でWebフォントも取得します（次の取得から）");
+    } catch (e) { $("rbNoWebfonts").checked = !$("rbNoWebfonts").checked; throw e; }
   }));
   $("rbLinkBoxes").addEventListener("change", () => perform(async () => {
     try {

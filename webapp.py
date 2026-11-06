@@ -36,7 +36,7 @@ import ttlcache
 import updater
 import webauthn
 
-VERSION = "0.1.53"
+VERSION = "0.1.54"
 PORT = 17864
 ROOT = Path(__file__).resolve().parent
 FILES = {"/": ("web/index.html", "text/html; charset=utf-8"),
@@ -461,7 +461,7 @@ def server_state_hub(server):
 # Writes under these prefixes change nothing the cached reads show (screen input only).
 RB_QUIET_POSTS = ("/api/debug/log", "/api/diag/diskio/start", "/api/diag/diskio/stop", "/api/rb/input", "/api/rb/viewport", "/api/rb/snapshot", "/api/rb/snapshot/release",
                   "/api/rb/tap-page", "/api/rb/reader", "/api/rb/probe", "/api/rb/intercepts/open",
-                  "/api/rb/mirror", "/api/rb/mirror/click", "/api/rb/mirror/release",
+                  "/api/rb/mirror", "/api/rb/mirror/click", "/api/rb/mirror/release", "/api/rb/firstload",
                   "/api/selftest/start", "/api/selftest/cancel", "/api/selftest/client",
                   "/api/selftest/swipe", "/api/selftest/swipe/goto")
 
@@ -562,7 +562,7 @@ class Handler(BaseHTTPRequestHandler):
             raw = gzip.compress(raw, 5)       # v0.1.39: only the mirror endpoints ask for this
             encoded = True
         self.send_response(status)
-        if status != 204:       # a 204 has neither a body nor a Content-Length
+        if status not in (204, 304):       # a 204 / 304 has neither a body nor a Content-Length
             self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(len(raw)))
             if encoded:
@@ -1049,11 +1049,21 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/rb/mirror/res":
                 # Mirror display: one image / font, read through the NAS browser (never a remote URL).
                 query = parse_qs(urlsplit(self.path).query)
-                data, mime = self.server.rb.mirror_resource(query.get("tab", [""])[0], query.get("r", [""])[0])
+                tab_id, token = query.get("tab", [""])[0], query.get("r", [""])[0]
+                # v0.1.54: the URL may carry the content hash (h): then the bytes can never change under it and
+                # the phone keeps them for a day; without it they are revalidated by ETag after five minutes
+                known = self.server.rb.mirror_resource_etag(tab_id, token)
+                if known and ('"%s"' % known) in (self.headers.get("If-None-Match") or ""):
+                    return self.send_data(304, b"", "application/octet-stream", extra={
+                        "ETag": '"%s"' % known, "Cache-Control": "private, max-age=300"})
+                data, mime = self.server.rb.mirror_resource(tab_id, token)
+                chash = rb_mirror.content_hash(data)
                 svg = mime == "image/svg+xml"
+                immutable = query.get("h", [""])[0] == chash
                 return self.send_data(
                     200, data, mime, csp=rb_mirror.RES_SVG_CSP if svg else "default-src 'none'",
-                    extra={"Cache-Control": "private, max-age=300", "Content-Disposition": "inline"})
+                    extra={"Cache-Control": "private, max-age=86400, immutable" if immutable else "private, max-age=300",
+                           "ETag": '"%s"' % chash, "Content-Disposition": "inline"})
             if path == "/api/rb/site-rules":
                 return self.send_data(200, {"items": self.store.site_rules(),
                                             "block_ads": self.store.settings().get("block_ads", True),
@@ -1513,7 +1523,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_data(200, self.server.rb.reader(body.get("tab")))
             if path == "/api/rb/mirror":
                 return self.send_data(200, self.server.rb.mirror(
-                    body.get("tab"), full=body.get("full") is not False, force=body.get("force") is True),
+                    body.get("tab"), full=body.get("full") is not False, force=body.get("force") is True,
+                    partial=body.get("partial") is True),
                     compress=True)
             if path == "/api/rb/mirror/click":
                 result = self.server.rb.mirror_click(
@@ -1528,6 +1539,9 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_data(200, result)
             if path == "/api/rb/mirror/release":
                 return self.send_data(200, self.server.rb.mirror_release(body.get("tab")))
+            if path == "/api/rb/firstload":
+                # v0.1.54: the phone's side of the first-load timeline (numbers only, validated by the Hub)
+                return self.send_data(200, self.server.rb.first_load_report(body.get("tab"), body.get("marks")))
             if path == "/api/rb/probe":
                 result = self.server.rb.probe(
                     body.get("tab"), body.get("x"), body.get("y"), url_check=self.reject_hub_origin,

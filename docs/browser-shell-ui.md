@@ -348,3 +348,10 @@ Cloudflare等で手元のブラウザ（iframe）では開けないサイトを�
 - レポート: アプリのバージョン、NASの事実、端末のUA・viewport・DPR・エンジンのフラグ、全項目の値・しきい値・状態、デバッグログ末尾50行（rb/render/engine/http）。パスワード等とURLの中身は入れません。
 - v0.1.46: 端末のライブ受信は MJPEG（最初の画像2.5秒）→ SSE（3秒のfps）→ ポーリング（3秒のfps。`remoteLoop` と同じ `since=<最後のseq>`、窓の終わりで中断）の順に個別に測り、アプリが最終的に使う経路（最初に使えたもの）を報告する。注意はその経路がポーリングで5fps未満のときだけ、フレームが全く無ければ失敗。`client.secure`（https判定）、`client.clipboard`（clipboard APIまたは `queryCommandSupported('copy')`）、`env.cgroup`（cgroup階層とコンテナごとのメモリ/I/Oの取得元。取れないときは `/proc/<pid>/cgroup` の先頭行とマウント一覧を値に載せる）を追加。実サイトは DOMContentLoaded までの時間で判定（8秒以内で合格、完全な読み込み未完了は注記のみ）し、ライブは3秒間NASのページを300msごとに200pxスクロール（隔離ワールドの `Runtime.evaluate`）して動きを作って測る。クライアントの測定中はそのタブのスクリーンキャストをアイドル停止から守る。レポートの見出しに `[Source] cgroup=…` と `[Live] transport=…` を追加。
 - 未検証: 実機NAS、実iPhone（WebKit）、実サイト、headfulなChromiumでのライブfps（ヘッドレスでは断続的になるため、fpsは注意止まり）。
+
+## v0.1.54 初回読み込みの高速化（実機未検証）
+- **計測**: タップ→タブ作成→遷移確定→DOMContentLoaded→最初のコピー開始/終了→文書配信→端末の初描画→全体、を1ページごとに記録（`rb_firstload.py`、RAMのみ）。速度表示に1行、デバッグログ（render）、自己テスト（`builtin.first_load` / `site.N.first_load`、段階ごとの目安としきい値とヒント）に出ます。
+- **タブ作成**: `POST /api/rb/tabs` はページの読み込みを待ちません。CDPの命令をまとめて送り、メモリ確認は `docker stats` を待たずcgroup/直近の結果を使います（タブ0枚なら省略）。**予備タブ**（設定›ブラウザ›予備タブを用意、既定ON）は空の `about:blank` を1枚だけ用意し、使われたら次をDOMContentLoaded後に補充します。メモリ不足・120秒無操作・停止・オプションOFFで閉じ、ユーザーのタブ数には数えません。
+- **最初のコピー**: 3秒タイマーではなくDOMContentLoadedで開始。要素が1500以上のページは、最初に2画面分より下を空きの箱にした部分コピーを出し、続けて全体に置き換えます。リーダーも同じ時点で抽出します（本文が先、画像は遅延）。
+- **リソース**: Hubが画像16枚・フォント4つを先読み（1タブ6並列）。URLは内容ハッシュ付きの固定URLで `Cache-Control: private, max-age=86400, immutable`、ETag/304、タブ・ページをまたいで共有（TTL10分・48MB）。端末は先頭画像のpreload、残りは `loading=lazy decoding=async`。`font-display:swap` を追加し、設定›ブラウザ「Webフォントを使わない（速い）」（既定ON）では文字用のWebフォントを外します（アイコンフォントは残す）。
+- **ブロックリスト**: 同梱の静的リストにタグ管理・解析・セッション記録・広告配信・SNS/コメント・チャット/プッシュ系を追加（ダウンロードはしません）。サイト別の広告ブロック切替はそのまま。

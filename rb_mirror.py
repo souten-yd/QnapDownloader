@@ -10,11 +10,13 @@ without scripts. Nothing here talks to the network; the NAS browser fetches reso
 Stdlib only. Python 3.8 compatible.
 """
 import base64
+import hashlib
 import html as htmllib
 import ipaddress
 import re
 import secrets
 import threading
+import time
 from collections import OrderedDict
 from html.parser import HTMLParser
 from urllib.parse import urljoin, urlsplit
@@ -30,8 +32,14 @@ IMAGE_MAX_BYTES = 4 * 1024 * 1024    # same as the reader's
 INLINE_FONT_MAX = 512 * 1024         # data: fonts of a stylesheet are kept as Hub resources up to this
 INLINE_IMAGE_MAX = 200 * 1024        # data: images stay inline up to this
 CACHE_TOTAL_BYTES = 48 * 1024 * 1024  # fetched resources, all tabs together (LRU)
+RESOURCE_TTL = 600.0                 # v0.1.54: a fetched resource is reused (any page, any tab) for this long
 URL_MAX = 2048
 RES_PATH = "/api/rb/mirror/res?tab=%s&r=%s"
+RES_PATH_HASH = RES_PATH + "&h=%s"
+HASH_RE = re.compile(r"[0-9a-f]{12}\Z")
+FIRST_EAGER_IMAGES = 2               # v0.1.54: the first images of a page load at once; the rest are lazy
+PRELOAD_IMAGES = 3                   # ... and are announced with <link rel=preload> in the document head
+PRELOAD_FONTS = 2
 CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 
 # ------------------------------------------------------------------ document shell
@@ -61,14 +69,30 @@ def css_for_style(css):
     return css.replace("</", "<\\/")
 
 
-def build_document(css, body, html_attrs="", body_attrs=""):
+_PRELOAD_PATH = re.compile(r"/api/rb/mirror/res\?tab=b[0-9]{1,6}&r=[0-9a-f]{16}(?:&h=[0-9a-f]{12})?\Z")
+
+
+def preload_links(images=(), fonts=()):
+    """<link rel=preload> tags for Hub resource paths (anything else is ignored): the phone starts the first
+    images and fonts while it is still parsing the CSS (v0.1.54). CSP allows them (img-src / font-src 'self')."""
+    out = []
+    for path in list(images)[:PRELOAD_IMAGES]:
+        if isinstance(path, str) and _PRELOAD_PATH.match(path):
+            out.append('<link rel="preload" as="image" href="%s">' % htmllib.escape(path, quote=True))
+    for path in list(fonts)[:PRELOAD_FONTS]:
+        if isinstance(path, str) and _PRELOAD_PATH.match(path):
+            out.append('<link rel="preload" as="font" crossorigin href="%s">' % htmllib.escape(path, quote=True))
+    return "".join(out)
+
+
+def build_document(css, body, html_attrs="", body_attrs="", preload=""):
     """The full HTML document of a capture (everything already sanitized by the caller)."""
     return ("<!doctype html><html%s><head><meta charset=\"utf-8\">"
             "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
-            "<meta http-equiv=\"Content-Security-Policy\" content=\"%s\">"
+            "<meta http-equiv=\"Content-Security-Policy\" content=\"%s\">%s"
             "<style id=\"mirrorCss\">%s</style><style id=\"mirrorOwn\">%s</style></head>"
             "<body%s>%s</body></html>") % (
-        html_attrs, DOC_CSP, css_for_style(css), OWN_CSS, body_attrs, body)
+        html_attrs, DOC_CSP, preload, css_for_style(css), OWN_CSS, body_attrs, body)
 
 
 # ------------------------------------------------------------------ URLs
@@ -116,6 +140,24 @@ def resolve_url(base, ref):
 
 
 # ------------------------------------------------------------------ resource references
+def stable_token(url, kind):
+    """The opaque reference of (url, kind): the same everywhere, so the phone's HTTP cache and the Hub's
+    resource cache can recognise a resource on any page or tab (v0.1.54). Only URLs registered in a tab's
+    table are ever fetched, so a guessable token grants nothing."""
+    return hashlib.sha256(("%s\0%s" % (kind, url)).encode("utf-8", "replace")).hexdigest()[:16]
+
+
+def content_hash(data):
+    return hashlib.sha1(data).hexdigest()[:12]
+
+
+def res_path(tab, token, chash=None):
+    """Path of a resource; with the content hash the URL is immutable (Cache-Control: immutable is safe)."""
+    if chash and HASH_RE.match(chash):
+        return RES_PATH_HASH % (tab, token, chash)
+    return RES_PATH % (tab, token)
+
+
 class TokenMap:
     """Per-tab table: opaque token -> {url, kind} or inline bytes. Lives only in RAM."""
 
@@ -124,6 +166,7 @@ class TokenMap:
         self._lock = threading.Lock()
         self._by_token = {}
         self._by_key = {}
+        self._order = []
 
     def __len__(self):
         return len(self._by_token)
@@ -132,6 +175,13 @@ class TokenMap:
         with self._lock:
             self._by_token.clear()
             self._by_key.clear()
+            del self._order[:]
+
+    def _new_token(self, wanted):
+        token = wanted
+        while token is None or token in self._by_token:
+            token = secrets.token_hex(8)
+        return token
 
     def register(self, url, kind):
         """Token of `url` (kind "img" or "font"), or None when the table is full."""
@@ -142,64 +192,107 @@ class TokenMap:
                 return token
             if len(self._by_token) >= self.cap:
                 return None
-            token = secrets.token_hex(8)
+            token = self._new_token(stable_token(url, kind))
             self._by_token[token] = {"url": url, "kind": kind}
             self._by_key[key] = token
+            self._order.append(token)
             return token
 
     def register_data(self, data, mime, kind="font"):
-        key = ("data", hash(data), len(data), mime, kind)
+        key = ("data", content_hash(data), len(data), mime, kind)
         with self._lock:
             token = self._by_key.get(key)
             if token is not None:
                 return token
             if len(self._by_token) >= self.cap:
                 return None
-            token = secrets.token_hex(8)
+            token = self._new_token(stable_token("data:" + content_hash(data), kind))
             self._by_token[token] = {"url": None, "kind": kind, "data": data, "mime": mime}
             self._by_key[key] = token
+            self._order.append(token)
             return token
 
     def get(self, token):
         with self._lock:
             return self._by_token.get(token)
 
+    def ordered(self):
+        """[(token, kind)] of the URL references in registration order (HTML images come first, then CSS)."""
+        with self._lock:
+            return [(t, self._by_token[t]["kind"]) for t in self._order
+                    if t in self._by_token and self._by_token[t].get("url")]
+
 
 class ResourceCache:
-    """LRU of fetched resources: (tab id, token) -> (bytes, mime). The total size is capped."""
+    """LRU of fetched resources keyed by token (= URL + kind), shared by every tab and page (v0.1.54).
 
-    def __init__(self, cap_bytes=CACHE_TOTAL_BYTES):
+    Entries expire after `ttl` seconds, so a changed image shows up again; the total size is capped.
+    `drop_tab` forgets the tab's claim on its entries (an entry nobody claims is freed).
+    """
+
+    def __init__(self, cap_bytes=CACHE_TOTAL_BYTES, ttl=RESOURCE_TTL, clock=time.monotonic):
         self.cap = cap_bytes
+        self.ttl = ttl
+        self._clock = clock
         self.bytes = 0
         self._lock = threading.Lock()
-        self._items = OrderedDict()
+        self._items = OrderedDict()      # token -> [data, mime, chash, expires, owners]
+
+    def _remove(self, token):
+        item = self._items.pop(token, None)
+        if item is not None:
+            self.bytes -= len(item[0])
 
     def get(self, tab, token):
         with self._lock:
-            item = self._items.get((tab, token))
+            item = self._items.get(token)
             if item is None:
                 return None
-            self._items.move_to_end((tab, token))
-            return item
+            if item[3] <= self._clock():
+                self._remove(token)
+                return None
+            self._items.move_to_end(token)
+            item[4].add(tab)
+            return item[0], item[1]
+
+    def known_hash(self, token):
+        """Content hash of the cached bytes of `token`, or None (not cached / expired)."""
+        with self._lock:
+            item = self._items.get(token)
+            if item is None or item[3] <= self._clock():
+                return None
+            return item[2]
 
     def put(self, tab, token, data, mime):
         size = len(data)
         if size > self.cap:
             return
+        now = self._clock()
         with self._lock:
-            old = self._items.pop((tab, token), None)
-            if old is not None:
-                self.bytes -= len(old[0])
-            self._items[(tab, token)] = (data, mime)
+            old = self._items.get(token)
+            owners = old[4] if old is not None else set()
+            self._remove(token)
+            owners.add(tab)
+            self._items[token] = [data, mime, content_hash(data), now + self.ttl, owners]
             self.bytes += size
+            for stale in [t for t, v in self._items.items() if v[3] <= now]:
+                self._remove(stale)
             while self.bytes > self.cap and self._items:
-                _, (dropped, _) = self._items.popitem(last=False)
-                self.bytes -= len(dropped)
+                _, dropped = self._items.popitem(last=False)
+                self.bytes -= len(dropped[0])
 
     def drop_tab(self, tab):
         with self._lock:
-            for key in [k for k in self._items if k[0] == tab]:
-                self.bytes -= len(self._items.pop(key)[0])
+            for token in list(self._items):
+                owners = self._items[token][4]
+                owners.discard(tab)
+                if not owners:
+                    self._remove(token)
+
+    def clear(self):
+        with self._lock:
+            self._items.clear()
+            self.bytes = 0
 
     def __len__(self):
         return len(self._items)
@@ -322,10 +415,44 @@ def _data_font(value):
     return (data, mime) if mime and len(data) <= INLINE_FONT_MAX else None
 
 
-def rewrite_css(text, base, register, register_data=None):
+_ICON_FONT = re.compile(
+    r"(?i)icon|awesome|glyph|symbol|material|fontello|ionicons|dashicons|feather|bootstrap|emoji|linea|themify|"
+    r"elegant|et-line|typicons|entypo|octicons|\bmdi\b|\bfa[a-z]?\b|lucide|remix|boxicons|swiper|slick|iconfont")
+_FACE_FAMILY = re.compile(r"(?i)font-family\s*:\s*([^;}]+)")
+
+
+def _block_end(text, start):
+    """Index of the `}` that closes the block whose body starts at `start`, or -1 (an @font-face body has no nesting)."""
+    quote = ""
+    j, n = start, len(text)
+    while j < n:
+        ch = text[j]
+        if quote:
+            if ch == "\\":
+                j += 1
+            elif ch == quote:
+                quote = ""
+        elif ch in "\"'":
+            quote = ch
+        elif ch == "}":
+            return j
+        j += 1
+    return -1
+
+
+def _icon_face(body):
+    """True when an @font-face body declares an icon font (kept even when text web fonts are left out)."""
+    m = _FACE_FAMILY.search(body)
+    return bool(m and _ICON_FONT.search(m.group(1)))
+
+
+def rewrite_css(text, base, register, register_data=None, web_fonts=True):
     """CSS with every url() / image-set() string turned into a Hub resource reference.
 
     `register(url, kind) -> path or None`; `register_data(bytes, mime) -> path or None`.
+    v0.1.54: every kept @font-face gets `font-display:swap` (text shows at once in a system font, the web
+    font replaces it when it arrives); with `web_fonts=False` text web fonts are removed entirely (icon fonts
+    stay), so nothing is fetched for them.
     Comments, @import, @charset and constructs old engines executed (behavior, -moz-binding,
     expression()) are removed. Anything not understood as a URL becomes url("") instead of staying.
     """
@@ -435,13 +562,24 @@ def rewrite_css(text, base, register, register_data=None):
             emit(")")
             i += 1
         elif token == "{":
-            blocks.append("".join(prelude).strip().lower().startswith("@font-face"))
+            face = "".join(prelude).strip().lower().startswith("@font-face")
+            if face and not web_fonts:
+                end = _block_end(text, i + 1)
+                if end >= 0 and not _icon_face(text[i + 1:end]):
+                    del out[len(out) - len(prelude):]       # the "@font-face" head already emitted
+                    del prelude[:]
+                    i = end + 1
+                    continue
+            blocks.append(face)
             del prelude[:]
             out.append("{")
             i += 1
         elif token == "}":
-            if blocks:
-                blocks.pop()
+            if blocks and blocks.pop():
+                tail = "".join(out[-8:]).rstrip()
+                if tail and tail[-1] not in ";{":
+                    out.append(";")
+                out.append("font-display:swap;")
             del prelude[:]
             out.append("}")
             i += 1
@@ -524,6 +662,7 @@ class _Sanitizer(HTMLParser):
         self.after_pre = False
         self.truncated = False
         self.images = 0
+        self.first_images = []       # v0.1.54: Hub paths of the first images (preloaded by the document)
         self.links = 0
         self.dropped = 0
 
@@ -618,7 +757,14 @@ class _Sanitizer(HTMLParser):
             if path:
                 self.images += 1
                 body += ' src="%s"' % htmllib.escape(path, quote=True)
-            body += ' loading="lazy" decoding="async"'
+                if len(self.first_images) < PRELOAD_IMAGES:
+                    self.first_images.append(path)
+            # v0.1.54: the first images are what the first screen shows: load them at once (the first with
+            # high priority); the rest wait until they are near the screen
+            if path and self.images <= FIRST_EAGER_IMAGES:
+                body += ' decoding="async"' + (' fetchpriority="high"' if self.images == 1 else "")
+            else:
+                body += ' loading="lazy" decoding="async"'
         self._put("<%s%s>" % (tag, body))
         if tag in ("pre", "textarea"):
             self.after_pre = True
@@ -685,7 +831,7 @@ def sanitize_html(raw, base, register, register_data=None):
     except (AssertionError, ValueError, RecursionError):
         raise MirrorError("ページの内容を整形できませんでした") from None
     return out, {"images": parser.images, "links": parser.links, "dropped": parser.dropped,
-                 "truncated": parser.truncated}
+                 "truncated": parser.truncated, "first_images": parser.first_images}
 
 
 def clean_attr_string(raw, base, register, register_data=None):
@@ -764,7 +910,11 @@ var started=Date.now();
 var domN=S.n;
 if(S.map.size>P.nodes*3)S.map.clear();
 var NODE_CAP=P.nodes,BYTE_CAP=P.bytes,CSS_CAP=P.css,TARGET=P.target,SVG_CAP=1500,DEPTH_CAP=256;
-var buf=[],bytes=0,nodes=0,trunc=false,ph=0,cssTrunc=false;
+var buf=[],bytes=0,nodes=0,trunc=false,ph=0,cssTrunc=false,partial=false,FOLD=0;
+// v0.1.54 "above the fold first": on a large page, block elements that start below the first screens are
+// sent as empty boxes of their measured height (the layout and the scroll height stay right); the Hub
+// follows with the complete copy. Fixed / sticky / positioned content is always kept.
+if(P.fold>0&&document.getElementsByTagName('*').length>=P.foldMin)FOLD=window.scrollY+P.fold;
 var NONASCII=/[^\x00-\x7f]/;
 var SVGNS='http://www.w3.org/2000/svg';
 var DROP_TAGS={script:1,noscript:1,template:1,style:1,link:1,meta:1,base:1,title:1,head:1,datalist:1,
@@ -892,6 +1042,17 @@ function attrString(el,tag,extra,styleExtra){
  if(styleExtra&&!styled)out+=' style="'+esc(styleExtra)+'"';
  return out+(extra||'');
 }
+var FOLD_NO={img:1,input:1,textarea:1,select:1,button:1,br:1,hr:1,wbr:1,svg:1,picture:1,video:1,audio:1,canvas:1,
+ iframe:1,object:1,embed:1,area:1,col:1,option:1};
+function foldBox(el,tag,cs){
+ if(FOLD_NO[tag])return null;
+ var pos=cs.position;if(pos!=='static'&&pos!=='relative')return null;
+ var d=cs.display;
+ if(d!=='block'&&d!=='flex'&&d!=='grid'&&d!=='list-item'&&d!=='flow-root'&&d!=='table')return null;
+ var r=el.getBoundingClientRect();
+ if(r.height<2||r.width<2||r.top+window.scrollY<FOLD)return null;
+ return r;
+}
 function placeholder(el,label,rc){
  var w=Math.round(rc?rc.width:0),h=Math.round(rc?rc.height:0);
  if(w<=0&&h<=0)return;
@@ -971,6 +1132,14 @@ function walk(el,depth,pre){
  }
  if(tag==='input'&&(el.type||'').toLowerCase()==='file'){placeholder(el,'ファイル',el.getBoundingClientRect());return;}
  var otag=tag==='form'?'div':tag;
+ if(FOLD>0){
+  var fb=foldBox(el,tag,cs);
+  if(fb){
+   partial=true;
+   push('<'+otag+attrString(el,tag,dm(el),'height:'+Math.round(fb.height)+'px;overflow:hidden;box-sizing:border-box')+'></'+otag+'>');
+   return;
+  }
+ }
  var extra=dm(el),styleExtra='';
  if(tag==='a'||tag==='area')extra+=linkAttrs(el);
  if(tag==='img'){
@@ -1080,7 +1249,7 @@ if(body){
 var sheets=collectSheets();
 return {url:location.href,base:document.baseURI,title:String(document.title||'').slice(0,300),html:buf.join(''),
  hattrs:hattrs,battrs:battrs,sheets:sheets,nodes:nodes,bytes:bytes,truncated:trunc,css_truncated:cssTrunc,
- placeholders:ph,domN:domN,ms:Date.now()-started,w:window.innerWidth,dpr:window.devicePixelRatio||1};
+ placeholders:ph,domN:domN,partial:partial,ms:Date.now()-started,w:window.innerWidth,dpr:window.devicePixelRatio||1};
 })(__PARAMS__)
 """.replace("__OBSERVER__", _OBSERVER_JS)
 
@@ -1088,11 +1257,18 @@ return {url:location.href,base:document.baseURI,title:String(document.title||'')
 IMAGE_TARGET_PX = 1800      # images are never chosen wider than this (device pixels)
 
 
-def serializer_script(dpr=2.0):
-    """MIRROR_JS with its fixed limits filled in (numbers only: no page or user data goes into the script)."""
+PARTIAL_MIN_ELEMENTS = 1500   # v0.1.54: smaller pages are always copied in full
+PARTIAL_SCREENS = 2           # ... larger ones first as far as this many screens down
+
+
+def serializer_script(dpr=2.0, fold=0):
+    """MIRROR_JS with its fixed limits filled in (numbers only: no page or user data goes into the script).
+    `fold` (CSS px, 0 = off) is the depth of a first, partial copy."""
     dpr = min(3.0, max(1.0, float(dpr)))
-    params = ("{nodes:%d,bytes:%d,css:%d,sheets:%d,target:%d,dpr:%.2f}" %
-              (MAX_NODES, MAX_HTML_BYTES, MAX_CSS_BYTES // 2, MAX_SHEETS, IMAGE_TARGET_PX, dpr))
+    fold = max(0, min(20000, int(fold)))
+    params = ("{nodes:%d,bytes:%d,css:%d,sheets:%d,target:%d,dpr:%.2f,fold:%d,foldMin:%d}" %
+              (MAX_NODES, MAX_HTML_BYTES, MAX_CSS_BYTES // 2, MAX_SHEETS, IMAGE_TARGET_PX, dpr, fold,
+               PARTIAL_MIN_ELEMENTS))
     return MIRROR_JS.replace("__PARAMS__", params)
 
 
@@ -1102,10 +1278,11 @@ def click_script(m, fx=0.5, fy=0.5):
 
 # ------------------------------------------------------------------ assembling a capture
 class _Sheets:
-    def __init__(self, register, register_data, css_text):
+    def __init__(self, register, register_data, css_text, web_fonts=True):
         self.register = register
         self.register_data = register_data
         self.css_text = css_text
+        self.web_fonts = web_fonts
 
 
 def _sheet_css(text, base, media, depth, ctx):
@@ -1118,7 +1295,7 @@ def _sheet_css(text, base, media, depth, ctx):
         child = ctx.css_text(target) if target else None
         if isinstance(child, str) and child:
             pieces.append(_sheet_css(child, target, import_media, depth + 1, ctx))
-    pieces.append(rewrite_css(text, base, ctx.register, ctx.register_data))
+    pieces.append(rewrite_css(text, base, ctx.register, ctx.register_data, ctx.web_fonts))
     return media_wrap("".join(pieces), media)
 
 
@@ -1126,12 +1303,18 @@ def _text(value, limit):
     return value[:limit] if isinstance(value, str) else ""
 
 
-def assemble(raw, register, register_data=None, css_text=None):
+SHEET_CACHE_MAX = 400
+
+
+def assemble(raw, register, register_data=None, css_text=None, web_fonts=True, cache=None):
     """Hub-side processing of the serializer's output: validate, sanitize, rewrite.
 
     Returns {url, base, title, html, css, html_attrs, body_attrs, truncated, css_truncated, nodes,
     html_bytes, css_bytes, images, links, sheets, placeholders}. `css_text(url) -> str|None`
     supplies the text of a stylesheet the page could not read itself (cross-origin).
+    v0.1.54: `web_fonts=False` leaves text web fonts out; `cache` (a dict kept by the caller for one page)
+    remembers the rewritten CSS of a stylesheet by the hash of its text, so a recapture of the same page does
+    not parse the same 100 KB again. The result also holds `first_images` (paths to preload) and `partial`.
     """
     if not isinstance(raw, dict):
         raise MirrorError("ページの内容を取得できませんでした")
@@ -1142,7 +1325,7 @@ def assemble(raw, register, register_data=None, css_text=None):
     html, stats = sanitize_html(raw.get("html"), base, register, register_data)
     html_attrs = clean_attr_string(raw.get("hattrs"), base, register, register_data)
     body_attrs = clean_attr_string(raw.get("battrs"), base, register, register_data)
-    ctx = _Sheets(register, register_data, css_text or (lambda _url: None))
+    ctx = _Sheets(register, register_data, css_text or (lambda _url: None), web_fonts)
     css_parts, css_bytes, css_trunc = [], 0, raw.get("css_truncated") is True
     sheets = raw.get("sheets") if isinstance(raw.get("sheets"), list) else []
     used = 0
@@ -1156,7 +1339,16 @@ def assemble(raw, register, register_data=None, css_text=None):
             text = ctx.css_text(public_http_url(sheet["cdp"]) or "")
         if not isinstance(text, str) or not text:
             continue
-        piece = _sheet_css(text[:MAX_CSS_BYTES], sbase, media, 0, ctx)
+        key = None
+        if cache is not None:
+            key = (hashlib.sha1(text[:MAX_CSS_BYTES].encode("utf-8", "replace")).hexdigest(), sbase, media, web_fonts)
+        piece = cache.get(key) if key is not None else None
+        if piece is None:
+            piece = _sheet_css(text[:MAX_CSS_BYTES], sbase, media, 0, ctx)
+            if key is not None:
+                if len(cache) >= SHEET_CACHE_MAX:
+                    cache.clear()
+                cache[key] = piece
         size = len(piece.encode("utf-8", "replace"))
         if css_bytes + size > MAX_CSS_BYTES:
             css_trunc = True
@@ -1173,4 +1365,5 @@ def assemble(raw, register, register_data=None, css_text=None):
         "nodes": max(0, nodes), "html_bytes": len(html.encode("utf-8", "replace")), "css_bytes": css_bytes,
         "images": stats["images"], "links": stats["links"], "sheets": used,
         "placeholders": raw.get("placeholders") if isinstance(raw.get("placeholders"), int) else 0,
+        "first_images": stats["first_images"], "partial": raw.get("partial") is True,
     }

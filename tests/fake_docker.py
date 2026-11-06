@@ -20,6 +20,7 @@ class FakeDocker:
         self.build_fail = False
         self.stats_out = "512MiB / 2GiB|25.00%"
         self.stats_fail = False
+        self.stats_delay = 0.0    # seconds a `docker stats` call takes (it samples for a second or more on a NAS)
         self.container_logs = ""
         self.logs_fail = False
         self.run_fail = None      # stderr text: `docker run -d` fails, leaving a "created" container
@@ -82,6 +83,9 @@ class FakeDocker:
                 return self.result(1, "", "no such container")
             return self.result(0, "", self.container_logs)
         if a[0] == "stats":
+            if self.stats_delay:
+                import time
+                time.sleep(self.stats_delay)
             if self.stats_fail or a[-1] not in self.containers:
                 return self.result(1, "", "no such container")
             return self.result(0, self.stats_out + "\n")

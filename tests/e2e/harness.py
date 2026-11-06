@@ -75,6 +75,63 @@ def make_png(width, height, color):
             chunk(b"IDAT", zlib.compress(raw, 6)) + chunk(b"IEND", b""))
 
 
+def make_first_load_page(query):
+    """/firstload.html: a page shaped like the slow real ones. Query: nodes (default 3000), ads (blocking third-party
+    scripts/images on ad hosts, default 6), fonts (web fonts, default 4), imgs (default 24), slowload (ms the
+    load event is held back, default 4000), delay (ms every first-party resource takes, default 150)."""
+    def num(key, default, high):
+        try:
+            return max(0, min(high, int(query.get(key, [default])[0])))
+        except ValueError:
+            return default
+    nodes, ads, fonts = num("nodes", 3000, 20000), num("ads", 6, 40), num("fonts", 4, 12)
+    imgs, slowload, delay = num("imgs", 24, 200), num("slowload", 4000, 20000), num("delay", 150, 3000)
+    sections = max(1, nodes // 10)
+    every = max(1, sections // max(1, imgs))
+    head = ["<!doctype html><html lang='ja'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>",
+            "<title>First load fixture</title>",
+            "<link rel='stylesheet' href='/css/site.css?fonts=%d&delay=%d'>" % (fonts, delay)]
+    # third-party scripts: the first ones block parsing (a sync tag), the rest are async tags / pixels
+    hosts = ["ads.doubleclick.net", "www.googletagmanager.com", "securepubads.g.doubleclick.net", "www.google-analytics.com",
+             "static.criteo.net", "cdn.taboola.com", "connect.facebook.net", "platform.twitter.com"]
+    for i in range(ads):
+        host = hosts[i % len(hosts)]
+        if i % 3 == 0:
+            head.append("<script src='https://%s/tag%d.js?delay=900'></script>" % (host, i))
+        else:
+            head.append("<script async src='https://%s/tag%d.js?delay=1200'></script>" % (host, i))
+    head.append("</head><body>")
+    body = ["<header class='top'><h1>E2E 初回読み込みテスト</h1><nav><a href='/article.html'>記事</a></nav></header>",
+            "<img class='hero' width='390' height='260' src='/img/780/520.png?c=3366aa&delay=%d' alt='hero'>" % (delay * 2)]
+    for i in range(sections):
+        body.append("<section class='s'><h2>見出し %d</h2><p>これは本文の段落です。%d 番目のセクションの文章。<a href='/p/%d'>リンク</a></p>"
+                    "<ul><li>項目 A</li><li>項目 B</li><li>項目 C</li></ul></section>" % (i, i, i))
+        if i % every == every - 1:
+            body.append("<img width='390' height='160' loading='lazy' src='/img/780/320.png?c=%06x&delay=%d' alt='img %d'>" % (
+                (i * 7919) % 0xFFFFFF, delay, i))
+    if slowload:
+        body.append("<img width='1' height='1' src='/img/10/10.png?delay=%d' alt=''>" % slowload)
+    body.append("</body></html>")
+    return "".join(head + body).encode("utf-8")
+
+
+def make_first_load_css(query):
+    try:
+        fonts = max(0, min(12, int(query.get("fonts", ["4"])[0])))
+    except ValueError:
+        fonts = 4
+    rules = []
+    for i in range(fonts):
+        rules.append("@font-face{font-family:'Fx%d';src:url('/font/f%d.woff2?delay=350') format('woff2');font-weight:%d}" % (i, i, 400 + (i % 3) * 100))
+    rules.append("body{margin:0;font:16px/1.6 'Fx0',sans-serif}.top{background:#223;color:#fff;padding:8px 12px}"
+                 ".hero{display:block;width:100%;height:auto}.s{padding:6px 12px;border-bottom:1px solid #ddd}"
+                 ".s h2{font:600 18px 'Fx1',sans-serif;margin:4px 0}.top{background-image:url('/img/40/40.png?c=223344&delay=200')}")
+    for i in range(600):
+        rules.append(".c%d .x%d>a:hover{color:#%06x;margin:%dpx}@media (min-width:%dpx){.c%d{padding:%dpx}}" % (
+            i, i, (i * 40503) % 0xFFFFFF, i % 9, 600 + i, i, i % 7))
+    return "".join(rules).encode("utf-8")
+
+
 class FixtureServer:
     def __init__(self, workdir):
         cert, key = Path(workdir) / "cert.pem", Path(workdir) / "key.pem"
@@ -102,6 +159,21 @@ class FixtureServer:
                     return self.reply(204, b"", "text/plain")
                 fx.hits[path] += 1
                 fx.times[path] = time.monotonic()
+                q = parse_qs(parts.query)
+                try:
+                    wait = min(20000, max(0, int(q.get("delay", ["0"])[0])))
+                except ValueError:
+                    wait = 0
+                if wait:
+                    time.sleep(wait / 1000.0)         # v0.1.54: a slow resource (the NAS's line is slower than ours)
+                if path.endswith(".js"):
+                    return self.reply(200, b"/* tag */", "application/javascript")
+                if path.startswith("/font/"):
+                    return self.reply(200, b"wOF2" + b"\x00" * 2048, "font/woff2")
+                if path == "/css/site.css":
+                    return self.reply(200, make_first_load_css(q), "text/css")
+                if path == "/firstload.html":
+                    return self.reply(200, make_first_load_page(q), "text/html; charset=utf-8")
                 if path.startswith("/img/"):
                     try:
                         w, h = (int(v) for v in path[5:].replace(".png", "").split("/"))
@@ -171,7 +243,9 @@ class Env:
             [binary, "--headless=new", "--no-sandbox", "--remote-debugging-port=%d" % self.cdp_port,
              "--user-data-dir=" + self.chrome_udd, "--no-proxy-server", "--disable-gpu",
              "--no-first-run", "--no-default-browser-check", "--ignore-certificate-errors",
-             "--host-resolver-rules=MAP *.example.com 127.0.0.1:%d, MAP *.example.net 127.0.0.1:%d" % (port, port),
+             "--host-resolver-rules=" + ", ".join("MAP %s 127.0.0.1:%d" % (h, port) for h in (
+                 "*.example.com", "*.example.net", "*.doubleclick.net", "*.googletagmanager.com", "*.google-analytics.com",
+                 "*.criteo.net", "*.taboola.com", "*.facebook.net", "*.twitter.com")),
              "about:blank"],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         import remote_browser as rb
@@ -222,6 +296,7 @@ class Env:
         mem = root / "meminfo"
         mem.write_text("MemTotal: 16000000 kB\nMemAvailable: 9000000 kB\n")
         fd = FakeDocker()
+        self.fake_docker = fd
         runtime = container_runtime.Runtime(fd, isfile=fd.isfile, access=lambda p, m: True, meminfo_path=str(mem))
         fd.images.add(runtime.browser_tag(str(ctx)))
         cdp = self.cdp_port

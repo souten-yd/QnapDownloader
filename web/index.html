@@ -444,6 +444,18 @@
           <details class="hint"><summary aria-label="詳しい説明">ⓘ</summary><p>既知の広告・トラッカー・ポップアンダー配信元（Hub内の固定リスト）への通信をChromiumで止め、表示を軽くします。Rapidgatorなどのホスターは止めません。サイトごとに下の一覧でOFFにできます。</p></details></span></div>
         <label class="switch" for="blockAds"><input type="checkbox" id="blockAds" role="switch" aria-label="広告をブロック"><span class="switch-track" aria-hidden="true"></span></label>
        </div>
+       <div class="set-row">
+        <div class="set-main"><span class="set-label">予備タブを用意（初回が速い）</span>
+         <span class="set-desc"><span class="set-text">空のタブを1枚待機させ、ページを開く時間を短くします</span>
+          <details class="hint"><summary aria-label="詳しい説明">ⓘ</summary><p>NASブラウザが動いている間、画面サイズを合わせた空のタブを1枚だけ待機させ、ページを開くときはそこへ移動するだけにします（タブ数には数えません）。空きメモリが少ないとき、しばらく使わないとき、NASブラウザの停止時には自動で閉じます。常駐オンのときも使われなければ閉じます。</p></details></span></div>
+        <label class="switch" for="rbSpareTab"><input type="checkbox" id="rbSpareTab" role="switch" aria-label="予備タブを用意"><span class="switch-track" aria-hidden="true"></span></label>
+       </div>
+       <div class="set-row">
+        <div class="set-main"><span class="set-label">Webフォントを使わない（速い）</span>
+         <span class="set-desc"><span class="set-text">ミラー表示で文字をまず端末のフォントで出します</span>
+          <details class="hint"><summary aria-label="詳しい説明">ⓘ</summary><p>ミラー表示のコピーから本文用のWebフォントを外し、端末のフォントで文字をすぐ表示します（アイコン用フォントは残します）。オフにするとWebフォントも取得し、届いたものから入れ替えます（font-display: swap）。</p></details></span></div>
+        <label class="switch" for="rbNoWebfonts"><input type="checkbox" id="rbNoWebfonts" role="switch" aria-label="Webフォントを使わない"><span class="switch-track" aria-hidden="true"></span></label>
+       </div>
       </div>
 
       <div class="sub" data-sub="rules">
