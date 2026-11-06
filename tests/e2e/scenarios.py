@@ -610,14 +610,17 @@ def passkey_login(ph):
     page.click("#revokeAll")
     cookie_now = lambda: ([c["value"] for c in ph.context.cookies() if c["name"] == "qdl_session" and c["domain"].lstrip(".") == "localhost"] or [""])[0]
     ph.wait(lambda: cookie_now() != old, 15, "session replaced or cleared by revoke-all")
-    ph.wait(lambda: page.locator("#passkeyLogin").is_visible() or ph.js("state.authed === true"), 15,
+    # "authed" alone is not enough: right after revoke-all the app may still hold state.authed === true
+    # from the old session for a moment, so a conditional sign-in only counts once a new cookie exists.
+    signed_in = lambda: ph.js("state.authed === true") and cookie_now() not in ("", old)
+    ph.wait(lambda: page.locator("#passkeyLogin").is_visible() or signed_in(), 15,
             "login screen (or automatic conditional sign-in) after revoke-all")
-    if not ph.js("state.authed === true"):
+    if not signed_in():
         try:
             page.click("#passkeyLogin", timeout=2000)
         except Exception:
-            assert ph.js("state.authed === true"), "button vanished without a login"   # autofill won the race
-    ph.wait(lambda: ph.js("state.authed === true"), 15, "passkey login")
+            ph.wait(signed_in, 5, "button vanished: autofill sign-in")   # autofill won the race
+    ph.wait(signed_in, 15, "passkey login with a new session cookie")
     ph.log("conditional UI signed in automatically" if page.locator("#passkeyLogin").count() and
            not page.locator("#login").is_visible() else "")
     fresh = [c for c in ph.context.cookies() if c["name"] == "qdl_session" and c["domain"].lstrip(".") == "localhost"][0]["value"]
