@@ -24,6 +24,14 @@ Reference: souten-yd/QnapSelfCare DEVELOPMENT_WORKFLOW.md on main, checked 2026-
 7. For application changes, by default deliver through validated main to a published release with correct QPKG, checksum and linked source revision unless a newer user instruction explicitly stops earlier. Documentation-only PRs need no new binary release; state that clearly.
 8. If testing, publication or permissions block a step, report exactly what remains; never claim it was completed.
 
+## Documentation rules (README / CHANGELOG)
+
+- README.md describes the current product only, in the usual order: overview, features, requirements, installation, initial setup, HTTPS / remote use, usage, data and updates, troubleshooting, development, documents. Write it for users; keep it short.
+- Do NOT put in README.md: per-version notes ("現在の状態", "直前の vX"), version tags in headings, implementation details, test results, history of removed features, or development plans. Those belong in CHANGELOG.md (per version), docs/ (design and details) or docs/roadmap.md (plans).
+- Every version bump adds one entry at the top of CHANGELOG.md (`## vX.Y.Z`, a few sentences in Japanese for users: what changed and why). Do not rewrite older entries.
+- Update README.md only when user-facing facts change (a new feature, a new setting location, a new setup step, a changed requirement).
+- tests/test_docs_rules.py enforces these rules in `scripts/verify.sh`.
+
 ## QNAP implementation requirements
 
 - Target TS-253Be (x86_64), QTS 5.x. QDK version pinned and downloaded with verified checksum. Keep app version, QPKG version and Release asset version consistent.
