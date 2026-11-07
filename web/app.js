@@ -75,7 +75,7 @@ const DISPLAY_CHIP_TITLE = {reader: "リーダー", mirror: "ミラー", tiles: 
 // v0.1.60: this file's own version. The Hub's version (from /api/state) is compared with it: a shell cache that is
 // older than the Hub (the app was updated while the home-screen app was closed) is dropped and the page reloaded.
 // tests/test_web_shell.py checks that it equals webapp.VERSION.
-const APP_VERSION = "0.1.61";
+const APP_VERSION = "0.1.62";
 const PT_DISPLAY_LABEL = "パススルー";      // v0.1.57: not a NAS-browser display, so not in RB_DISPLAY_LABELS
 const RB_PERF_WINDOW_MS = 5000;
 const RB_STREAM_FIRST_MS = 5000;     // MJPEG only (no SSE available): first picture within this, else polling
@@ -92,6 +92,9 @@ const RB_KEYS = ["Enter", "Backspace", "Tab", "Escape", "Delete",
   "ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown"];
 const SHELL_KEY = "qnapdl.shell.v1";
 const HOST_MODE_KEY = "qnapdl.hostmodes.v1";
+const RECENT_KEY = "qnapdl.recent.v1";        // v0.1.62: recent pages (this device only, never sent anywhere)
+const RECENT_MAX = 20;
+const REMOTE_PT_MODE = "remote-pt";           // v0.1.62: passthrough remembered for a site (stored only; not a NAS display)
 const TAB_STORAGE_KEY = "qnapdl.webtabs.v1";
 const LEGACY_AUTO_KEY = "qnapdl.downloads.auto";   // v0.1.11 switch; removed silently
 // v0.1.33: four sections, each with in-page subsections (#/settings/jd2/accounts scrolls to one).
@@ -160,6 +163,13 @@ function element(tag, text, className) {
   const node = document.createElement(tag);
   if (text !== undefined && text !== null) node.textContent = String(text);
   if (className) node.className = className;
+  return node;
+}
+
+// v0.1.62: one shape for "nothing here": what is empty, then (muted) what to do about it.
+function emptyState(message, hint) {
+  const node = element("p", message, "empty-state");
+  if (hint) { node.appendChild(document.createElement("br")); node.appendChild(element("span", hint, "empty-hint")); }
   return node;
 }
 
@@ -238,7 +248,7 @@ function readHostModes() {
     const data = JSON.parse(readLocal(HOST_MODE_KEY) || "[]");
     if (!Array.isArray(data)) return [];
     return data.filter(e => Array.isArray(e) && typeof e[0] === "string" && e[0].length <= 253 &&
-      REMOTE_MODES.includes(e[1])).map(e => [e[0], e[1]]).slice(-MAX_HOST_MODES);
+      (REMOTE_MODES.includes(e[1]) || e[1] === REMOTE_PT_MODE)).map(e => [e[0], e[1]]).slice(-MAX_HOST_MODES);
   } catch (e) { return []; }
 }
 
@@ -252,16 +262,40 @@ function migrateHostModes() {
   } catch (e) { /* ignore: reads still skip the old values */ }
 }
 
+// v0.1.62: the display is remembered per SITE (registrable domain: www.example.com, a.example.com and example.com
+// share one entry). There is no public-suffix list here: two-letter country codes with a generic second level
+// (co.jp, or.jp, com.au, ...) keep three labels, everything else keeps two. Old exact-host entries still match.
+const SLD_GENERIC = new Set(["co", "com", "net", "org", "ne", "or", "ac", "go", "gr", "ed", "gov", "edu", "ad", "lg"]);
+function siteKey(hostOrUrl) {
+  let host = String(hostOrUrl || "").trim().toLowerCase();
+  if (/^[a-z][a-z0-9+.-]*:\/\//.test(host)) { try { host = new URL(host).hostname; } catch (e) { /* keep as is */ } }
+  host = host.replace(/^www\./, "").replace(/\.$/, "");
+  if (!host || host.includes(":") || /^[\d.]+$/.test(host)) return host;
+  const labels = host.split(".");
+  if (labels.length <= 2) return host;
+  const tld = labels[labels.length - 1], second = labels[labels.length - 2];
+  if (tld.length === 2 && SLD_GENERIC.has(second)) return labels.slice(-3).join(".");
+  return labels.slice(-2).join(".");
+}
+
 function rememberHostMode(host, mode) {
   if (!host) return;
-  const list = readHostModes().filter(e => e[0] !== host);
-  if (REMOTE_MODES.includes(mode)) list.push([host, mode]);   // no entry = the default display
+  const key = siteKey(host);
+  const list = readHostModes().filter(e => siteKey(e[0]) !== key);
+  if (REMOTE_MODES.includes(mode) || mode === REMOTE_PT_MODE) list.push([key, mode]);   // no entry = the default display
   writeLocal(HOST_MODE_KEY, JSON.stringify(list.slice(-MAX_HOST_MODES)));
 }
 
 function rememberedMode(host) {
-  const hit = readHostModes().find(e => e[0] === host);
+  if (!host) return null;
+  const all = readHostModes();
+  const hit = all.find(e => e[0] === host) || all.find(e => siteKey(e[0]) === siteKey(host));
   return hit ? hit[1] : null;
+}
+
+// v0.1.62: does the site of this address have a remembered display (any, including passthrough)?
+function hasSiteDisplay(url) {
+  return Boolean(rememberedMode(hostOf(url)));
 }
 
 function displayHosts() {
@@ -269,6 +303,31 @@ function displayHosts() {
 }
 
 migrateHostModes();
+
+// ------------------------------------------------- app progress line (v0.1.62)
+// A data load of an app screen that is still running after 300 ms shows the thin line at the top of the content (the
+// same look as the web tab's line). Fast loads never show it, and nothing is held back for it: it only reports.
+const LOAD_LINE_DELAY_MS = 300;
+const appLoad = {n: 0, timer: 0};
+function trackLoad(promise) {
+  appLoad.n++;
+  if (appLoad.n === 1) {
+    clearTimeout(appLoad.timer);
+    appLoad.timer = setTimeout(() => {
+      if (appLoad.n > 0 && state.route.view !== "tab") { const bar = document.getElementById("appLoading"); if (bar) bar.hidden = false; }
+    }, LOAD_LINE_DELAY_MS);
+  }
+  const done = () => {
+    appLoad.n = Math.max(0, appLoad.n - 1);
+    if (appLoad.n === 0) {
+      clearTimeout(appLoad.timer);
+      const bar = document.getElementById("appLoading");
+      if (bar) bar.hidden = true;
+    }
+  };
+  promise.then(done, done);
+  return promise;
+}
 
 // ------------------------------------------------- stale-while-revalidate
 // Views paint cached data immediately, refresh in the background when the
@@ -303,6 +362,7 @@ async function swr(key, path, render, opts = {}) {
       return entry;
     }).finally(() => swrPending.delete(key));
     swrPending.set(key, pending);
+    trackLoad(pending);
   }
   const entry = await pending;
   if (epoch === swrEpoch) swrPaint(key, entry, render, slot);
@@ -812,6 +872,7 @@ function renderWebTabs() {
     list.appendChild(wrap);
   }
   updateMobileBar();
+  renderHomeTabs();      // v0.1.62
 }
 
 // v0.1.60: the second row is gone. What it showed now lives in: the mode chip inside the omnibox (NAS browser /
@@ -863,6 +924,7 @@ async function loadSettings(force = false) {
 // Settings and bookmarks arrive with the first /api/state call (seeded into the swr cache), so
 // entering the home view costs no request.
 async function loadHome(force = false) {
+  renderHomeTabs(); renderHomeRecent();      // v0.1.62: from what is already here, before any request answers
   await Promise.all([loadSettings(force), loadBookmarks(force)]);
 }
 
@@ -931,6 +993,8 @@ function setCheck(rowId, done) {
 // One "はじめに" checklist until a save folder is chosen and the engine is set
 // up; afterwards a single status line. Nothing renders before both are known.
 function renderHome() {
+  renderHomeTabs();      // v0.1.62: guarded by a signature; the lists are rebuilt only when something changed
+  renderHomeRecent();
   const e = state.engine, cfg = state.settings;
   if (!e || !cfg) {
     setShown("onboarding", false);
@@ -987,6 +1051,132 @@ function renderHome() {
   setShown("homeEngineStart", phase === "stopped" || phase === "failed");
 }
 
+
+// ----------------------------------------------- browse home (v0.1.62)
+// v0.1.62: open tabs as cards (tap = switch, x = close), the recent pages list (localStorage only, never sent
+// anywhere) and a "copied URL" chip that reads the clipboard only when it is tapped.
+function readRecent() {
+  try {
+    const data = JSON.parse(readLocal(RECENT_KEY) || "[]");
+    if (!Array.isArray(data)) return [];
+    return data.filter(e => e && typeof e.u === "string" && /^https?:\/\//i.test(e.u) && e.u.length <= 2048)
+      .map(e => ({u: e.u, t: typeof e.t === "string" ? e.t.slice(0, 200) : "", at: Number(e.at) || 0})).slice(0, RECENT_MAX);
+  } catch (e) { return []; }
+}
+
+// Remember a page the NAS browser / passthrough finished loading: newest first, one row per address.
+function noteVisit(url, title) {
+  if (typeof url !== "string" || !/^https?:\/\//i.test(url) || url.length > 2048) return;
+  if (/__cf_chl|\/cdn-cgi\/challenge/i.test(url)) return;      // Cloudflare check pages are not worth remembering
+  const list = readRecent();
+  const hit = list.find(e => e.u === url);
+  if (hit && hit.t === (title || hit.t) && list[0] === hit) return;     // nothing new
+  const next = [{u: url, t: String(title || (hit && hit.t) || "").slice(0, 200), at: Date.now()}]
+    .concat(list.filter(e => e.u !== url)).slice(0, RECENT_MAX);
+  writeLocal(RECENT_KEY, JSON.stringify(next));
+  renderHomeRecent();
+}
+
+function clearRecent() {
+  removeLocal(RECENT_KEY);
+  renderHomeRecent();
+  flash("最近見たページを消しました");
+}
+
+// A cheap thumbnail only: the first tile the phone already holds for a "fast" tab. Nothing is fetched for this.
+function tabThumb(tab) {
+  const view = tab.rb && tab.rb.view;
+  const first = view && view.tiles && view.tiles[0];
+  return first && typeof first.url === "string" && first.url.startsWith("blob:") ? first.url : "";
+}
+
+function tabCardInfo(tab) {
+  const url = tab.current || tab.history[tab.index] || "";
+  const title = (tab.pt ? tab.ptTitle : tab.rb && tab.rb.title) || "";
+  const display = tab.pt ? PT_DISPLAY_LABEL : tab.rb ? RB_DISPLAY_LABELS[tabDisplay(tab)] || "" : "";
+  return {url, title: title || hostOf(url), host: hostOf(url), display};
+}
+
+function renderHomeTabs() {
+  const tabs = state.tabs.filter(t => !t.diag && t.history.length);
+  const infos = tabs.map(t => [t, tabCardInfo(t)]);
+  const sig = infos.map(([t, i]) => [t.id, i.url, i.title, i.display, tabThumb(t) ? 1 : 0].join("|")).join("\n");
+  if (sig === state.homeTabsSig) return;
+  state.homeTabsSig = sig;
+  setShown("homeTabs", tabs.length > 0);
+  const nodes = infos.map(([tab, info]) => {
+    const card = element("div", undefined, "tab-card");
+    card.dataset.tab = tab.id;
+    const main = element("button", undefined, "tab-card-main");
+    main.type = "button";
+    main.setAttribute("aria-label", info.title + "（" + info.host + "）のタブへ切り替え");
+    const thumb = element("span", undefined, "tab-card-thumb");
+    const src = tabThumb(tab);
+    if (src) {
+      const img = document.createElement("img");
+      img.alt = ""; img.decoding = "async"; img.src = src;      // v0.1.62: a blob: URL of a tile the phone already holds (tabThumb)
+      img.addEventListener("error", () => img.remove());
+      thumb.appendChild(img);
+    }
+    thumb.appendChild(element("span", info.host.slice(0, 1).toUpperCase(), "tab-card-letter"));
+    main.appendChild(thumb);
+    main.appendChild(element("strong", info.title, "tab-card-title"));
+    const meta = element("span", undefined, "tab-card-meta");
+    meta.appendChild(element("span", info.host, "tab-card-host"));
+    if (info.display) meta.appendChild(element("span", info.display, "tab-card-mode"));
+    main.appendChild(meta);
+    main.addEventListener("click", () => navigate("#/tab/" + tab.id));
+    const close = element("button", undefined, "tab-card-close");
+    close.type = "button";
+    close.setAttribute("aria-label", "タブを閉じる: " + info.title);
+    close.appendChild(icon("x"));
+    close.addEventListener("click", () => closeTab(tab.id));
+    card.append(main, close);
+    return card;
+  });
+  $("homeTabGrid").replaceChildren(...nodes);
+}
+
+function renderHomeRecent() {
+  const list = readRecent();
+  const sig = JSON.stringify(list);
+  if (sig === state.homeRecentSig) return;
+  state.homeRecentSig = sig;
+  setShown("homeRecent", list.length > 0);
+  $("homeRecentList").replaceChildren(...list.map(entry => {
+    const row = element("button", undefined, "recent-row");
+    row.type = "button";
+    row.dataset.url = entry.u;
+    row.title = entry.u;
+    row.appendChild(element("strong", entry.t || hostOf(entry.u), "recent-title"));
+    row.appendChild(element("span", hostOf(entry.u), "recent-host"));
+    row.addEventListener("click", () => perform(() => openWebUrl(entry.u)));
+    return row;
+  }));
+}
+
+// The first https address in the copied text (a single plain address is passed on as it is: the Hub validates it).
+function clipboardUrl(text) {
+  const t = String(text || "").trim();
+  if (!t) return "";
+  if (t.length <= 2048 && !/\s/.test(t)) return t;
+  const m = /https?:\/\/[^\s<>"']+/i.exec(t);
+  return m ? m[0].replace(/[.,;:)\]}]+$/, "") : "";
+}
+
+// Clipboard access happens here only, on the tap. Without the API (or when it is refused) the address bar gets the focus.
+async function openClipboardUrl() {
+  let text = "";
+  if (navigator.clipboard && typeof navigator.clipboard.readText === "function") {
+    try { text = await navigator.clipboard.readText(); } catch (e) { text = ""; }
+  }
+  const url = clipboardUrl(text);
+  if (url) { await openWebUrl(url); return; }
+  if (text) flash("コピーした内容にURLが見つかりません");
+  const box = $("omnibox");
+  box.focus();
+}
+
 // --------------------------------------------------------------- bookmarks
 function renderBookmarks(b) {
   state.bookmarks = Array.isArray(b.items) ? b.items : [];
@@ -1037,7 +1227,7 @@ function renderSpeedDial() {
 function renderBookmarkList() {
   const list = $("bookmarkItems");
   if (!state.bookmarks.length) {
-    list.replaceChildren(element("p", "ブックマークはまだありません。", "empty-state"));
+    list.replaceChildren(emptyState("ブックマークはありません", "Webタブの ☆ から追加できます"));
     return;
   }
   const nodes = [];
@@ -1674,6 +1864,7 @@ function applyRemoteMeta(tab, f) {
     changed = true;
     if (!loading) scheduleRemoteLinks(tab);
   }
+  if (!loading && url !== "" && changed && !tab.diag) noteVisit(url, title);     // v0.1.62: recent pages (idempotent for the same page)
   if (typeof f.editable === "boolean") setEditable(tab, f.editable, false);
   if (Number.isFinite(f.popups) && f.popups !== rb.popups) { rb.popups = f.popups; changed = true; }
   if (f.blocked && f.blocked !== rb.blocked) toast(String(f.blocked), "error");
@@ -2641,7 +2832,13 @@ function tabDisplay(tab) {
 
 // 「表示: リーダー / 高速 / ライブ」 from the menu: remembered per host.
 function setUserDisplay(tab, mode) {
-  if (tab && mode === "pt") { perform(() => enterPt(tab)); return; }                      // v0.1.57
+  if (tab && mode === "pt") {                                                              // v0.1.57
+    perform(async () => {
+      await enterPt(tab);
+      if (tab.pt) { const host = hostOf(tab.current || ""); if (host) rememberHostMode(host, REMOTE_PT_MODE); renderRemoteHosts(); }   // v0.1.62
+    });
+    return;
+  }
   if (tab && tab.pt && MODE_OF_DISPLAY[mode]) { leavePt(tab, mode); return; }
   if (!tab || !tab.rb || !RB_DISPLAY_LABELS[mode]) return;
   const host = hostOf(tab.current || "");
@@ -5702,8 +5899,33 @@ function onPopState() {
 }
 
 // Open a URL typed/clicked by the user: in the active web tab, else a new tab. Always the NAS browser.
+// v0.1.62: an address whose site has passthrough remembered, when passthrough is available now: the plain https
+// address to open in the frame, else "" (the NAS browser opens it with the site's remembered or the default display).
+// Decided on this device from what it already knows (no request, so opening a page costs nothing extra).
+function rememberedPtUrl(value) {
+  if (!ptAvailable() || typeof value !== "string") return "";
+  const v = value.trim();
+  const url = /^https:\/\/[^\s]+$/i.test(v) ? v : /^[a-z0-9-]+(\.[a-z0-9-]+)+(:\d+)?(\/\S*)?$/i.test(v) ? "https://" + v : "";
+  return url && url.length <= 2048 && rememberedMode(hostOf(url)) === REMOTE_PT_MODE ? url : "";
+}
+
+async function openRememberedPt(tab, url) {
+  if (tab.pt) { pushHistory(tab, url); tab.current = url; tab.ptTitle = ""; saveTabs(); await ptGo(tab, url); return; }
+  pushHistory(tab, url);
+  tab.current = url;
+  saveTabs();
+  await enterPt(tab);
+}
+
 async function openWebUrl(value) {
   const tab = activeWebTab();
+  const ptUrl = rememberedPtUrl(value);
+  if (ptUrl && (tab || !tabLimitReached())) {     // v0.1.62: the site's remembered display is passthrough
+    const target = tab || createTab();
+    if (!tab) navigate("#/tab/" + target.id);
+    await openRememberedPt(target, ptUrl);
+    return;
+  }
   if (tab) { await (tab.pt ? ptNavigateTo(tab, value) : navigateTab(tab, value)); return; }   // v0.1.57: pt tabs stay in the frame
   if (tabLimitReached()) return;
   // v0.1.59: an address that looks right goes straight into the tabs request (the Hub validates it there and
@@ -5879,6 +6101,7 @@ async function ptStep(tab, delta) {
 function ptNav(tab, m) {
   if (m.kind === "title") {
     tab.ptTitle = String(m.title || "").slice(0, 200);
+    if (tab.current) noteVisit(tab.current, tab.ptTitle);      // v0.1.62
     if (activeWebTab() === tab) updateWebStatus(tab);
     return;
   }
@@ -5901,6 +6124,7 @@ function ptNav(tab, m) {
   }
   tab.current = url;
   saveTabs();
+  noteVisit(url, tab.ptTitle);      // v0.1.62: recent pages
   if (activeWebTab() === tab) { updateChrome(); updateWebStatus(tab); setShown("remoteLoading", false); }
 }
 
@@ -6102,6 +6326,11 @@ function configureMenu() {
     n.setAttribute("aria-checked", String(n.dataset.display === display));
   });
   $("menuPerf").setAttribute("aria-checked", String(Boolean(state.rbPerf)));
+  // v0.1.62: only offered while this site has a remembered display
+  const forget = $("menuForgetSite");
+  const site = web ? siteKey(hostOf(tab.current || tab.history[tab.index] || "")) : "";
+  forget.hidden = !(web && hasSiteDisplay(tab.current || tab.history[tab.index] || ""));
+  forget.textContent = "このサイトの表示を忘れる" + (site ? "（" + site + "）" : "");
 }
 
 function openMenu() {
@@ -6122,6 +6351,7 @@ async function menuAction(action) {
   else if (action.startsWith("quality:")) setRbQuality(action.slice(8));
   else if (action.startsWith("display:")) setUserDisplay(tab, action.slice(8));
   else if (action === "perf") setPerf(!state.rbPerf);
+  else if (action === "forgetSite" && tab) forgetSiteDisplay(tab);
   else if (action === "stageUrl" && tab) await stageTabUrl(tab);
   else if (action === "bookmark" && tab) await bookmarkTab(tab);
   else if (action === "closeTab" && tab) closeTab(tab.id);
@@ -6130,6 +6360,17 @@ async function menuAction(action) {
   else if (action === "bookmarks") navigate("#/settings/browser/bookmarks");
   else if (action === "settings") navigate(settingsHash());
   else if (action === "logout") await logout();
+}
+
+// v0.1.62: 「このサイトの表示を忘れる」: the site goes back to the default display (settings).
+function forgetSiteDisplay(tab) {
+  const host = hostOf(tab.current || tab.history[tab.index] || "");
+  if (!host || !hasSiteDisplay(host)) return;
+  rememberHostMode(host, "");
+  renderRemoteHosts();
+  if (tab.rb && !tab.pt) { tab.rb.tilesFor = ""; tab.rb.readerFail = null; tab.rb.mirrorFail = null; applyDisplay(tab); }
+  updateChrome();
+  flash("このサイトの表示を忘れました（" + siteKey(host) + "）");
 }
 
 async function stageTabUrl(tab) {
@@ -6378,18 +6619,25 @@ function swipeRow(body, cfg) {
   wrap.dataset.key = cfg.key;
   const left = element("div", undefined, "swipe-under swipe-under-left");
   const right = element("div", undefined, "swipe-under swipe-under-right");
-  let startButton = null;
+  let startButton = null, pauseButton = null;
   if (cfg.startLabel) {
     startButton = element("button", cfg.startLabel, "swipe-btn " + (cfg.startLabel === "停止" ? "stop" : "start"));
     startButton.type = "button";
     left.appendChild(startButton);
+    // v0.1.62: a swipe to the LEFT reveals both 一時停止／再開 and 一覧から消す (a swipe to the right keeps its 開始／停止)
+    pauseButton = element("button", cfg.startLabel === "停止" ? "一時停止" : "再開",
+      "swipe-btn " + (cfg.startLabel === "停止" ? "stop" : "start"));
+    pauseButton.type = "button";
+    right.appendChild(pauseButton);
   }
-  const deleteButton = element("button", "削除", "swipe-btn delete");
+  const deleteButton = element("button", cfg.startLabel ? "消す" : "削除", "swipe-btn delete");
   deleteButton.type = "button";
+  deleteButton.setAttribute("aria-label", "一覧から消す（ファイルは残す）");
   right.appendChild(deleteButton);
+  const leftReveal = SWIPE_REVEAL * (pauseButton ? 2 : 1);
   body.classList.add("swipe-body");
   wrap.append(left, right, body);
-  const buttons = [startButton, deleteButton].filter(Boolean);
+  const buttons = [startButton, pauseButton, deleteButton].filter(Boolean);
   let offset = 0, startX = 0, startY = 0, startOffset = 0, axis = null, pid = null;
   let width = 320, timer = null, endedAt = 0;
 
@@ -6420,7 +6668,7 @@ function swipeRow(body, cfg) {
       // A full swipe runs the safe default: start/stop, or remove from the list only.
       if (deleting) cfg.onDelete(); else cfg.onStart();
     } else if (Math.abs(offset) >= SWIPE_REVEAL / 2) {
-      reveal(offset < 0 ? -SWIPE_REVEAL : SWIPE_REVEAL);
+      reveal(offset < 0 ? -leftReveal : SWIPE_REVEAL);
     } else {
       handle.close();
     }
@@ -6478,6 +6726,7 @@ function swipeRow(body, cfg) {
     }
   }, true);
   if (startButton) startButton.addEventListener("click", () => { handle.close(); cfg.onStart(); });
+  if (pauseButton) pauseButton.addEventListener("click", () => { handle.close(); cfg.onStart(); });
   deleteButton.addEventListener("click", () => { handle.close(); cfg.onDeleteSheet(); });
   wrap.addEventListener("keydown", e => {
     if (e.key === "Escape" && swipeState.open === handle) handle.close();
@@ -6791,8 +7040,60 @@ function bulkDeleteSheet() {
   }]);
 }
 
+// v0.1.62: JD2 has no "failed" flag in the snapshot: an item that is neither running nor finished and whose status
+// text names a problem is counted as failed (and left out of 待機).
+const FAILED_STATUS = /error|fail|offline|invalid|incorrect|expired|not\s*found|エラー|失敗|オフライン|見つかりません|期限|無効なリンク/i;
+function isFailed(item) {
+  return item.finished !== true && item.running !== true && typeof item.status === "string" && FAILED_STATUS.test(item.status);
+}
+
+// Totals for the summary at the top of the downloads tab; only what the fetched page holds (packages, else files).
+function summarizeDownloads(snap) {
+  const out = {running: 0, waiting: 0, finished: 0, failed: 0, speed: 0, eta: null, hasMore: false, total: 0};
+  if (!snap) return out;
+  const rows = snap.packages && snap.packages.length ? snap.packages : snap.links || [];
+  let remaining = 0, remainingKnown = true, maxEta = null;
+  for (const item of rows) {
+    out.total++;
+    if (item.finished === true) { out.finished++; continue; }
+    if (item.running === true) {
+      out.running++;
+      if (typeof item.speed_bytes === "number") out.speed += item.speed_bytes;
+      if (typeof item.eta_seconds === "number") maxEta = maxEta === null ? item.eta_seconds : Math.max(maxEta, item.eta_seconds);
+    } else if (isFailed(item)) out.failed++;
+    else out.waiting++;
+    if (item.running === true || !isFailed(item)) {
+      if (typeof item.bytes_total === "number" && item.bytes_total > 0) {
+        remaining += Math.max(0, item.bytes_total - (typeof item.bytes_loaded === "number" ? item.bytes_loaded : 0));
+      } else remainingKnown = false;
+    }
+  }
+  // Remaining time of everything that still has to be downloaded at the current total speed; else the longest
+  // per-item estimate; unknown when neither exists (nothing running).
+  if (out.running > 0 && out.speed > 0 && remainingKnown) out.eta = Math.ceil(remaining / out.speed);
+  else if (out.running > 0 && maxEta !== null) out.eta = maxEta;
+  out.hasMore = Boolean(snap.has_more);
+  return out;
+}
+
+function renderDownloadsSummary(snap, hasItems) {
+  const box = $("downloadsSummary");
+  box.hidden = !hasItems;
+  if (!hasItems) return;
+  const sum = summarizeDownloads(snap);
+  $("dlSpeed").textContent = sum.running ? "合計 " + readableSize(sum.speed) + "/秒" : "停止中";
+  $("dlEta").textContent = sum.running && sum.eta !== null ? "残り " + readableEta(sum.eta) : "";
+  $("dlCountRunning").textContent = String(sum.running);
+  $("dlCountWaiting").textContent = String(sum.waiting);
+  $("dlCountFinished").textContent = String(sum.finished);
+  $("dlCountFailed").textContent = String(sum.failed);
+  box.classList.toggle("has-failed", sum.failed > 0);
+  box.title = sum.hasMore ? "このページ（" + sum.total + "件）の集計です" : "";
+}
+
 function matchesFilter(item) {
-  if (state.filter !== "all" && itemState(item) !== state.filter) return false;
+  if (state.filter === "failed") { if (!isFailed(item)) return false; }
+  else if (state.filter !== "all" && itemState(item) !== state.filter) return false;
   const q = state.query.trim().toLowerCase();
   return !q || String(item.name).toLowerCase().includes(q);
 }
@@ -6839,7 +7140,7 @@ function renderDownloads() {
   if (!snap) {
     list.replaceChildren(); orphans.replaceChildren();
     setShown("orphanFiles", false); setShown("downloadsTools", false);
-    $("downloadsSummary").textContent = "";
+    renderDownloadsSummary(null, false);
     return;
   }
   const hasItems = snap.packages.length > 0 || snap.links.length > 0;
@@ -6869,19 +7170,15 @@ function renderDownloads() {
   if (!snap.packages.length) for (const file of looseShown) nodes.push(fileRow(file));
   if (!nodes.length) {
     const filtering = state.filter !== "all" || state.query.trim() !== "";
-    nodes.push(element("p", filtering && hasItems ? "条件に一致するものはありません" :
-      "ダウンロードはありません。「リンク」から追加できます", "empty-state"));
+    nodes.push(filtering && hasItems ? emptyState("条件に一致するものはありません", "絞り込みを変えてください") :
+      emptyState("ダウンロードはありません", "「リンク」から追加できます"));
   }
   list.replaceChildren(...nodes);
   const showLoose = snap.packages.length > 0 && looseShown.length > 0;
   setShown("orphanFiles", showLoose);
   orphans.replaceChildren(...(showLoose ? looseShown.map(fileRow) : []));
   $("orphanSummary").textContent = "他のファイル（" + looseShown.length + "件）";
-  const rows = snap.packages.length ? snap.packages : snap.links;
-  const counts = {running: 0, waiting: 0, finished: 0};
-  for (const item of rows) counts[itemState(item)]++;
-  $("downloadsSummary").textContent = hasItems ? "実行中 " + counts.running + " · 待機 " +
-    counts.waiting + " · 完了 " + counts.finished : "";
+  renderDownloadsSummary(snap, hasItems);       // v0.1.62
   for (const key of Array.from(swipeState.select.keys)) {
     if (!swipeState.index.has(key)) swipeState.select.keys.delete(key);
   }
@@ -6979,7 +7276,9 @@ async function loadDownloads(page, options = {}) {
   state.downloadsBusy = true;
   $("downloadsRefresh").disabled = true;
   try {
-    const snap = await api("/api/jd2/downloads?page=" + page);
+    const request = api("/api/jd2/downloads?page=" + page);
+    trackLoad(request);        // v0.1.62: the progress line when the list takes longer than 300 ms
+    const snap = await request;
     state.snapshot = snap;
     state.snapshotJson = JSON.stringify(snap);
     state.snapshotAt = Date.now();
@@ -7023,6 +7322,13 @@ function setFilter(filter) {
 function jd2CanSend() { return Boolean(state.live && state.live.engine && state.live.engine.can_send === true); }
 
 const LINK_STATE_LABELS = {staged: "未送信", sending: "送信中", uncertain: "要確認", sent: "送信済み"};
+// v0.1.62: what this page is doing with a link right now: id -> {s: "sending" | "failed", msg}. Shown over the Hub's
+// state so 送信中 / 失敗 are visible while a hand-off runs and after it failed (the Hub keeps a failed link as 未送信).
+const linkUi = new Map();
+function setLinkUi(id, st, msg) {
+  if (st) linkUi.set(id, {s: st, msg: msg || ""}); else linkUi.delete(id);
+}
+function repaintQueue() { if (state.queueData) renderQueue(state.queueData); }
 
 function renderQueue(q) {
   state.queueData = q;
@@ -7031,17 +7337,24 @@ function renderQueue(q) {
   const staged = q.items.filter(l => l.state === "staged");
   setShown("sendAll", canSend && staged.length >= 2);
   setShown("linksMore", q.items.length > 0);   // history deletion only exists when there is something
-  if (!q.items.length) nodes.push(element("p", "追加したリンクはありません", "empty-state"));
+  if (!q.items.length) nodes.push(emptyState("追加したリンクはありません", "上の欄に貼り付けると追加できます"));
   for (const link of q.items) {
     const container = element("div", undefined, "item link-item");
     container.appendChild(element("span", link.url, "link-url"));
     const row = element("div", undefined, "link-actions");
-    const chip = element("span", LINK_STATE_LABELS[link.state] || link.state, "state-chip link-" + link.state);
+    const ui = linkUi.get(link.id);
+    const live = link.state === "staged" && ui ? ui.s : "";            // v0.1.62: this page's view of a staged link
+    const chip = live === "sending" ? element("span", "送信中", "state-chip link-sending is-live") :
+      live === "failed" ? element("span", "失敗", "state-chip link-failed") :
+      element("span", LINK_STATE_LABELS[link.state] || link.state, "state-chip link-" + link.state);
+    if (live === "failed") chip.title = ui.msg || "送信できませんでした";
     if (link.state === "uncertain" || link.state === "sending") chip.title = "送信結果が不明です。JD2で確認してください";
     row.appendChild(chip);
-    if (link.state === "staged") {
+    container.dataset.state = live || link.state;
+    if (live === "failed" && ui.msg) row.appendChild(element("span", ui.msg, "link-note"));
+    if (link.state === "staged" && live !== "sending") {
       if (canSend) {
-        const send = element("button", "JD2へ送る", "btn small");
+        const send = element("button", live === "failed" ? "再送信" : "JD2へ送る", "btn small");
         send.type = "button";
         send.addEventListener("click", () => perform(() => sendLinks([link])));
         row.appendChild(send);
@@ -7089,15 +7402,22 @@ async function sendLinks(links, opts = {}) {
   // Only the Links page "send all" (5+ links) asks; every other send was asked for explicitly.
   if (opts.confirmMany && links.length >= 5 &&
       !confirm(links.length + "件のリンクをJD2へ順に送ります。" + sendStartText() + "続けますか？")) return;
-  let sent = 0;
+  let sent = 0, current = null;
+  for (const link of links) setLinkUi(link.id, "sending");     // v0.1.62: every link in this hand-off shows 送信中 at once
+  repaintQueue();
   try {
     for (const link of links) {
+      current = link;
       await api("/api/links/send", {id: link.id});
+      setLinkUi(link.id, "");
       sent++;
     }
   } catch (e) {
+    for (const link of links) setLinkUi(link.id, "");
+    if (current) setLinkUi(current.id, "failed", e.message);    // the link that failed; the rest were not tried
     swrDrop("links");
     await loadQueue(true).catch(() => {});
+    repaintQueue();
     throw new Error((many ? sent + "/" + links.length + "件送信後に停止: " : "") + e.message);
   }
   swrDrop("links");
@@ -7122,6 +7442,7 @@ function schedulePaste(delay = PASTE_DEBOUNCE_MS) {
   state.pasteSeq++;
   state.paste = null;
   $("pasteAdd").disabled = true;
+  $("pasteSend").disabled = true;
   if (!$("pasteBox").value.trim()) { setShown("pasteResult", false); return; }
   state.pasteTimer = setTimeout(() => perform(runPastePreview), delay);
 }
@@ -7133,6 +7454,10 @@ function showPaste(summary, urls, buttonLabel) {
   $("pasteList").replaceChildren(...urls.map(u => element("div", u, "item")));
   $("pasteAdd").textContent = buttonLabel || "追加";
   $("pasteAdd").hidden = !buttonLabel;
+  // v0.1.62: the send button is there at once (when JD2 can take links), next to the count
+  const send = $("pasteSend");
+  send.hidden = !(buttonLabel && jd2CanSend());
+  send.textContent = urls.length > 1 ? urls.length + "件を追加してJD2へ送る" : "追加してJD2へ送る";
   setShown("pasteResult", true);
 }
 
@@ -7145,6 +7470,7 @@ async function runPastePreview() {
     state.paste = {kind: "url", url: text};
     showPaste("追加するURL", [text], "このURLを追加");
     $("pasteAdd").disabled = false;
+    $("pasteSend").disabled = false;
     return;
   }
   const preview = await api("/api/rapidgator/extract", {content, limit: 20, commit: false});
@@ -7155,12 +7481,13 @@ async function runPastePreview() {
       "追加できるリンクが見つかりません", [], "");
     return;
   }
-  state.paste = {kind: "extract", content, digest: preview.digest, limit: 20, count: preview.count};
+  state.paste = {kind: "extract", content, digest: preview.digest, limit: 20, count: preview.count, urls: preview.items};
   showPaste(preview.count + "件見つかりました", preview.items, preview.count + "件を追加");
   $("pasteAdd").disabled = false;
+  $("pasteSend").disabled = false;
 }
 
-async function addPasted() {
+async function addPasted(thenSend = false) {
   const pasted = state.paste;
   if (!pasted) return;
   if (pasted.kind === "extract" && $("pasteBox").value !== pasted.content) {
@@ -7169,6 +7496,7 @@ async function addPasted() {
     return;
   }
   $("pasteAdd").disabled = true;
+  $("pasteSend").disabled = true;
   state.paste = null;
   let message;
   if (pasted.kind === "url") {
@@ -7187,6 +7515,28 @@ async function addPasted() {
   swrDrop("links");
   await loadQueue(true);
   flash(message);
+  if (thenSend && jd2CanSend()) {       // v0.1.62: 追加してJD2へ送る: only the links of this paste that are still 未送信
+    const wanted = new Set(pasted.kind === "url" ? [pasted.url] : pasted.urls || []);
+    const items = state.queueData ? state.queueData.items.filter(l => l.state === "staged" && wanted.has(l.url)) : [];
+    if (items.length) await sendLinks(items);
+  }
+}
+
+// v0.1.62: 貼り付け button. The clipboard is read only here (an explicit tap); without the API, or when it is
+// refused, the box gets the focus so the long-press paste of the phone works.
+async function pasteFromClipboard() {
+  let text = "";
+  if (navigator.clipboard && typeof navigator.clipboard.readText === "function") {
+    try { text = await navigator.clipboard.readText(); } catch (e) { text = ""; }
+  }
+  const box = $("pasteBox");
+  if (!text.trim()) {
+    box.focus();
+    flash("コピーした内容を読めませんでした。欄を長押しして「ペースト」してください");
+    return;
+  }
+  box.value = text.slice(0, PASTE_LIMIT);
+  schedulePaste(0);        // the count and the buttons appear at once
 }
 
 // -------------------------------------------------------------- settings
@@ -7819,7 +8169,8 @@ function teardownSession() {
       "folderPicker", "bookmarkItems", "shareDevices", "accountsList", "speedDial", "bookmarkBar", "webTabs"]) {
     $(id).replaceChildren();
   }
-  $("downloadsSummary").textContent = "";
+  renderDownloadsSummary(null, false);
+  state.homeTabsSig = ""; $("homeTabGrid").replaceChildren(); setShown("homeTabs", false);     // v0.1.62
   $("pasteBox").value = "";
   hideShareToken();
   setShown("pasteResult", false);
@@ -8092,6 +8443,8 @@ function wireDownloads() {
   $("linksMore").addEventListener("click", linksMenu);
   $("homeEngineSetup").addEventListener("click", () => perform(() => startEngineSetup()));
   $("homeEngineStart").addEventListener("click", () => perform(startEngine));
+  $("homePasteOpen").addEventListener("click", () => perform(openClipboardUrl));     // v0.1.62: clipboard read on this tap only
+  $("homeRecentClear").addEventListener("click", clearRecent);
   $("downloadsEngineAction").addEventListener("click", () => {
     if ($("downloadsEngineAction").dataset.action === "setup") navigate("#/settings/jd2/engine");
     else perform(startEngine);
@@ -8109,7 +8462,9 @@ function wireDownloads() {
 }
 
 function wireLinks() {
-  $("pasteBox").addEventListener("input", () => schedulePaste());
+  $("pasteBox").addEventListener("input", e => schedulePaste(e && e.inputType === "insertFromPaste" ? 0 : PASTE_DEBOUNCE_MS));
+  $("pasteButton").addEventListener("click", () => perform(pasteFromClipboard));
+  $("pasteSend").addEventListener("click", () => perform(() => addPasted(true)));
   $("pasteAdd").addEventListener("click", () => perform(addPasted));
   $("sendAll").addEventListener("click", () => perform(sendAllStaged));
 }
@@ -8232,7 +8587,7 @@ function applyState(d) {
   if (engineChanged || !state.engine) {
     if (engineDetailWanted() && !first) {
       swrDrop("engine");
-      loadEngine(true).then(() => { if ($("engineLogBox").open) return loadEngineLog(); }).catch(() => {});
+      loadEngine(true).then(() => { if ($("engineAdvanced").open) return loadEngineLog(); }).catch(() => {});
       if (e.running) loadJd2Status(true).catch(() => {});
     } else {
       applyEngineLight(e);
@@ -8380,8 +8735,17 @@ function renderEngine(e) {
     if (current && typeof current.progress === "number") progress.value = current.progress;
     else progress.removeAttribute("value");
   }
+  // v0.1.62: the error is one line with a 詳しく toggle (the full text is one tap away)
+  const errorText = e.error || "";
+  if ($("engineError").textContent !== errorText) {
+    $("engineError").classList.add("is-clamped");
+    $("engineErrorMore").textContent = "詳しく";
+    $("engineErrorMore").setAttribute("aria-expanded", "false");
+  }
   $("engineError").hidden = !e.error;
-  $("engineError").textContent = e.error || "";
+  $("engineError").textContent = errorText;
+  setShown("engineErrorRow", Boolean(e.error));
+  setShown("engineErrorMore", Boolean(e.error));
   if (!running) $("engineTestResult").textContent = "";
   setShown("engineAutostartRow", e.installed === true);
   $("engineAutostart").checked = Boolean(e.autostart);
@@ -10227,8 +10591,10 @@ function renderRemoteHosts() {
   const nodes = [];
   for (const host of hosts) {
     const row = element("div", undefined, "item");
-    const shown = DISPLAY_OF_MODE[rememberedMode(host)];
-    row.appendChild(element("span", host + "（" + (shown ? RB_DISPLAY_LABELS[shown] : "既定の表示") + "）"));
+    const stored = rememberedMode(host);
+    const shown = DISPLAY_OF_MODE[stored];
+    row.appendChild(element("span", host + "（" + (stored === REMOTE_PT_MODE ? PT_DISPLAY_LABEL :
+      shown ? RB_DISPLAY_LABELS[shown] : "既定の表示") + "）"));
     const off = element("button", "解除", "btn small");
     off.type = "button";
     off.addEventListener("click", () => { rememberHostMode(host, ""); renderRemoteHosts(); });
@@ -10614,8 +10980,13 @@ function wireEngine() {
   $("engineKeysCopy").addEventListener("click", async () => {
     copyText($("engineKeysOut").textContent);
   });
-  $("engineLogBox").addEventListener("toggle", () => {
-    if ($("engineLogBox").open) perform(loadEngineLog);
+  $("engineErrorMore").addEventListener("click", () => {      // v0.1.62
+    const clamped = $("engineError").classList.toggle("is-clamped");
+    $("engineErrorMore").textContent = clamped ? "詳しく" : "閉じる";
+    $("engineErrorMore").setAttribute("aria-expanded", String(!clamped));
+  });
+  $("engineAdvanced").addEventListener("toggle", () => {      // the log is read when 詳細・ログ is opened
+    if ($("engineAdvanced").open) perform(loadEngineLog);
   });
   $("rbLogBox").addEventListener("toggle", () => {
     if ($("rbLogBox").open) perform(loadBrowserLog);

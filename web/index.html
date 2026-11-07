@@ -130,6 +130,7 @@
        <button type="button" role="menuitemradio" data-action="quality:high" data-quality="high">高画質</button>
       </div>
       <button type="button" role="menuitemcheckbox" data-action="perf" data-scope="remote" id="menuPerf" class="menu-toggle">速度表示<span class="menu-check" aria-hidden="true"></span></button>
+      <button type="button" role="menuitem" data-action="forgetSite" data-scope="remote" id="menuForgetSite" hidden>このサイトの表示を忘れる</button>
       <hr>
       <button type="button" role="menuitem" data-action="stageUrl">このURLをリンクに追加</button>
       <button type="button" role="menuitem" data-action="bookmark">ブックマークに追加</button>
@@ -149,6 +150,8 @@
  <div id="bookmarkBar" class="bookmark-bar" aria-label="ブックマークバー" hidden></div>
 
  <main id="content" class="content">
+  <!-- v0.1.62: one thin progress line for app-screen data loads that take longer than 300 ms (the web tab has its own #webLoading) -->
+  <div id="appLoading" class="loading-bar app-loading" role="progressbar" aria-label="読み込み中" hidden></div>
   <section id="view-home" class="view" role="tabpanel" aria-label="新しいタブ" hidden>
    <div class="page">
     <h1 class="home-title"><img src="/icon.svg" width="34" height="34" alt=""> QnapDownloader <small class="js-version"></small></h1>
@@ -178,6 +181,22 @@
      <a id="homeStatusLink" class="home-status-link" href="#/downloads" hidden></a>
      <button type="button" id="homeEngineStart" class="btn small" hidden>起動</button>
     </div>
+    <!-- v0.1.62: open tabs, copied-URL chip, recent pages (client-side only), then the bookmarks -->
+    <section id="homeTabs" class="home-block" aria-label="開いているタブ" hidden>
+     <h2>開いているタブ</h2>
+     <div id="homeTabGrid" class="tab-grid"></div>
+    </section>
+    <div class="home-chips">
+     <button type="button" id="homePasteOpen" class="chip-btn">コピーしたURLを開く</button>
+    </div>
+    <section id="homeRecent" class="home-block" aria-label="最近見たページ" hidden>
+     <div class="section-head">
+      <h2>最近見たページ</h2>
+      <button type="button" id="homeRecentClear" class="btn small quiet">履歴を消す</button>
+     </div>
+     <div id="homeRecentList" class="items recent-list"></div>
+    </section>
+    <h2 id="homeBookmarksTitle" class="home-h2">ブックマーク</h2>
     <div id="speedDial" class="dial"></div>
     <p id="speedDialEmpty" class="muted" hidden>ブックマークはありません。Webタブの ☆ で追加できます。</p>
    </div>
@@ -214,10 +233,20 @@
        <button type="button" class="chip" data-filter="running" aria-pressed="false">実行中</button>
        <button type="button" class="chip" data-filter="waiting" aria-pressed="false">待機</button>
        <button type="button" class="chip" data-filter="finished" aria-pressed="false">完了</button>
+       <button type="button" class="chip" data-filter="failed" aria-pressed="false">失敗</button>
       </div>
       <input type="search" id="downloadsSearch" class="search" placeholder="名前で絞り込み" aria-label="名前で絞り込み" maxlength="200" autocomplete="off">
      </div>
-     <div id="downloadsSummary" class="summary-line muted"></div>
+     <!-- v0.1.62: total speed, ETA and the counts, computed from the list already fetched (no extra request) -->
+     <div id="downloadsSummary" class="dl-summary" aria-live="off" hidden>
+      <div class="dl-summary-main"><b id="dlSpeed" class="dl-speed"></b><span id="dlEta" class="muted"></span></div>
+      <div class="dl-summary-counts">
+       <span class="dl-count is-running"><b id="dlCountRunning">0</b>進行中</span>
+       <span class="dl-count is-waiting"><b id="dlCountWaiting">0</b>待機</span>
+       <span class="dl-count is-finished"><b id="dlCountFinished">0</b>完了</span>
+       <span class="dl-count is-failed"><b id="dlCountFailed">0</b>失敗</span>
+      </div>
+     </div>
      <div id="downloadList" class="items"></div>
      <details id="orphanFiles" class="fold" hidden>
       <summary id="orphanSummary">その他のファイル</summary>
@@ -238,12 +267,19 @@
      <h1>リンク</h1>
      <span class="head-tools"><button type="button" id="linksMore" class="icon-btn small" aria-label="リンクの操作" aria-haspopup="dialog" title="履歴の削除" hidden><svg class="icon" aria-hidden="true"><use href="#i-more"/></svg></button></span>
     </div>
-    <label for="pasteBox">リンクを貼り付け（URL・テキスト・HTML）</label>
+    <p class="muted links-help">コピーしたリンクを「貼り付け」で入れると、見つかった件数をすぐ表示します。「追加」で一覧に保存、「JD2へ送る」でそのままダウンロードを始めます。</p>
+    <div class="paste-head">
+     <label for="pasteBox">リンクを貼り付け（URL・テキスト・HTML）</label>
+     <button type="button" id="pasteButton" class="btn small">貼り付け</button>
+    </div>
     <textarea id="pasteBox" rows="3" maxlength="65536" placeholder="https://…" autocomplete="off" autocapitalize="off" spellcheck="false"></textarea>
     <div id="pasteResult" class="paste-result" role="status" aria-live="polite" hidden>
      <p id="pasteSummary"></p>
      <div id="pasteList" class="items compact"></div>
-     <button type="button" id="pasteAdd" class="btn primary" disabled>追加</button>
+     <div class="paste-actions">
+      <button type="button" id="pasteAdd" class="btn primary" disabled>追加</button>
+      <button type="button" id="pasteSend" class="btn primary" disabled hidden>追加してJD2へ送る</button>
+     </div>
     </div>
     <div class="section-head">
      <h2>追加したリンク</h2>
@@ -266,7 +302,9 @@
      <section class="settings-section" data-section="jd2" hidden>
       <h1>JD2</h1>
       <div class="sub" data-sub="engine">
-       <h2>エンジン</h2>
+       <!-- v0.1.62: one status card: state, mode, the one action that fits the state, the error as one line -->
+       <div class="card engine-card">
+       <h2 class="card-title">エンジン</h2>
        <div class="engine-head">
         <p id="engineState" class="engine-state" role="status" aria-live="polite">確認しています…</p>
         <div class="engine-actions">
@@ -277,10 +315,13 @@
        </div>
        <p id="engineMode" class="set-text muted"></p>
        <button type="button" id="engineMigrate" class="btn small" hidden>コンテナへ移行</button>
-       <p id="engineNoContainer" class="engine-error" hidden>QTSのApp CenterでContainer Stationをインストールしてください（JD2を隔離して動かすために使います。入れない場合は「詳細」からQTS直接実行も選べます）</p>
+       <p id="engineNoContainer" class="engine-error" hidden>Container Stationが必要です（App Centerで入れてください。入れない場合は「詳細・ログ」からQTS直接実行も選べます）</p>
        <p id="engineProgressText" class="muted" hidden></p>
        <progress id="engineProgress" max="100" class="wide-progress" hidden></progress>
-       <p id="engineError" class="engine-error" hidden></p>
+       <div id="engineErrorRow" class="engine-error-row" hidden>
+        <p id="engineError" class="engine-error is-clamped" hidden></p>
+        <button type="button" id="engineErrorMore" class="btn small quiet" aria-expanded="false" hidden>詳しく</button>
+       </div>
        <p id="engineTestResult" class="set-text muted" role="status" aria-live="polite"></p>
        <div class="set-row" id="engineAutostartRow" hidden>
         <div class="set-main"><span class="set-label">Hub起動時にエンジンも起動</span></div>
@@ -292,30 +333,7 @@
         <button type="button" id="jd2Update" class="btn small" hidden>JD2を更新</button>
         <button type="button" id="jd2Preset" class="btn small">推奨設定を再適用</button>
        </div>
-       <details id="engineStepsBox" class="fold" hidden>
-        <summary id="engineStepsSummary">初期設定の進行状況</summary>
-        <ol id="engineSteps" class="engine-steps"></ol>
-       </details>
-       <details id="engineDetails" class="fold">
-        <summary>詳細</summary>
-        <div id="engineComponents" class="items"></div>
-        <p id="engineMeta" class="muted"></p>
-        <p class="muted">JD2とJavaはQPKGに同梱されません。公式の固定URLから取得し、SHA-256で検証して永続データ領域に置きます。</p>
-        <div id="engineNativeRow" class="engine-row" hidden>
-         <button type="button" id="engineNativeRemove" class="btn small">従来方式のJavaを削除</button>
-        </div>
-        <button type="button" id="engineSetupNative" class="btn small" hidden>QTS直接実行で初期設定（非推奨・Container Stationなし用）</button>
-        <button type="button" id="engineResetup" class="btn small" hidden>初期設定をやり直す</button>
-        <div id="engineKeysRow" hidden>
-         <button type="button" id="engineKeys" class="btn small">推奨設定の項目を調べる</button>
-         <button type="button" id="engineKeysCopy" class="btn small" hidden>コピー</button>
-         <pre id="engineKeysOut" class="update-log" hidden></pre>
-        </div>
-       </details>
-       <details id="engineLogBox" class="fold">
-        <summary>ログ</summary>
-        <pre id="engineLog" class="update-log">開くと表示します</pre>
-       </details>
+       </div>
       </div>
 
       <div class="sub" data-sub="accounts">
@@ -350,13 +368,6 @@
         <button type="submit" id="accountAdd" class="btn primary">追加</button>
        </form>
        <p id="accountResult" class="set-text muted" role="status" aria-live="polite"></p>
-       <details id="accountSchemaBox" class="fold">
-        <summary>詳細</summary>
-        <p class="muted">一覧に出ないアカウントがある場合は、この結果を開発者に送ってください</p>
-        <button type="button" id="accountSchema" class="btn small quiet">アカウント情報の項目を調べる</button>
-        <button type="button" id="accountSchemaCopy" class="btn small" hidden>コピー</button>
-        <pre id="accountSchemaOut" class="update-log" hidden></pre>
-       </details>
       </div>
 
       <div class="sub" data-sub="storage">
@@ -401,6 +412,41 @@
         <label class="switch" for="autoClearDownloads"><input type="checkbox" id="autoClearDownloads" role="switch" aria-label="完了・スキップしたダウンロードを自動で消す"><span class="switch-track" aria-hidden="true"></span></label>
        </div>
       </div>
+
+      <details id="engineAdvanced" class="fold">
+       <summary>詳細・ログ</summary>
+       <div id="engineStepsBox" class="adv-block" hidden>
+        <h3 id="engineStepsSummary">初期設定の進行状況</h3>
+        <ol id="engineSteps" class="engine-steps"></ol>
+              </div>
+       <div id="engineDetails" class="adv-block">
+        <h3>エンジンの詳細</h3>
+        <div id="engineComponents" class="items"></div>
+        <p id="engineMeta" class="muted"></p>
+        <p class="muted">JD2とJavaはQPKGに同梱されません。公式の固定URLから取得し、SHA-256で検証して永続データ領域に置きます。</p>
+        <div id="engineNativeRow" class="engine-row" hidden>
+         <button type="button" id="engineNativeRemove" class="btn small">従来方式のJavaを削除</button>
+        </div>
+        <button type="button" id="engineSetupNative" class="btn small" hidden>QTS直接実行で初期設定（非推奨・Container Stationなし用）</button>
+        <button type="button" id="engineResetup" class="btn small" hidden>初期設定をやり直す</button>
+        <div id="engineKeysRow" hidden>
+         <button type="button" id="engineKeys" class="btn small">推奨設定の項目を調べる</button>
+         <button type="button" id="engineKeysCopy" class="btn small" hidden>コピー</button>
+         <pre id="engineKeysOut" class="update-log" hidden></pre>
+        </div>
+              </div>
+       <div id="accountSchemaBox" class="adv-block">
+        <h3>アカウント情報の項目</h3>
+        <p class="muted">一覧に出ないアカウントがある場合は、この結果を開発者に送ってください</p>
+        <button type="button" id="accountSchema" class="btn small quiet">アカウント情報の項目を調べる</button>
+        <button type="button" id="accountSchemaCopy" class="btn small" hidden>コピー</button>
+        <pre id="accountSchemaOut" class="update-log" hidden></pre>
+              </div>
+       <div id="engineLogBox" class="adv-block">
+        <h3>ログ</h3>
+        <pre id="engineLog" class="update-log">開くと表示します</pre>
+              </div>
+      </details>
      </section>
 
      <section class="settings-section" data-section="browser" hidden>

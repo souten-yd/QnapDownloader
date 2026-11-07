@@ -42,6 +42,10 @@ selftest（設定›診断›自己テストを実行して、全項目が終わ
 ### 要求数の予算と楽観的UI（v0.1.59）
 budget-open-mirror / budget-open-reader（アドレスバーからページを開くと、本文が端末に出るまでの `/api/` 要求が3件以内。`page.on("request")` で数え、ページ内の10msポーラーが本文を見つけた瞬間の件数で切る。長いポーリング・画像・firstloadの報告は数えない。ミラーはリンクのタップも検証し、metaの長いポーリングを除いて3件以内）/ budget-idle-state（Downloads画面で何も起きない10秒間の `/api/state` 応答が1件以内）/ optimistic-switch（スイッチを押して200ms後、`page.route` で1.5秒止めた保存の返事を待たずに見た目と `state.settings` が変わり保存中の印が付く・500で失敗させると元に戻りエラーが出る）。selftest シナリオは新しい「操作の応答」セクション（画面切り替え・スイッチの反応・待機30秒の通信量・ページを開く通信回数）が全部合格することも確認する。
 
+### v0.1.60〜v0.1.62 のシナリオ
+- **v0.1.61**: bar-single-row（Webタブの上部が1段・⋮は1つ・右下の再読み込みボタン無し・旧2段メニューの項目がすべて1つのメニューにある）/ omnibox-domain（入力していないときはドメイン、フォーカスでURL全体）/ bar-collapse-mirror・bar-collapse-reader（スクロールで上部バーと下のタブバーが隠れ、戻すと再表示・隠れても表示サイズは変わらない）/ link-tap-feedback・reader-link-feedback（リンクをタップした瞬間の強調と進行線）/ app-shell-cache（Chromiumのみ: Service Workerがアプリ本体だけをキャッシュし、版が変わると捨てて1回だけ再読み込み、「アプリのキャッシュを消す」で解除）。
+- **v0.1.62**: home-tabs-recent（ブラウズホームに開いているタブのカードと最近見たページ・タップで切り替え・×でNASのタブごと閉じる・履歴の消去・クリップボードはタップするまで読まない・拒否時はアドレスバーへフォーカス）/ links-paste（貼り付けボタン＋件数＋「追加してJD2へ送る」・各リンクの送信中/失敗の表示と再送信）/ downloads-summary（`summarizeDownloads` の数値・ページの集計・失敗の絞り込み・左スワイプで一時停止/再開と消す・追加の要求が無い。JD2が動かないharnessなので一覧は注入。スワイプはChromiumのみ）/ settings-jd2-layout（セクション順・折りたたみは「詳細・ログ」1つで閉じている・旧ページの全コントロールのIDが残っている・エラーは1行で「詳しく」で展開・状態ごとに主ボタンは1つ）/ site-display-memory（登録可能ドメイン単位の記憶: 別サブドメインのページが最初からリーダーで開き、tabsリクエストに `first: reader` が載る・別ドメインは既定・「忘れる」・旧データの互換）/ site-display-pt（パススルーの記憶: 次のページは枠に直接開きNASのタブは作らない・使えないときは既定・忘れる。WebKitは未検証）/ toast-above-bar（430x873で通知が下のタブバーに重ならない・アプリの進行線は300ms未満では出ず、遅い取得で出て終わると消える）。
+
 ### 初回読み込みの計測（v0.1.54）
 `python3 tests/e2e/bench_firstload.py --runs 3 [--display mirror|reader] [--cdp-delay-ms 120] [--stats-delay 1.8] [--setting rb_spare_tab=false]` は、タップから本文・先頭画像・全体が端末に出るまでをページ内の20msポーラーで測り、中央値を出します（最初の1回は捨てます）。`--cdp-delay-ms` はNASのChromiumの応答遅延、`--stats-delay` は `docker stats` の所要時間を模擬します（実機のネットワークは再現しません）。このスクリプトとharness.py・fake_docker.pyを古い版に置けば「変更前」も同じ方法で測れます。
 

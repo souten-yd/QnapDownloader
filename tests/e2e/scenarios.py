@@ -1199,7 +1199,7 @@ def optimistic_switch(ph):
 
 NARROW = {"width": 430, "height": 873}
 MENU_ACTIONS = {"newTab", "reopen", "forward", "reload", "display:reader", "display:mirror", "display:tiles", "display:live",
-                "display:pt", "quality:speed", "quality:standard", "quality:high", "perf", "stageUrl", "bookmark", "closeTab",
+                "display:pt", "quality:speed", "quality:standard", "quality:high", "perf", "forgetSite", "stageUrl", "bookmark", "closeTab",
                 "bookmarks", "settings", "logout"}
 
 
@@ -1490,3 +1490,370 @@ def app_shell_cache(ph):
     after = _shell_state(ph)
     assert after["workerStart"] == 0 and not after["controller"], "the reset page was still served by the worker: %s" % after
     ph.take_errors("Failed to load resource")
+
+
+# ------------------------------------------------------------------ v0.1.62: home, links, downloads, JD2 settings, site display, feedback
+RG1 = "https://rapidgator.net/file/0123456789abcdef0123456789abcdef/a.rar"
+RG2 = "https://rapidgator.net/file/fedcba9876543210fedcba9876543210/b.rar"
+RG3 = "https://rapidgator.net/file/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/c.rar"
+
+
+def _go(ph, hash_):
+    ph.js("(h)=>{location.hash=h}", hash_)
+
+
+def _fake_clipboard(ph, text=None):
+    """Replace navigator.clipboard.readText with a counter (text=None: the read is refused). Returns nothing; the count
+    is window.__clipReads."""
+    ph.js("""(t)=>{window.__clipReads=0;
+      Object.defineProperty(navigator,'clipboard',{configurable:true,value:{readText:()=>{window.__clipReads++;
+        return t===null?Promise.reject(new Error('denied')):Promise.resolve(t)}}})}""", text)
+
+
+@scenario("home-tabs-recent")
+def home_tabs_recent(ph):
+    """v0.1.62: the browse home lists the open tabs as cards (tap = switch, x = close) and the recent pages (this device
+    only; cleared by the button), and the 「コピーしたURLを開く」 chip reads the clipboard only when it is tapped."""
+    ph.page.set_viewport_size(NARROW)
+    ph.js("()=>{localStorage.removeItem('qnapdl.recent.v1')}")
+    _fake_clipboard(ph, "  https://a.example.com/article2.html  ")
+    first = ph.open("/article.html")
+    ph.wait(lambda: "E2E" in ph.mirror_text(), 15, "first page")
+    _go(ph, "#/home")
+    ph.wait(lambda: _visible(ph, "#view-home:not([hidden]) .tab-card") == 1, 8, "one tab card")
+    second = None
+    ph.page.wait_for_timeout(300)
+    assert ph.js("window.__clipReads") == 0, "the clipboard was read without a tap"
+    # the chip opens the copied address in a NEW tab (the home has no tab of its own)
+    ph.page.locator("#homePasteOpen").tap()
+    ph.wait(lambda: ph.js("state.tabs.length") == 2, 15, "the copied URL opened a tab")
+    assert ph.js("window.__clipReads") == 1
+    ph.wait(lambda: "E2E" in ph.mirror_text(), 15, "second page")
+    ph.wait(lambda: ph.js("state.tabs.filter(t=>t.rb).length") == 2, 10, "both tabs have a NAS tab")
+    _go(ph, "#/home")
+    ph.wait(lambda: _visible(ph, "#view-home:not([hidden]) .tab-card") == 2, 8, "two tab cards")
+    card = ph.js("""()=>{const c=document.querySelector('#homeTabGrid .tab-card');
+      return {host:c.querySelector('.tab-card-host').textContent, mode:(c.querySelector('.tab-card-mode')||{}).textContent||'',
+              title:c.querySelector('.tab-card-title').textContent}}""")
+    assert card["host"] == "a.example.com" and card["mode"] and card["title"], card
+    # tap = switch
+    ph.page.locator("#homeTabGrid .tab-card .tab-card-main").first.tap()
+    ph.wait(lambda: ph.js("state.route.view === 'tab'"), 5, "switched to the tab")
+    assert ph.js("state.route.tabId") == ph.js("state.tabs[0].id")
+    # x = close (the NAS tab goes with it)
+    _go(ph, "#/home")
+    ph.wait(lambda: _visible(ph, "#view-home:not([hidden]) .tab-card") == 2, 8, "cards again")
+    gone = ph.js("state.tabs[1].rb && state.tabs[1].rb.id")
+    ph.page.locator("#homeTabGrid .tab-card .tab-card-close").nth(1).tap()
+    ph.wait(lambda: _visible(ph, "#view-home:not([hidden]) .tab-card") == 1, 5, "one card left")
+    assert ph.js("state.tabs.length") == 1
+    if gone:
+        ph.wait(lambda: gone not in ph.env.tabs(), 8, "the NAS tab was closed")
+    # recent pages: listed, tappable, stored on this device only, cleared by the button
+    ph.wait(lambda: _visible(ph, "#homeRecentList .recent-row") >= 1, 10, "recent pages")
+    stored = ph.js("JSON.parse(localStorage.getItem('qnapdl.recent.v1')||'[]')")
+    assert stored and all(set(e) == {"u", "t", "at"} for e in stored) and len(stored) <= 20, stored
+    assert any(e["u"].endswith("/article.html") for e in stored), stored
+    ph.page.locator("#homeRecentClear").tap()
+    ph.wait(lambda: ph.js("document.getElementById('homeRecent').hidden"), 3, "recent list hidden")
+    assert ph.js("localStorage.getItem('qnapdl.recent.v1')") is None
+    # a refused clipboard read focuses the address bar (no error, no tab)
+    _fake_clipboard(ph, None)
+    before = ph.js("state.tabs.length")
+    ph.page.locator("#homePasteOpen").tap()
+    ph.wait(lambda: ph.js("document.activeElement && document.activeElement.id") == "omnibox", 5, "address bar focused")
+    assert ph.js("state.tabs.length") == before
+    # the setup card stays while setup is incomplete (the harness has no download folder)
+    assert ph.js("!document.getElementById('onboarding').hidden"), "setup card missing"
+
+
+@scenario("links-paste")
+def links_paste(ph):
+    """v0.1.62: 「貼り付け」 reads the clipboard on the tap, shows the count and the send button at once, and every link shows
+    送信中 while it is handed over and 失敗 when that fails."""
+    ph.page.set_viewport_size(NARROW)
+    ph.post("/api/links/clear", {"include_staged": True})        # the Hub's store is shared by the scenarios of a run
+    _go(ph, "#/links")
+    ph.wait(lambda: _visible(ph, "#pasteButton") == 1, 8, "links view")
+    ph.js("()=>{state.live=Object.assign({},state.live,{engine:{can_send:true}})}")
+    _fake_clipboard(ph, "see these:\n%s\n%s\nbye" % (RG1, RG2))
+    ph.page.wait_for_timeout(300)
+    assert ph.js("window.__clipReads") == 0
+    ph.page.locator("#pasteButton").tap()
+    ph.wait(lambda: "2件見つかりました" in ph.js("document.getElementById('pasteSummary').textContent"), 3, "count (no 400 ms wait)")
+    assert ph.js("window.__clipReads") == 1
+    assert _visible(ph, "#pasteSend") == 1 and ph.js("!document.getElementById('pasteSend').disabled"), "send button"
+    assert "2件" in ph.js("document.getElementById('pasteSend').textContent")
+    # a refused read leaves the box alone and focuses it
+    _fake_clipboard(ph, None)
+    ph.js("()=>{document.getElementById('pasteBox').value='';schedulePaste(0)}")
+    ph.page.locator("#pasteButton").tap()
+    ph.wait(lambda: ph.js("document.activeElement && document.activeElement.id") == "pasteBox", 5, "box focused")
+    # per-link state: stage 3 links, send them; the second one fails
+    for url in (RG1, RG2, RG3):
+        assert ph.post("/api/links", {"url": url})["status"] == 201
+    ph.js("()=>{swrDrop('links');loadQueue(true)}")
+    ph.wait(lambda: ph.js("document.querySelectorAll('#queueItems .link-item').length") >= 3, 8, "three links")
+    held = []
+
+    def handler(route):
+        held.append(route)
+    ph.page.route("**/api/links/send", handler)
+    ph.js("()=>{sendLinks(state.queueData.items.filter(l=>l.state==='staged')).catch(()=>{})}")
+    ph.wait(lambda: held, 5, "the first send request")
+    states = ph.js("[...document.querySelectorAll('#queueItems .link-item')].map(e=>e.querySelector('.state-chip').textContent)")
+    assert states.count("送信中") == 3, "every link of the hand-off shows 送信中: %s" % states
+    held.pop().fulfill(status=500, content_type="application/json", body='{"error": "送信できません（テスト）"}')
+    ph.wait(lambda: ph.js("[...document.querySelectorAll('#queueItems .state-chip')].some(e=>e.textContent==='失敗')"), 8, "失敗 shown")
+    states = ph.js("[...document.querySelectorAll('#queueItems .link-item')].map(e=>e.querySelector('.state-chip').textContent)")
+    assert states.count("失敗") == 1 and states.count("送信中") == 0, states
+    assert "再送信" in ph.js("document.querySelector('#queueItems .link-item .btn').textContent")
+    ph.page.unroute("**/api/links/send")
+    ph.take_errors("status of 500")
+    ph.post("/api/links/clear", {"include_staged": True})
+
+
+@scenario("downloads-summary")
+def downloads_summary(ph):
+    """v0.1.62: the summary (total speed, remaining time, counts) is computed from the list that is already there; a
+    swipe to the left offers 一時停止/再開 and 消す (the JD2 harness is not running: the list is injected)."""
+    ph.page.set_viewport_size(NARROW)
+    _go(ph, "#/downloads")
+    ph.wait(lambda: ph.js("!!document.querySelector('#view-downloads:not([hidden]) h1')"), 8, "downloads view")
+    sums = ph.js("""()=>{
+      const mk=(o)=>Object.assign({name:'x',status:'',bytes_loaded:0,bytes_total:1000,speed_bytes:null,eta_seconds:null,running:false,finished:false,progress:0},o);
+      const snap={packages:[mk({running:true,speed_bytes:100,eta_seconds:5,bytes_loaded:500}),
+        mk({running:true,speed_bytes:300,eta_seconds:60,bytes_loaded:900}),
+        mk({finished:true,bytes_loaded:1000}),mk({}),mk({status:'Offline'}),mk({status:'ファイルが見つかりません'})],links:[],has_more:false};
+      const a=summarizeDownloads(snap);
+      const idle=summarizeDownloads({packages:[mk({})],links:[],has_more:false});
+      const nodata=summarizeDownloads({packages:[mk({running:true,bytes_total:null})],links:[],has_more:true});
+      return {a,idle,nodata}}""")
+    a = sums["a"]
+    assert (a["running"], a["waiting"], a["finished"], a["failed"]) == (2, 1, 1, 2), a
+    assert a["speed"] == 400, a
+    # remaining: (1000-500) + (1000-900) + 1000 (waiting) = 1600 bytes at 400 B/s -> 4 s
+    assert a["eta"] == 4, a
+    assert sums["idle"]["eta"] is None and sums["idle"]["speed"] == 0, sums["idle"]
+    assert sums["nodata"]["eta"] is None and sums["nodata"]["hasMore"] is True, sums["nodata"]
+    # the numbers on the page (no request is made for them)
+    ph.js("""()=>{state.engine=Object.assign({},state.engine,{phase:'running'});
+      const mk=(n,o)=>Object.assign({name:n,status:'',bytes_loaded:1048576*100,bytes_total:1048576*500,speed_bytes:null,eta_seconds:null,running:false,
+        finished:false,progress:20,id:'1'+n.length+Math.random().toString().slice(2,7),child_count:1,folder:{flat:true}},o);
+      const p=[mk('Pack A',{running:true,speed_bytes:2097152,eta_seconds:200}),mk('Pack B',{}),mk('Pack C',{finished:true,progress:100,bytes_loaded:1048576*500}),mk('Pack D',{status:'Offline'})];
+      const l=p.map(x=>Object.assign({},x,{package_id:x.id,id:x.id+'9',host:'rapidgator.net'}));
+      window.__apiBefore=reqStats.all;
+      state.snapshot={page:0,packages:p,links:l,has_more:false};state.snapshotJson=JSON.stringify(state.snapshot);
+      state.downloadsSig='';renderDownloads();}""")
+    txt = ph.js("""()=>({speed:$('dlSpeed').textContent,eta:$('dlEta').textContent,r:$('dlCountRunning').textContent,w:$('dlCountWaiting').textContent,
+      f:$('dlCountFinished').textContent,x:$('dlCountFailed').textContent,shown:!$('downloadsSummary').hidden,calls:reqStats.all-window.__apiBefore})""")
+    assert txt["shown"] and txt["speed"].startswith("合計 2") and "/秒" in txt["speed"] and txt["eta"].startswith("残り"), txt
+    assert (txt["r"], txt["w"], txt["f"], txt["x"]) == ("1", "1", "1", "1"), txt
+    assert txt["calls"] == 0, "the summary made requests: %s" % txt
+    # failed filter
+    ph.js("()=>{setFilter('failed')}")
+    assert ph.js("document.querySelectorAll('#downloadList .download-card').length") == 1
+    ph.js("()=>{setFilter('all')}")
+    # swipe actions exist on the rows: one-file packages stay single rows
+    rows = ph.js("""()=>[...document.querySelectorAll('#downloadList .swipe')].map(w=>({
+      pause:(w.querySelector('.swipe-under-right .swipe-btn.stop,.swipe-under-right .swipe-btn.start')||{}).textContent,
+      del:(w.querySelector('.swipe-under-right .swipe-btn.delete')||{}).textContent,
+      single:!!w.querySelector('.pkg-head') && w.querySelector('.pkg-head').tagName==='DIV'}))""")
+    assert len(rows) == 4 and rows[0]["pause"] == "一時停止" and rows[1]["pause"] == "再開" and rows[3]["pause"] == "再開", rows
+    assert rows[2]["pause"] is None and [r["del"] for r in rows] == ["消す", "消す", "削除", "消す"], rows     # a finished row can only be removed
+    assert ph.js("document.querySelectorAll('#downloadList .row-menu').length") == 4, "the ⋯ menu per item"
+    if ph.engine == "chromium":
+        box = ph.js("""()=>{const r=document.querySelector('#downloadList .swipe .swipe-body').getBoundingClientRect();return {x:r.left,y:r.top+r.height/2,w:r.width}}""")
+        x0 = box["x"] + box["w"] * 0.7
+        ph.cdp_touch([(x0, box["y"], 0), (x0 - 40, box["y"], 40), (x0 - 80, box["y"], 40), (x0 - 130, box["y"], 40)])
+        ph.wait(lambda: ph.js("(()=>{const b=document.querySelector('#downloadList .swipe .swipe-body');"
+                              "return b && /translateX\\(-/.test(b.style.transform)})()"), 4, "row swiped to the left")
+        pos = ph.js("()=>{const w=document.querySelector('#downloadList .swipe');const b=w.querySelector('.swipe-body').getBoundingClientRect();"
+                    "const p=w.querySelector('.swipe-under-right .swipe-btn.stop').getBoundingClientRect();"
+                    "return {bodyLeft:b.left,btnLeft:p.left,btnRight:p.right,wrapRight:w.getBoundingClientRect().right}}")
+        assert pos["btnRight"] <= pos["wrapRight"] + 1 and pos["btnLeft"] >= pos["bodyLeft"] - 1 and pos["btnRight"] > pos["bodyLeft"], pos
+        assert ph.js("document.querySelectorAll('#downloadList .swipe-under-right .swipe-btn').length") == 7   # 2 per row, 1 for the finished one
+    ph.js("()=>{state.engine=Object.assign({},state.engine,{phase:'stopped'});state.snapshot=null;state.downloadsSig='';renderDownloads()}")
+
+
+@scenario("settings-jd2-layout")
+def settings_jd2_layout(ph):
+    """v0.1.62: Settings › JD2 = status card, accounts, save folder, send switches, ONE collapsed 詳細・ログ; every control
+    of the old page is still there; an error is one line with a 詳しく toggle."""
+    ph.page.set_viewport_size(NARROW)
+    _go(ph, "#/settings/jd2")
+    ph.wait(lambda: _visible(ph, "#view-settings:not([hidden]) #engineState") == 1, 8, "jd2 settings")
+    order = ph.js("""()=>{const sec=document.querySelector('.settings-section[data-section=jd2]');
+      const subs=[...sec.querySelectorAll(':scope > .sub, :scope > details')].map(e=>e.dataset.sub||e.id);
+      const folds=[...sec.querySelectorAll('details.fold')].map(d=>({id:d.id,open:d.open}));
+      return {subs,folds}}""")
+    assert order["subs"] == ["engine", "accounts", "storage", "send", "engineAdvanced"], order
+    assert order["folds"] == [{"id": "engineAdvanced", "open": False}], order
+    ids = ("engineState engineSetup engineStart engineStop engineMode engineMigrate engineNoContainer engineProgressText engineProgress "
+           "engineError engineErrorMore engineTestResult engineAutostartRow engineAutostart engineJd2 jd2Status jd2Check jd2Update jd2Preset "
+           "engineStepsBox engineSteps engineDetails engineComponents engineMeta engineNativeRow engineNativeRemove engineSetupNative "
+           "engineResetup engineKeysRow engineKeys engineKeysCopy engineKeysOut engineLogBox engineLog accountsState accountsReload "
+           "accountsList accountEdit accountEditForm accountEditUser accountEditPass accountEditSave accountEditCancel accountsSecure "
+           "accountForm accountHost accountUser accountPass accountAdd accountResult accountSchemaBox accountSchema accountSchemaCopy "
+           "accountSchemaOut selectedFolder folderChange flattenNow flattenResult sendAutostart probeAutosend autoClearLinks "
+           "autoClearDownloads").split()
+    missing = [i for i in ids if not ph.js("(i)=>!!document.getElementById(i)", i)]
+    assert not missing, "controls missing: %s" % missing
+    # the sections are in the agreed order on the page
+    pos = ph.js("""()=>['engineState','accountForm','selectedFolder','sendAutostart','engineAdvanced'].map(id=>document.getElementById(id).getBoundingClientRect().top)""")
+    assert pos == sorted(pos), pos
+    # the log and the engine details live inside the one fold; the two old 「詳細」 folds are gone
+    assert ph.js("['engineDetails','engineLogBox','accountSchemaBox','engineStepsBox'].every(id=>document.getElementById(id).closest('#engineAdvanced'))")
+    # one error line + 詳しく
+    ph.js("""()=>{renderEngine({phase:'failed',installed:true,mode:'container',container:{available:true},steps:[],components:[],
+      error:'JD2を起動できませんでした。' + 'とても長い理由の説明。'.repeat(14)})}""")
+    m = ph.js("()=>{const e=document.getElementById('engineError'),r=e.getBoundingClientRect();return {h:r.height,lh:parseFloat(getComputedStyle(e).lineHeight)||20,clamped:e.classList.contains('is-clamped'),vw:innerWidth}}")
+    assert m["clamped"] and m["h"] <= m["lh"] + 20, "the error is not one line: %s" % m
+    assert _visible(ph, "#engineErrorMore") == 1
+    ph.page.locator("#engineErrorMore").tap()
+    m2 = ph.js("()=>{const e=document.getElementById('engineError');return {h:e.getBoundingClientRect().height,clamped:e.classList.contains('is-clamped')}}")
+    assert not m2["clamped"] and m2["h"] > m["h"] * 1.5, (m, m2)
+    # exactly one primary action per state
+    for phase, installed in (("stopped", True), ("running", True), ("not_installed", False)):
+        ph.js("(a)=>{renderEngine({phase:a[0],installed:a[1],mode:'container',container:{available:true},steps:[],components:[],error:''})}", [phase, installed])
+        n = _visible(ph, "#engineSetup,#engineStart,#engineStop")
+        assert n == 1, "%s: %d primary buttons" % (phase, n)
+    # opening 詳細・ログ shows the log (and nothing else is needed to find it)
+    ph.page.locator("#engineAdvanced > summary").tap()
+    ph.wait(lambda: ph.js("document.getElementById('engineAdvanced').open"), 3, "fold open")
+
+
+@scenario("site-display-memory")
+def site_display_memory(ph):
+    """v0.1.62: the display chosen for a tab is remembered per site (registrable domain) and used the next time a page
+    of that site is opened - decided on the phone, so it rides in the same tabs request (first = reader); the menu's
+    「このサイトの表示を忘れる」 goes back to the default."""
+    ph.page.set_viewport_size(NARROW)
+    ph.js("()=>{localStorage.removeItem('qnapdl.hostmodes.v1')}")
+    keys = ph.js("""()=>['www.example.com','a.b.example.com','example.co.jp','shop.example.co.jp','a.example.com','127.0.0.1','[::1]']
+      .map(h=>siteKey(h))""")
+    assert keys == ["example.com", "example.com", "example.co.jp", "example.co.jp", "example.com", "127.0.0.1", "[::1]"], keys
+    posted = []
+    ph.page.on("request", lambda r: posted.append(r.post_data or "") if r.url.endswith("/api/rb/tabs") else None)
+    ph.open("/article.html")
+    ph.wait(lambda: "E2E" in ph.mirror_text(), 15, "default (mirror)")
+    assert ph.display() == "mirror"
+    ph.js("()=>{configureMenu()}")
+    assert ph.js("document.getElementById('menuForgetSite').hidden"), "nothing to forget yet"
+    ph.js("()=>{setUserDisplay(activeWebTab(),'reader')}")
+    ph.wait(lambda: ph.display() == "reader", 8, "reader chosen")
+    ph.js("()=>{configureMenu()}")
+    assert not ph.js("document.getElementById('menuForgetSite').hidden"), "forget item missing"
+    stored = ph.js("JSON.parse(localStorage.getItem('qnapdl.hostmodes.v1'))")
+    assert stored == [["example.com", "remote-reader"]], stored
+    # another page of the same site (a sub-domain), in a new tab: reader straight away, asked for in the tabs request
+    _go(ph, "#/home")
+    posted.clear()
+    omni = ph.page.locator("#omnibox").first
+    omni.click()
+    omni.fill("https://sub.a.example.com/article2.html")
+    omni.press("Enter")
+    ph.wait(lambda: ph.js("(()=>{const t=activeWebTab();return !!(t&&t.rb)})()"), 15, "second tab")
+    assert ph.display() == "reader", ph.display()
+    assert posted and '"first":"reader"' in posted[-1].replace(" ", ""), posted
+    # a different site keeps the default
+    _go(ph, "#/home")
+    omni = ph.page.locator("#omnibox").first
+    omni.click()
+    omni.fill("https://b.example.net/article.html")
+    omni.press("Enter")
+    ph.wait(lambda: ph.js("(()=>{const t=activeWebTab();return !!(t&&t.rb&&t.current.includes('example.net'))})()"), 15, "third tab")
+    assert ph.display() == "mirror", ph.display()
+    # forget on the example.com tab -> default again
+    ph.js("()=>{navigate('#/tab/'+state.tabs[1].id)}")
+    ph.wait(lambda: ph.js("(()=>{const t=activeWebTab();return !!(t&&t.rb&&t.current.includes('example.com'))})()"), 8, "back on tab 2")
+    ph.js("()=>{configureMenu()}")
+    ph.js("()=>{menuAction('forgetSite')}")
+    ph.wait(lambda: ph.js("localStorage.getItem('qnapdl.hostmodes.v1')") == "[]", 3, "entry removed")
+    ph.wait(lambda: ph.display() == "mirror", 8, "default display again")
+    ph.js("()=>{configureMenu()}")
+    assert ph.js("document.getElementById('menuForgetSite').hidden")
+    # an old exact-host entry keeps working
+    ph.js("()=>{localStorage.setItem('qnapdl.hostmodes.v1', JSON.stringify([['a.example.com','remote-fast']]))}")
+    assert ph.js("rememberedMode('a.example.com')") == "remote-fast"
+    assert ph.js("rememberedMode('www.a.example.com')") == "remote-fast"
+    assert ph.js("rememberedMode('b.example.net')") is None
+    ph.js("()=>{localStorage.removeItem('qnapdl.hostmodes.v1')}")
+
+
+@scenario("site-display-pt")
+def site_display_pt(ph):
+    """v0.1.62: passthrough is remembered for a site too: the next page of that site opens in the frame (no NAS tab)
+    while it is available, falls back to the default display when it is not, and 「忘れる」 returns to the NAS browser."""
+    ph.setting("pt_enabled", False)
+    _pt_local(ph)
+    ph.js("()=>{localStorage.removeItem('qnapdl.hostmodes.v1')}")
+    ph.open("/article.html")
+    ph.js("()=>{setUserDisplay(activeWebTab(),'pt')}")
+    ph.wait(lambda: ph.js("(()=>{const t=activeWebTab();return !!(t&&t.pt&&!t.rb)})()"), 8, "passthrough chosen")
+    assert ph.js("JSON.parse(localStorage.getItem('qnapdl.hostmodes.v1'))") == [["example.com", "remote-pt"]]
+    _go(ph, "#/home")
+    omni = ph.page.locator("#omnibox").first
+    omni.click()
+    omni.fill("https://a.example.com/ptx/page.html")
+    omni.press("Enter")
+    ph.wait(lambda: ph.js("(()=>{const t=activeWebTab();return !!(t&&t.pt&&!t.rb&&t.history.length)})()"), 8, "a new passthrough tab")
+    fr = _pt_frame(ph)
+    ph.wait(lambda: fr.locator("#t").count() > 0, 15, "page drawn in the frame")
+    assert ph.env.tabs() == {} or not [t for t in ph.env.tabs().values() if "ptx" in t.url], "a NAS tab was opened for it"
+    # passthrough not available (setting off): the default display is used
+    ph.setting("pt_enabled", False)
+    ph.js("refreshPt()")
+    ph.wait(lambda: ph.js("!ptAvailable()"), 8, "passthrough off")
+    ph.js("()=>{rememberedPtUrl('https://a.example.com/x')}")
+    assert ph.js("rememberedPtUrl('https://a.example.com/x')") == ""
+    ph.setting("pt_enabled", True)
+    ph.js("refreshPt()")
+    ph.wait(lambda: ph.js("ptAvailable()"), 8, "passthrough on")
+    assert ph.js("rememberedPtUrl('https://sub.a.example.com/x')") == "https://sub.a.example.com/x"
+    assert ph.js("rememberedPtUrl('https://b.example.net/x')") == ""
+    # forget -> the NAS browser again
+    ph.js("()=>{forgetSiteDisplay(activeWebTab())}")
+    assert ph.js("rememberedPtUrl('https://a.example.com/x')") == ""
+    ph.js("()=>{localStorage.removeItem('qnapdl.hostmodes.v1')}")
+
+
+@scenario("toast-above-bar")
+def toast_above_bar(ph):
+    """v0.1.62: toasts sit above the bottom tab bar and never cover it (430x873), however many there are, also on a web tab;
+    the thin progress line shows only for loads longer than 300 ms."""
+    ph.page.set_viewport_size(NARROW)
+    for view in ("#/home", "#/downloads", "#/links"):
+        _go(ph, view)
+        # one ordinary toast at a time + sticky ones (e.g. 「Hubが更新されています」): a long error and a sticky one together
+        ph.js("""()=>{toast('エラーの通知です。'.repeat(8),'error');stickyToast('t62','更新があります。再読み込みしてください','info',[{label:'再読み込み',run:()=>{}}])}""")
+        ph.wait(lambda: ph.js("document.querySelectorAll('#notice .toast').length") >= 2, 3, "toasts")
+        m = ph.js("""()=>{const bar=document.getElementById('mobileBar').getBoundingClientRect();
+          const ts=[...document.querySelectorAll('#notice .toast')].map(t=>t.getBoundingClientRect());
+          return {barTop:bar.top,barH:bar.height,maxBottom:Math.max(...ts.map(r=>r.bottom)),minTop:Math.min(...ts.map(r=>r.top)),vh:innerHeight}}""")
+        assert m["barH"] > 30 and m["maxBottom"] <= m["barTop"] - 4 and m["minTop"] >= 0, "%s: %s" % (view, m)
+        ph.js("()=>{clearToast();document.querySelectorAll('#notice .toast').forEach(t=>t.remove())}")
+    # on a web tab as well
+    ph.open("/article.html")
+    ph.wait(lambda: "E2E" in ph.mirror_text(), 15, "page")
+    ph.js("()=>{flash('Webタブの通知')}")
+    m = ph.js("""()=>{const bar=document.getElementById('mobileBar').getBoundingClientRect();const t=document.querySelector('#notice .toast').getBoundingClientRect();
+      return {barTop:bar.top,bottom:t.bottom}}""")
+    assert m["bottom"] <= m["barTop"] - 4, m
+    # the progress line: not for a fast load, shown for a slow one
+    _go(ph, "#/home")
+    ph.page.wait_for_timeout(300)
+    ph.js("()=>{window.__seen=false;new MutationObserver(()=>{if(!document.getElementById('appLoading').hidden)window.__seen=true})"
+          ".observe(document.getElementById('appLoading'),{attributes:true})}")
+    ph.js("()=>{swrDrop('bookmarks');loadBookmarks(true)}")
+    ph.page.wait_for_timeout(500)
+    assert not ph.js("window.__seen"), "the line showed for a fast load"
+    held = []
+    ph.page.route("**/api/bookmarks", lambda route: held.append(route))
+    ph.js("()=>{swrDrop('bookmarks');loadBookmarks(true)}")
+    ph.wait(lambda: held, 3, "slow request held")
+    assert ph.js("document.getElementById('appLoading').hidden"), "shown too early"
+    ph.wait(lambda: not ph.js("document.getElementById('appLoading').hidden"), 2, "the line appears after 300 ms")
+    held.pop().continue_()
+    ph.wait(lambda: ph.js("document.getElementById('appLoading').hidden"), 5, "the line is gone when the load ends")
+    ph.page.unroute("**/api/bookmarks")
