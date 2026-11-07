@@ -115,8 +115,8 @@ class LinkGrabberViewTests(unittest.TestCase):
         options = view.linkgrabber_query_options()
         self.assertEqual(options[0]["maxResults"], 50)
         self.assertEqual(options[0]["startAt"], 0)
-        self.assertFalse({"url", "password", "downloadPassword", "saveTo", "comment",
-                          "availability"}.intersection(options[0]))
+        self.assertFalse({"url", "password", "downloadPassword", "saveTo", "comment"}.intersection(options[0]))
+        self.assertTrue(options[0]["availability"] and options[0]["enabled"])     # v0.1.70: why it waits
 
     def test_snapshot_projects_names_ids_and_drops_the_rest(self):
         out = view.linkgrabber_snapshot([

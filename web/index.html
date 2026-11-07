@@ -233,6 +233,9 @@
        <h2>JD2で待機中のリンク <span id="waitingCount" class="muted"></span></h2>
        <button type="button" id="waitingStart" class="btn small primary">すべて開始</button>
       </div>
+      <!-- v0.1.70: why links wait, and the one-tap clean-up of the ones that never start -->
+      <p id="waitingNote" class="muted waiting-note"></p>
+      <button type="button" id="waitingClean" class="btn small" hidden>重複・オフラインを消す</button>
       <div id="waitingList" class="waiting-list"></div>
      </section>
      <!-- v0.1.63: filters + summary form a sticky side column on wide screens -->
@@ -428,6 +431,12 @@
          <span class="set-desc"><span class="set-text">ダウンロードタブの完了・スキップ済みを一覧から消します</span>
           <details class="hint"><summary aria-label="詳しい説明">ⓘ</summary><p>ONのとき、JD2が動いていれば約1分ごとに、完了したものと「既にあるファイル」でスキップしたものをJD2の一覧から消します（「完了・スキップを一覧から消す」と同じ処理）。実行中・待機・失敗・一時停止は消さず、保存したファイルも消えません。</p></details></span></div>
         <label class="switch" for="autoClearDownloads"><input type="checkbox" id="autoClearDownloads" role="switch" aria-label="完了・スキップしたダウンロードを自動で消す"><span class="switch-track" aria-hidden="true"></span></label>
+       </div>
+       <div class="set-row">
+        <div class="set-main"><span class="set-label">ファイルがないリンクを自動で消す</span>
+         <span class="set-desc"><span class="set-text">「File not found」のリンクを待機中・ダウンロードの一覧から消します</span>
+          <details class="hint"><summary aria-label="詳しい説明">ⓘ</summary><p>ONのとき、JD2が動いていれば約30〜60秒ごとに、配布元でファイルが消えている（オフライン／File not found）リンクをJD2の一覧から消します。確認中のもの、一時的なエラー、「既にあるファイル」、同じファイルがダウンロード一覧にあるリンクは消しません。一覧から消すだけで、保存したファイルは消えません。</p></details></span></div>
+        <label class="switch" for="autoClearMissing"><input type="checkbox" id="autoClearMissing" role="switch" aria-label="ファイルがないリンクを自動で消す"><span class="switch-track" aria-hidden="true"></span></label>
        </div>
       </div>
 

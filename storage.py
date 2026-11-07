@@ -36,6 +36,8 @@ DEFAULTS = {
     # v0.1.56: both OFF. Forget Links-tab rows once JD2 took them; clear finished/skipped JD2 entries.
     "auto_clear_links": False,
     "auto_clear_downloads": False,
+    # v0.1.70: ON (asked for). Remove JD2 links whose file is gone from the hoster ("File not found") from the lists.
+    "auto_clear_missing": True,
     # v0.1.57: passthrough display (the page is drawn by the phone, every request goes out from the NAS). OFF by default; the
     # listener (127.0.0.1:17865) only runs while this is on. pt_public_port is the port `tailscale serve --https=` exposes it on.
     "pt_enabled": False,
@@ -46,7 +48,7 @@ DEFAULTS = {
     "home_recent": True,
 }
 BOOL_OPTIONS = ("send_autostart", "block_ads", "probe_autosend", "rb_link_boxes", "rb_resident",
-                "rb_spare_tab", "rb_no_webfonts", "auto_clear_links", "auto_clear_downloads", "pt_enabled",
+                "rb_spare_tab", "rb_no_webfonts", "auto_clear_links", "auto_clear_downloads", "auto_clear_missing", "pt_enabled",
                 "home_recent")
 ENUM_OPTIONS = {"rb_default_mode": ("reader", "mirror", "fast", "live")}
 INT_OPTIONS = {"pt_public_port": (1, 65535), "rb_max_tabs": (1, 20)}

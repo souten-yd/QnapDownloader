@@ -453,6 +453,10 @@ label{display:block;margin:12px 0;color:var(--muted);font-size:13px}
 .waiting-box{margin-bottom:12px}
 .waiting-list{max-height:220px;overflow:auto;font-size:13px}
 .waiting-item{display:flex;gap:8px;padding:3px 0;border-bottom:1px solid var(--border)}
+.waiting-note{margin:4px 0 8px;font-size:12px;line-height:1.5}
+.waiting-item{flex-wrap:wrap}
+.waiting-reason{flex-basis:100%;order:5;font-size:12px;color:var(--muted)}
+.waiting-reason.is-stuck{color:var(--danger,#b3261e)}
 .waiting-name{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 
 /* ---- v0.1.29: automatic live display chip ---- */

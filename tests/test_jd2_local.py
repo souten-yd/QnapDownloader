@@ -563,12 +563,21 @@ class ControllerCallTests(unittest.TestCase):
             {"name": "a.rar", "host": "rapidgator.net", "bytesTotal": 100, "uuid": 11, "packageUUID": 5,
              "url": "https://rapidgator.net/file/secret", "saveTo": "/share/x", "password": "pw"}]}
         out = self.adapter.list_linkgrabber()
+        # v0.1.70: the second (last) request is the names-only download-list query for the duplicate check
+        paths = list(self.server.paths)
+        last = self.decoded()
+        self.assertEqual(last[0], "/downloadsV2/queryLinks")
+        self.assertEqual(last[1], [{"name": True, "host": True, "maxResults": 500, "startAt": 0}])
+        self.server.paths[:] = paths[:-1]
         prefix, args = self.decoded()
         self.assertEqual(prefix, "/linkgrabberv2/queryLinks")
         self.assertEqual(args, [{"name": True, "host": True, "bytesTotal": True, "uuid": True,
-                                 "packageUUID": True, "maxResults": 50, "startAt": 0}])
+                                 "packageUUID": True, "availability": True, "enabled": True,
+                                 "maxResults": 50, "startAt": 0}])
+        # no availability field: never treated as checked (v0.1.70)
         self.assertEqual(out["items"], [{"id": "11", "package_id": "5", "name": "a.rar",
-                                         "host": "rapidgator.net", "bytes_total": 100}])
+                                         "host": "rapidgator.net", "bytes_total": 100,
+                                         "state": "unknown", "reason": "確認中"}])
         self.assertNotIn("secret", str(out))
         self.assertNotIn("/share/x", str(out))
 

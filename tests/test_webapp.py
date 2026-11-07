@@ -565,7 +565,7 @@ class HttpTests(unittest.TestCase):
                                          headers={"Host": "192.168.68.57:17864"})
         with self.client.open(request, timeout=4) as response:
             self.assertEqual(response.status, 200)
-            self.assertEqual(json.load(response)["version"], "0.1.69")
+            self.assertEqual(json.load(response)["version"], "0.1.70")
         with self.client.open(self.url + "/icon.svg", timeout=4) as response:
             self.assertEqual(response.status, 200)
             self.assertEqual(response.headers.get_content_type(), "image/svg+xml")
@@ -1144,6 +1144,12 @@ class HttpTests(unittest.TestCase):
         self.assertEqual(self.req("/api/jd2/downloads?page=999")[0],400)
         self.assertEqual(self.req("/api/jd2/downloads?page=-1")[0],400)
         self.assertEqual(calls,[2])
+        # v0.1.70: the page-0 snapshot carries the one-time "file not found" notice, later pages do not
+        self.assertNotIn("missing_cleared", result)
+        self.server.engine._note_missing(3)
+        code,first = self.req("/api/jd2/downloads?page=0")
+        self.assertEqual(first["missing_cleared"], 3)
+        self.assertEqual(self.server.engine.pop_missing_cleared(), 0)
         with self.client.open(self.url,timeout=4) as response:
             html=response.read().decode()
         self.assertIn('data-tab="downloads"',html)
@@ -1479,7 +1485,7 @@ class HttpTests(unittest.TestCase):
         self.assertFalse(info["supported"])
         code, _ = self.req("/api/update/apply", {"version": "v0.1.8"})
         self.assertEqual(code, 400)
-        self.assertEqual(self.req("/api/health")[1]["version"], "0.1.69")
+        self.assertEqual(self.req("/api/health")[1]["version"], "0.1.70")
         self.assertFalse(self.req("/api/jd2/status")[1]["connected"])
         self.assertEqual(self.req("/api/jd2/update/apply", {"confirmed": True})[0], 400)
         self.assertEqual(self.req("/api/jd2/preset/apply", {"confirmed": True})[0], 400)
@@ -1495,6 +1501,7 @@ class HttpTests(unittest.TestCase):
                 ("/api/jd2/downloads/cleanup", {"confirmed": True}),
                 ("/api/settings/options", {"send_autostart": False}),
                 ("/api/jd2/linkgrabber/start", {"confirmed": True}),
+                ("/api/jd2/waiting/clean", {"confirmed": True}),      # v0.1.70
                 ("/api/jd2/downloads/start", {}),
                 ("/api/jd2/downloads/stop", {"confirmed": True}))
 
