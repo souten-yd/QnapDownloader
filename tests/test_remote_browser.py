@@ -3633,6 +3633,77 @@ class SseStreamTests(StreamBase):
 
 
 # ------------------------------------------------------------ v0.1.46: no docker stats on the /api/state path
+# ------------------------------------------------------------ v0.1.68: WebSocket live stream (producer side)
+class WsStreamTests(StreamBase):
+    """stream(ws=True): raw JPEG bytes per write, newest frame only, pings, alive() and on_start()."""
+
+    def run_ws(self, ident="b1", write=None, **kwargs):
+        return self.run_stream(ident, write, ws=True, **kwargs)
+
+    def test_each_write_is_the_raw_jpeg_and_on_start_runs_before_the_first_frame(self):
+        started = []
+        out, errors, thread = self.run_ws(on_start=lambda: started.append(True))
+        self.assertTrue(self.wait_for(lambda: started))
+        self.assertEqual((started, out), ([True], []))              # no padding, no frame yet
+        for data in (b"\xff\xd8\xff-one", b"\xff\xd8\xff-second"):
+            before = len(out)
+            self.feed("SESSION1", data=self.jpeg(data))
+            self.assertTrue(self.wait_for(lambda: len(out) > before))
+            self.assertEqual(out[-1], data)
+        self.rb.close_tab("b1")
+        thread.join(3)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(errors, [])
+
+    def test_a_slow_writer_gets_only_the_newest_frame(self):
+        gate = threading.Event()
+        first = []
+
+        def slow_first(part):
+            if not first:
+                first.append(1)
+                gate.wait(3)
+        out, errors, thread = self.run_ws(write=slow_first)
+        self.assertTrue(self.wait_for(lambda: self.rb._tabs["b1"].streams == 1))
+        self.feed("SESSION1", data=self.jpeg(b"\xff\xd8\xff-A"))
+        self.assertTrue(self.wait_for(lambda: len(out) == 1))
+        for name in (b"B", b"C", b"D"):                  # arrive while the writer is blocked (a slow viewer)
+            self.feed("SESSION1", data=self.jpeg(b"\xff\xd8\xff-" + name))
+        gate.set()
+        self.assertTrue(self.wait_for(lambda: len(out) >= 2))
+        self.assertEqual(out[1], b"\xff\xd8\xff-D")
+        time.sleep(0.2)
+        self.assertEqual(len(out), 2)                    # B and C were never queued
+
+    def test_idle_stream_pings_and_a_busy_one_does_not(self):
+        pings = []
+        with mock.patch.object(rb, "WS_PING_SECONDS", 0.15):
+            out, errors, thread = self.run_ws(ping=lambda: pings.append(time.monotonic()), heartbeat=30)
+            self.assertTrue(self.wait_for(lambda: self.rb._tabs["b1"].streams == 1))
+            self.assertTrue(self.wait_for(lambda: len(pings) >= 2, 3.0))
+            self.assertEqual(out, [])
+            count = len(pings)
+            for n in range(6):                           # frames faster than the ping interval: no ping needed
+                self.feed("SESSION1", data=self.jpeg(b"\xff\xd8\xff-%d" % n))
+                time.sleep(0.05)
+            self.assertLessEqual(len(pings) - count, 1)
+
+    def test_alive_false_ends_the_stream_and_the_slot_is_freed(self):
+        alive = [True]
+        out, errors, thread = self.run_ws(alive=lambda: alive[0])
+        self.assertTrue(self.wait_for(lambda: self.rb._tabs["b1"].streams == 1))
+        alive[0] = False
+        thread.join(3)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual((errors, self.rb._tabs["b1"].streams, self.rb._streams), ([], 0, 0))
+
+    def test_a_missing_tab_fails_before_on_start(self):
+        started = []
+        with self.assertRaises(rb.TabGone):
+            self.rb.stream("b9", lambda part: None, ws=True, on_start=lambda: started.append(1))
+        self.assertEqual(started, [])
+
+
 class StatusWithoutDockerStatsTests(BrowserBase):
     def stats_calls(self):
         return [c for c in self.fake.docker_calls() if c[0] == "stats"]

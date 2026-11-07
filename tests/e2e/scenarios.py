@@ -87,23 +87,74 @@ LIVE_SHOWN = "(()=>{const i=document.getElementById('remoteImg');return !i.hidde
 
 @scenario("display-live", display="live")
 def display_live(ph):
-    """The live picture arrives over whichever transport works here (MJPEG first, then SSE, then polling)."""
+    """The live picture arrives over whichever transport works here (v0.1.68: WebSocket first)."""
     tab = ph.open("/article.html")
     ph.wait(lambda: ph.display() == "live", 5, "display live")
     ph.wait(lambda: ph.js(LIVE_SHOWN), 20, "live frame visible")
     ph.wait(lambda: ph.env.tabs()[tab].seq > 0, 10, "server has produced frames (seq>0)")
     kind = ph.js("state.rbStream ? state.rbStream.kind : 'poll'")
-    assert kind in ("mjpeg", "sse", "poll"), kind
+    assert kind == "ws", "expected the WebSocket transport here, got %s" % kind
     ph.notes.append("transport " + kind)
     perf = ph.js("(()=>{setPerf(true);return perfText()})()")
-    assert "ライブ(" in perf, perf
+    assert "ライブ(WebSocket)" in perf, perf
+
+
+def blob_tracker(ph):
+    """Counts the object URLs the app has alive (created and not yet revoked)."""
+    ph.js("""()=>{
+      if (window.__urls) return;
+      window.__urls = new Set(); window.__urlMax = 0;
+      const make = URL.createObjectURL.bind(URL), drop = URL.revokeObjectURL.bind(URL);
+      URL.createObjectURL = function (b) { const u = make(b); window.__urls.add(u); window.__urlMax = Math.max(window.__urlMax, window.__urls.size); return u; };
+      URL.revokeObjectURL = function (u) { window.__urls.delete(u); return drop(u); };
+    }""")
+
+
+@scenario("live-ws", display="live")
+def live_ws(ph):
+    """v0.1.68: the live display reads the screencast from the Hub's WebSocket: >= 3 fps on a page that animates, the
+    JPEG frames are drawn as blob images without leaking object URLs, the transport is named in the speed line, and the
+    socket is closed while the page is hidden and opened again when it is shown."""
+    blob_tracker(ph)
+    tab = ph.open("/anim.html")
+    ph.wait(lambda: ph.display() == "live", 5, "display live")
+    ph.wait(lambda: ph.js("state.rbStream && state.rbStream.kind") == "ws", 10, "WebSocket transport")
+    ph.wait(lambda: ph.js(LIVE_SHOWN), 15, "WebSocket frame visible")
+    assert ph.js("document.getElementById('remoteImg').src").startswith("blob:"), "frames are drawn as blob images"
+    ph.wait(lambda: ph.js("state.rbStream.loaded") is True, 5, "first frame seen")
+    f0, t0 = ph.js("state.rbStream.frames"), time.monotonic()
+    ph.page.wait_for_timeout(3000)
+    f1, t1 = ph.js("state.rbStream.frames"), time.monotonic()
+    fps = (f1 - f0) / (t1 - t0)
+    ph.notes.append("ws %.1f fps" % fps)
+    assert fps >= 3, "only %.1f fps over WebSocket" % fps
+    assert ph.env.stream_hits["ws"] >= 1 and ph.env.stream_hits["sse"] == 0 and ph.env.stream_hits["mjpeg"] == 0, dict(ph.env.stream_hits)
+    perf = ph.js("(()=>{setPerf(true);return perfText()})()")
+    assert perf.startswith("ライブ(WebSocket)") and "fps" in perf, perf
+    pref = ph.js("JSON.parse(localStorage.getItem(RB_LIVE_PREF_KEY))")
+    assert pref["t"] == "ws" and not pref.get("fail"), pref
+    assert ph.js("window.__urlMax") <= 3 and ph.js("window.__urls.size") <= 2, (ph.js("window.__urlMax"), ph.js("window.__urls.size"))
+    assert ph.env.tabs()[tab].streams == 1
+    # hidden: the socket is closed and the Hub's stream ends
+    ph.js("""()=>{Object.defineProperty(document,'visibilityState',{value:'hidden',configurable:true});
+      document.dispatchEvent(new Event('visibilitychange'));}""")
+    ph.wait(lambda: ph.js("state.rbStream") is None, 5, "stream closed while hidden")
+    ph.wait(lambda: ph.env.tabs()[tab].streams == 0, 8, "Hub stream ended")
+    assert ph.js("window.__urls.size") == 0, "object URLs alive after closing: %s" % ph.js("window.__urls.size")
+    # shown again: a new socket and frames again
+    hits = ph.env.stream_hits["ws"]
+    ph.js("""()=>{Object.defineProperty(document,'visibilityState',{value:'visible',configurable:true});
+      document.dispatchEvent(new Event('visibilitychange'));}""")
+    ph.wait(lambda: ph.js("state.rbStream && state.rbStream.kind") == "ws", 10, "WebSocket again")
+    ph.wait(lambda: (ph.js("state.rbStream.frames") or 0) >= 3, 10, "frames after showing again")
+    assert ph.env.stream_hits["ws"] == hits + 1
 
 
 @scenario("live-sse-fallback", display="live")
 def live_sse_fallback(ph):
-    """MJPEG never delivers a byte (buffering proxy): after 2.5 s the client reads the event stream and draws
-    the frames; the working transport is remembered for the next start."""
-    ph.env.blocked.add("mjpeg")
+    """The WebSocket never delivers (nothing answers the upgrade): after 2.5 s the client reads the event stream and
+    draws the frames; the failure is remembered, so a new app start goes straight to SSE."""
+    ph.env.blocked.add("ws")
     t0 = time.monotonic()
     tab = ph.open("/article.html")
     ph.wait(lambda: ph.display() == "live", 5, "display live")
@@ -112,32 +163,140 @@ def live_sse_fallback(ph):
     assert ph.js("document.getElementById('remoteImg').src").startswith("blob:"), "frames are drawn as blob images"
     ph.wait(lambda: ph.env.tabs()[tab].seq > 0 and ph.env.tabs()[tab].streams >= 1, 10, "server streams to the phone")
     ph.notes.append("SSE after %.1fs" % (time.monotonic() - t0))
-    assert ph.env.stream_hits["sse"] >= 1 and ph.env.stream_hits["mjpeg"] >= 1
+    assert ph.env.stream_hits["sse"] >= 1 and ph.env.stream_hits["ws"] >= 1 and ph.env.stream_hits["mjpeg"] == 0
     perf = ph.js("(()=>{setPerf(true);return perfText()})()")
-    assert "ライブ(SSE: MJPEGの最初の画面が届かない)" in perf, perf
-    assert ph.js("JSON.parse(localStorage.getItem(RB_LIVE_PREF_KEY)).t") == "sse"
-    # at most two object URLs alive: the shown one (and the one being decoded)
-    # remembered: a new app start goes straight to SSE and does not touch MJPEG again today
-    hits = ph.env.stream_hits["mjpeg"]
+    assert "ライブ(SSE: WebSocketの最初の画面が届かない)" in perf, perf
+    pref = ph.js("JSON.parse(localStorage.getItem(RB_LIVE_PREF_KEY))")
+    assert pref["t"] == "sse" and "ws" in pref["fail"], pref
+    # remembered: a new app start goes straight to SSE and does not touch the WebSocket again today
+    hits = ph.env.stream_hits["ws"]
     ph.page.reload()
     ph.page.wait_for_selector("#omnibox", state="attached")
     ph.wait(lambda: ph.js("state.authed === true"), 10, "session after reload")
     ph.wait(lambda: ph.js("state.rbStream && state.rbStream.kind") == "sse", 20, "SSE again after reload")
     ph.wait(lambda: ph.js(LIVE_SHOWN), 15, "SSE frame visible after reload")
-    assert ph.env.stream_hits["mjpeg"] == hits, "MJPEG was retried although SSE was remembered"
+    assert ph.env.stream_hits["ws"] == hits, "the WebSocket was retried although it failed today"
+
+
+@scenario("live-ws-refused", display="live")
+def live_ws_refused(ph):
+    """The WebSocket endpoint answers the upgrade with an error at once (a proxy without upgrade support): two errors in
+    a row and the client moves on to SSE without waiting for the first-frame limit."""
+    ph.env.refused.add("ws")
+    t0 = time.monotonic()
+    ph.open("/article.html")
+    ph.wait(lambda: ph.js("state.rbStream && state.rbStream.kind") == "sse", 10, "switched to SSE")
+    ph.notes.append("SSE after %.1fs" % (time.monotonic() - t0))
+    assert time.monotonic() - t0 < 2.4 + 6, "waited for the first-frame limit"
+    ph.wait(lambda: ph.js(LIVE_SHOWN), 15, "SSE frame visible")
+    perf = ph.js("(()=>{setPerf(true);return perfText()})()")
+    assert "ライブ(SSE: WebSocketのエラー)" in perf, perf
+    assert ph.env.stream_hits["ws"] >= 2
+
+
+@scenario("live-mjpeg-fallback", display="live")
+def live_mjpeg_fallback(ph):
+    """Neither WebSocket nor SSE delivers: MJPEG (the <img> stream) is the third try."""
+    ph.env.blocked.update(("ws", "sse"))
+    # an animating page: a screencast that starts late (after 5.5 s of failed tries) only gets frames from a page that changes
+    ph.open("/anim.html")
+    ph.wait(lambda: ph.display() == "live", 5, "display live")
+    ph.wait(lambda: ph.js("state.rbStream && state.rbStream.kind") == "mjpeg", 20, "switched to MJPEG")
+    ph.wait(lambda: ph.js("(()=>{const i=document.getElementById('remoteImg');return !i.hidden&&i.naturalWidth>0&&i.currentSrc.indexOf('/api/rb/stream.mjpg')>=0})()"),
+            15, "MJPEG frame visible")
+    perf = ph.js("(()=>{setPerf(true);return perfText()})()")
+    assert "ライブ(MJPEG: SSEの最初の画面が届かない)" in perf, perf
+    pref = ph.js("JSON.parse(localStorage.getItem(RB_LIVE_PREF_KEY))")
+    assert pref["t"] == "mjpeg" and set(pref["fail"]) == {"ws", "sse"}, pref
 
 
 @scenario("live-polling-fallback", display="live")
 def live_polling_fallback(ph):
-    """Neither stream delivers: the client ends on frame.jpg polling and says why."""
-    ph.env.blocked.update(("mjpeg", "sse"))
+    """No stream delivers: the client ends on frame.jpg polling and says why."""
+    ph.env.blocked.update(("ws", "mjpeg", "sse"))
     tab = ph.open("/article.html")
     ph.wait(lambda: ph.display() == "live", 5, "display live")
-    ph.wait(lambda: ph.js("(()=>{const t=activeWebTab();return !!(t&&t.rb&&t.rb.streamFailed)})()"), 20, "gave up on streams")
+    ph.wait(lambda: ph.js("(()=>{const t=activeWebTab();return !!(t&&t.rb&&t.rb.streamFailed)})()"), 30, "gave up on streams")
     ph.wait(lambda: ph.js(LIVE_SHOWN), 20, "polled frame visible")
     perf = ph.js("(()=>{setPerf(true);return perfText()})()")
     assert "ライブ(ポーリング: " in perf, perf
     assert ph.js("JSON.parse(localStorage.getItem(RB_LIVE_PREF_KEY)).t") == "poll"
+    assert set(ph.js("JSON.parse(localStorage.getItem(RB_LIVE_PREF_KEY)).fail")) == {"ws", "sse", "mjpeg"}
+
+
+@scenario("live-ws-proxy", display="live")
+def live_ws_proxy(ph):
+    """The real-device problem in a box (v0.1.68): the app is reached through a reverse proxy that buffers every ordinary
+    response until it ends (so MJPEG and SSE deliver nothing) but tunnels WebSocket upgrades, like `tailscale serve`.
+    The live display still runs at >= 3 fps, over the WebSocket."""
+    import harness
+    proxy = harness.BufferingProxy(ph.env.port)
+    try:
+        ph.page.goto("http://127.0.0.1:%d/" % proxy.port)
+        ph.wait(lambda: ph.js("state.authed === true"), 15, "session through the proxy (cookies are shared by host name)")
+        ph.page.wait_for_selector("#omnibox", state="attached")
+        tab = ph.open("/anim.html")
+        ph.wait(lambda: ph.display() == "live", 5, "display live")
+        ph.wait(lambda: ph.js("state.rbStream && state.rbStream.kind") == "ws", 15, "WebSocket transport through the proxy")
+        ph.wait(lambda: ph.js(LIVE_SHOWN), 15, "frame visible through the proxy")
+        ph.wait(lambda: ph.js("state.rbStream.loaded") is True, 5, "first frame seen")
+        f0, t0 = ph.js("state.rbStream.frames"), time.monotonic()
+        ph.page.wait_for_timeout(3000)
+        fps = (ph.js("state.rbStream.frames") - f0) / (time.monotonic() - t0)
+        ph.notes.append("ws through the buffering proxy: %.1f fps" % fps)
+        assert fps >= 3, "only %.1f fps through the proxy" % fps
+        assert proxy.seen["upgrade"] >= 1, dict(proxy.seen)
+        # and the proxy really is a buffering one: the event stream does not start through it
+        got = ph.js("""async (id)=>{const ctl=new AbortController();setTimeout(()=>ctl.abort(),1500);
+          try{const r=await fetch('/api/rb/stream.sse?tab='+encodeURIComponent(id),{signal:ctl.signal,credentials:'same-origin'});
+          return 'status '+r.status}catch(e){return 'nothing in 1.5s'}}""", tab)
+        assert got == "nothing in 1.5s", "the proxy did not buffer the event stream: %s" % got
+        assert proxy.seen["stream-buffered:/api/rb/stream.sse"] >= 1, dict(proxy.seen)
+        perf = ph.js("(()=>{setPerf(true);return perfText()})()")
+        assert perf.startswith("ライブ(WebSocket)"), perf
+    finally:
+        proxy.close()
+
+
+@scenario("ws-security", display="live")
+def ws_security(ph):
+    """The Hub's WebSocket endpoint from outside the app (a raw RFC 6455 client): another site's Origin is refused
+    (403), so is a missing Origin, a missing session (401) and an unknown tab (404); the right Origin gets frames
+    (JPEG) and misbehaving frames are closed with the RFC codes."""
+    import struct
+
+    import harness
+    import remote_browser as rb
+    tab = ph.open("/anim.html")
+    ph.wait(lambda: ph.display() == "live", 5, "display live")
+    cookie = "; ".join("%s=%s" % (c["name"], c["value"]) for c in ph.context.cookies() if c["name"] == "qdl_session")
+    assert cookie, "no session cookie"
+    port = ph.env.port
+    path = "/api/rb/stream.ws?tab=" + tab
+    own = "http://127.0.0.1:%d" % port
+    for what, kwargs, want in (
+            ("cross-site origin", dict(origin="http://evil.example", cookie=cookie), 403),
+            ("origin of another port", dict(origin="http://127.0.0.1:1", cookie=cookie), 403),
+            ("no origin", dict(origin=None, cookie=cookie), 403),
+            ("no session", dict(origin=own, cookie=""), 401),
+            ("unknown tab", dict(origin=own, cookie=cookie, path="/api/rb/stream.ws?tab=b999"), 404)):
+        status, headers, sock = harness.raw_ws_client(port, kwargs.get("path", path), kwargs["origin"], kwargs["cookie"])
+        sock.close()
+        assert status == want, "%s: %s instead of %s" % (what, status, want)
+    status, headers, sock = harness.raw_ws_client(port, path, own, cookie)
+    assert status == 101 and headers["sec-websocket-accept"] == "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=", (status, headers)
+    fp = sock.makefile("rb")
+    fin, opcode, payload = rb.read_frame(lambda n: fp.read(n) if n else b"")
+    assert opcode == rb.OP_BINARY and payload[:2] == b"\xff\xd8", "first message is not a JPEG: %r" % payload[:8]
+    sock.sendall(rb.encode_frame(rb.OP_PING, b"x", mask=False))             # a client frame without a mask
+    while True:
+        fin, opcode, payload = rb.read_frame(lambda n: fp.read(n) if n else b"")
+        if opcode == rb.OP_CLOSE:
+            break
+    assert struct.unpack(">H", payload[:2])[0] == 1002, payload
+    sock.close()
+    ph.wait(lambda: ph.env.tabs()[tab].streams <= 1, 5, "the refused sockets left no stream behind")
+    ph.take_errors("/api/rb/viewport")      # the app's own viewport post can race the raw sockets above (400 while the tab settles)
 
 
 @scenario("copy-fallback")
@@ -441,6 +600,11 @@ def selftest(ph):
         assert cid in checks, "missing check " + cid
     live = checks["client.live"]
     assert live["status"] != "fail" and "経路:" in live["value"], live
+    # v0.1.68: the page under test really moves (it used to be a still page below the fold: ~0.3 fps on every path), and the
+    # report line names the WebSocket first
+    assert live["status"] == "pass" and live["value"].startswith("経路: WebSocket / "), live
+    assert "[Live] transport=websocket" in ph.js("fetch('/api/selftest/report').then(r=>r.json()).then(j=>j.text)"), "report header"
+    ph.notes.append("builtin.fps " + checks["builtin.fps"]["value"][:30])
     ph.notes.append("live: " + live["value"][:60])
     # v0.1.59: 「操作の応答」: route switches, switch feedback, idle traffic and the request count of opening a page
     response = {c["id"]: c for c in snap["checks"] if c["section"] == "response"}
@@ -2503,8 +2667,9 @@ def probe_queue_burst(ph):
     # the pill opens the list; every row has its links and the send / add actions
     ph.js("document.getElementById('probeChip').click()")
     ph.wait(lambda: ph.js("!document.getElementById('probeSheet').hidden"), 5, "the sheet")
-    rows = ph.js("document.querySelectorAll('#probeList .probe-job').length")
-    assert rows == 12, "the sheet lists %s jobs" % rows
+    # the sheet opens at once and fills when the job list arrives
+    ph.wait(lambda: ph.js("document.querySelectorAll('#probeList .probe-job').length") == 12, 5,
+            "the sheet lists the 12 jobs (now %s)" % ph.js("document.querySelectorAll('#probeList .probe-job').length"))
     text = ph.js("document.getElementById('probeSheet').innerText")
     assert "追加" in text and "リンク解析" in text, text[:300]
     ph.take_errors("status of 429", "ERR_ABORTED", "Failed to fetch", "Load failed")

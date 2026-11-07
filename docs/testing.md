@@ -36,8 +36,12 @@ settings-routes / display-reader・mirror・tiles・live / mirror-tap-link（ク
 mirror-menu-toggle（`href="#"` と自ページ宛の2種類のトグルが再読み込みにならない）/ mirror-dynamic / mirror-security（CSP・スクリプト不実行）/
 reader-cards（ラベル・サイズあり/なし、ページ送りチップ）/ gesture-flick-mirror・tiles、gesture-close-tab（Chromiumのみ: CDPタッチが必要）/
 reload-reattach / challenge-wait-fast・mirror（確認ページはライブに切り替えず「安全性の確認中」を表示、リダイレクト後 6 秒以内に本来のページを選んだ表示で出す・履歴は増えない）/ history-skip-and-first-page（確認ページ・トークン付き重複の履歴を1回で飛ばして戻る、最初のページでは案内のみでアプリの画面は変わらない）/ swipe-diagnostic・swipe-manual（Chromiumのみ: 設定›診断›自己テストの「スワイプだけ確認」「手動で確認」）/
-live-sse-fallback（MJPEGが1バイトも届かない状態を再現: 2.5秒後にSSEへ切替わりフレームが届く・経路を記憶して再読み込み後はMJPEGを触らない）/ live-polling-fallback（MJPEGもSSEも届かない: ポーリングで表示し理由を出す）/ copy-fallback（`navigator.clipboard` が無くても隠しtextarea＋execCommandでコピー）/
+live-ws（v0.1.68: 動くページ `fixtures/anim.html` でWebSocket経路が使われ3 fps以上・フレームは blob 画像で object URL が増え続けない・速度表示に「ライブ(WebSocket)」・画面を隠すとソケットとHubの配信が止まり、戻すと開き直す）/ live-sse-fallback（WebSocketのアップグレードに誰も答えない状態: 2.5秒後にSSEへ切替わりフレームが届く・失敗を記憶して再読み込み後はWebSocketを触らない）/ live-ws-refused（アップグレードが即エラー: 2回続けて失敗した時点でSSEへ）/ live-mjpeg-fallback（WebSocketもSSEも届かない: MJPEG）/ live-polling-fallback（どれも届かない: ポーリングで表示し理由を出す）/ live-ws-proxy（v0.1.68: ハーネスの `BufferingProxy` ＝普通の応答を終わるまで溜め込み、WebSocketのアップグレードだけ素通しするテスト専用のリバースプロキシ越しにアプリを開く。MJPEG/SSEは届かない（SSEが1.5秒で何も返さないことも確認）のに、WebSocketで3 fps以上のライブ表示が動く＝実機の症状の再現）/ ws-security（Python製のRFC 6455クライアントで直接叩く: 別サイトのOrigin 403・Origin無し403・セッション無し401・存在しないタブ404、正しいOriginならJPEGが届き、マスク無しフレームは1002で閉じられる）/ copy-fallback（`navigator.clipboard` が無くても隠しtextarea＋execCommandでコピー）/
 selftest（設定›診断›自己テストを実行して、全項目が終わり、レポートに NAS・端末・ログが入り、URLがホスト名だけになり、テスト用タブが残らない） / first-load（v0.1.54: 読み込みが終わらない重いページでも本文がミラーに先に出る・段階別の所要時間（作成/遷移/DOM構築/コピー作成と端末側の作成応答〜全体）が揃う・広告等のブロック数が数えられる・最初のコピーが部分コピーで後から全体に置き換わる）。
+
+### v0.1.68 WebSocket（ライブ表示）の単体テスト
+`tests/test_ws_hub.py`（ハンドシェイク: RFC例 `dGhlIHNhbXBsZSBub25jZQ==` → `s3pPLMBiTxaQ9kYGzzhZRbK+xOo=`・フレームの符号化（7/16/64ビット長）・マスク付きクライアントフレームの復号（RFC 5.7の `Hello`）・マスク無し=1002・4KiB超=1009（本体を読む前）・予約ビット/不正な制御フレーム・ping/pong・close往復・分割/バイナリ/その他の文字=1002/1003/1008・読まない端末で送信が止まり切断・無音の端末の切断・同時接続の上限と最古の切断）、`tests/test_remote_browser.py` の `WsStreamTests`（生のJPEGを1書き込みずつ・遅い書き込み側には最新の1枚だけ・ping・`alive()` で終了・`on_start` はタブが無ければ呼ばれない）、`tests/test_webapp.py`（101の前の拒否: 401/403/404/400、フレーム・ping・close・プロトコル違反の符号、タブを閉じると終わる、`/` のCSPだけにwss/wsが入る）。
+E2Eの `live-ws-proxy` は、実機の症状（プロキシが長い応答を溜め込む）をそのまま再現した回帰テストです。
 
 ### 要求数の予算と楽観的UI（v0.1.59）
 budget-open-mirror / budget-open-reader（アドレスバーからページを開くと、本文が端末に出るまでの `/api/` 要求が3件以内。`page.on("request")` で数え、ページ内の10msポーラーが本文を見つけた瞬間の件数で切る。長いポーリング・画像・firstloadの報告は数えない。ミラーはリンクのタップも検証し、metaの長いポーリングを除いて3件以内）/ budget-idle-state（Downloads画面で何も起きない10秒間の `/api/state` 応答が1件以内）/ optimistic-switch（スイッチを押して200ms後、`page.route` で1.5秒止めた保存の返事を待たずに見た目と `state.settings` が変わり保存中の印が付く・500で失敗させると元に戻りエラーが出る）。selftest シナリオは新しい「操作の応答」セクション（画面切り替え・スイッチの反応・待機30秒の通信量・ページを開く通信回数）が全部合格することも確認する。
@@ -72,6 +76,8 @@ GitHubのE2Eでは実機のNAS・iPhone・実サイトを測れないため、�
 続けて端末（iPhone等）がリーダー描画・ミラー読み込み・`wireMirrorDoc` のpointer/click到達・ミラー差し替え・タイル・ライブ受信・Hubとの往復時間を測って `POST /api/selftest/client` で返す。
 判定は常にHub側。「結果をコピー」の本文（日本語＋English、秘密なし、URLはホスト名のみ、デバッグログ末尾50行つき）を開発者へ貼ると、実機でしか出ない不具合を直せる。
 結果はHubのRAMに直近5件だけ残り、ディスクへは書かない。上限は6分（v0.1.65: 「タブの容量」「リンク解析キュー」を足したため）で、中止・エラー時もテスト用タブと一時的に入れたデバッグログを元に戻す。
+
+v0.1.68: 動くページ（`/anim`）の動く箱は、以前は記事の末尾（800x400の画像3枚の下）にあり、スマホ大の表示範囲の外だったため、読み込み中の約21フレームが出たあとスクリーンキャストは1枚も送らなかった。「ライブ表示（スクリーンキャスト） 7.0 fps（21フレーム / 3秒）」はその21フレームの数字で、端末側のライブ受信の測定（ポーリング 0.3 fps ＝ 最初の1枚だけ）も止まったページを測っていた。今は箱が表示範囲の上端に固定され（`position:fixed`）、40ms間隔の変化が続くので、どの経路のfpsも「動くページの実際の速度」になる（このE2E環境で約25 fps。NASの実機では下がる可能性が高い＝それが本来の測定値）。
 
 長押しのhosterプローブそのもの（実ドメイン）は未対応だが、v0.1.65 から「リンク解析キュー」の確認が仮想ページ（`selftest.example.com/go/N` が偽の Rapidgator ファイルページへ転送する）で行われる。
 

@@ -37,8 +37,9 @@ import state_hub
 import ttlcache
 import updater
 import webauthn
+import ws_hub
 
-VERSION = "0.1.67"
+VERSION = "0.1.68"
 PORT = 17864
 ROOT = Path(__file__).resolve().parent
 FILES = {"/": ("web/index.html", "text/html; charset=utf-8"),
@@ -62,6 +63,8 @@ def app_csp(pt_origin=None):
     return (CSP.replace("connect-src 'self';", "connect-src 'self' %s;" % pt_origin)
                .replace("frame-src 'self';", "frame-src 'self' %s;" % pt_origin))
 
+
+WS_HOST = re.compile(r"[A-Za-z0-9.-]{1,253}(:[0-9]{1,5})?|\[[0-9A-Fa-f:.]{2,45}\](:[0-9]{1,5})?")   # v0.1.68: a Host safe to put into the CSP
 
 FAILED = {}
 PASSKEY_BEGIN = {}     # per-address passkey login/begin timestamps (RAM only)
@@ -577,6 +580,17 @@ def server_pt(server):
     return manager
 
 
+def server_ws_registry(server):
+    """v0.1.68: the live WebSocket sockets of this Hub (at most ws_hub.MAX_SOCKETS)."""
+    registry = getattr(server, "ws_live", None)
+    if registry is None:
+        with SESSION_LOCK:
+            registry = getattr(server, "ws_live", None)
+            if registry is None:
+                registry = server.ws_live = ws_hub.Registry()
+    return registry
+
+
 def server_state_hub(server):
     hub = getattr(server, "state_hub", None)
     if hub is None:
@@ -656,6 +670,40 @@ class Handler(BaseHTTPRequestHandler):
         except OSError:
             pass
         if not started:
+            raise remote_browser.TabGone("このタブはすでに閉じられています")
+
+    def stream_ws(self, tab_id):
+        """Live display as a WebSocket (v0.1.68): one binary message (the JPEG) per screencast frame.
+
+        The caller has checked the admin session, the Host and the Origin. Refusals before the upgrade are
+        ordinary JSON errors (400 handshake, 404 tab, 429 stream limit); after the 101 the socket speaks
+        RFC 6455 (ws_hub.py). Runs until the viewer leaves, the tab closes or after 10 minutes (the phone reconnects).
+        """
+        problem = ws_hub.handshake_error(self.command, self.headers)
+        if problem:
+            return self.reject(problem[1], problem[0])
+        key = self.headers.get("Sec-WebSocket-Key").strip()
+        live = ws_hub.LiveSocket(self.connection)
+        self.close_connection = True
+        registry = server_ws_registry(self.server)
+        upgraded = []
+
+        def upgrade():
+            self.connection.sendall(ws_hub.handshake_response(key))
+            upgraded.append(True)
+            registry.add(live)
+            live.start_reader()
+        try:
+            self.server.rb.stream(tab_id, live.send_binary, ws=True, ping=live.send_ping, alive=live.alive,
+                                  on_start=upgrade)
+        except OSError:
+            pass
+        finally:
+            registry.remove(live)
+            if upgraded:
+                live.finish()
+        if not upgraded:
+            # Ended before the upgrade (tab closed, container stopped): report it like the other streams.
             raise remote_browser.TabGone("このタブはすでに閉じられています")
 
     def stream_mjpeg(self, tab_id):
@@ -752,6 +800,22 @@ class Handler(BaseHTTPRequestHandler):
         if manager is None or not manager.enabled:
             return CSP
         return app_csp(self.pt_origin()[0])
+
+    def ws_origins(self):
+        """v0.1.68: "wss://HOST ws://HOST" for the Host of this request (the live WebSocket), or "" for an odd Host.
+        Both schemes on purpose: the scheme the page really runs on is decided by the proxy in front, and a page on
+        https can never use ws:// anyway (mixed content), so naming it widens nothing."""
+        host = self.headers.get("Host", "")
+        return "wss://%s ws://%s" % (host, host) if WS_HOST.fullmatch(host) else ""
+
+    def index_csp(self):
+        """v0.1.68: the app document's policy. WebKit (iOS 18) does not treat ws: / wss: as 'self' for connect-src, so the
+        WebSocket origin of this very Host is named; nothing else changes (other responses keep the plain policy)."""
+        csp = self.app_csp()
+        origins = self.ws_origins()
+        if origins:
+            csp = csp.replace("connect-src 'self'", "connect-src 'self' " + origins, 1)
+        return csp
 
     def pt_status(self):
         manager = server_pt(self.server)
@@ -982,7 +1046,8 @@ class Handler(BaseHTTPRequestHandler):
         path = urlsplit(self.path).path
         if path in FILES:
             filename, typ = FILES[path]
-            return self.send_data(200, (ROOT / filename).read_bytes(), typ)
+            return self.send_data(200, (ROOT / filename).read_bytes(), typ,
+                                  csp=self.index_csp() if path == "/" else None)
         if path == APP_SW_PATH:
             # v0.1.60: the app-shell Service Worker carries the Hub's version (its cache name), so a release is a new worker.
             body = (ROOT / "web/app-sw.js").read_bytes().replace(b"__QD_VERSION__", VERSION.encode("ascii"))
@@ -1219,6 +1284,14 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/rb/stream.mjpg":
                 query = parse_qs(urlsplit(self.path).query)
                 return self.stream_mjpeg(query.get("tab", [""])[0])
+            if path == "/api/rb/stream.ws":
+                # v0.1.68: the same live frames over a WebSocket (reverse proxies pass the upgrade unbuffered).
+                # Cross-site WebSocket hijacking: browsers send Origin on every WebSocket handshake and the
+                # session cookie is SameSite=Strict, but the Origin must still be the app's own (as for POSTs).
+                if not self.origin_ok():
+                    return self.reject("Originが許可されていません", 403)
+                query = parse_qs(urlsplit(self.path).query)
+                return self.stream_ws(query.get("tab", [""])[0])
             if path == "/api/rb/stream.sse":
                 # v0.1.46: the same live frames as Server-Sent Events (base64 JPEG), for proxies that
                 # buffer multipart/x-mixed-replace but flush text/event-stream at once.

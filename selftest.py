@@ -161,7 +161,8 @@ HINTS = {
     "client.mirror_morph": "ミラーの差し替えが遅いです。重いページでは高速表示やリーダー表示が向いています。",
     "client.tiles": "高速表示のタイルの表示が遅いです。Hubへの通信速度を確認し、画質を速度優先にしてください。",
     "client.live": "ライブ表示のフレームが届きません。経路（プロキシ）がストリームを溜め込んでいる可能性があります。この結果を開発者へ送ってください。",
-    "client.live:polling": "ストリーム（MJPEG・SSE）がこの端末へ届かず、静止画ポーリング（5fps未満）で動いています。経由しているプロキシがストリームを溜め込んでいる可能性があります。画質を速度優先にし、この結果を開発者へ送ってください。",
+    "client.live:polling": "ストリーム（WebSocket・SSE・MJPEG）がこの端末へ届かず、静止画ポーリング（5fps未満）で動いています。経由しているプロキシがストリームを溜め込んでいる、またはWebSocketを通していない可能性があります。画質を速度優先にし、この結果を開発者へ送ってください。",
+    "client.live:slow": "ライブ表示は届いていますが、動くページで5fps未満です。NASの負荷（JD2のダウンロード・展開など）か回線の速度を確認し、画質を速度優先にしてください。",
     "client.route": "画面の切り替えが遅いです（通信なしで切り替わるはずです）。この端末の負荷（他のタブ・アプリ）を確認し、この結果を開発者へ送ってください。",
     "client.toggle": "スイッチを押してから見た目が変わるまでが遅いです。端末が忙しいか、画面の描き直しが重い可能性があります。この結果を開発者へ送ってください。",
     "client.idle": "何もしていないのにHubへの問い合わせが多いです（/api/state が30秒に3回を超えています）。NASブラウザのメモリ表示などが変化として扱われている可能性があります。デバッグログを有効にしてこの結果を開発者へ送ってください。",
@@ -211,7 +212,7 @@ CLIENT_NAMES = {
 }
 CLIENT_ID = re.compile(r"client\.[a-z_]{1,24}\Z")
 RUN_ID = re.compile(r"[A-Za-z0-9_-]{8,40}\Z")
-NUM_KEYS = ("ms", "n", "kb", "fps", "fps_mjpeg", "fps_sse", "fps_poll", "state", "total")
+NUM_KEYS = ("ms", "n", "kb", "fps", "fps_ws", "fps_mjpeg", "fps_sse", "fps_poll", "state", "total")
 
 
 def remote_browser_origin():
@@ -390,9 +391,14 @@ PAGES = {
         "セルフテスト 長いページ",
         "<main><h1>長いページ</h1>%s</main>" % "".join(
             "<p>%d. %s</p>" % (i, _PARA) for i in range(1, 91))),
+    # v0.1.68: the moving box is fixed at the top of the viewport. It used to sit at the END of the article (below three
+    # 800x400 images), i.e. far outside a phone-sized viewport: nothing visible changed, the screencast sent only the ~21
+    # frames of the page load and then none, so "7.0 fps" (21 frames / 3 s) was the load, and every later measurement of
+    # this page (the phone's live test) saw a still page (about 0.3 fps = the one frame it got).
     "/anim": _page(
         "セルフテスト アニメーション",
-        _article_body('<div id="a" style="height:120px;margin-top:10px;color:#fff;font-size:24px">frame 0</div>'),
+        _article_body('<div id="a" style="position:fixed;left:0;right:0;top:0;z-index:9999;height:120px;'
+                      'color:#fff;font-size:24px;background:#124">frame 0</div>'),
         script='<script>var n=0,e=document.getElementById("a");setInterval(function(){n++;'
                'e.style.background="hsl("+(n*23%360)+",70%,45%)";e.textContent="frame "+n;},40);</script>'),
 }
@@ -563,15 +569,18 @@ def client_evaluate(item):
             status = FAIL
         elif transport == "poll" and fps < FPS_WARN:
             status, variant = WARN, "polling"
+        elif fps < FPS_WARN:
+            status, variant = WARN, "slow"          # v0.1.68: a stream that arrives but is slow on a moving page
         parts = []
-        for key, name_, fkey in (("mjpeg", "MJPEG", "fps_mjpeg"), ("sse", "SSE", "fps_sse"), ("poll", "ポーリング", "fps_poll")):
+        for key, name_, fkey in (("ws", "WebSocket", "fps_ws"), ("sse", "SSE", "fps_sse"), ("mjpeg", "MJPEG", "fps_mjpeg"),
+                                 ("poll", "ポーリング", "fps_poll")):
             figure = item.get(fkey)
             if flags.get(key) is True:
                 parts.append("%s %s fps" % (name_, _fmt(figure)) if _num(figure) else "%s OK" % name_)
             elif key in flags or _num(figure):
                 parts.append("%s 届かず" % name_ if not _num(figure) or figure <= 0 else "%s %s fps" % (name_, _fmt(figure)))
         value = "経路: %s / %s fps / %s KB毎フレーム（%s）" % (label, _fmt(fps), _fmt(kb), "、".join(parts) or "測定なし")
-        threshold = "ストリーム(MJPEG/SSE)が届くこと。ポーリングなら >= %g fps" % FPS_WARN
+        threshold = "WebSocket / ストリーム(SSE・MJPEG)が >= %g fps で届くこと（ポーリングは >= %g fps）" % (FPS_WARN, FPS_WARN)
     elif cid == "client.route":
         status = FAIL if item.get("ok") is not True else rate(ms, CLIENT_ROUTE_WARN_MS, CLIENT_ROUTE_FAIL_MS)
         value = "最も遅い %s ms（%s 画面）" % (_fmt(ms), _fmt(n))
@@ -608,12 +617,13 @@ def client_evaluate(item):
             "variant": variant}
 
 
-TRANSPORT_LABEL = {"mjpeg": "ストリーム(MJPEG)", "sse": "ストリーム(SSE)", "poll": "ポーリング"}
+TRANSPORT_LABEL = {"ws": "WebSocket", "sse": "ストリーム(SSE)", "mjpeg": "ストリーム(MJPEG)", "poll": "ポーリング"}
+TRANSPORT_REPORT = {"ws": "websocket", "poll": "polling"}      # the [Live] line of the report (others: their own key)
 
 
 def live_transport(flags):
-    """The transport the app would end up on, in its own order: MJPEG, then SSE, then polling (or None)."""
-    for key in ("mjpeg", "sse", "poll"):
+    """The transport the app would end up on, in its own order (v0.1.68): WebSocket, SSE, MJPEG, then polling (or None)."""
+    for key in ("ws", "sse", "mjpeg", "poll"):
         if (flags or {}).get(key) is True:
             return key
     return None
@@ -2710,7 +2720,7 @@ class SelfTest:
                 info.get("chromium") or "?", "on" if info.get("resident") else "off", info.get("engine") or "?"),
             "[Source] cgroup=%s | container-stats=%s" % (info.get("cgroup") or "?", info.get("cgroup_sources") or "?"),
             "[Live] transport=%s fps=%s" % (
-                ({"poll": "polling"}.get(info.get("live_transport"), info.get("live_transport")) or "none")
+                (TRANSPORT_REPORT.get(info.get("live_transport"), info.get("live_transport")) or "none")
                 if run.client == "received" else "n/a",
                 _fmt(info.get("live_fps")) if run.client == "received" else "-"),
         ]
