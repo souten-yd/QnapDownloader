@@ -76,6 +76,8 @@ FETCH_PATTERNS = tuple({"urlPattern": pattern, "resourceType": "Document"} for p
 # is used so the normal validators (mirror, reader) treat the page like any other.
 SELFTEST_ORIGIN = "https://selftest.example.com"
 SELFTEST_TABS = 1              # self-test tabs open at once (they do not count against MAX_TABS)
+ORPHAN_IDLE = 90.0             # v0.1.60: at the tab cap, a tab nobody polled for this long is closed to make room
+OPEN_NONCE_TTL = 120.0         # v0.1.60: a repeated tab-open request with the same nonce returns the same tab
 INTERCEPT_CAP = 20             # events kept per tab (RAM only)
 INTERCEPT_DEDUP = 2.0          # an identical event within this many seconds is one event
 BYPASS_TTL = 30.0              # a "page open" bypass is valid for one navigation, this long
@@ -2106,6 +2108,12 @@ class RemoteBrowser:
             checked = browser_safety.validate(url)
         with self._open_lock:
             self._touch()
+            # v0.1.60: tabs whose opener never got the answer (a dropped or aborted request) are nobody's: at the
+            # cap, the ones no client polled for ORPHAN_IDLE seconds are closed first, oldest first.
+            if selftest is None:
+                for orphan in self._orphans_for_room():
+                    debuglog.log("rb", "info", "tab close (orphan at the cap)", {"tab": orphan.id})
+                    self._drop_tab(orphan, close=True)
             with self._lock:
                 if self._state == "stopping":
                     raise BrowserError("停止処理中です。数秒後にもう一度お試しください")
@@ -2496,6 +2504,18 @@ class RemoteBrowser:
                 resident = self._resident and self._state == "running"
             if resident:
                 self._schedule_trim()
+
+    def _orphans_for_room(self):
+        """v0.1.60: the user tabs to close so one more fits under MAX_TABS (only ones idle >= ORPHAN_IDLE)."""
+        now = self._clock()
+        with self._lock:
+            user = [t for t in self._tabs.values() if not t.selftest]
+            excess = len(user) - MAX_TABS + 1
+            if excess <= 0:
+                return []
+            idle = sorted((t for t in user if t.pollers == 0 and now - t.last_poll >= ORPHAN_IDLE),
+                          key=lambda t: t.last_poll)
+            return idle[:excess]
 
     def close_tab(self, ident):
         tab = self._tab(ident)

@@ -500,6 +500,20 @@ class HttpTests(unittest.TestCase):
         self.assertEqual(code, 400)
         self.assertIn("最大3枚", body["error"])
 
+    def test_rb_tab_open_repeated_with_the_same_nonce_returns_the_same_tab(self):
+        # v0.1.60: a lost answer is asked again with the same nonce: no second (orphan) tab
+        self.login()
+        code, first = self.req("/api/rb/tabs", {"url": "https://example.com/a", "nonce": "n0nce-1234abcd"})
+        self.assertEqual(code, 201)
+        code, again = self.req("/api/rb/tabs", {"url": "https://example.com/a", "nonce": "n0nce-1234abcd"})
+        self.assertEqual(code, 201)
+        self.assertEqual(again["id"], first["id"])
+        self.assertEqual(again["url"], "https://example.com/a")
+        code, other = self.req("/api/rb/tabs", {"url": "https://example.com/b", "nonce": "n0nce-5678abcd"})
+        self.assertNotEqual(other["id"], first["id"])
+        self.assertEqual(len(self.req("/api/rb/status")[1]["tabs"]), 2)
+        self.assertEqual(self.req("/api/rb/tabs", {"url": "https://example.com/c", "nonce": "bad nonce!"})[0], 400)
+
     def test_engine_native_remove_refused_in_native_mode(self):
         self.login()
         code, body = self.req("/api/engine/native/remove", {"confirmed": True})
@@ -534,7 +548,7 @@ class HttpTests(unittest.TestCase):
                                          headers={"Host": "192.168.68.57:17864"})
         with self.client.open(request, timeout=4) as response:
             self.assertEqual(response.status, 200)
-            self.assertEqual(json.load(response)["version"], "0.1.59")
+            self.assertEqual(json.load(response)["version"], "0.1.60")
         with self.client.open(self.url + "/icon.svg", timeout=4) as response:
             self.assertEqual(response.status, 200)
             self.assertEqual(response.headers.get_content_type(), "image/svg+xml")
@@ -1448,7 +1462,7 @@ class HttpTests(unittest.TestCase):
         self.assertFalse(info["supported"])
         code, _ = self.req("/api/update/apply", {"version": "v0.1.8"})
         self.assertEqual(code, 400)
-        self.assertEqual(self.req("/api/health")[1]["version"], "0.1.59")
+        self.assertEqual(self.req("/api/health")[1]["version"], "0.1.60")
         self.assertFalse(self.req("/api/jd2/status")[1]["connected"])
         self.assertEqual(self.req("/api/jd2/update/apply", {"confirmed": True})[0], 400)
         self.assertEqual(self.req("/api/jd2/preset/apply", {"confirmed": True})[0], 400)
