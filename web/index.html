@@ -86,16 +86,18 @@
   <button type="button" id="newTab" class="icon-btn small" aria-label="新しいタブ" title="新しいタブ"><svg class="icon" aria-hidden="true"><use href="#i-plus"/></svg></button>
  </header>
 
+ <button type="button" id="chromePeek" class="chrome-peek" aria-hidden="true" tabindex="-1"></button>
  <div class="toolbar" role="toolbar" aria-label="ブラウザツールバー">
   <div class="nav-group">
    <button type="button" id="navBack" class="icon-btn" aria-label="戻る" title="戻る"><svg class="icon" aria-hidden="true"><use href="#i-back"/></svg></button>
-   <button type="button" id="navForward" class="icon-btn" aria-label="進む" title="進む"><svg class="icon" aria-hidden="true"><use href="#i-forward"/></svg></button>
-   <button type="button" id="navReload" class="icon-btn" aria-label="再読み込み" title="再読み込み"><svg class="icon" aria-hidden="true"><use href="#i-reload"/></svg></button>
+   <button type="button" id="navForward" class="icon-btn nav-fwd" aria-label="進む" title="進む"><svg class="icon" aria-hidden="true"><use href="#i-forward"/></svg></button>
+   <button type="button" id="navReload" class="icon-btn nav-wide" aria-label="再読み込み" title="再読み込み"><svg class="icon" aria-hidden="true"><use href="#i-reload"/></svg></button>
   </div>
   <form id="omniForm" class="omnibox" autocomplete="off">
    <svg class="icon omni-icon" aria-hidden="true"><use id="omniIcon" href="#i-gear"/></svg>
    <input id="omnibox" type="text" inputmode="url" enterkeyhint="go" autocapitalize="off" autocorrect="off" spellcheck="false" maxlength="65536" aria-label="アドレスバー" placeholder="URLを入力または貼り付け">
-   <button type="button" id="starBtn" class="icon-btn small" aria-label="ブックマークに追加" aria-pressed="false" title="ブックマークに追加"><svg class="icon" aria-hidden="true"><use href="#i-star"/></svg></button>
+   <button type="button" id="modeBtn" class="mode-chip" aria-label="表示方法" title="表示方法を選ぶ" aria-haspopup="menu" hidden></button>
+   <button type="button" id="starBtn" class="icon-btn small nav-wide" aria-label="ブックマークに追加" aria-pressed="false" title="ブックマークに追加"><svg class="icon" aria-hidden="true"><use href="#i-star"/></svg></button>
   </form>
   <div class="tool-right">
    <a id="dlButton" class="icon-btn has-badge" href="#/downloads" aria-label="ダウンロード" title="ダウンロード"><svg class="icon" aria-hidden="true"><use href="#i-download"/></svg><span class="badge js-dl-badge" hidden></span></a>
@@ -108,6 +110,11 @@
      </div>
      <div class="menu-section" data-scope="web">
       <div class="menu-head">このページ</div>
+      <div id="menuPage" class="menu-page" hidden></div>
+      <div class="menu-nav" role="group" aria-label="ページの操作">
+       <button type="button" role="menuitem" data-action="forward" id="menuForward">→ 進む</button>
+       <button type="button" role="menuitem" data-action="reload" id="menuReload">⟳ 再読み込み</button>
+      </div>
       <div class="menu-label" data-scope="remote">表示</div>
       <div class="menu-seg" role="group" aria-label="表示方法" data-scope="remote">
        <button type="button" role="menuitemradio" data-action="display:reader" data-display="reader">リーダー</button>
@@ -596,6 +603,11 @@
         <pre id="updateLog" class="update-log">開くと表示します</pre>
        </details>
        <p class="set-text muted">QPKGとして導入した環境のみ更新できます（JD2本体はJD2の「エンジン」）</p>
+       <div class="update-line">
+        <span>画面の高速起動用キャッシュ</span>
+        <button type="button" id="appCacheClear" class="btn small">アプリのキャッシュを消す</button>
+       </div>
+       <p id="appCacheStatus" class="set-text muted" role="status">画面の読み込みが古いままのときに使います（消して、再読み込みします）。</p>
       </div>
 
       <div class="sub" data-sub="login">
@@ -784,7 +796,6 @@
       <button type="button" id="chalLiveBtn" class="chal-live-btn" hidden>確認画面を操作する</button>
      </div>
      <div id="snapProgress" class="loading-bar snap-progress" role="progressbar" aria-label="ページを取得中" hidden></div>
-     <button type="button" id="tileRefresh" class="tile-refresh" aria-label="再取得" title="再取得" hidden>⟳</button>
      <div id="remoteRing" class="press-ring" aria-hidden="true" hidden></div>
      <div id="perfOverlay" class="perf-overlay" role="status" hidden></div>
     </div>

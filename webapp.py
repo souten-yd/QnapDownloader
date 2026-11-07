@@ -38,7 +38,7 @@ import ttlcache
 import updater
 import webauthn
 
-VERSION = "0.1.60"
+VERSION = "0.1.61"
 PORT = 17864
 ROOT = Path(__file__).resolve().parent
 FILES = {"/": ("web/index.html", "text/html; charset=utf-8"),
@@ -47,12 +47,14 @@ FILES = {"/": ("web/index.html", "text/html; charset=utf-8"),
          "/icon.svg": ("web/icon.svg", "image/svg+xml"),
          "/apple-touch-icon.png": ("web/apple-touch-icon.png", "image/png"),
          "/icon-192.png": ("web/icon-192.png", "image/png")}
+APP_SW_PATH = "/app-sw.js"       # v0.1.60: served by handle_get (version substituted), not part of FILES
 # No frame-src https: since v0.1.35 (the in-phone iframe browser is gone). v0.1.39 adds frame-src 'self'
 # for ONE thing: the mirror display's sandboxed iframe, whose document is /api/rb/mirror/doc of this very
 # origin (a srcdoc iframe would inherit this policy and lose its inline styles; see docs/browser-shell-ui.md).
 # That response carries its own, stricter policy (rb_mirror.DOC_CSP_HEADER). External pages are never framed.
+# v0.1.60: worker-src 'self' for the app-shell Service Worker (/app-sw.js, app origin only; the passthrough origin B is separate).
 CSP = ("default-src 'none'; img-src 'self' data: blob:; script-src 'self'; style-src 'self'; "
-       "connect-src 'self'; frame-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'")
+       "connect-src 'self'; frame-src 'self'; worker-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'")
 # v0.1.57: with the passthrough display ON the app may frame (and ping) origin B, and nothing else.
 def app_csp(pt_origin=None):
     if not pt_origin:
@@ -925,6 +927,10 @@ class Handler(BaseHTTPRequestHandler):
         if path in FILES:
             filename, typ = FILES[path]
             return self.send_data(200, (ROOT / filename).read_bytes(), typ)
+        if path == APP_SW_PATH:
+            # v0.1.60: the app-shell Service Worker carries the Hub's version (its cache name), so a release is a new worker.
+            body = (ROOT / "web/app-sw.js").read_bytes().replace(b"__QD_VERSION__", VERSION.encode("ascii"))
+            return self.send_data(200, body, "text/javascript; charset=utf-8", extra={"Service-Worker-Allowed": "/"})
         if path == "/api/health":
             return self.send_data(200, {"version": VERSION,
                          "settings_revision": self.store.revision()})

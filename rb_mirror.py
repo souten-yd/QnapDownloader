@@ -57,6 +57,9 @@ OWN_CSS = (
     "[data-href]{cursor:pointer;-webkit-tap-highlight-color:rgba(10,132,255,.2);-webkit-touch-callout:none;"
     "-webkit-user-select:none;user-select:none}"
     "[data-frag]{cursor:pointer}"
+    # v0.1.60: instant feedback on a link tap (the app adds the class on pointerup, before the new copy arrives)
+    ".qd-tap{background-color:rgba(10,132,255,.18)!important;outline:2px solid rgba(10,132,255,.55)!important;"
+    "outline-offset:1px!important;border-radius:3px}"
     "img{-webkit-touch-callout:none}"
     ".qdm-ph{display:flex;align-items:center;justify-content:center;box-sizing:border-box;max-width:100%;"
     "background:#f0f1f3;color:#6b7280;border:1px dashed #c3c8cf;border-radius:4px;overflow:hidden;"
