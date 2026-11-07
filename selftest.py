@@ -58,7 +58,7 @@ CAPACITY_PAGE_WARN_MIB = 300   # one page this big is worth a hint
 CAPACITY_MAX_TABS = 20         # the largest setting of rb_max_tabs
 # v0.1.65: 「リンク解析キュー」: this many virtual long presses are queued at once and must finish one after another
 QUEUE_PROBES = 10
-QUEUE_BUDGET_S = 45.0
+QUEUE_BUDGET_S = 90.0             # v0.1.66: 10 probes one at a time (a slow NAS needs ~5 s each)
 CAPACITY_VIRTUAL = (("/article", "軽い仮想ページ"), ("/heavy?k=1", "重い仮想ページ1"),
                     ("/heavy?k=2", "重い仮想ページ2"), ("/heavy?k=3", "重い仮想ページ3"))
 
@@ -2384,11 +2384,13 @@ class SelfTest:
             done = [j for j in jobs if j["state"] == "done" and j.get("links")]
             failed = [j for j in jobs if j["state"] == "failed"]
             waiting = [j for j in jobs if j["state"] in ("queued", "running")]
+            empty = [j for j in jobs if j["state"] == "done" and not j.get("links")]    # v0.1.66: ended, nothing found
             reasons = sorted({_short(j.get("error") or "", 60) for j in failed})
             status = PASS if len(done) == len(ids) else (WARN if done else FAIL)
             self._add(run, "queue", "queue.finish", "全件の完了", status,
-                      "%d/%d件完了・失敗%d・未完了%d（全体%.1f秒%s）" % (
-                          len(done), len(ids), len(failed), len(waiting), total, "・" + " / ".join(reasons) if reasons else ""),
+                      "%d/%d件完了・リンクなし%d・失敗%d・未完了%d（全体%.1f秒%s）" % (
+                          len(done), len(ids), len(empty), len(failed), len(waiting), total,
+                          "・" + " / ".join(reasons) if reasons else ""),
                       "%d/%d件完了" % (len(ids), len(ids)), hint_key="queue.finish")
             spans = sorted((j["started"], j["finished"]) for j in jobs if j.get("started") and j.get("finished"))
             overlap = sum(1 for a, b in zip(spans, spans[1:]) if b[0] < a[1] - 0.05)

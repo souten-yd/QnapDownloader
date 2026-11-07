@@ -562,7 +562,7 @@ class HttpTests(unittest.TestCase):
                                          headers={"Host": "192.168.68.57:17864"})
         with self.client.open(request, timeout=4) as response:
             self.assertEqual(response.status, 200)
-            self.assertEqual(json.load(response)["version"], "0.1.65")
+            self.assertEqual(json.load(response)["version"], "0.1.66")
         with self.client.open(self.url + "/icon.svg", timeout=4) as response:
             self.assertEqual(response.status, 200)
             self.assertEqual(response.headers.get_content_type(), "image/svg+xml")
@@ -1476,7 +1476,7 @@ class HttpTests(unittest.TestCase):
         self.assertFalse(info["supported"])
         code, _ = self.req("/api/update/apply", {"version": "v0.1.8"})
         self.assertEqual(code, 400)
-        self.assertEqual(self.req("/api/health")[1]["version"], "0.1.65")
+        self.assertEqual(self.req("/api/health")[1]["version"], "0.1.66")
         self.assertFalse(self.req("/api/jd2/status")[1]["connected"])
         self.assertEqual(self.req("/api/jd2/update/apply", {"confirmed": True})[0], 400)
         self.assertEqual(self.req("/api/jd2/preset/apply", {"confirmed": True})[0], 400)
@@ -1819,6 +1819,20 @@ class HttpTests(unittest.TestCase):
             transfer.assert_not_called()
         job = self.req("/api/rb/probe/jobs?tab=b1")[1]["jobs"][0]
         self.assertEqual((job["state"], job["sent"]), ("done", None))
+
+    def test_autosend_that_cannot_happen_keeps_its_reason_on_the_job(self):
+        # v0.1.66: no silent failure: after the retries the reason is on the job (the list shows it)
+        self.queue_setup()
+        with patch.object(webapp, "PROBE_AUTOSEND_RETRIES", 0), \
+                patch.object(self.server.jd2, "_require", return_value=self.jd2_ready(False)), \
+                patch("jd2_transfer.transfer") as transfer:
+            self.req("/api/rb/probe", {"tab": "b1", "href": "https://blog.example.org/go/1"})
+            self.assertTrue(self.server.rb.probes.wait_idle(10))
+            transfer.assert_not_called()
+        job = self.req("/api/rb/probe/jobs?tab=b1")[1]["jobs"][0]
+        self.assertEqual(job["state"], "done")
+        self.assertEqual(job["sent"]["sent"], 0)
+        self.assertIn("自動送信できませんでした", job["sent"]["error"])
 
     def test_a_rapidgator_press_is_still_answered_with_the_result_itself(self):
         self.login()

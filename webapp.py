@@ -38,7 +38,7 @@ import ttlcache
 import updater
 import webauthn
 
-VERSION = "0.1.65"
+VERSION = "0.1.66"
 PORT = 17864
 ROOT = Path(__file__).resolve().parent
 FILES = {"/": ("web/index.html", "text/html; charset=utf-8"),
@@ -410,22 +410,39 @@ def send_many(server, links):
             "autostart": autostart}
 
 
-def probe_job_autosend(server, job):
+PROBE_AUTOSEND_RETRIES = 3          # v0.1.66: JD2 busy / starting: try again after 10, 20, 30 s
+
+
+def probe_job_autosend(server, job, attempt=0):
     """v0.1.65: a queued analysis finished with links. With the option probe_autosend and a JD2 that can take them they go
     to JD2 right here on the Hub (the phone may be in the background), and the job remembers the outcome. Otherwise
-    nothing happens and the phone shows the result with its buttons."""
+    nothing happens and the phone shows the result with its buttons.
+    v0.1.66: nothing fails silently any more: a JD2 that cannot take links now is asked again a few times, and the
+    reason of a send that did not happen is kept on the job (shown in the list) and in the debug log."""
     if not job.get("links"):
         return
+    reason, result = None, None
     try:
         if server.store.settings().get("probe_autosend", True) is not True:
             return
         with server.jd2.lock:
             adapter = server.jd2._require()
         if getattr(adapter, "can_send", False) is not True:
+            reason = "JD2が送信できる状態ではありません"
+        else:
+            result = send_many(server, job["links"])
+    except Exception as error:
+        reason = str(error) or type(error).__name__
+    if reason is not None:
+        debuglog.log("rb", "warn", "probe autosend not done", {"reason": reason[:120], "attempt": attempt})
+        if attempt < PROBE_AUTOSEND_RETRIES:
+            timer = threading.Timer(10.0 * (attempt + 1), probe_job_autosend, args=(server, job, attempt + 1))
+            timer.daemon = True
+            timer.start()
             return
-        result = send_many(server, job["links"])
-    except Exception:
-        return
+        result = {"sent": 0, "skipped": 0, "total": len(job["links"]), "error": "自動送信できませんでした: " + reason[:120]}
+    elif result.get("error"):
+        debuglog.log("rb", "warn", "probe autosend error", {"error": str(result["error"])[:120]})
     server.rb.probes.mark_sent(job["tab"], job["id"], result)
     try:
         server_cache(server).invalidate()
