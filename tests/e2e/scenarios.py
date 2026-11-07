@@ -2139,7 +2139,7 @@ def desktop_mouse_nav(ph):
         ph.page.mouse.wheel(-90, 0)
         ph.page.wait_for_timeout(25)
     ph.page.wait_for_timeout(700)
-    assert ph.env.nas_url(tab).endswith("/scroller.html"), "a swipe over the scrolling table moved the NAS page: %s" % ph.env.nas_url(tab)
+    assert ph.env.nas_url(tab).endswith("/scroller.html"), "a swipe over the scrolling table moved the NAS page: %s; wheel log: %s" % (ph.env.nas_url(tab), ph.js("JSON.stringify(wheelLog.slice(-8))"))
     # a page that is itself wider than the window: the sideways wheel scrolls it
     ph.post("/api/rb/navigate", {"tab": tab, "url": BASE + "/hwide.html"})
     ph.wait(lambda: ph.env.nas_url(tab).endswith("/hwide.html"), 10, "navigated to hwide")
@@ -2152,7 +2152,7 @@ def desktop_mouse_nav(ph):
         ph.page.mouse.wheel(-90, 0)
         ph.page.wait_for_timeout(25)
     ph.page.wait_for_timeout(700)
-    assert ph.env.nas_url(tab).endswith("/hwide.html"), "a sideways swipe on a page that scrolls sideways moved the NAS page"
+    assert ph.env.nas_url(tab).endswith("/hwide.html"), "a sideways swipe on a page that scrolls sideways moved the NAS page; wheel log: %s" % ph.js("JSON.stringify(wheelLog.slice(-8))")
     assert ph.js("location.hash") == hash_before
 
 
