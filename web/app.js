@@ -10245,7 +10245,7 @@ async function swipeFlick(ctx, o) {
         runMirror(ctx.d.tab, {force: true, immediate: true, quiet: true}).catch(() => {});
       }
       return Boolean(el);
-    }, tabDisplay(ctx.d.tab) === "mirror" ? 10000 : 1500);   // mirror: a loaded CI runner delivers the copy late
+    }, tabDisplay(ctx.d.tab) === "mirror" ? 4000 : 1500);    // longer waits pushed the whole check past its time limit
     if (!el) {
       let md = null;
       try { md = mirrorDoc(); } catch (e) { md = null; }
