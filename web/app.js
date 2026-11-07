@@ -886,7 +886,13 @@ function checkBootVersion(version) {
 
 // ---- v0.1.60: app shell cache (Service Worker /app-sw.js, secure contexts only: https / localhost) ----
 const SHELL_RELOAD_KEY = "qd.shellReload";
-function swSupported() { return "serviceWorker" in navigator && window.isSecureContext === true; }
+// https only (the home-screen app over tailscale serve). A loopback http page is a secure context too, but WebKit
+// refuses workers there ("access control checks"); Chromium-based browsers keep it for local tests.
+function swSupported() {
+  if (!("serviceWorker" in navigator) || window.isSecureContext !== true) return false;
+  if (location.protocol === "https:") return true;
+  return /^(127\.0\.0\.1|localhost)$/.test(location.hostname) && /Chrome\//.test(navigator.userAgent);
+}
 function shellServedFromCache() {
   try { return swSupported() && Boolean(navigator.serviceWorker.controller); } catch (e) { return false; }
 }
@@ -7995,8 +8001,17 @@ function wireShell() {
     if (box.value === state.omniShort) box.value = state.omniDisplay;
     box.select();
     requestAnimationFrame(() => { if (document.activeElement === box) box.select(); });   // iOS places the caret after focus
+    state.omniSelectOnUp = true;
+    setTimeout(() => { if (document.activeElement === box && state.omniSelectOnUp) box.select(); }, 60);
   });
-  $("omnibox").addEventListener("blur", () => { $("omnibox").value = state.omniShort; });
+  // WebKit puts the caret where the tap ended (after focus and the frame above): keep the whole URL selected once
+  $("omnibox").addEventListener("mouseup", e => {
+    if (!state.omniSelectOnUp) return;
+    state.omniSelectOnUp = false;
+    e.preventDefault();
+    $("omnibox").select();
+  });
+  $("omnibox").addEventListener("blur", () => { state.omniSelectOnUp = false; $("omnibox").value = state.omniShort; });
   $("modeBtn").addEventListener("click", () => {      // v0.1.60: the display chooser is the "表示" group of the menu
     if (!$("menu").hidden) { closeMenu(false); return; }
     openMenu();
@@ -9264,7 +9279,7 @@ async function swipeFlick(ctx, o) {
       const d0 = env.target.ownerDocument || env.target;       // the whole page, not the element under the centre
       el = d0.querySelector ? d0.querySelector(o.sel) : null;
       return Boolean(el);
-    }, 4000);
+    }, tabDisplay(ctx.d.tab) === "mirror" ? 10000 : 1500);   // mirror: a loaded CI runner delivers the copy late
     if (!el) return "none";
     const r = el.getBoundingClientRect();
     env.target = el;
