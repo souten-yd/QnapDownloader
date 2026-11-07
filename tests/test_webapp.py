@@ -5,6 +5,8 @@ from http.server import ThreadingHTTPServer
 import json
 import os
 from pathlib import Path
+import socket
+import struct
 import tempfile
 import time
 import threading
@@ -25,6 +27,7 @@ import remote_browser
 import jd2_accounts
 import state_hub
 import webapp
+import ws_hub
 from fake_docker import FakeDocker
 from test_remote_browser import FakeWS
 from test_jd2_accounts import FakeAdapter
@@ -562,7 +565,7 @@ class HttpTests(unittest.TestCase):
                                          headers={"Host": "192.168.68.57:17864"})
         with self.client.open(request, timeout=4) as response:
             self.assertEqual(response.status, 200)
-            self.assertEqual(json.load(response)["version"], "0.1.67")
+            self.assertEqual(json.load(response)["version"], "0.1.68")
         with self.client.open(self.url + "/icon.svg", timeout=4) as response:
             self.assertEqual(response.status, 200)
             self.assertEqual(response.headers.get_content_type(), "image/svg+xml")
@@ -1476,7 +1479,7 @@ class HttpTests(unittest.TestCase):
         self.assertFalse(info["supported"])
         code, _ = self.req("/api/update/apply", {"version": "v0.1.8"})
         self.assertEqual(code, 400)
-        self.assertEqual(self.req("/api/health")[1]["version"], "0.1.67")
+        self.assertEqual(self.req("/api/health")[1]["version"], "0.1.68")
         self.assertFalse(self.req("/api/jd2/status")[1]["connected"])
         self.assertEqual(self.req("/api/jd2/update/apply", {"confirmed": True})[0], 400)
         self.assertEqual(self.req("/api/jd2/preset/apply", {"confirmed": True})[0], 400)
@@ -2387,6 +2390,204 @@ class HttpTests(unittest.TestCase):
             self.assertEqual(self.server.rb._streams, 0)
         finally:
             conn.close()
+
+    # ---- v0.1.68: WebSocket live stream --------------------------------------------------------
+    WS_KEY = "dGhlIHNhbXBsZSBub25jZQ=="
+
+    def ws_open(self, path="/api/rb/stream.ws?tab=b1", origin="same", cookie=True, host=None, key=None, version="13",
+                upgrade="websocket", connection="Upgrade", method="GET"):
+        """Raw WebSocket handshake; returns (socket, status, headers, body_or_rest). `origin` "same" = the app's own."""
+        host = host or self.host
+        lines = ["%s %s HTTP/1.1" % (method, path), "Host: " + host]
+        if upgrade:
+            lines.append("Upgrade: " + upgrade)
+        if connection:
+            lines.append("Connection: " + connection)
+        lines.append("Sec-WebSocket-Key: " + (self.WS_KEY if key is None else key))
+        if version:
+            lines.append("Sec-WebSocket-Version: " + version)
+        if origin == "same":
+            lines.append("Origin: http://" + host)
+        elif origin:
+            lines.append("Origin: " + origin)
+        if cookie:
+            lines.append("Cookie: " + "; ".join("%s=%s" % (c.name, c.value) for c in self.cookie))
+        sock = socket.create_connection(("127.0.0.1", self.port), timeout=5)
+        self.addCleanup(sock.close)
+        sock.sendall(("\r\n".join(lines) + "\r\n\r\n").encode("ascii"))
+        data = b""
+        while b"\r\n\r\n" not in data:
+            chunk = sock.recv(4096)
+            if not chunk:
+                break
+            data += chunk
+        head, _, rest = data.partition(b"\r\n\r\n")
+        status = int(head.split(b" ", 2)[1])
+        headers = {}
+        for line in head.split(b"\r\n")[1:]:
+            name, _, value = line.decode("latin-1").partition(":")
+            headers[name.strip().lower()] = value.strip()
+        if status != 101:
+            while True:
+                try:
+                    chunk = sock.recv(4096)
+                except OSError:
+                    break
+                if not chunk:
+                    break
+                rest += chunk
+        return sock, status, headers, rest
+
+    def ws_frame(self, sock, buffer=b""):
+        fp = sock.makefile("rb")
+        self.addCleanup(fp.close)
+        return remote_browser.read_frame(lambda n: fp.read(n) if n else b"")
+
+    def test_ws_handshake_refusals_come_before_any_upgrade(self):
+        self.assertEqual(self.ws_open(cookie=False)[1], 401)                  # no session
+        self.login()
+        self.assertEqual(self.ws_open()[1], 404)                              # no such tab yet
+        self.req("/api/rb/tabs", {"url": "https://example.com/a"})
+        cases = (
+            ("no cookie", dict(cookie=False), 401),
+            ("foreign origin", dict(origin="http://evil.example"), 403),
+            ("same host other scheme/port", dict(origin="http://127.0.0.1:1"), 403),
+            ("no origin", dict(origin=None), 403),
+            ("null origin", dict(origin="null"), 403),
+            ("foreign host header", dict(host="evil.example"), 403),
+            ("unknown tab", dict(path="/api/rb/stream.ws?tab=b9"), 404),
+            ("bad tab id", dict(path="/api/rb/stream.ws?tab=../x"), 400),
+            ("bad version", dict(version="8"), 400),
+            ("no version", dict(version=None), 400),
+            ("bad key", dict(key="short"), 400),
+            ("no upgrade header", dict(upgrade=None), 400),
+            ("no connection upgrade", dict(connection="keep-alive"), 400),
+        )
+        for name, kwargs, status in cases:
+            with self.subTest(name):
+                sock, got, headers, body = self.ws_open(**kwargs)
+                self.assertEqual(got, status, body)
+                self.assertNotIn("sec-websocket-accept", headers)
+                sock.close()
+        self.assertEqual(self.server.rb._streams, 0)
+        self.assertEqual(webapp.server_ws_registry(self.server).count(), 0)
+
+    def test_ws_stream_frames_control_frames_and_close(self):
+        self.login()
+        self.req("/api/rb/tabs", {"url": "https://example.com/a"})
+        jpeg = b"\xff\xd8\xff\xe0JFIF-ws"
+        sock, status, headers, rest = self.ws_open()
+        self.assertEqual(status, 101)
+        self.assertEqual(headers["sec-websocket-accept"], "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=")
+        self.assertEqual((headers["upgrade"].lower(), headers["connection"].lower()), ("websocket", "upgrade"))
+        self.assertEqual(rest, b"")
+        fp = sock.makefile("rb")
+        self.addCleanup(fp.close)
+        read = lambda: remote_browser.read_frame(lambda n: fp.read(n) if n else b"")
+        for _ in range(300):
+            if webapp.server_ws_registry(self.server).count() == 1:
+                break
+            time.sleep(0.01)
+        self.assertEqual(self.server.rb._streams, 1)
+        self.rb_ws.emit("Page.screencastFrame", {
+            "data": base64.b64encode(jpeg).decode(), "sessionId": 1,
+            "metadata": {"deviceWidth": 390, "deviceHeight": 700}}, "SESSION1")
+        self.assertEqual(read(), (True, remote_browser.OP_BINARY, jpeg))        # the JPEG as it is, one message
+        self.assertEqual(self.req("/api/rb/meta?tab=b1&wait=0")[1]["streams"], 1)
+        mask = lambda op, payload=b"": remote_browser.encode_frame(op, payload, mask=True)
+        sock.sendall(mask(remote_browser.OP_PING, b"p1") + mask(remote_browser.OP_TEXT, b"ack"))
+        self.assertEqual(read(), (True, remote_browser.OP_PONG, b"p1"))
+        # the phone closes: the Hub echoes the close and frees the stream
+        sock.sendall(mask(remote_browser.OP_CLOSE, struct.pack(">H", 1000)))
+        fin, opcode, payload = read()
+        self.assertEqual((opcode, struct.unpack(">H", payload[:2])[0]), (remote_browser.OP_CLOSE, 1000))
+        for _ in range(300):
+            if self.server.rb._streams == 0 and webapp.server_ws_registry(self.server).count() == 0:
+                break
+            time.sleep(0.01)
+        self.assertEqual((self.server.rb._streams, webapp.server_ws_registry(self.server).count()), (0, 0))
+        self.assertEqual(sock.recv(10), b"")                                    # and drops the connection
+
+    def test_ws_protocol_violations_close_the_socket_with_the_rfc_codes(self):
+        self.login()
+        self.req("/api/rb/tabs", {"url": "https://example.com/a"})
+        for name, data, code in (
+                ("unmasked", remote_browser.encode_frame(remote_browser.OP_TEXT, b"ack", mask=False), 1002),
+                ("oversized", remote_browser.encode_frame(remote_browser.OP_BINARY, b"x" * 5000, mask=True), 1009),
+                ("fragmented", remote_browser.encode_frame(remote_browser.OP_TEXT, b"ac", fin=False, mask=True), 1002),
+                ("binary", remote_browser.encode_frame(remote_browser.OP_BINARY, b"x", mask=True), 1003)):
+            with self.subTest(name):
+                sock, status, headers, rest = self.ws_open()
+                self.assertEqual(status, 101)
+                sock.sendall(data)
+                fp = sock.makefile("rb")
+                fin, opcode, payload = remote_browser.read_frame(lambda n: fp.read(n) if n else b"")
+                self.assertEqual((opcode, struct.unpack(">H", payload[:2])[0]), (remote_browser.OP_CLOSE, code))
+                for _ in range(300):
+                    if self.server.rb._streams == 0:
+                        break
+                    time.sleep(0.01)
+                self.assertEqual(self.server.rb._streams, 0)
+                fp.close()
+                sock.close()
+
+    def test_ws_ends_when_the_tab_closes_and_the_cap_is_enforced_by_the_registry(self):
+        self.login()
+        self.req("/api/rb/tabs", {"url": "https://example.com/a"})
+        self.server.ws_live = ws_hub.Registry(1)
+        first, status, _, _ = self.ws_open()
+        self.assertEqual(status, 101)
+        for _ in range(300):
+            if self.server.ws_live.count() == 1:
+                break
+            time.sleep(0.01)
+        second, status, _, _ = self.ws_open()
+        self.assertEqual(status, 101)                       # the newer socket takes the place of the oldest
+        fp = first.makefile("rb")
+        self.addCleanup(fp.close)
+        fin, opcode, payload = remote_browser.read_frame(lambda n: fp.read(n) if n else b"")
+        self.assertEqual((opcode, struct.unpack(">H", payload[:2])[0]), (remote_browser.OP_CLOSE, ws_hub.CLOSE_REPLACED))
+        self.assertLessEqual(self.server.ws_live.count(), 1)
+        self.assertEqual(self.req("/api/rb/tabs/close", {"id": "b1"})[0], 200)       # closing the tab ends the stream
+        fp2 = second.makefile("rb")
+        self.addCleanup(fp2.close)
+        fin, opcode, payload = remote_browser.read_frame(lambda n: fp2.read(n) if n else b"")
+        self.assertEqual(opcode, remote_browser.OP_CLOSE)
+        for _ in range(300):
+            if self.server.rb._streams == 0 and self.server.ws_live.count() == 0:
+                break
+            time.sleep(0.01)
+        self.assertEqual((self.server.rb._streams, self.server.ws_live.count()), (0, 0))
+
+    def test_app_document_csp_names_the_websocket_origin_of_its_host_only(self):
+        """WebKit does not treat ws: / wss: as 'self': the document's connect-src names this very host. Other responses
+        keep the plain policy."""
+        def csp(path, host=None, headers=None):
+            sent = {"Host": host or self.host}
+            sent.update(headers or {})
+            request = urllib.request.Request(self.url + path, headers=sent)
+            with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(request, timeout=4) as response:
+                return response.headers["Content-Security-Policy"]
+        policy = csp("/")
+        self.assertIn("connect-src 'self' wss://%s ws://%s;" % (self.host, self.host), policy)
+        self.assertEqual(len(__import__("re").findall(r"wss?://", policy)), 2)      # two origins, nothing else
+        self.assertIn("default-src 'none'", policy)
+        self.assertIn("script-src 'self'", policy)
+        self.assertEqual(csp("/api/health"), webapp.CSP)             # the API keeps the old policy byte for byte
+        self.assertEqual(csp("/app.js"), webapp.CSP)
+        # behind tailscale serve (https, a ts.net name): the Host of the request
+        tailnet = csp("/", host="nas.tail1234.ts.net", headers={"X-Forwarded-Proto": "https"})
+        self.assertIn("connect-src 'self' wss://nas.tail1234.ts.net ws://nas.tail1234.ts.net;", tailnet)
+        # a Host that could change the policy is never copied into it
+        odd = webapp.Handler.ws_origins
+        fake = type("H", (), {"headers": {"Host": "a.example; script-src *"}})()
+        self.assertEqual(odd(fake), "")
+        for host in ("a b", "x'y", "x;y", "", "a,b", "a/b"):
+            self.assertEqual(odd(type("H", (), {"headers": {"Host": host}})()), "", host)
+        # the app-shell worker only handles the shell files: it can never see the live endpoints
+        worker = (webapp.ROOT / "web/app-sw.js").read_text(encoding="utf-8")
+        self.assertNotIn("stream", worker)
+        self.assertNotIn("WebSocket", worker)
 
     def test_state_polls_with_a_running_browser_never_start_docker_stats(self):
         self.login()

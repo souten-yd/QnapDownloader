@@ -219,6 +219,7 @@ STREAM_BOUNDARY = "qdlframe"
 SSE_PING_SECONDS = 10.0        # v0.1.46: `: ping` comment on an idle event stream
 SSE_PADDING = (b":" + b" " * 2047 + b"\n\n")      # 2 KiB first comment: small proxy buffers flush at once
 SSE_PING = b": ping\n\n"
+WS_PING_SECONDS = 20.0         # v0.1.68: a WebSocket live stream pings the phone this often while no frame goes out
 
 
 def sse_event(base64_jpeg):
@@ -3360,7 +3361,8 @@ class RemoteBrowser:
                 tab.pollers -= 1
                 tab.last_poll = self._clock()
 
-    def stream(self, ident, write, max_seconds=STREAM_MAX_SECONDS, heartbeat=STREAM_HEARTBEAT, sse=False):
+    def stream(self, ident, write, max_seconds=STREAM_MAX_SECONDS, heartbeat=STREAM_HEARTBEAT, sse=False,
+               ws=False, ping=None, alive=None, on_start=None):
         """Push the tab's screencast to `write(bytes)` as multipart/x-mixed-replace parts (or, with `sse`,
         as Server-Sent Events: `event: frame` + the frame's base64 JPEG, v0.1.46).
 
@@ -3370,6 +3372,12 @@ class RemoteBrowser:
         evicts it (a viewer behind a buffering proxy never shows us that its old stream is gone), or
         after `max_seconds`. The SSE form starts with a 2 KiB comment (defeats small proxy buffers) and
         sends a `: ping` comment every SSE_PING_SECONDS while no frame goes out.
+
+        v0.1.68: with `ws` every `write()` gets the raw JPEG bytes (one WebSocket message per frame, ws_hub.py);
+        `ping()` is called every WS_PING_SECONDS while no frame goes out; `alive()` returning False ends the
+        stream (the socket was closed by the phone; checked at least once a second); `on_start()` runs once the
+        stream is registered and the screencast runs, before the first wait (the 101 upgrade is sent there, so
+        a missing tab / the stream limit are still ordinary HTTP errors). Newest frame only, as above.
         """
         tab = self._tab(ident)
         stop = threading.Event()
@@ -3387,7 +3395,7 @@ class RemoteBrowser:
             tab.screencast = True
         stream_started = stream_logged = time.monotonic()
         stream_parts = 0
-        debuglog.log("net", "info", "stream connect", {"tab": ident, "kind": "sse" if sse else "mjpeg"})
+        debuglog.log("net", "info", "stream connect", {"tab": ident, "kind": "ws" if ws else "sse" if sse else "mjpeg"})
         try:
             self._touch()
             if starting:
@@ -3398,30 +3406,38 @@ class RemoteBrowser:
                         tab.screencast = False
                     raise
             started = last_sent = last_write = time.monotonic()
+            if on_start is not None:
+                on_start()
             if sse:
                 write(SSE_PADDING)
                 last_write = time.monotonic()
             end = started + max_seconds
             since, last = 0, None
-            while time.monotonic() < end and not stop.is_set():
+            while time.monotonic() < end and not stop.is_set() and (alive is None or alive()):
                 with self._cv:
                     while (tab.seq <= since and self._tabs.get(tab.id) is tab and
-                           self._state == "running" and not stop.is_set()):
+                           self._state == "running" and not stop.is_set() and (alive is None or alive())):
                         now = time.monotonic()
                         remaining = min(1.0, heartbeat - (now - last_sent), end - now)
                         if sse:
                             remaining = min(remaining, SSE_PING_SECONDS - (now - last_write))
+                        if ws:
+                            remaining = min(remaining, WS_PING_SECONDS - (now - last_write))
                         if remaining <= 0:
                             break
                         self._cv.wait(remaining)
                         tab.last_poll = self._last_activity = self._clock()
-                    if self._tabs.get(tab.id) is not tab or self._state != "running" or stop.is_set():
+                    if (self._tabs.get(tab.id) is not tab or self._state != "running" or stop.is_set() or
+                            (alive is not None and not alive())):
                         return
                     fresh = tab.seq > since
                     since = tab.seq
                     text = tab.frame
                 if sse and not fresh and time.monotonic() - last_write >= SSE_PING_SECONDS:
                     write(SSE_PING)
+                    last_write = time.monotonic()
+                if ws and not fresh and ping is not None and time.monotonic() - last_write >= WS_PING_SECONDS:
+                    ping()
                     last_write = time.monotonic()
                 if fresh and text:
                     last = text if sse else base64.b64decode(text)
@@ -3432,6 +3448,9 @@ class RemoteBrowser:
                 if sse:
                     part = sse_event(last)
                     size = len(last) * 3 // 4
+                elif ws:
+                    part = last                      # v0.1.68: one WebSocket message = the JPEG as it is
+                    size = len(last)
                 else:
                     part = ("--%s\r\nContent-Type: image/jpeg\r\nContent-Length: %d\r\n\r\n"
                             % (STREAM_BOUNDARY, len(last))).encode("ascii") + last + b"\r\n"

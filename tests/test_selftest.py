@@ -215,30 +215,42 @@ class ClientEvaluateTests(unittest.TestCase):
     def test_live_transports(self):
         live = lambda **kw: self.ev(id="client.live", **kw)
         # no frame on any transport (or no fps) is the failure
-        self.assertEqual(live(fps=0, flags={"mjpeg": False, "sse": False, "poll": False})["status"], FAIL)
+        self.assertEqual(live(fps=0, flags={"ws": False, "mjpeg": False, "sse": False, "poll": False})["status"], FAIL)
         self.assertEqual(live(fps=0, flags={"mjpeg": True})["status"], FAIL)
         self.assertEqual(live(fps=5, flags={})["status"], FAIL)
-        # the app ends on the first transport that works: MJPEG, then SSE, then polling
-        for flags, label in (({"mjpeg": True, "sse": True, "poll": True}, "MJPEG"),
-                             ({"mjpeg": False, "sse": True, "poll": True}, "SSE"),
-                             ({"mjpeg": False, "sse": False, "poll": True}, "ポーリング")):
+        # v0.1.68: the app ends on the first transport that works: WebSocket, then SSE, then MJPEG, then polling
+        for flags, label in (({"ws": True, "sse": True, "mjpeg": True, "poll": True}, "経路: WebSocket"),
+                             ({"ws": False, "sse": True, "mjpeg": True, "poll": True}, "経路: ストリーム(SSE)"),
+                             ({"ws": False, "sse": False, "mjpeg": True, "poll": True}, "経路: ストリーム(MJPEG)"),
+                             ({"ws": False, "sse": False, "mjpeg": False, "poll": True}, "経路: ポーリング")):
             with self.subTest(flags=flags):
-                out = live(fps=12, flags=flags, fps_mjpeg=12, fps_sse=11, fps_poll=4)
+                out = live(fps=12, flags=flags, fps_ws=12, fps_sse=11, fps_mjpeg=12, fps_poll=6)
                 self.assertEqual(out["status"], PASS)             # 12 fps on whichever transport
-                self.assertIn("経路: ストリーム(%s)" % label if label != "ポーリング" else "経路: ポーリング", out["value"])
-        # only polling below 5 fps is a warning; a slow stream on its own is not
-        poll = live(fps=3, flags={"mjpeg": False, "sse": False, "poll": True}, fps_poll=3)
+                self.assertIn(label, out["value"])
+        # below 5 fps on a moving page is a warning on every transport (polling keeps its own hint)
+        poll = live(fps=3, flags={"ws": False, "mjpeg": False, "sse": False, "poll": True}, fps_poll=3)
         self.assertEqual((poll["status"], poll["variant"]), (WARN, "polling"))
+        for flags in ({"ws": True}, {"sse": True}, {"mjpeg": True}):
+            slow = live(fps=2, flags=flags)
+            self.assertEqual((slow["status"], slow["variant"]), (WARN, "slow"), flags)
         self.assertEqual(live(fps=7, flags={"mjpeg": False, "sse": False, "poll": True})["status"], PASS)
-        self.assertEqual(live(fps=2, flags={"mjpeg": False, "sse": True})["status"], PASS)
-        self.assertEqual(live(fps=2, flags={"mjpeg": True})["status"], PASS)
-        # the value tells every measured transport
-        out = live(fps=6.5, flags={"mjpeg": False, "sse": True, "poll": True}, fps_mjpeg=0, fps_sse=6.5, fps_poll=0.1)
-        for part in ("経路: ストリーム(SSE)", "MJPEG 届かず", "SSE 6.5 fps", "ポーリング 0.1 fps"):
+        self.assertEqual(live(fps=5, flags={"ws": True})["status"], PASS)
+        # the value tells every measured transport: the real-device case (only polling arrived at 0.3 fps, v0.1.65) ...
+        out = live(fps=0.3, flags={"ws": False, "sse": False, "mjpeg": False, "poll": True},
+                   fps_ws=0, fps_sse=0, fps_mjpeg=0, fps_poll=0.3)
+        self.assertEqual(out["status"], WARN)
+        # ... and what it looks like once WebSocket gets through
+        out = live(fps=6.8, flags={"ws": True, "sse": False, "mjpeg": False, "poll": True},
+                   fps_ws=6.8, fps_sse=0, fps_mjpeg=0, fps_poll=0.3)
+        self.assertEqual(out["status"], PASS)
+        for part in ("経路: WebSocket", "6.8 fps", "WebSocket 6.8 fps", "SSE 届かず", "MJPEG 届かず", "ポーリング 0.3 fps"):
             self.assertIn(part, out["value"])
         self.assertEqual(selftest.live_transport({"sse": True}), "sse")
+        self.assertEqual(selftest.live_transport({"ws": True, "sse": True, "mjpeg": True, "poll": True}), "ws")
+        self.assertEqual(selftest.live_transport({"mjpeg": True, "poll": True}), "mjpeg")
         self.assertIsNone(selftest.live_transport({"mjpeg": False}))
-        self.assertIn("ストリーム", selftest.HINTS["client.live:polling"])
+        self.assertIn("WebSocket", selftest.HINTS["client.live:polling"])
+        self.assertIn("5fps", selftest.HINTS["client.live:slow"])
 
     def test_v0159_response_checks(self):
         ev = self.ev
@@ -1333,6 +1345,32 @@ class EnvCgroupAndReportTests(unittest.TestCase):
         self.assertIn("[WARN] client.secure", text)
         self.assertIn("ts.net", text)
         self.assertEqual(run.info["live_transport"], "sse")
+
+    def test_the_animating_page_moves_inside_the_viewport(self):
+        """v0.1.68: the moving box was at the end of the article, far below a phone's viewport: the screencast sent only the
+        frames of the page load (21 = '7.0 fps' in 3 s) and then nothing, and the phone's live test measured a still page."""
+        page = selftest.PAGES["/anim"]
+        box = page[page.index('id="a"') - 40:page.index('id="a"') + 200]
+        for token in ("position:fixed", "top:0", "z-index"):
+            self.assertIn(token, box)
+        self.assertIn("setInterval", page)
+
+    def test_report_header_names_websocket(self):
+        runner = make_runner()
+        runner.start({"client": False})
+        run = runner._run
+        with runner._cv:
+            run.state, run.phase, run.client = "running", "client", "pending"
+        payload = good_payload(run.id)
+        payload["checks"][-1] = {"id": "client.live", "fps": 6.8, "kb": 29, "fps_ws": 6.8, "fps_sse": 0, "fps_poll": 0.3,
+                                 "fps_mjpeg": 0, "flags": {"ws": True, "sse": False, "mjpeg": False, "poll": True}}
+        runner.submit_client(payload)
+        text = runner.report(run.id)["text"]
+        self.assertIn("[Live] transport=websocket fps=6.8", text)
+        self.assertIn("経路: WebSocket / 6.8 fps", text)
+        self.assertEqual(run.info["live_transport"], "ws")
+        with self.assertRaises(ValueError):                    # fps_ws is a number like the others
+            selftest.validate_client(dict(payload, checks=[{"id": "client.live", "fps_ws": "x"}]))
 
     def test_keep_is_requested_for_the_phone_phase(self):
         clock = Clock()

@@ -75,14 +75,16 @@ const DISPLAY_CHIP_TITLE = {reader: "リーダー", mirror: "ミラー", tiles: 
 // v0.1.60: this file's own version. The Hub's version (from /api/state) is compared with it: a shell cache that is
 // older than the Hub (the app was updated while the home-screen app was closed) is dropped and the page reloaded.
 // tests/test_web_shell.py checks that it equals webapp.VERSION.
-const APP_VERSION = "0.1.67";
+const APP_VERSION = "0.1.68";
 const PT_DISPLAY_LABEL = "パススルー";      // v0.1.57: not a NAS-browser display, so not in RB_DISPLAY_LABELS
 const RB_PERF_WINDOW_MS = 5000;
-const RB_STREAM_FIRST_MS = 5000;     // MJPEG only (no SSE available): first picture within this, else polling
-const RB_MJPEG_FIRST_MS = 2500;      // v0.1.46: MJPEG first picture within this, else the event stream (SSE)
-const RB_SSE_FIRST_MS = 3000;        // v0.1.46: SSE first frame within this, else polling
+const RB_STREAM_FIRST_MS = 5000;     // MJPEG as the last stream (v0.1.68: after WebSocket and SSE): first picture within this, else polling
+const RB_MJPEG_FIRST_MS = 2500;      // v0.1.46: the self-test's MJPEG first-picture limit
+const RB_SSE_FIRST_MS = 3000;        // v0.1.46: SSE first frame within this, else the next transport (MJPEG)
+const RB_WS_FIRST_MS = 2500;         // v0.1.68: WebSocket first frame within this, else SSE
+const RB_WS_ACK_MS = 25000;          // v0.1.68: the phone sends a tiny "ack" text this often (keeps proxies from idling the socket)
 const RB_LIVE_PREF_KEY = "qnapdl.livetransport.v1";
-const RB_LIVE_RETRY_MS = 24 * 60 * 60 * 1000;   // a device that fell back to SSE / polling retries MJPEG once a day
+const RB_LIVE_RETRY_MS = 24 * 60 * 60 * 1000;   // a transport that failed on this device is retried once a day (v0.1.68: per transport)
 const RB_STREAM_ERR_WINDOW_MS = 10000;
 const RB_STREAM_META_S = 2;
 const RB_STREAM_RECONNECT_MS = 9 * 60 * 1000;
@@ -2010,14 +2012,15 @@ async function sendViewport(tab) {
 
 const nextPaint = () => new Promise(resolve => requestAnimationFrame(() => resolve()));
 
-// ---- live display: MJPEG push (v0.1.30), event stream (SSE, v0.1.46), polling ----
-// 1. The <img> points at /api/rb/stream.mjpg (same origin, cookie sent); the Hub pushes the newest frame.
-// 2. Some proxies (Tailscale Serve, nginx ...) buffer multipart/x-mixed-replace but flush text/event-stream
-//    at once, so when no MJPEG picture arrives in RB_MJPEG_FIRST_MS the same frames are read from
-//    /api/rb/stream.sse (fetch + ReadableStream, else EventSource) and drawn into the same <img>.
-// 3. No SSE frame in RB_SSE_FIRST_MS: frame.jpg polling as before.
+// ---- live display: WebSocket (v0.1.68), event stream (SSE, v0.1.46), MJPEG push (v0.1.30), polling ----
+// 0. v0.1.68: /api/rb/stream.ws (wss:// on https): one binary message (a JPEG) per frame, decoded like the SSE frames.
+//    A real iPhone behind `tailscale serve` got neither MJPEG nor SSE (the proxy buffers long responses) but reverse
+//    proxies pass WebSocket upgrades through. No frame in RB_WS_FIRST_MS: the next transport.
+// 1. SSE: /api/rb/stream.sse (fetch + ReadableStream, else EventSource), frames drawn into the same <img>.
+// 2. MJPEG: the <img> points at /api/rb/stream.mjpg (same origin, cookie sent); the Hub pushes the newest frame.
+// 3. Nothing delivers: frame.jpg polling as before.
 // Metadata (address, title, loading, link-map revision, fps) still comes from the /api/rb/meta long-poll.
-// The transport that worked is remembered per device (MJPEG is retried at most once a day).
+// A transport that failed on this device is skipped for a day (RB_LIVE_RETRY_MS), the one that worked is remembered.
 // The stream is closed whenever the tab is hidden, switched or the mode changes.
 let streamNonce = 0;
 function streamUrl(rb) {
@@ -2027,7 +2030,16 @@ function sseUrl(rb) {
   return "/api/rb/stream.sse?tab=" + encodeURIComponent(rb.id) + "&n=" + (++streamNonce);
 }
 
-const LIVE_KIND_LABEL = {mjpeg: "ストリーム", sse: "SSE", poll: "ポーリング"};
+const LIVE_KIND_LABEL = {ws: "WebSocket", sse: "SSE", mjpeg: "MJPEG", poll: "ポーリング"};
+// v0.1.68: the transports in the order they are tried. A reverse proxy such as `tailscale serve` buffered MJPEG and SSE
+// on a real iPhone, but passes WebSocket upgrades through unbuffered, so WebSocket goes first.
+const LIVE_ORDER = ["ws", "sse", "mjpeg"];
+
+function wsUrl(rb) {
+  return (location.protocol === "https:" ? "wss://" : "ws://") + location.host +
+    "/api/rb/stream.ws?tab=" + encodeURIComponent(rb.id) + "&n=" + (++streamNonce);
+}
+function wsSupported() { return typeof WebSocket === "function" && typeof Blob === "function"; }
 
 function sseFetchOk() {
   return typeof fetch === "function" && typeof AbortController === "function" && typeof TextDecoder === "function" &&
@@ -2045,15 +2057,34 @@ function liveSavePref(patch) {
   writeLocal(RB_LIVE_PREF_KEY, JSON.stringify(Object.assign(liveLoadPref(), patch)));
 }
 
-// Which transport a live tab starts with: the remembered one, except that MJPEG is retried once a day.
-function liveStartKind() {
-  const pref = liveLoadPref();
-  const now = Date.now();
-  if ((pref.t === "sse" || pref.t === "poll") && !(now - (Number(pref.mjpegAt) || 0) > RB_LIVE_RETRY_MS)) {
-    return pref.t === "sse" && !sseSupported() ? "poll" : pref.t;
-  }
-  return "mjpeg";
+function liveKindSupported(kind) {
+  return kind === "ws" ? wsSupported() : kind === "sse" ? sseSupported() : kind === "mjpeg";
 }
+// A transport that did not deliver on this device is skipped for a day (then retried once). pref.fail = {kind: time}.
+function liveFailedRecently(kind, pref = liveLoadPref()) {
+  const at = Number(pref.fail && typeof pref.fail === "object" ? pref.fail[kind] : 0) || 0;
+  return at > 0 && Date.now() - at <= RB_LIVE_RETRY_MS;
+}
+function liveMarkFailed(kind) {
+  const pref = liveLoadPref();
+  liveSavePref({fail: Object.assign({}, pref.fail && typeof pref.fail === "object" ? pref.fail : {}, {[kind]: Date.now()})});
+}
+function liveMarkWorked(kind) {
+  const pref = liveLoadPref();
+  const fail = Object.assign({}, pref.fail && typeof pref.fail === "object" ? pref.fail : {});
+  delete fail[kind];
+  liveSavePref({t: kind, fail});
+}
+// The first transport (WebSocket -> SSE -> MJPEG) that this browser can do and that did not fail today, else "poll".
+function liveNextKind(after) {
+  const pref = liveLoadPref();
+  for (const kind of LIVE_ORDER.slice(after ? LIVE_ORDER.indexOf(after) + 1 : 0)) {
+    if (liveKindSupported(kind) && !liveFailedRecently(kind, pref)) return kind;
+  }
+  return "poll";
+}
+// Which transport a live tab starts with.
+function liveStartKind() { return liveNextKind(""); }
 
 // Server-Sent Events text -> onEvent(name, data). Comments (": ping") are ignored.
 function sseParser(onEvent) {
@@ -2130,7 +2161,8 @@ function reconnectStream(rb) {
   s.loaded = false;
   s.stalledSince = 0;
   s.arm();
-  if (s.kind === "sse") connectSse(s);
+  if (s.kind === "ws") connectWs(s);
+  else if (s.kind === "sse") connectSse(s);
   else $("remoteImg").src = streamUrl(rb);
 }
 
@@ -2165,14 +2197,16 @@ function closeStream() {
   }
 }
 
-// The current transport did not deliver: MJPEG -> SSE -> polling. `reason` is shown in the speed overlay.
+// The current transport did not deliver: WebSocket -> SSE -> MJPEG -> polling. `reason` is shown in the speed overlay.
 function streamAdvance(tab, rb, reason) {
   const s = state.rbStream;
-  const kind = s ? s.kind : "mjpeg";
+  const kind = s ? s.kind : "ws";
   rb.perf.fallback = reason;
   dlog("net", "warn", "stream fallback", {from: kind, reason});
-  if (kind === "mjpeg" && sseSupported()) {
-    openStream(tab, rb, "sse");
+  liveMarkFailed(kind);
+  const next = liveNextKind(kind);
+  if (next !== "poll") {
+    openStream(tab, rb, next);
     return;
   }
   rb.streamFailed = true;
@@ -2196,7 +2230,7 @@ function connectSse(s) {
       s.loaded = true;
       clearTimeout(s.timer);
       rb.perf.streamMs = performance.now() - s.opened;
-      liveSavePref({t: "sse"});
+      liveMarkWorked("sse");
       dlog("net", "info", "sse first frame", {ms: Math.round(rb.perf.streamMs)});
     }
     if (tab) presentRemoteFrame(tab, rb, blob).catch(() => {});
@@ -2215,11 +2249,82 @@ function connectSse(s) {
   }
 }
 
+// v0.1.68: one WebSocket to the live endpoint. onFrame(ArrayBuffer) per binary message. `done` resolves when it
+// ends normally after it was open (the Hub's 10 minute limit, a close frame) and rejects when it never opened or
+// ended abnormally. `close()` ends it quietly. Text messages from the Hub are ignored.
+function wsConnect(url, onFrame) {
+  const handle = {close: () => {}, opened: false};
+  handle.done = new Promise((resolve, reject) => {
+    let socket = null, ack = 0, finished = false;
+    const finish = (ok, error) => {
+      if (finished) return;
+      finished = true;
+      clearTimeout(ack);
+      if (ok) resolve(); else reject(error);
+    };
+    try { socket = new WebSocket(url); } catch (e) { finish(false, e); return; }
+    socket.binaryType = "arraybuffer";
+    handle.close = () => {
+      socket.onopen = socket.onmessage = socket.onerror = socket.onclose = null;
+      try { socket.close(1000); } catch (e) { /* already closed */ }
+      finish(true);
+    };
+    socket.onopen = () => {
+      handle.opened = true;
+      const beat = () => {
+        try { if (socket.readyState === 1) socket.send("ack"); } catch (e) { /* closing */ }
+        if (!finished) ack = setTimeout(beat, RB_WS_ACK_MS);
+      };
+      ack = setTimeout(beat, RB_WS_ACK_MS);
+    };
+    socket.onmessage = event => { if (event.data instanceof ArrayBuffer) onFrame(event.data); };
+    socket.onerror = () => { /* the close event follows */ };
+    socket.onclose = event => {
+      // 4001: a newer socket replaced this one (the Hub's cap); 1006: never opened / dropped
+      if (handle.opened && event.code !== 1006 && event.code !== 4001) finish(true);
+      else finish(false, new Error("WebSocket " + (handle.opened ? "closed " : "failed ") + event.code));
+    };
+  });
+  return handle;
+}
+
+// WebSocket: (re)connect `s`; frames are decoded off-screen like the SSE ones (presentRemoteFrame keeps at most two
+// object URLs alive: the shown one and the one being decoded).
+function connectWs(s) {
+  if (s.conn) s.conn.close();
+  const {rb} = s;
+  const tab = remoteTabOf(rb);
+  const conn = wsConnect(wsUrl(rb), buffer => {
+    if (state.rbStream !== s || s.conn !== conn) return;
+    if (!s.loaded) {
+      s.loaded = true;
+      clearTimeout(s.timer);
+      rb.perf.streamMs = performance.now() - s.opened;
+      liveMarkWorked("ws");
+      dlog("net", "info", "ws first frame", {ms: Math.round(rb.perf.streamMs)});
+    }
+    s.frames = (s.frames || 0) + 1;
+    if (tab) presentRemoteFrame(tab, rb, new Blob([buffer], {type: "image/jpeg"})).catch(() => {});
+  });
+  s.conn = conn;
+  s.connAt = performance.now();
+  conn.done.then(() => ended(false), () => ended(true));
+  function ended(failed) {
+    if (state.rbStream !== s || s.conn !== conn) return;
+    const now = performance.now();
+    s.errors = s.errors.filter(t => now - t < RB_STREAM_ERR_WINDOW_MS);
+    if (failed || now - s.connAt < 2000) s.errors.push(now);      // an end right after the start is an error too
+    dlog("net", failed ? "warn" : "info", "ws ended", {failed, count: s.errors.length});
+    if (s.errors.length >= 2) { streamAdvance(remoteTabOf(rb), rb, "WebSocketのエラー"); return; }
+    s.retry = setTimeout(() => { if (state.rbStream === s && s.conn === conn) connectWs(s); }, failed ? 500 : 50);
+  }
+}
+
 function remoteTabOf(rb) {
   return state.tabs.find(t => t.rb === rb) || null;
 }
 
-function openStream(tab, rb, kind = "mjpeg") {
+function openStream(tab, rb, kind = "ws") {
   closeStream();
   dropRemoteImage(rb);
   const img = $("remoteImg");
@@ -2229,14 +2334,14 @@ function openStream(tab, rb, kind = "mjpeg") {
   rb.stream = s;
   rbShown.owner = rb;
   rbShown.url = "";
-  const limit = kind === "sse" ? RB_SSE_FIRST_MS : (sseSupported() ? RB_MJPEG_FIRST_MS : RB_STREAM_FIRST_MS);
+  const limit = kind === "ws" ? RB_WS_FIRST_MS : kind === "sse" ? RB_SSE_FIRST_MS : RB_STREAM_FIRST_MS;
   const shown = () => {
     if (state.rbStream !== s) return;
     if (!s.loaded) {
       s.loaded = true;
       clearTimeout(s.timer);
       rb.perf.streamMs = performance.now() - s.opened;
-      liveSavePref({t: "mjpeg"});
+      liveMarkWorked("mjpeg");
       dlog("net", "info", "stream first frame", {ms: Math.round(rb.perf.streamMs)});
     }
     img.hidden = false;
@@ -2251,7 +2356,7 @@ function openStream(tab, rb, kind = "mjpeg") {
       if (state.rbStream !== s || s.loaded) return;
       if (kind === "mjpeg" && img.naturalWidth > 0 && img.currentSrc.indexOf("/api/rb/stream.mjpg") >= 0) { shown(); return; }
       if (performance.now() >= deadline) {
-        streamAdvance(tab, rb, kind === "sse" ? "SSEも最初の画面が届かない" : "MJPEGの最初の画面が届かない");
+        streamAdvance(tab, rb, kind === "ws" ? "WebSocketの最初の画面が届かない" : kind === "sse" ? "SSEの最初の画面が届かない" : "MJPEGの最初の画面が届かない");
         return;
       }
       s.timer = setTimeout(check, 250);
@@ -2259,13 +2364,18 @@ function openStream(tab, rb, kind = "mjpeg") {
     s.timer = setTimeout(check, 250);
   };
   s.arm = arm;
+  if (kind === "ws") {
+    dlog("net", "info", "ws open", {});
+    arm();
+    connectWs(s);
+    return;
+  }
   if (kind === "sse") {
     dlog("net", "info", "sse open", {});
     arm();
     connectSse(s);
     return;
   }
-  liveSavePref({mjpegAt: Date.now()});    // MJPEG is tried now: not again for a day if it fails
   img.onload = shown;
   img.onerror = () => {
     if (state.rbStream !== s) return;
@@ -2284,7 +2394,7 @@ function openStream(tab, rb, kind = "mjpeg") {
   img.src = streamUrl(rb);
 }
 
-async function streamLoop(tab, gen, kind = "mjpeg") {
+async function streamLoop(tab, gen, kind = "ws") {
   let fails = 0, first = true;
   await nextPaint();
   await nextPaint();
@@ -2771,7 +2881,7 @@ function perfText(tab = remoteTab()) {
       " · 取得 " + Math.round(p.extractMs || 0) + " ms" + (p.imgs ? " · 画像取得 " + Math.round(each) + " ms" : "");
   }
   if (rb && rb.stream && !rb.streamFailed) {
-    return "ライブ(" + LIVE_KIND_LABEL[rb.stream.kind === "sse" ? "sse" : "mjpeg"] + (p.fallback ? ": " + p.fallback : "") + ")・" +
+    return "ライブ(" + LIVE_KIND_LABEL[rb.stream.kind === "ws" || rb.stream.kind === "sse" ? rb.stream.kind : "mjpeg"] + (p.fallback ? ": " + p.fallback : "") + ")・" +
       quality + " · " + (p.fps || 0).toFixed(1) + " fps · " +
       kb(p.frameBytes || 0) + "/枚 · 応答 " + Math.round(p.streamMs || 0) + " ms";
   }
@@ -10600,6 +10710,7 @@ function selftestDevice() {
     clipboard_api: Boolean(navigator.clipboard && navigator.clipboard.writeText),
     exec_copy: selftestExecCopySupported(),
     sse: sseSupported(),
+    websocket: wsSupported(),
     live_pref: String(liveLoadPref().t || "-").slice(0, 8),
     secure_context: window.isSecureContext === true,
     https: location.protocol === "https:",
@@ -10706,7 +10817,7 @@ async function selftestClient(snap) {
 const CLIENT_STEP_LABEL = {"client.route": "画面の切り替え", "client.toggle": "スイッチの反応", "client.idle": "待機中の通信（30秒）",
   "client.open_rtt": "ページを開く通信回数", "client.rtt": "Hubとの通信", "client.reader": "リーダー表示", "client.mirror_load": "ミラーの読み込み",
   "client.mirror_events": "ミラー内のタップ", "client.mirror_morph": "ミラーの差し替え", "client.tiles": "高速表示",
-  "client.live": "ライブ表示（MJPEG・SSE・ポーリング）"};
+  "client.live": "ライブ表示（WebSocket・SSE・MJPEG・ポーリング）"};
 
 // ---- v0.1.59: 「操作の応答」 ----
 const nextFrame2 = async () => { await nextPaint(); await nextPaint(); };
@@ -10911,10 +11022,12 @@ async function selftestTilesStep(tab, created) {
 }
 
 // Live display the way the app does it, in the app's order, each transport measured on its own:
-//   1. MJPEG: an <img> on stream.mjpg must show a first frame within RB_MJPEG_FIRST_MS (then its frames are
-//      counted for SELFTEST_LIVE_MS with a fetch reader, else the Hub's own fps figure is used);
+//   1. v0.1.68 WebSocket: stream.ws read for SELFTEST_LIVE_MS (first frame within RB_WS_FIRST_MS; frames per second);
 //   2. SSE: stream.sse read for SELFTEST_LIVE_MS (frames per second);
-//   3. polling: frame.jpg requested exactly like remoteLoop (since = last seq, no rev) for SELFTEST_LIVE_MS.
+//   3. MJPEG: an <img> on stream.mjpg must show a first frame within RB_MJPEG_FIRST_MS (then its frames are
+//      counted for SELFTEST_LIVE_MS with a fetch reader, else the Hub's own fps figure is used);
+//   4. polling: frame.jpg requested exactly like remoteLoop (since = last seq, no rev) for SELFTEST_LIVE_MS.
+// The page under test is the animating one (/anim), so the figures are frames per second of a page that changes.
 // The app ends on the first of them that works; the Hub judges (client_evaluate) from the flags.
 async function selftestLiveMjpeg(tab, holder, out) {
   const img = new Image();
@@ -10973,6 +11086,29 @@ async function selftestLiveMjpeg(tab, holder, out) {
   if (!Number.isFinite(out.fps_mjpeg)) out.fps_mjpeg = 0;
 }
 
+async function selftestLiveWs(tab, out) {
+  let frames = 0, bytes = 0, firstAt = 0;
+  const started = performance.now();
+  let conn = null;
+  try {
+    conn = wsConnect(wsUrl({id: tab}), buffer => {
+      if (!frames) firstAt = performance.now();
+      frames++;
+      bytes += buffer.byteLength;
+    });
+    conn.done.catch(() => {});
+    await selftestWaitFor(() => frames > 0, RB_WS_FIRST_MS, 50);
+    if (frames > 0) await delay(Math.max(0, SELFTEST_LIVE_MS - (performance.now() - started)));
+  } catch (e) { /* unsupported */ }
+  if (conn) conn.close();
+  const counted = Math.max(performance.now() - (firstAt || started), 100);
+  out.flags.ws = frames > 0;
+  // frames after the first one, per second since the first (a short window must not inflate the figure)
+  out.fps_ws = frames > 1 ? Math.round((frames - 1) / (counted / 1000) * 10) / 10 : 0;
+  out.ws_ms = firstAt ? Math.round(firstAt - started) : 0;
+  if (frames > 0 && !out.kb) out.kb = Math.round(bytes / frames / 1024);
+}
+
 async function selftestLiveSse(tab, out) {
   let frames = 0, bytes = 0;
   const started = performance.now();
@@ -11016,16 +11152,20 @@ async function selftestLivePoll(tab, out) {
 
 async function selftestLiveStep(tab, holder) {
   const out = {flags: {}, kb: 0, firstMs: 0};
-  await selftestLiveMjpeg(tab, holder, out);
+  if (wsSupported()) await selftestLiveWs(tab, out);
   await delay(300);
   if (sseSupported()) await selftestLiveSse(tab, out);
   await delay(300);
+  await selftestLiveMjpeg(tab, holder, out);
+  await delay(300);
   await selftestLivePoll(tab, out);
-  const chosen = out.flags.mjpeg ? "mjpeg" : out.flags.sse ? "sse" : out.flags.poll ? "poll" : "";
-  const fps = chosen === "mjpeg" ? out.fps_mjpeg : chosen === "sse" ? out.fps_sse : chosen === "poll" ? out.fps_poll : 0;
-  const note = out.flags.mjpeg ? "MJPEGの最初の画面 " + out.firstMs + " ms" : "MJPEGの最初の画面が届かない（" + (RB_MJPEG_FIRST_MS / 1000) + "秒）";
-  const result = {ok: Boolean(chosen), fps: fps || 0, kb: out.kb, ms: out.firstMs, flags: out.flags, note};
-  for (const key of ["fps_mjpeg", "fps_sse", "fps_poll"]) if (Number.isFinite(out[key])) result[key] = out[key];
+  const chosen = out.flags.ws ? "ws" : out.flags.sse ? "sse" : out.flags.mjpeg ? "mjpeg" : out.flags.poll ? "poll" : "";
+  const fps = chosen === "ws" ? out.fps_ws : chosen === "sse" ? out.fps_sse : chosen === "mjpeg" ? out.fps_mjpeg :
+    chosen === "poll" ? out.fps_poll : 0;
+  const note = out.flags.ws ? "WebSocketの最初の画面 " + out.ws_ms + " ms" :
+    wsSupported() ? "WebSocketの最初の画面が届かない（" + (RB_WS_FIRST_MS / 1000) + "秒）" : "WebSocket非対応";
+  const result = {ok: Boolean(chosen), fps: fps || 0, kb: out.kb, ms: out.ws_ms || out.firstMs, flags: out.flags, note};
+  for (const key of ["fps_ws", "fps_mjpeg", "fps_sse", "fps_poll"]) if (Number.isFinite(out[key])) result[key] = out[key];
   return result;
 }
 

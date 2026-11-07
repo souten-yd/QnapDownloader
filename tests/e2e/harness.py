@@ -264,6 +264,156 @@ class FixtureServer:
         self.httpd.server_close()
 
 
+# ---------------------------------------------------------------- v0.1.68: a buffering reverse proxy (test only)
+
+class BufferingProxy:
+    """The real-device problem in a box: a reverse proxy in front of the Hub that BUFFERS every ordinary response
+    until the upstream closes it (so a stream that never ends, MJPEG or SSE, delivers nothing to the phone) but
+    tunnels WebSocket upgrades unbuffered, as `tailscale serve` does. Counts what it saw. Test code only."""
+
+    def __init__(self, upstream_port):
+        self.upstream = ("127.0.0.1", upstream_port)
+        self.seen = Counter()               # "upgrade", "buffered", "stream-buffered:<path>"
+        self._stop = threading.Event()
+        self._conns = set()
+        self._lock = threading.Lock()
+        self.sock = socket.socket()
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.sock.bind(("127.0.0.1", 0))
+        self.sock.listen(32)
+        self.port = self.sock.getsockname()[1]
+        threading.Thread(target=self._accept, daemon=True).start()
+
+    def _accept(self):
+        while not self._stop.is_set():
+            try:
+                client, _ = self.sock.accept()
+            except OSError:
+                return
+            threading.Thread(target=self._serve, args=(client,), daemon=True).start()
+
+    def _track(self, *socks):
+        with self._lock:
+            self._conns.update(socks)
+
+    @staticmethod
+    def _read_head(client):
+        data = b""
+        while b"\r\n\r\n" not in data:
+            chunk = client.recv(65536)
+            if not chunk:
+                return None, b""
+            data += chunk
+            if len(data) > 1 << 20:
+                return None, b""
+        head, _, rest = data.partition(b"\r\n\r\n")
+        return head, rest
+
+    def _serve(self, client):
+        upstream = None
+        try:
+            self._track(client)
+            head, rest = self._read_head(client)
+            if head is None:
+                return
+            lines = head.decode("latin-1").split("\r\n")
+            headers = {k.strip().lower(): v.strip() for k, _, v in (l.partition(":") for l in lines[1:])}
+            length = int(headers.get("content-length", "0") or 0)
+            while len(rest) < length:
+                rest += client.recv(65536)
+            upstream = socket.create_connection(self.upstream, timeout=10)
+            self._track(upstream)
+            upstream.settimeout(None)
+            if "upgrade" in headers.get("connection", "").lower() and headers.get("upgrade", "").lower() == "websocket":
+                self.seen["upgrade"] += 1
+                upstream.sendall(head + b"\r\n\r\n" + rest)
+                self._tunnel(client, upstream)
+                return
+            path = lines[0].split(" ")[1] if len(lines[0].split(" ")) > 1 else ""
+            self.seen["buffered"] += 1
+            if "/api/rb/stream." in path:
+                self.seen["stream-buffered:" + path.split("?")[0]] += 1
+            request = [lines[0]] + [l for l in lines[1:] if not l.lower().startswith("connection:")] + ["Connection: close"]
+            upstream.sendall(("\r\n".join(request) + "\r\n\r\n").encode("latin-1") + rest)
+            # buffer the whole response: nothing reaches the client before the upstream ends it
+            body = b""
+            while not self._stop.is_set():
+                readable, _, _ = select.select([upstream, client], [], [], 0.2)
+                if client in readable:
+                    try:
+                        if not client.recv(1, socket.MSG_PEEK):
+                            return                  # the phone gave up: stop buffering for it
+                    except OSError:
+                        return
+                if upstream in readable:
+                    chunk = upstream.recv(65536)
+                    if not chunk:
+                        break
+                    body += chunk
+            if body:
+                client.sendall(body)
+        except OSError:
+            pass
+        finally:
+            for sock in (upstream, client):
+                if sock is not None:
+                    try:
+                        sock.close()
+                    except OSError:
+                        pass
+
+    def _tunnel(self, a, b):
+        socks = [a, b]
+        while not self._stop.is_set():
+            readable, _, _ = select.select(socks, [], [], 0.5)
+            for src in readable:
+                dst = b if src is a else a
+                try:
+                    chunk = src.recv(65536)
+                    if not chunk:
+                        return
+                    dst.sendall(chunk)
+                except OSError:
+                    return
+
+    def close(self):
+        self._stop.set()
+        try:
+            self.sock.close()
+        except OSError:
+            pass
+        with self._lock:
+            conns = list(self._conns)
+        for sock in conns:
+            try:
+                sock.close()
+            except OSError:
+                pass
+
+
+def raw_ws_client(port, path, origin, cookie, host=None):
+    """A WebSocket client written from the RFC (not the app's): returns (status, headers, sock). With status 101 the
+    caller reads frames with remote_browser.read_frame and writes masked ones with remote_browser.encode_frame."""
+    host = host or "127.0.0.1:%d" % port
+    lines = ["GET %s HTTP/1.1" % path, "Host: " + host, "Upgrade: websocket", "Connection: Upgrade",
+             "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==", "Sec-WebSocket-Version: 13"]
+    if origin is not None:
+        lines.append("Origin: " + origin)
+    if cookie:
+        lines.append("Cookie: " + cookie)
+    sock = socket.create_connection(("127.0.0.1", port), timeout=8)
+    sock.sendall(("\r\n".join(lines) + "\r\n\r\n").encode("ascii"))
+    data = b""
+    while b"\r\n\r\n" not in data:
+        chunk = sock.recv(4096)
+        if not chunk:
+            break
+        data += chunk
+    head = data.partition(b"\r\n\r\n")[0].decode("latin-1").split("\r\n")
+    headers = {k.strip().lower(): v.strip() for k, _, v in (l.partition(":") for l in head[1:])}
+    return int(head[0].split(" ")[1]), headers, sock
+
+
 # ---------------------------------------------------------------- the whole environment
 
 class Env:
@@ -275,8 +425,9 @@ class Env:
         self.fx = FixtureServer(self.tmp)
         self.cdp_port = free_port()
         self.setup_done = False
-        self.blocked = set()        # {"mjpeg", "sse"}: the stream never sends a byte (what a buffering proxy does)
+        self.blocked = set()        # {"ws", "mjpeg", "sse"}: the stream never sends a byte (what a buffering proxy does)
         self.stream_hits = Counter()
+        self.refused = set()        # v0.1.68: {"ws"}: the endpoint answers at once with an error (a proxy without upgrade support)
         self._start_nas_chrome(find_chrome(nas_chrome))
         self._start_webapp()
 
@@ -436,11 +587,13 @@ class Env:
         """Scenarios can make a live transport 'buffered by a proxy': the request is accepted and the response
         never starts (no headers, no byte), until the phone gives up and closes the connection."""
         env = self
-        for attr, kind in (("stream_mjpeg", "mjpeg"), ("stream_sse", "sse")):
+        for attr, kind in (("stream_ws", "ws"), ("stream_mjpeg", "mjpeg"), ("stream_sse", "sse")):
             original = getattr(webapp.Handler, attr)
 
             def wrapper(handler, tab_id, _original=original, _kind=kind):
                 env.stream_hits[_kind] += 1
+                if _kind in env.refused:
+                    return handler.reject("test: refused", 503)
                 if _kind not in env.blocked:
                     return _original(handler, tab_id)
                 handler.close_connection = True
@@ -463,6 +616,7 @@ class Env:
     def reset_tabs(self):
         """Between scenarios: close every NAS tab and forget the fixture counters."""
         self.blocked.clear()
+        self.refused.clear()
         self.stream_hits.clear()
         try:                           # v0.1.57: every scenario starts with the passthrough off and no sessions
             import webapp
@@ -520,6 +674,10 @@ CONSOLE_ALLOW = (
     # current copy back (keepMirrorFrame): an expired copy (410) or the blocked app root in the frame
     "the server responded with a status of 410",
     "violates the following Content Security Policy directive: \"frame-ancestors 'none'\"",
+    # v0.1.68: a WebSocket the app gave up on (no first frame, closed while connecting) is logged by the browser as
+    # "WebSocket connection to ... failed" / "... is closed before the connection is established". A CSP block of the
+    # WebSocket is worded differently ("Refused to connect ...") and still fails the scenario.
+    "WebSocket connection to",
 )
 # WebKit reports a request the app itself aborted (the /api/state long-poll when the page or view
 # changes) as "Fetch API cannot load <own /api/...> due to access control checks", sometimes as a

@@ -770,7 +770,7 @@ const state = {rbPerf: true, rbPerfSamples: [], rbPerfSince: 0, rbQuality: "stan
 const RB_QUALITY_LABELS = {speed: "速度優先", standard: "標準", high: "高画質"};
 const remoteTab = () => null;
 const tabDisplay = tab => tab.display;
-const LIVE_KIND_LABEL = {mjpeg: "ストリーム", sse: "SSE", poll: "ポーリング"};
+const LIVE_KIND_LABEL = {ws: "WebSocket", sse: "SSE", mjpeg: "MJPEG", poll: "ポーリング"};
 """ + record + text + """
 let t = 0;
 const mk = () => ({now: () => t});
@@ -794,11 +794,16 @@ state.rbQuality = "speed";
 const live = {display: "live", rb: {stream: {}, streamFailed: false,
   perf: {fps: 9.84, frameBytes: 22528, streamMs: 120}}};
 let o = perfText(live);
-if (o !== "ライブ(ストリーム)・速度優先 · 9.8 fps · 22 KB/枚 · 応答 120 ms") { console.error("stream: " + o); process.exit(1); }
+if (o !== "ライブ(MJPEG)・速度優先 · 9.8 fps · 22 KB/枚 · 応答 120 ms") { console.error("stream: " + o); process.exit(1); }
 live.rb.stream = {kind: "sse"};
-live.rb.perf.fallback = "MJPEGの最初の画面が届かない";
+live.rb.perf.fallback = "WebSocketの最初の画面が届かない";
 o = perfText(live);
-if (o !== "ライブ(SSE: MJPEGの最初の画面が届かない)・速度優先 · 9.8 fps · 22 KB/枚 · 応答 120 ms") { console.error("sse: " + o); process.exit(1); }
+if (o !== "ライブ(SSE: WebSocketの最初の画面が届かない)・速度優先 · 9.8 fps · 22 KB/枚 · 応答 120 ms") { console.error("sse: " + o); process.exit(1); }
+live.rb.stream = {kind: "ws"};      // v0.1.68: the transport and its speed in the existing speed line
+live.rb.perf.fallback = "";
+o = perfText(live);
+if (o !== "ライブ(WebSocket)・速度優先 · 9.8 fps · 22 KB/枚 · 応答 120 ms") { console.error("ws: " + o); process.exit(1); }
+live.rb.perf.fallback = "x";
 live.rb.perf.fallback = "";
 live.rb.streamFailed = true;
 if (!perfText(live).startsWith("ライブ(ポーリング)・速度優先 · ")) { console.error("fallback: " + perfText(live)); process.exit(1); }
@@ -821,12 +826,14 @@ if (o !== "リーダー · ブロック 3 · 画像 1/2 · 取得 600 ms · 画�
         script = """
 (async function () {
 const RB_LIVE_PREF_KEY = "k"; const RB_LIVE_RETRY_MS = 24 * 60 * 60 * 1000;
+const LIVE_ORDER = ["ws", "sse", "mjpeg"];
 const store = {};
 const readLocal = key => (key in store ? store[key] : null);
 const writeLocal = (key, value) => { store[key] = value; };
-let sseOn = true;
+let sseOn = true, wsOn = true;
 const sseSupported = () => sseOn;
-""" + fn("liveLoadPref") + fn("liveSavePref") + fn("liveStartKind") + fn("sseParser") + """
+const wsSupported = () => wsOn;
+""" + fn("liveLoadPref") + fn("liveSavePref") + fn("liveKindSupported") + fn("liveFailedRecently") + fn("liveMarkFailed") + fn("liveMarkWorked") + fn("liveNextKind") + fn("liveStartKind") + fn("sseParser") + """
 const eq = (a, b, what) => { if (JSON.stringify(a) !== JSON.stringify(b)) { console.error(what + ": " + JSON.stringify(a) + " != " + JSON.stringify(b)); process.exit(1); } };
 // event stream parsing: comments and pings are ignored, events may be split anywhere
 const seen = [];
@@ -835,23 +842,37 @@ feed(":" + " ".repeat(2047) + "\\n\\n");
 feed("event: frame\\ndata: QUJ");
 feed("D\\n\\n: ping\\n\\nevent: frame\\ndata: WFla\\n\\n");
 eq(seen, [["frame", "QUJD"], ["frame", "WFla"]], "sse events");
-// transport memory: nothing stored -> MJPEG; a remembered SSE / polling sticks for a day, then MJPEG is retried
-eq(liveStartKind(), "mjpeg", "default");
-writeLocal(RB_LIVE_PREF_KEY, JSON.stringify({t: "sse", mjpegAt: Date.now() - 1000}));
-eq(liveStartKind(), "sse", "sticky sse");
-writeLocal(RB_LIVE_PREF_KEY, JSON.stringify({t: "poll", mjpegAt: Date.now() - 1000}));
-eq(liveStartKind(), "poll", "sticky poll");
-writeLocal(RB_LIVE_PREF_KEY, JSON.stringify({t: "sse", mjpegAt: Date.now() - RB_LIVE_RETRY_MS - 1000}));
-eq(liveStartKind(), "mjpeg", "daily MJPEG retry");
-writeLocal(RB_LIVE_PREF_KEY, JSON.stringify({t: "mjpeg", mjpegAt: Date.now()}));
-eq(liveStartKind(), "mjpeg", "mjpeg stays");
-writeLocal(RB_LIVE_PREF_KEY, JSON.stringify({t: "sse", mjpegAt: Date.now()}));
+// v0.1.68 transport order WebSocket -> SSE -> MJPEG -> polling; a transport that failed is skipped for a day
+eq(liveStartKind(), "ws", "default is WebSocket");
+eq(liveNextKind("ws"), "sse", "after ws");
+eq(liveNextKind("sse"), "mjpeg", "after sse");
+eq(liveNextKind("mjpeg"), "poll", "after mjpeg");
+liveMarkFailed("ws");
+eq(liveStartKind(), "sse", "ws failed today");
+eq(liveNextKind("ws"), "sse", "next after the failed ws");
+liveMarkFailed("sse");
+eq(liveStartKind(), "mjpeg", "ws and sse failed today");
+liveMarkFailed("mjpeg");
+eq(liveStartKind(), "poll", "all failed today");
+writeLocal(RB_LIVE_PREF_KEY, JSON.stringify({fail: {ws: Date.now() - RB_LIVE_RETRY_MS - 1000, sse: Date.now() - 1000}}));
+eq(liveStartKind(), "ws", "a day later WebSocket is tried again");
+liveMarkWorked("ws");
+eq(JSON.parse(store[RB_LIVE_PREF_KEY]).t, "ws", "remembered");
+eq(Object.keys(JSON.parse(store[RB_LIVE_PREF_KEY]).fail), ["sse"], "a transport that worked is no longer failed");
+wsOn = false;
+eq(liveStartKind(), "mjpeg", "no WebSocket here, sse failed today");
 sseOn = false;
-eq(liveStartKind(), "poll", "sse remembered but unsupported here");
+writeLocal(RB_LIVE_PREF_KEY, "{}");
+eq(liveStartKind(), "mjpeg", "neither ws nor sse here");
 writeLocal(RB_LIVE_PREF_KEY, "not json");
 eq(liveStartKind(), "mjpeg", "garbage is ignored");
-liveSavePref({t: "sse"}); liveSavePref({mjpegAt: 5});
-eq(JSON.parse(store[RB_LIVE_PREF_KEY]), {t: "sse", mjpegAt: 5}, "merge");
+writeLocal(RB_LIVE_PREF_KEY, JSON.stringify({fail: "x", t: 5}));
+eq(liveStartKind(), "mjpeg", "a malformed fail map is ignored");
+wsOn = true;
+writeLocal(RB_LIVE_PREF_KEY, "{}");
+eq(liveStartKind(), "ws", "ws again");
+liveSavePref({t: "sse"}); liveSavePref({fail: {ws: 5}});
+eq(JSON.parse(store[RB_LIVE_PREF_KEY]), {t: "sse", fail: {ws: 5}}, "merge");
 })();
 """
         result = subprocess.run(["node", "-e", script], capture_output=True, text=True, timeout=20)
@@ -878,8 +899,14 @@ eq(JSON.parse(store[RB_LIVE_PREF_KEY]), {t: "sse", mjpegAt: 5}, "merge");
 
     def test_v0146_selftest_client_measures_each_live_transport_in_the_apps_order(self):
         step = re.search(r"async function selftestLiveStep\(tab, holder\) \{.*?\n\}\n", self.js, re.S).group(0)
-        self.assertLess(step.index("selftestLiveMjpeg("), step.index("selftestLiveSse("))
-        self.assertLess(step.index("selftestLiveSse("), step.index("selftestLivePoll("))
+        self.assertLess(step.index("selftestLiveWs("), step.index("selftestLiveSse("))      # v0.1.68: WebSocket first
+        self.assertLess(step.index("selftestLiveSse("), step.index("selftestLiveMjpeg("))
+        self.assertLess(step.index("selftestLiveMjpeg("), step.index("selftestLivePoll("))
+        ws = re.search(r"async function selftestLiveWs\(tab, out\) \{.*?\n\}\n", self.js, re.S).group(0)
+        self.assertIn("wsUrl({id: tab})", ws)
+        self.assertIn("RB_WS_FIRST_MS", ws)
+        self.assertIn("conn.close()", ws)
+        self.assertIn('"fps_ws"', step)
         self.assertIn("RB_MJPEG_FIRST_MS", self.js[self.js.index("async function selftestLiveMjpeg"):])
         poll = re.search(r"async function selftestLivePoll\(tab, out\) \{.*?\n\}\n", self.js, re.S).group(0)
         self.assertIn('"&since=" + seq', poll)               # exactly like remoteLoop: since = last seq, no rev
@@ -892,7 +919,7 @@ eq(JSON.parse(store[RB_LIVE_PREF_KEY]), {t: "sse", mjpegAt: 5}, "merge");
         text = re.search(r"function perfText\(tab = remoteTab\(\)\) \{.*?\n\}\n", self.js, re.S).group(0)
         for label in ('"ライブ("', "LIVE_KIND_LABEL", "ライブ(ポーリング", "高速(全体表示)", "リーダー"):
             self.assertIn(label, text)
-        self.assertIn('{mjpeg: "ストリーム", sse: "SSE", poll: "ポーリング"}', self.js)
+        self.assertIn('{ws: "WebSocket", sse: "SSE", mjpeg: "MJPEG", poll: "ポーリング"}', self.js)
         # live display: the <img> points at the stream; metadata still comes from the meta long-poll
         self.assertIn("/api/rb/stream.mjpg?tab=", self.js)
         self.assertIn("/api/rb/stream.sse?tab=", self.js)
@@ -907,12 +934,14 @@ eq(JSON.parse(store[RB_LIVE_PREF_KEY]), {t: "sse", mjpegAt: 5}, "merge");
         self.assertIn("streamLoop(tab, state.rbGen, kind)", self.js)
         # fallback: two errors within 10 s, or no picture within 2.5 s (MJPEG, then SSE 3 s) before polling
         self.assertIn("RB_STREAM_FIRST_MS = 5000", self.js)
+        self.assertIn("RB_WS_FIRST_MS = 2500", self.js)
         self.assertIn("RB_MJPEG_FIRST_MS = 2500", self.js)
         self.assertIn("RB_SSE_FIRST_MS = 3000", self.js)
         self.assertIn("RB_STREAM_ERR_WINDOW_MS = 10000", self.js)
         self.assertIn("s.errors.length >= 2", self.js)
         advance = re.search(r"function streamAdvance\(tab, rb, reason\) \{.*?\n\}\n", self.js, re.S).group(0)
-        self.assertIn('openStream(tab, rb, "sse")', advance)
+        self.assertIn("liveNextKind(kind)", advance)              # v0.1.68: WebSocket -> SSE -> MJPEG -> polling
+        self.assertIn("openStream(tab, rb, next)", advance)
         self.assertIn("rb.streamFailed = true;", advance)
         # closed when hidden / switched / mode changes / the picture is dropped / logout
         sync = re.search(r"function syncRemotePoll\(\) \{.*?\n\}\n", self.js, re.S).group(0)

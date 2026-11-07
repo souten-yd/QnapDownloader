@@ -274,6 +274,9 @@ Cloudflare等で手元のブラウザ（iframe）では開けないサイトを�
 - 上限: 1タブ2本（v0.1.46: 3本目は同じタブの最も古い1本を終了させて受け付ける。プロキシ越しでは端末が切断しても古い接続にHubが気づけないため）、全体4本（超過は429）。ストリームは閲覧中としてカウントされ（アイドル停止の判定に入る）、他のリクエストを止めない（デーモンスレッド、ソケットのタイムアウト10秒）。最初のフレームが届いた時点で応答が始まる。
 - 端末: ライブ表示では `<img>` の `src` を同一オリジンのストリームURLにする。タブ情報・リンク位置表の版・fpsは `/api/rb/meta`（2秒ロングポーリング）から受け取る（fpsはHub側で直近3秒から算出）。ストリームが10秒以内に2回エラーになるか、最初の画像が出ない場合は次の経路へ進む（v0.1.46: 下の「SSE」参照）。タブが非表示・切替・表示方法の変更・ログアウトの際はストリームを閉じる（`src` を外す）。
 
+### v0.1.68 ライブ表示の経路: WebSocket → SSE → MJPEG → ポーリング
+v0.1.65 の実機（`tailscale serve` 経由）では MJPEG も SSE も端末へ届かず、ポーリング 0.3 fps でした。WebSocketのアップグレードはリバースプロキシが溜め込まずに通すため、`GET /api/rb/stream.ws?tab=ID`（`ws_hub.py`、詳細は docs/https-and-share.md の E）を最初の経路にしました。端末は `wss://`（httpなら `ws://`）で同一オリジンに繋ぎ、バイナリメッセージ（JPEG）を `Blob` にして `presentRemoteFrame`（SSEと同じデコード・差し替え、object URLは表示中＋デコード中の2つまで）で `#remoteImg` に出します。2.5秒以内に最初の画面が無ければSSE→MJPEG→ポーリングの順に落ち、届かなかった経路は端末ごとに1日スキップします（`qnapdl.livetransport.v1` の `fail`）。速度表示は「ライブ(WebSocket)」「ライブ(SSE: WebSocketの最初の画面が届かない)」「ライブ(MJPEG: …)」「ライブ(ポーリング: …)」。
+
 ### v0.1.46 ライブ表示の経路: MJPEG → SSE → ポーリング
 実機（Tailscale Serve経由のiPhone）で、プロキシが `multipart/x-mixed-replace` を溜め込み、最初のフレームが届かなかった（Goのリバースプロキシは `text/event-stream` だけ即時フラッシュする）。
 - `GET /api/rb/stream.sse?tab=ID`（ログイン必須、stream.mjpgと同じ検査・上限・間隔・ハートビート・10分上限）: `Content-Type: text/event-stream`、`Cache-Control: no-store`、`X-Accel-Buffering: no`。最初に約2 KiBのコメント行（小さなプロキシのバッファを押し出す）、以降 `event: frame\ndata: <JPEGのbase64>\n\n`（最新フレームのみ）。10秒フレームが無ければ `: ping`。
