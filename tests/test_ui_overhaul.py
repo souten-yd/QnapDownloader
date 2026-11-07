@@ -173,7 +173,7 @@ class LinksAndTimersTests(unittest.TestCase):
         for call in re.finditer(r'api\("/api/(engine|rb)/status"\)', JS):
             before = JS[max(0, call.start() - 400):call.start()]
             self.assertNotRegex(before, r"setTimeout\(\w*Tick")
-        self.assertEqual(len(re.findall(r"sched\.add\(", JS)), 8)   # v0.1.52: the Cloudflare rb-auto poll is gone
+        self.assertEqual(len(re.findall(r"sched\.add\(", JS)), 7)   # v0.1.52: the Cloudflare rb-auto poll is gone; v0.1.65: so is the probe-flight ticker
         self.assertIn('document.visibilityState !== "visible"', JS[JS.index("const sched = {"):])
         self.assertIn("/api/state?rev=", JS)
 

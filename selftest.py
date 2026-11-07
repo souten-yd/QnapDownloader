@@ -12,6 +12,7 @@ reachable through the URL validation path. Real sites are optional, validated by
 Every threshold and every hint lives in this file so that the server and the phone are judged by the same
 rules (the phone only sends measurements).
 """
+import hashlib
 import json
 import os
 import re
@@ -29,7 +30,7 @@ import diskio
 import rb_firstload
 import rb_resident
 
-HARD_TIMEOUT = 300.0           # seconds for the whole run
+HARD_TIMEOUT = 360.0           # seconds for the whole run (v0.1.65: +60 s for 「タブの容量」)
 CLIENT_WAIT = 150.0             # how long the server waits for the phone's measurements
 HISTORY_MAX = 5                # finished runs kept in RAM
 MAX_URLS = 5
@@ -47,13 +48,26 @@ SWIPE_REPORT_PASS_LINES = 14   # ... and per passing step
 SWIPE_REPORT_BYTES = 90000     # the swipe part of the report text is cut here
 DEFAULT_VIEWPORT = (390, 844, 3.0)
 MIB = 1024 * 1024
+# v0.1.65: 「タブの容量」 (memory per open page and the recommended number of tabs)
+CAPACITY_BUDGET_S = 60.0       # the whole section; pages that do not fit are left out (and said so)
+CAPACITY_SETTLE_S = 1.5        # after DOMContentLoaded / load: idle time before the memory is read
+CAPACITY_SITE_LOAD_S = 10.0    # a real site gets this long to reach DOMContentLoaded here
+CAPACITY_MARGIN = 1.25         # safety factor on the per-page cost in the recommendation
+CAPACITY_FLOOR_MIB = 30        # a page never costs less than this in the recommendation (measurement noise)
+CAPACITY_PAGE_WARN_MIB = 300   # one page this big is worth a hint
+CAPACITY_MAX_TABS = 20         # the largest setting of rb_max_tabs
+# v0.1.65: 「リンク解析キュー」: this many virtual long presses are queued at once and must finish one after another
+QUEUE_PROBES = 10
+QUEUE_BUDGET_S = 45.0
+CAPACITY_VIRTUAL = (("/article", "軽い仮想ページ"), ("/heavy?k=1", "重い仮想ページ1"),
+                    ("/heavy?k=2", "重い仮想ページ2"), ("/heavy?k=3", "重い仮想ページ3"))
 
 PASS, WARN, FAIL, SKIP = "pass", "warn", "fail", "skip"
 STATUSES = (PASS, WARN, FAIL, SKIP)
 
 SECTIONS = (("env", "環境"), ("browser", "NASブラウザ起動"), ("builtin", "内蔵テストページ"),
             ("client", "この端末（スマホ）"), ("response", "操作の応答"), ("swipe", "スワイプ（自動）"), ("swipe_manual", "スワイプ（手動）"),
-            ("sites", "実サイト"), ("pt", "パススルー"),
+            ("sites", "実サイト"), ("capacity", "タブの容量"), ("queue", "リンク解析キュー"), ("pt", "パススルー"),
             ("cleanup", "後片付け"))
 SECTION_LABEL = dict(SECTIONS)
 
@@ -160,13 +174,18 @@ HINTS = {
     "site.mirror": "このサイトのミラー表示が重い／失敗します。リーダー表示や高速表示が向いています。",
     "site.tiles": "このサイトの高速表示（タイル）の取得が遅いです。",
     "site.live": "スクロールで動きを作ってもライブ表示のフレームレートが低いです。画質を速度優先にしてください。",
+    "queue.finish": "リンク解析が全件終わりませんでした。メモリ保護で待たされたか、NASブラウザが重い可能性があります。",
+    "queue.sequential": "解析が同時に走っています。リンク解析は1件ずつ順に実行する設計です。",
+    "capacity.page": "このページ1枚で大きくメモリを使います。重いサイトを何枚も開くとメモリ保護でタブを開けなくなります。",
+    "capacity.recommend": "現在のタブ上限が推奨枚数より多いです。上限まで開くと、メモリ保護で新しいタブを開けなくなることがあります（設定›ブラウザの「推奨値にする」）。",
+    "capacity.stopped": "メモリ保護のため途中までしか測れませんでした。推奨枚数は測れた範囲の値です。",
     "cleanup.tabs": "セルフテスト用のタブが閉じられていません。NASブラウザを停止して再起動してください。",
     "cleanup.disk": "テスト中にHubがディスクへ多く書き込みました。デバッグログやDBの書き込みを確認してください。",
     "swipe.missing": "端末側のスワイプ確認の結果が届きませんでした（画面を閉じた・通信が切れた等）。もう一度実行してください。",
     "swipe.display": "要求した表示に切り替わりませんでした（リーダー抽出に失敗すると高速表示になります）。そのモードの判定は参考値です。",
     "swipe.history": "表示の切り替えや戻る操作でブラウザの履歴が増えました。戻る操作が何度も必要になる原因です。この結果を開発者へ送ってください。",
     "run.error": "セルフテストが途中で例外になりました。この結果を開発者へ送ってください。",
-    "run.timeout": "5分の上限に達したため途中で終了しました。NASの負荷が高い可能性があります。",
+    "run.timeout": "6分の上限に達したため途中で終了しました。NASの負荷が高い可能性があります。",
 }
 
 for _sid, _text in rb_firstload.HINTS.items():
@@ -193,6 +212,58 @@ CLIENT_NAMES = {
 CLIENT_ID = re.compile(r"client\.[a-z_]{1,24}\Z")
 RUN_ID = re.compile(r"[A-Za-z0-9_-]{8,40}\Z")
 NUM_KEYS = ("ms", "n", "kb", "fps", "fps_mjpeg", "fps_sse", "fps_poll", "state", "total")
+
+
+def remote_browser_origin():
+    import remote_browser
+    return remote_browser.SELFTEST_ORIGIN
+
+
+def recommend_tabs(per_tab_mib, base_mib, limit_mib, available_mib, open_tabs=0, limit_percent=80.0,
+                   min_available_mib=2048, margin=CAPACITY_MARGIN, max_tabs=CAPACITY_MAX_TABS):
+    """v0.1.65: how many tabs fit, from the measured cost of one page. None when there is no usable per-page cost.
+
+    per_tab_mib   cost of one more page (a high value of the measured real pages, else the heavy virtual page)
+    base_mib      container memory when the measurement started (the browser itself + the `open_tabs` user tabs)
+    limit_mib     the container's memory limit (None: unknown, the container condition is left out)
+    available_mib MemAvailable of the NAS when the measurement started (None: left out)
+    The guard refuses a new tab at `limit_percent` of the container limit or when MemAvailable would drop below
+    `min_available_mib`; both are turned into a number of pages of `per_tab_mib * margin`. Clamped to 1..max_tabs.
+    Returns {"tabs", "by_container", "by_host", "per_tab_mib"} (the two limits are None when not computable).
+    """
+    if not isinstance(per_tab_mib, (int, float)) or per_tab_mib != per_tab_mib or per_tab_mib <= 0:
+        return None
+    cost = max(float(per_tab_mib), float(CAPACITY_FLOOR_MIB)) * margin
+    by_container = by_host = None
+    if isinstance(limit_mib, (int, float)) and limit_mib > 0 and isinstance(base_mib, (int, float)):
+        browser_only = max(0.0, base_mib - open_tabs * per_tab_mib)       # the browser without its user tabs
+        by_container = int(max(0.0, limit_mib * limit_percent / 100.0 - browser_only) // cost)
+    if isinstance(available_mib, (int, float)):
+        by_host = open_tabs + int(max(0.0, available_mib - min_available_mib) // cost)
+    candidates = [v for v in (by_container, by_host) if v is not None]
+    tabs = min(candidates) if candidates else max_tabs
+    return {"tabs": max(1, min(max_tabs, tabs)), "by_container": by_container, "by_host": by_host,
+            "per_tab_mib": round(per_tab_mib, 1)}
+
+
+def page_costs(samples):
+    """Per-page cost statistics from [(label, delta_mib, real)] in opening order. The first page also pays for the
+    renderer process that starts with it, so it is shown but not averaged unless it is the only one.
+    Returns {"avg", "max", "per_tab", "basis", "n"}; per_tab = the highest real-site cost, else the heaviest virtual
+    page after the first (the first when nothing else was measured). All None without samples."""
+    deltas = [(label, max(0.0, d), real) for label, d, real in samples if d is not None]
+    if not deltas:
+        return {"avg": None, "max": None, "per_tab": None, "basis": None, "n": 0}
+    rest = deltas[1:] or deltas
+    avg = sum(d for _, d, _ in rest) / len(rest)
+    top = max(d for _, d, _ in rest)
+    real = [d for _, d, r in rest if r]
+    if real:
+        per_tab, basis = max(real), "real"
+    else:
+        heavy = [d for label, d, _ in rest if "重い" in label] or [d for _, d, _ in rest]
+        per_tab, basis = max(heavy), "virtual"
+    return {"avg": avg, "max": top, "per_tab": per_tab, "basis": basis, "n": len(deltas)}
 
 
 class Busy(RuntimeError):
@@ -268,6 +339,23 @@ def _swipe_page(letter):
         '%s</article></main>' % (letter, para * 3, rows, para * 3))
 
 
+def _heavy_page():
+    """v0.1.65: a page that costs real memory like a busy site: ~3000 DOM nodes, 12 large images (decoded size
+    ~2.4 MB each), a few hundred KB of script data and style rules. Static (no timers): only memory is measured."""
+    rows = "".join('<li class="r%d"><span>項目%d</span> <a href="/article">リンク%d</a> <em>%s</em></li>' % (
+        i % 7, i, i, "あいうえお" * 4) for i in range(1, 1201))
+    images = "".join('<img src="/i/1000x600.png?c=%s" width="1000" height="600" alt="重い画像%d" style="width:100%%;height:auto">'
+                     % (("3366cc", "cc6633", "33aa66", "aa3366", "6633cc", "33cccc")[i % 6], i) for i in range(12))
+    css = "".join(".r%d{padding:%dpx;color:#%02x%02x%02x}" % (i, i % 5, i * 7 % 256, i * 13 % 256, i * 29 % 256)
+                  for i in range(7))
+    script = ('<script>var d=[];for(var i=0;i<60000;i++)d.push({i:i,s:"item"+i});window.__heavy=d;'
+              'var ul=document.getElementById("extra");for(var j=0;j<600;j++){var li=document.createElement("li");'
+              'li.textContent="動的な項目 "+j;ul.appendChild(li);}</script>')
+    return _page("セルフテスト 重いページ",
+                 "<main><h1>重いページ</h1><ul>%s</ul>%s<ul id=\"extra\"></ul></main>" % (rows, images),
+                 css=css, script=script)
+
+
 SWIPE_LETTERS = ("A", "B", "C")
 SWIPE_CHALLENGE_PATH = "/cdn-cgi/challenge-platform/h/b/swipe"
 SWIPE_ROUTE = ("/swipe/a", SWIPE_CHALLENGE_PATH, "/swipe/a?__cf_chl_tk=selftest", "/swipe/b", "/swipe/c")
@@ -297,6 +385,7 @@ PAGES = {
         "<main><h1>スクリプトで変わるページ</h1><p>読み込みの1秒後に行が追加されます。</p><div id=\"list\"></div></main>",
         script='<script>setTimeout(function(){var d=document.createElement("div");'
                'd.textContent="SELFTEST-LATE-ROW 読み込み後に追加された行";document.getElementById("list").appendChild(d);},1000);</script>'),
+    "/heavy": _heavy_page(),
     "/long": _page(
         "セルフテスト 長いページ",
         "<main><h1>長いページ</h1>%s</main>" % "".join(
@@ -334,6 +423,15 @@ class Fixtures:
                 return None
             w, h = min(int(match.group(1)), 1200), min(int(match.group(2)), 1200)
             return (200, "image/png", make_png(w, h, query.get("c", ["888888"])[0]))
+        match = re.fullmatch(r"/go/([0-9]{1,3})", path)
+        if match:
+            # v0.1.65: a virtual page that forwards to a (fake) Rapidgator file page, like a link-protection site does
+            digest = hashlib.md5(("selftest-%s" % match.group(1)).encode("ascii")).hexdigest()
+            page = _page("リンク先 %s" % match.group(1), "<main><p>転送しています…</p></main>",
+                         script='<script>setTimeout(function(){location.replace("https://rapidgator.net/file/%s");},150);</script>' % digest)
+            with self._lock:
+                self.hits["/go"] += 1
+            return (200, "text/html; charset=utf-8", page.encode("utf-8"))
         page = PAGES.get(path)
         if page is None:
             return None
@@ -1642,6 +1740,8 @@ class SelfTest:
                           "端末側の結果が届かなかったため省略しました")
                 self._leave(run, "swipe", skipped=True)
         self._sites(run)
+        self._capacity(run, fixtures)
+        self._queue(run, fixtures)
 
     @staticmethod
     def _origin():
@@ -2128,6 +2228,243 @@ class SelfTest:
                 continue
             self._site(run, index, item, label, width, height, dpr)
         self._leave(run, "sites")
+
+    # ---------------------------------------------------------------- 「タブの容量」 (v0.1.65)
+    def _mem_sample(self):
+        """Fresh container memory {used_mib, anon_mib}: a cgroup read now (never the 5 s cache), else a new docker stats."""
+        try:
+            value = self.rb.container_memory(fresh=True)
+        except Exception:
+            return None
+        if not value:
+            return None
+        anon = value.get("anon_bytes")
+        return {"used": value["used_bytes"] / MIB, "anon": None if anon is None else anon / MIB,
+                "source": value.get("source")}
+
+    def _capacity(self, run, fixtures):
+        """Opens pages one at a time and KEEPS them open so the browser's memory grows, reading the container's memory
+        after each page has loaded and settled: the cost of one page, and from it the recommended number of tabs.
+        Pages: the built-in virtual pages (a light one, a heavy one three times) and, when the user gave real sites
+        for the 実サイト part, those (same consent). Every tab is closed again; nothing is written to disk."""
+        rb = self.rb
+        self._enter(run, "capacity", "タブの容量を測っています")
+        opened = []
+        try:
+            t0 = self._clock()
+            base = self._mem_sample()
+            if base is None:
+                self._add(run, "capacity", "capacity.skipped", "タブの容量", SKIP,
+                          "コンテナのメモリを読めないため測れません")
+                self._leave(run, "capacity", skipped=True)
+                return
+            try:
+                status = rb.status()
+            except Exception:
+                status = {}
+            user_tabs = len(status.get("tabs") or [])
+            limit_mib = (status.get("memory") or {}).get("limit_mib")
+            if not limit_mib:
+                try:
+                    limit_bytes = rb._browser_limit_bytes()
+                    limit_mib = None if not limit_bytes else limit_bytes / MIB
+                except Exception:
+                    limit_mib = None
+            available = status.get("available_mib")
+            width, height, dpr = run.options["viewport"]
+            self._add(run, "capacity", "capacity.base", "ブラウザ本体（開いているページなし）", PASS,
+                      "コンテナ %d MiB%s / ユーザーのタブ %d 枚 / コンテナ上限 %s" % (
+                          base["used"], "" if limit_mib is None else "（上限 %d MiB）" % limit_mib, user_tabs,
+                          "-" if limit_mib is None else "%d MiB" % limit_mib))
+            plan = [(path, label, True) for path, label in CAPACITY_VIRTUAL]
+            for index, item in enumerate(run.options["urls"], 1):
+                plan.append((item["url"], "実サイト%d（%s）" % (index, item["host"]), False))
+            samples = []                  # (label, delta_mib, real)
+            previous = base["used"]
+            stopped = None
+            for number, (target, label, virtual) in enumerate(plan, 1):
+                self._guard(run)
+                if self._clock() - t0 > CAPACITY_BUDGET_S:
+                    stopped = "時間の上限（%d秒）のため %d 枚目以降は測りませんでした" % (CAPACITY_BUDGET_S, number)
+                    break
+                try:
+                    reason = rb.memory_reason()
+                except Exception as error:
+                    reason = _short(str(error), 100)
+                if reason:
+                    stopped = "メモリ保護のため %d 枚目で止めました（%s）" % (number, _short(reason, 100))
+                    break
+                self._step(run, "%d枚目 %s を開いています" % (number, label))
+                try:
+                    created = rb.open_tab(
+                        self._origin() + target if virtual else target,
+                        selftest={"fixture": fixtures, "capacity": True} if virtual else {"capacity": True})
+                except Exception as error:
+                    stopped = "%d 枚目を開けませんでした（%s）" % (number, _short(str(error), 100))
+                    break
+                tab = created["id"]
+                opened.append(tab)
+                try:
+                    rb.set_viewport(tab, width, height, dpr)
+                except Exception:
+                    pass
+                loaded = self._capacity_wait(run, tab, target if virtual else None, virtual)
+                self._wait(run, CAPACITY_SETTLE_S)
+                sample = self._mem_sample()
+                heap = None
+                try:
+                    heap = rb.selftest_heap(tab)
+                except Exception:
+                    heap = None
+                if sample is None:
+                    stopped = "%d 枚目のメモリを読めませんでした" % number
+                    break
+                delta = sample["used"] - previous
+                previous = sample["used"]
+                samples.append((label, delta, not virtual))
+                anon = ""
+                if sample["anon"] is not None:
+                    anon = " / うち匿名メモリ %d MiB" % sample["anon"]
+                self._add(run, "capacity", "capacity.page.%d" % number, "%d枚目 %s" % (number, label),
+                          WARN if delta > CAPACITY_PAGE_WARN_MIB else PASS,
+                          "%s%d MiB（コンテナ合計 %d MiB%s / JSヒープ %s / 読み込み %s）%s" % (
+                              "+" if delta >= 0 else "", round(delta), round(sample["used"]), anon,
+                              "-" if heap is None else "%.1f MiB" % (heap / MIB),
+                              "-" if loaded is None else "%d ms" % loaded,
+                              "（ブラウザの描画プロセスの起動を含む）" if number == 1 else ""),
+                          "<= %d MiB" % CAPACITY_PAGE_WARN_MIB, hint_key="capacity.page",
+                          extra={"site": label.split("（")[-1].rstrip("）")} if not virtual else None)
+            stats = page_costs(samples)
+            self._capacity_summary(run, stats, base["used"], limit_mib, available, user_tabs, stopped)
+        finally:
+            for tab in opened:
+                self._close_quiet(tab)
+            self._leave(run, "capacity")
+
+    def _queue(self, run, fixtures):
+        """v0.1.65: queues QUEUE_PROBES virtual long presses at once (RAM only, one tab, virtual pages) and checks what the
+        real queue promises: they all finish, one after another (never two at a time), none fails for lack of memory,
+        and each answer carries the links. Reports the time per job and the container's peak memory."""
+        rb = self.rb
+        self._enter(run, "queue", "リンク解析の待ち行列を確認しています")
+        tab = None
+        try:
+            try:
+                created = rb.open_tab(self._origin() + "/article", selftest={"fixture": fixtures})
+            except Exception as error:
+                self._add(run, "queue", "queue.run", "リンク解析キュー", SKIP, "確認用のタブを開けませんでした（%s）" % _short(str(error), 100))
+                return
+            tab = created["id"]
+            t0 = self._clock()
+            ids = []
+            try:
+                for n in range(1, QUEUE_PROBES + 1):
+                    answer = rb.probe_enqueue(tab, None, None, href=self._origin() + "/go/%d" % n, label="確認%d" % n)
+                    ids.append(answer["job"])
+            except Exception as error:
+                self._add(run, "queue", "queue.enqueue", "待ち行列への追加", FAIL, _short(str(error), 160),
+                          "%d件とも追加できること" % QUEUE_PROBES)
+                return
+            self._add(run, "queue", "queue.enqueue", "待ち行列への追加", PASS,
+                      "%d件を%d ms で追加（押してすぐ受け付けられる）" % (len(ids), int((self._clock() - t0) * 1000)))
+            peak = 0.0
+            jobs = []
+            while True:
+                self._guard(run)
+                jobs = rb.probe_jobs(tab)["jobs"]
+                sample = self._mem_sample()
+                if sample is not None:
+                    peak = max(peak, sample["used"])
+                if len(jobs) >= len(ids) and all(j["state"] in ("done", "failed", "cancelled") for j in jobs):
+                    break
+                if self._clock() - t0 > QUEUE_BUDGET_S:
+                    break
+                self._wait(run, 0.3)
+            total = self._clock() - t0
+            done = [j for j in jobs if j["state"] == "done" and j.get("links")]
+            failed = [j for j in jobs if j["state"] == "failed"]
+            waiting = [j for j in jobs if j["state"] in ("queued", "running")]
+            reasons = sorted({_short(j.get("error") or "", 60) for j in failed})
+            status = PASS if len(done) == len(ids) else (WARN if done else FAIL)
+            self._add(run, "queue", "queue.finish", "全件の完了", status,
+                      "%d/%d件完了・失敗%d・未完了%d（全体%.1f秒%s）" % (
+                          len(done), len(ids), len(failed), len(waiting), total, "・" + " / ".join(reasons) if reasons else ""),
+                      "%d/%d件完了" % (len(ids), len(ids)), hint_key="queue.finish")
+            spans = sorted((j["started"], j["finished"]) for j in jobs if j.get("started") and j.get("finished"))
+            overlap = sum(1 for a, b in zip(spans, spans[1:]) if b[0] < a[1] - 0.05)
+            per = [round(j["finished"] - j["started"], 2) for j in jobs if j.get("started") and j.get("finished")]
+            self._add(run, "queue", "queue.sequential", "1件ずつ順に解析", PASS if spans and not overlap else (SKIP if not spans else FAIL),
+                      "重なり%d件・1件あたり 平均 %.2f秒・最大 %.2f秒" % (overlap, sum(per) / len(per) if per else 0, max(per) if per else 0),
+                      "重なり0件", hint_key="queue.sequential")
+            self._add(run, "queue", "queue.memory", "解析中のメモリ（コンテナ最大）", PASS if peak else SKIP,
+                      "%d MiB" % round(peak) if peak else "取得できません")
+        finally:
+            if tab is not None:
+                try:
+                    rb.probes.tab_closed(tab)
+                except Exception:
+                    pass
+                self._close_quiet(tab)
+            self._leave(run, "queue")
+
+    def _capacity_wait(self, run, tab, path, virtual):
+        """Wait for a capacity page to finish loading; milliseconds, or None when it did not in time."""
+        started = self._clock()
+        if virtual:
+            return self._wait_loaded(run, tab, path, timeout=15.0, since=started)
+        limit = self._clock() + CAPACITY_SITE_LOAD_S
+        while self._clock() < limit:
+            self._guard(run)
+            info = self.rb.selftest_info(tab)
+            if info.get("dcl") or (not info["loading"] and info["url"] and info["url"] != "about:blank"):
+                return int((self._clock() - started) * 1000)
+            self._wait(run, 0.1)
+        return None
+
+    def _capacity_summary(self, run, stats, base_mib, limit_mib, available, user_tabs, stopped):
+        try:
+            current = self.rb.max_tabs()
+        except Exception:
+            current = None
+        if stats["per_tab"] is None:
+            self._add(run, "capacity", "capacity.summary", "推奨タブ枚数", SKIP,
+                      stopped or "1ページも測れませんでした")
+            return
+        rec = recommend_tabs(stats["per_tab"], base_mib, limit_mib, available, open_tabs=user_tabs,
+                             limit_percent=self._guard_percent(), min_available_mib=self._guard_available_mib())
+        tabs = rec["tabs"]
+        text = "1ページあたり 平均 %d MiB・最大 %d MiB → 推奨タブ枚数 %d枚（現在の上限 %s枚）" % (
+            round(stats["avg"]), round(stats["max"]), tabs, "?" if current is None else current)
+        detail = "（算出: 1ページ %d MiB%s × 余裕 %.2f / コンテナ基準で %s枚・空きメモリ基準で %s枚）" % (
+            round(stats["per_tab"]), "（実サイトの最大）" if stats["basis"] == "real" else "（重い仮想ページの最大）",
+            CAPACITY_MARGIN, "-" if rec["by_container"] is None else rec["by_container"],
+            "-" if rec["by_host"] is None else rec["by_host"])
+        status = PASS
+        if stopped:
+            status = WARN
+        elif current is not None and current > tabs:
+            status = WARN
+        hint_key = "capacity.stopped" if stopped else "capacity.recommend"
+        self._add(run, "capacity", "capacity.summary", "推奨タブ枚数", status,
+                  text + detail + ("。" + stopped if stopped else ""),
+                  "現在の上限 <= 推奨枚数", hint_key=hint_key)
+        run.info["tab_reco"] = {"tabs": tabs, "avg_mib": round(stats["avg"], 1), "max_mib": round(stats["max"], 1),
+                                "per_tab_mib": round(stats["per_tab"], 1), "basis": stats["basis"],
+                                "current": current, "pages": stats["n"], "partial": bool(stopped)}
+        try:
+            self.rb.tab_reco = dict(run.info["tab_reco"], at=int(self._wall()))
+        except Exception:
+            pass
+
+    @staticmethod
+    def _guard_percent():
+        import remote_browser
+        return remote_browser.MEM_LIMIT_PERCENT
+
+    @staticmethod
+    def _guard_available_mib():
+        import remote_browser
+        return remote_browser.MIN_AVAILABLE_KIB / 1024
 
     def _site(self, run, index, item, label, width, height, dpr):
         rb = self.rb

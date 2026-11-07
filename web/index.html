@@ -131,6 +131,7 @@
       </div>
       <button type="button" role="menuitemcheckbox" data-action="perf" data-scope="remote" id="menuPerf" class="menu-toggle">速度表示<span class="menu-check" aria-hidden="true"></span></button>
       <button type="button" role="menuitem" data-action="forgetSite" data-scope="remote" id="menuForgetSite" hidden>このサイトの表示を忘れる</button>
+      <button type="button" role="menuitem" data-action="probeList" data-scope="remote" id="menuProbes" hidden>リンク解析の一覧</button>
       <hr>
       <button type="button" role="menuitem" data-action="stageUrl">このURLをリンクに追加</button>
       <button type="button" role="menuitem" data-action="bookmark">ブックマークに追加</button>
@@ -534,10 +535,27 @@
         <label class="switch" for="rbSpareTab"><input type="checkbox" id="rbSpareTab" role="switch" aria-label="予備タブを用意"><span class="switch-track" aria-hidden="true"></span></label>
        </div>
        <div class="set-row">
+        <div class="set-main"><span class="set-label">最近見たページを表示</span>
+         <span class="set-desc"><span class="set-text">ブラウズのホームに最近見たページを出します（この端末にだけ保存）</span>
+          <details class="hint"><summary aria-label="詳しい説明">ⓘ</summary><p>オフにすると一覧を隠し、記録もしません。オフにしたときに、この端末に残っている一覧も消します。</p></details></span></div>
+        <label class="switch" for="homeRecentOn"><input type="checkbox" id="homeRecentOn" role="switch" aria-label="最近見たページを表示"><span class="switch-track" aria-hidden="true"></span></label>
+       </div>
+       <div class="set-row">
         <div class="set-main"><span class="set-label">Webフォントを使わない（速い）</span>
          <span class="set-desc"><span class="set-text">ミラー表示で文字をまず端末のフォントで出します</span>
           <details class="hint"><summary aria-label="詳しい説明">ⓘ</summary><p>ミラー表示のコピーから本文用のWebフォントを外し、端末のフォントで文字をすぐ表示します（アイコン用フォントは残します）。オフにするとWebフォントも取得し、届いたものから入れ替えます（font-display: swap）。</p></details></span></div>
         <label class="switch" for="rbNoWebfonts"><input type="checkbox" id="rbNoWebfonts" role="switch" aria-label="Webフォントを使わない"><span class="switch-track" aria-hidden="true"></span></label>
+       </div>
+       <div class="set-row">
+        <div class="set-main"><span class="set-label">NASブラウザのタブの上限</span>
+         <span class="set-desc"><span class="set-text" id="rbMaxTabsHint">同時に開くタブの最大枚数（1〜20）。多いほどNASのメモリを使います</span>
+          <details class="hint"><summary aria-label="詳しい説明">ⓘ</summary><p>ここで決めるのは「最大」で、その枚数まで開ける保証ではありません。空きメモリやブラウザのメモリ使用率が上限に近いときは、メモリ保護で新しいタブを開けません。1ページあたりのメモリは 設定›診断›自己テストの「タブの容量」で測れ、測定後は推奨の枚数がここに出ます（「推奨値にする」で反映）。</p></details></span></div>
+        <select id="rbMaxTabs" name="rbMaxTabs" class="inline-select" aria-label="NASブラウザのタブの上限"></select>
+       </div>
+       <div class="set-row" id="rbMaxTabsRecoRow" hidden>
+        <div class="set-main"><span class="set-label">推奨のタブ枚数</span>
+         <span class="set-desc"><span class="set-text" id="rbMaxTabsReco"></span></span></div>
+        <button type="button" id="rbMaxTabsApply" class="btn small">推奨値にする</button>
        </div>
       </div>
 
@@ -877,17 +895,19 @@
      <button type="button" id="popupToastAllow" class="btn small">常に許可</button>
      <button type="button" id="popupToastBlock" class="btn small">常にブロック</button>
     </div>
-    <button type="button" id="probeChip" class="probe-chip" aria-label="確認中のリンク" hidden>確認中 0件</button>
-    <div id="probeFlight" class="probe-flight" role="status" hidden></div>
-    <div id="probeSheet" class="remote-sheet probe-sheet" role="dialog" aria-label="リンク先を確認しました" hidden>
+    <button type="button" id="probeChip" class="probe-chip" aria-label="リンク解析の状況" hidden>リンク解析 0/0</button>
+    <div id="probeSheet" class="remote-sheet probe-sheet" role="dialog" aria-label="リンク解析" hidden>
      <div class="remote-sheet-head">
-      <strong id="probeTitle">リンク先を確認しました</strong>
+      <strong id="probeTitle">リンク解析</strong>
       <button type="button" id="probeClose" class="btn small" title="閉じる" aria-label="閉じる">×</button>
      </div>
      <div id="probeList" class="remote-sheet-list"></div>
      <div class="remote-sheet-actions intercept-actions">
       <button type="button" id="probeSendAll" class="btn primary" hidden>すべてJD2へ送る</button>
       <button type="button" id="probeAddAll" class="btn" hidden>リンクに追加</button>
+      <button type="button" id="probeRetryAll" class="btn" hidden>失敗を再試行</button>
+      <button type="button" id="probeCancelAll" class="btn" hidden>待ちを取り消す</button>
+      <button type="button" id="probeClear" class="btn" hidden>完了を消す</button>
      </div>
     </div>
     <div id="interceptSheet" class="remote-sheet intercept-sheet" role="dialog" aria-label="リンクを検出しました" hidden>

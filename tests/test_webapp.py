@@ -562,7 +562,7 @@ class HttpTests(unittest.TestCase):
                                          headers={"Host": "192.168.68.57:17864"})
         with self.client.open(request, timeout=4) as response:
             self.assertEqual(response.status, 200)
-            self.assertEqual(json.load(response)["version"], "0.1.64")
+            self.assertEqual(json.load(response)["version"], "0.1.65")
         with self.client.open(self.url + "/icon.svg", timeout=4) as response:
             self.assertEqual(response.status, 200)
             self.assertEqual(response.headers.get_content_type(), "image/svg+xml")
@@ -1476,7 +1476,7 @@ class HttpTests(unittest.TestCase):
         self.assertFalse(info["supported"])
         code, _ = self.req("/api/update/apply", {"version": "v0.1.8"})
         self.assertEqual(code, 400)
-        self.assertEqual(self.req("/api/health")[1]["version"], "0.1.64")
+        self.assertEqual(self.req("/api/health")[1]["version"], "0.1.65")
         self.assertFalse(self.req("/api/jd2/status")[1]["connected"])
         self.assertEqual(self.req("/api/jd2/update/apply", {"confirmed": True})[0], 400)
         self.assertEqual(self.req("/api/jd2/preset/apply", {"confirmed": True})[0], 400)
@@ -1708,10 +1708,17 @@ class HttpTests(unittest.TestCase):
                 self.rb_ws.emit("Fetch.requestPaused", {"requestId": "rp", "resourceType": "Document",
                                                         "request": {"url": hoster}}, "SESSION2")
         self.rb_ws.hook = hook
-        code, body = self.req("/api/rb/probe", {"tab": "b1", "x": 40, "y": 80})
-        self.assertEqual(code, 200)
-        self.assertEqual(body.pop("probe_id") and body, {"start_url": "https://blog.example.org/go?id=7",
-                                                         "final_url": hoster, "links": [hoster], "redirects": 0})
+        code, body = self.req("/api/rb/probe", {"tab": "b1", "x": 40, "y": 80, "label": "第1巻"})
+        # v0.1.65: a long press only queues a job and answers at once
+        self.assertEqual((code, body["state"], body["position"], body["label"], body["existing"]),
+                         (202, "queued", 1, "第1巻", False))
+        self.assertTrue(self.server.rb.probes.wait_idle(10))
+        code, listing = self.req("/api/rb/probe/jobs?tab=b1")
+        job = listing["jobs"][0]
+        self.assertEqual((code, job["id"], job["state"], job["links"], job["start_url"] if "start_url" in job else None),
+                         (200, body["job"], "done", [hoster], None))
+        self.assertEqual((job["href"], job["final_url"], job["redirects"]), ("https://blog.example.org/go?id=7", hoster, 0))
+        self.assertEqual(listing["summary"]["done"], 1)
         closed = [m["params"]["targetId"] for m in self.rb_ws.sent if m["method"] == "Target.closeTarget"]
         self.assertEqual(closed, ["TARGET00002"])
         for bad in ({"tab": "b1", "x": -1, "y": 0}, {"tab": "b1", "x": "a", "y": 0}, {"tab": "b1"},
@@ -1719,6 +1726,127 @@ class HttpTests(unittest.TestCase):
             with self.subTest(bad=bad):
                 self.assertEqual(self.req("/api/rb/probe", bad)[0], 400)
         self.assertEqual(self.req("/api/rb/probe", {"tab": "b9", "x": 1, "y": 1})[0], 404)
+
+    # ---- v0.1.65: the analysis queue over HTTP -------------------------------------------------
+    def queue_setup(self):
+        self.login()
+        webapp.wire_remote_browser(self.server)
+        self.open_tab_on()
+        hoster = self.HOSTER_A
+
+        def hook(message):
+            if message["method"] == "Page.navigate" and message.get("sessionId") != "SESSION1":
+                self.rb_ws.emit("Fetch.requestPaused", {"requestId": "rp", "resourceType": "Document",
+                                                        "request": {"url": hoster}}, message["sessionId"])
+        self.rb_ws.hook = hook
+
+    def test_twelve_presses_are_twelve_quick_answers_and_every_job_finishes(self):
+        self.queue_setup()
+        started = time.time()
+        answers = [self.req("/api/rb/probe", {"tab": "b1", "href": "https://blog.example.org/go/%d" % n}) for n in range(12)]
+        self.assertTrue(all(code == 202 for code, _ in answers))
+        self.assertLess(time.time() - started, 3.0)
+        self.assertEqual([a["job"] for _, a in answers], [j["id"] for j in self.server.rb.probe_jobs("b1")["jobs"]])
+        self.assertTrue(self.server.rb.probes.wait_idle(20))
+        code, listing = self.req("/api/rb/probe/jobs?tab=b1")
+        self.assertEqual([j["state"] for j in listing["jobs"]], ["done"] * 12)
+        self.assertEqual(listing["summary"], dict(listing["summary"], done=12, failed=0, queued=0, running=0, total=12, review=12))
+
+    def test_meta_has_the_probe_summary_and_accepts_pr(self):
+        self.queue_setup()
+        self.req("/api/rb/probe", {"tab": "b1", "href": "https://blog.example.org/go/1"})
+        self.assertTrue(self.server.rb.probes.wait_idle(10))
+        code, meta = self.req("/api/rb/meta?tab=b1&wait=0")
+        self.assertEqual((code, meta["probes"]["done"], meta["probes"]["total"]), (200, 1, 1))
+        code, meta2 = self.req("/api/rb/meta?tab=b1&wait=0&rev=%d&pr=%d" % (meta["rev"], meta["probes"]["rev"]))
+        self.assertEqual(code, 200)
+        self.assertEqual(self.req("/api/rb/meta?tab=b1&wait=0&pr=x")[0], 400)
+
+    def test_cancel_retry_dismiss_endpoints(self):
+        self.queue_setup()
+        self.rb_ws.fail["Fetch.enable"] = "Target closed"
+        self.req("/api/rb/probe", {"tab": "b1", "href": "https://blog.example.org/go/1"})
+        self.assertTrue(self.server.rb.probes.wait_idle(10))
+        code, listing = self.req("/api/rb/probe/jobs?tab=b1")
+        self.assertEqual((listing["jobs"][0]["state"], "Target closed" in listing["jobs"][0]["error"]), ("failed", True))
+        del self.rb_ws.fail["Fetch.enable"]
+        self.assertEqual(self.req("/api/rb/probe/retry", {"tab": "b1"}), (200, {"retried": 1}))
+        self.assertTrue(self.server.rb.probes.wait_idle(10))
+        self.assertEqual(self.req("/api/rb/probe/jobs?tab=b1")[1]["jobs"][0]["state"], "done")
+        self.assertEqual(self.req("/api/rb/probe/cancel", {"tab": "b1"}), (200, {"cancelled": 0}))
+        self.assertEqual(self.req("/api/rb/probe/dismiss", {"tab": "b1"}), (200, {"dismissed": 1}))
+        self.assertEqual(self.req("/api/rb/probe/jobs?tab=b1")[1]["jobs"], [])
+        for path in ("/api/rb/probe/cancel", "/api/rb/probe/retry", "/api/rb/probe/dismiss"):
+            self.assertEqual(self.req(path, {"tab": "b9"})[0], 404)
+            self.assertEqual(self.req(path, {"tab": "b1"}, csrf=False)[0], 403)
+        self.assertEqual(self.req("/api/rb/probe/jobs?tab=b9")[0], 404)
+
+    def test_probe_endpoints_need_a_login(self):
+        self.assertEqual(self.req("/api/rb/probe/jobs?tab=b1")[0], 401)
+        for path in ("/api/rb/probe/cancel", "/api/rb/probe/retry", "/api/rb/probe/dismiss"):
+            self.assertEqual(self.req(path, {"tab": "b1"})[0], 401)
+
+    def test_finished_jobs_are_sent_to_jd2_by_the_hub_when_the_option_is_on(self):
+        self.queue_setup()
+        self.req("/api/settings/folder", {"path": str(self.allowed)})
+        with patch.object(self.server.jd2, "_require", return_value=self.jd2_ready()), \
+                patch("jd2_transfer.prepare_transfer"), \
+                patch("jd2_transfer.transfer", return_value={"state": "sent"}) as transfer:
+            self.req("/api/rb/probe", {"tab": "b1", "href": "https://blog.example.org/go/1"})
+            self.assertTrue(self.server.rb.probes.wait_idle(10))
+            job = self.req("/api/rb/probe/jobs?tab=b1")[1]["jobs"][0]
+            self.assertEqual((job["state"], job["sent"]["sent"], job["sent"]["error"]), ("done", 1, None))
+            self.assertEqual([c.args[1] for c in transfer.call_args_list], [self.HOSTER_A])
+            self.assertEqual(self.req("/api/rb/probe/jobs?tab=b1")[1]["summary"]["review"], 0)
+            # the option off: the result waits for the user, who sends it from the list (by job id, never by URL)
+            self.req("/api/settings/options", {"probe_autosend": False})
+            self.req("/api/rb/probe", {"tab": "b1", "href": "https://blog.example.org/go/2"})
+            self.assertTrue(self.server.rb.probes.wait_idle(10))
+            second = [j for j in self.req("/api/rb/probe/jobs?tab=b1")[1]["jobs"] if j["href"].endswith("/2")][0]
+            self.assertIsNone(second["sent"])
+            self.assertEqual(transfer.call_count, 1)
+            code, body = self.req("/api/rb/probe/send", {"tab": "b1", "job": second["id"], "links": ["https://evil.example/x"]})
+            self.assertEqual((code, body["sent"], body["skipped"]), (200, 0, 1))      # the same hoster link: already sent
+            self.assertEqual(self.req("/api/rb/probe/send", {"tab": "b1", "job": "nope"})[0], 400)
+            self.assertEqual(self.req("/api/rb/probe/send", {"tab": "b2", "job": second["id"]})[0], 400)
+
+    def test_autosend_does_nothing_when_jd2_cannot_send(self):
+        self.queue_setup()
+        with patch.object(self.server.jd2, "_require", return_value=self.jd2_ready(False)), \
+                patch("jd2_transfer.transfer") as transfer:
+            self.req("/api/rb/probe", {"tab": "b1", "href": "https://blog.example.org/go/1"})
+            self.assertTrue(self.server.rb.probes.wait_idle(10))
+            transfer.assert_not_called()
+        job = self.req("/api/rb/probe/jobs?tab=b1")[1]["jobs"][0]
+        self.assertEqual((job["state"], job["sent"]), ("done", None))
+
+    def test_a_rapidgator_press_is_still_answered_with_the_result_itself(self):
+        self.login()
+        self.open_tab_on()
+        code, body = self.req("/api/rb/probe", {"tab": "b1", "href": self.HOSTER_A + "/x.rar.html"})
+        self.assertEqual((code, body["links"], body["redirects"]), (200, [self.HOSTER_A], 0))
+        self.assertTrue(body["probe_id"])
+
+    def test_the_tab_limit_is_a_setting(self):
+        self.login()
+        webapp.wire_remote_browser(self.server)
+        self.assertEqual(self.req("/api/settings")[1]["rb_max_tabs"], 3)
+        for bad in (0, 21, "5", True, 2.5, None):
+            with self.subTest(value=bad):
+                self.assertEqual(self.req("/api/settings/options", {"rb_max_tabs": bad})[0], 400)
+        self.assertEqual(self.req("/api/settings/options", {"rb_max_tabs": 5})[1]["rb_max_tabs"], 5)
+        self.assertEqual(self.req("/api/rb/status")[1]["max_tabs"], 5)         # the new limit counts at once
+        for n in range(5):
+            self.assertEqual(self.req("/api/rb/tabs", {"url": "https://example.com/%d" % n})[0], 201)
+        code, body = self.req("/api/rb/tabs", {"url": "https://example.com/6"})
+        self.assertEqual(code, 400)
+        self.assertEqual(body["error"], "NASブラウザのタブは最大5枚です（設定で変更できます）。不要なタブを閉じてください")
+
+    def test_the_self_test_recommendation_is_in_the_browser_status(self):
+        self.login()
+        self.assertIsNone(self.server.rb.status()["tab_reco"])
+        self.server.rb.tab_reco = {"tabs": 7, "avg_mib": 80.0, "max_mib": 120.0}
+        self.assertEqual(self.req("/api/rb/status")[1]["tab_reco"]["tabs"], 7)
 
     HOSTER_A = "https://rapidgator.net/file/0123456789abcdef0123456789abcdef"
     HOSTER_B = "https://rapidgator.net/file/fedcba9876543210fedcba9876543210"
@@ -1802,11 +1930,19 @@ class HttpTests(unittest.TestCase):
             self.assertEqual([c.args[1] for c in transfer.call_args_list], [self.HOSTER_B, self.HOSTER_A])
 
     def test_probe_queue_overflow_is_http_429(self):
-        self.login()
-        with patch.object(self.server.rb, "probe",
-                          side_effect=remote_browser.ProbeQueueFull("確認待ちが多すぎます")):
-            code, body = self.req("/api/rb/probe", {"tab": "b1", "x": 1, "y": 1})
-        self.assertEqual((code, body["error"]), (429, "確認待ちが多すぎます"))
+        # v0.1.65: only when all 200 slots still wait or run (a held-open request can no longer pile up)
+        self.queue_setup()
+        gate = threading.Event()
+        inner = self.rb_ws.hook
+        self.rb_ws.hook = lambda message: (gate.wait(10) if message["method"] == "Page.navigate" and message.get("sessionId") != "SESSION1" else None, inner(message))
+        with patch("rb_probe_queue.QUEUE_CAP", 5):
+            for n in range(5):
+                self.assertEqual(self.req("/api/rb/probe", {"tab": "b1", "href": "https://blog.example.org/go/%d" % n})[0], 202)
+            code, body = self.req("/api/rb/probe", {"tab": "b1", "href": "https://blog.example.org/go/99"})
+        self.assertEqual(code, 429)
+        self.assertIn("解析待ちが多すぎます", body["error"])
+        gate.set()
+        self.assertTrue(self.server.rb.probes.wait_idle(20))
 
     def test_links_clear_endpoint_keeps_staged_by_default(self):
         self.login()

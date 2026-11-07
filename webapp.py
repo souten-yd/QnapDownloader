@@ -38,7 +38,7 @@ import ttlcache
 import updater
 import webauthn
 
-VERSION = "0.1.64"
+VERSION = "0.1.65"
 PORT = 17864
 ROOT = Path(__file__).resolve().parent
 FILES = {"/": ("web/index.html", "text/html; charset=utf-8"),
@@ -367,10 +367,19 @@ def remember_probe(server, tab, links, now=None):
         return probe_id
 
 
-def send_probe_links(server, tab, probe_id, now=None):
-    """Send the stored links of one probe to JD2 (deduped); never takes URLs from the client."""
+def send_probe_links(server, tab, probe_id, now=None, job=None):
+    """Send the stored links of one probe (or, v0.1.65, of one queued analysis job) to JD2 (deduped); never takes URLs
+    from the client."""
     now = time.time() if now is None else now
     links = []
+    if job is not None:
+        found = server.rb.probes.get(tab, job) if isinstance(tab, str) and isinstance(job, str) else None
+        links = list(found["links"]) if found and found["state"] == "done" else []
+        if not links:
+            raise ValueError("この解析結果はありません（期限切れか、リンクが見つかっていません）")
+        result = send_many(server, links)
+        server.rb.probes.mark_sent(tab, job, result)
+        return result
     with _PROBE_LOCK:
         results = server.__dict__.get("probe_results", {}).get(tab) if isinstance(tab, str) else None
         if results is not None and isinstance(probe_id, str):
@@ -380,6 +389,11 @@ def send_probe_links(server, tab, probe_id, now=None):
                     break
     if not links:
         raise ValueError("確認結果の有効期限が切れました。もう一度長押ししてください")
+    return send_many(server, links)
+
+
+def send_many(server, links):
+    """Send these hoster links to JD2 one by one (dedupe on); {sent, skipped, total, error, autostart}."""
     sent = skipped = 0
     error = None
     for url in links:
@@ -396,10 +410,35 @@ def send_probe_links(server, tab, probe_id, now=None):
             "autostart": autostart}
 
 
+def probe_job_autosend(server, job):
+    """v0.1.65: a queued analysis finished with links. With the option probe_autosend and a JD2 that can take them they go
+    to JD2 right here on the Hub (the phone may be in the background), and the job remembers the outcome. Otherwise
+    nothing happens and the phone shows the result with its buttons."""
+    if not job.get("links"):
+        return
+    try:
+        if server.store.settings().get("probe_autosend", True) is not True:
+            return
+        with server.jd2.lock:
+            adapter = server.jd2._require()
+        if getattr(adapter, "can_send", False) is not True:
+            return
+        result = send_many(server, job["links"])
+    except Exception:
+        return
+    server.rb.probes.mark_sent(job["tab"], job["id"], result)
+    try:
+        server_cache(server).invalidate()
+        server_state_hub(server).poke()
+    except Exception:
+        pass
+
+
 def wire_remote_browser(server):
     """Give the NAS browser its site rules (DB) and the existing JD2 send path."""
     server.rb.rules = server.store
     server.rb.auto_send = lambda url: auto_send_link(server, url)
+    server.rb.on_probe_done = lambda job: probe_job_autosend(server, job)      # v0.1.65
 
 
 def boot_remote_browser(server):
@@ -532,7 +571,7 @@ def server_state_hub(server):
 
 
 # Writes under these prefixes change nothing the cached reads show (screen input only).
-RB_QUIET_POSTS = ("/api/debug/log", "/api/diag/diskio/start", "/api/diag/diskio/stop", "/api/rb/input", "/api/rb/viewport", "/api/rb/snapshot", "/api/rb/snapshot/release",
+RB_QUIET_POSTS = ("/api/rb/probe/cancel", "/api/rb/probe/retry", "/api/rb/probe/dismiss", "/api/debug/log", "/api/diag/diskio/start", "/api/diag/diskio/stop", "/api/rb/input", "/api/rb/viewport", "/api/rb/snapshot", "/api/rb/snapshot/release",
                   "/api/rb/tap-page", "/api/rb/reader", "/api/rb/probe", "/api/rb/intercepts/open",
                   "/api/rb/mirror", "/api/rb/mirror/click", "/api/rb/mirror/release", "/api/rb/firstload",
                   "/api/selftest/start", "/api/selftest/cancel", "/api/selftest/client",
@@ -1147,11 +1186,19 @@ class Handler(BaseHTTPRequestHandler):
                 vp_text = query.get("vp", [None])[0]
                 if vp_text is not None and (not vp_text.isdecimal() or len(vp_text) > 12):
                     raise ValueError("vpが不正です")
+                pr_text = query.get("pr", [None])[0]
+                if pr_text is not None and (not pr_text.isdecimal() or len(pr_text) > 12):
+                    raise ValueError("prが不正です")
                 return self.send_data(200, self.server.rb.page_meta(
                     query.get("tab", [""])[0], None if rev_text is None else int(rev_text),
                     wait=int(wait_text), links=query.get("links", ["0"])[0] == "1",
                     vp=None if vp_text is None else int(vp_text),
-                    fresh=query.get("fresh", ["0"])[0] == "1"))
+                    fresh=query.get("fresh", ["0"])[0] == "1",
+                    pr=None if pr_text is None else int(pr_text)))
+            if path == "/api/rb/probe/jobs":
+                # v0.1.65: the analysis jobs of one tab (the list sheet); the meta long-poll only carries their counts
+                query = parse_qs(urlsplit(self.path).query)
+                return self.send_data(200, self.server.rb.probe_jobs(query.get("tab", [""])[0]))
             if path == "/api/rb/stream.mjpg":
                 query = parse_qs(urlsplit(self.path).query)
                 return self.stream_mjpeg(query.get("tab", [""])[0])
@@ -1593,6 +1640,8 @@ class Handler(BaseHTTPRequestHandler):
                     self.store.set_option(key, body[key])
                 if "pt_enabled" in known or "pt_public_port" in known:
                     server_pt(self.server).sync()        # v0.1.57: the listener follows the switch at once
+                if "rb_max_tabs" in known:
+                    self.server.rb.forget_settings_cache()      # v0.1.65: the new tab limit counts from the next open
                 if "rb_resident" in known:
                     # v0.1.38: apply at once (start / let go of the resident NAS browser)
                     self.server.rb.set_resident(self.store.settings().get("rb_resident") is True)
@@ -1745,14 +1794,22 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_data(200, self.server.rb.first_load_report(
                     body.get("tab"), body.get("marks"), body.get("rtts")))
             if path == "/api/rb/probe":
-                result = self.server.rb.probe(
+                # v0.1.65: a long press only adds a job to the analysis queue and answers at once. A Rapidgator link needs no
+                # analysis: its result comes back right away (with a probe_id for /api/rb/probe/send).
+                queued = self.server.rb.probe_enqueue(
                     body.get("tab"), body.get("x"), body.get("y"), url_check=self.reject_hub_origin,
-                    href=body.get("href"), snap=body.get("snap"))
-                result = dict(result, probe_id=remember_probe(self.server, body.get("tab"), result.get("links")))
-                return self.send_data(200, result)
+                    href=body.get("href"), snap=body.get("snap"), label=body.get("label"))
+                if "direct" in queued:
+                    result = queued["direct"]
+                    return self.send_data(200, dict(result, probe_id=remember_probe(
+                        self.server, body.get("tab"), result.get("links"))))
+                return self.send_data(202, queued)
+            if path in ("/api/rb/probe/cancel", "/api/rb/probe/retry", "/api/rb/probe/dismiss"):
+                action = getattr(self.server.rb, "probe_" + path.rsplit("/", 1)[1])
+                return self.send_data(200, action(body.get("tab"), body.get("job")))
             if path == "/api/rb/probe/send":
                 return self.send_data(200, send_probe_links(
-                    self.server, body.get("tab"), body.get("probe_id")))
+                    self.server, body.get("tab"), body.get("probe_id"), job=body.get("job")))
             if path == "/api/rb/site-rules":
                 return self.send_data(200, self.store.set_site_rule(
                     body.get("host"), auto_send=body.get("auto_send"), popup=body.get("popup"),

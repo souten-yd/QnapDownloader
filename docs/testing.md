@@ -55,6 +55,13 @@ budget-open-mirror / budget-open-reader（アドレスバーからページを�
 ### 初回読み込みの計測（v0.1.54）
 `python3 tests/e2e/bench_firstload.py --runs 3 [--display mirror|reader] [--cdp-delay-ms 120] [--stats-delay 1.8] [--setting rb_spare_tab=false]` は、タップから本文・先頭画像・全体が端末に出るまでをページ内の20msポーラーで測り、中央値を出します（最初の1回は捨てます）。`--cdp-delay-ms` はNASのChromiumの応答遅延、`--stats-delay` は `docker stats` の所要時間を模擬します（実機のネットワークは再現しません）。このスクリプトとharness.py・fake_docker.pyを古い版に置けば「変更前」も同じ方法で測れます。
 
+### v0.1.65 のシナリオと計測
+- `probe-queue-burst`: ミラーで12回の長押し（`startProbe`）を続けて行う。各押下は2秒未満で受け付けられ、「リンク解析 n/12」のピルが出て、12件すべてが `done` になり、プローブ用ページは同時に1つ以下（`RemoteBrowser._probe_targets` を50msごとに見る）、ジョブの実行区間が重ならず、シートに12行ある。エラートーストなし。
+- `probe-queue-cancel`: 同じリンクの重複追加（`existing`）、`/api/rb/probe/cancel` で待ちが残らない、タブを閉じるとそのタブのジョブが消える。
+- `tab-limit-setting`: 設定›ブラウザ›「NASブラウザのタブの上限」を5にして再読み込み後も保たれ、5枚まで開けて6枚目は「NASブラウザのタブは最大5枚です（設定で変更できます）。不要なタブを閉じてください」で断られる。推奨値（自己テストが保存した `tab_reco`）を「推奨値にする」で適用できる。
+- `selftest` に「タブの容量」（5ページ分の行・「1ページあたり 平均 … 推奨タブ枚数 …」・`rb.tab_reco`）と「リンク解析キュー」（10件が1件ずつ完了）の確認を追加。ハーネスは `Env.model_container_memory(True, limit_mib=2048)` で実Chromeの使用メモリ（PSS）を偽の `docker stats` に反映する。
+- `python3 tests/e2e/bench_probe.py --mode old|new --count 12 [--base-percent 55 --per-target-percent 8.5 --hold-ms 700]` は、長押し12回の所要時間・成功数・失敗理由・同時に開いたプローブ数・無関係な `/api/session` 要求の待ち時間を測る。`old` は v0.1.63 のコード（保持型リクエスト）用で、その版にこのスクリプトと `fixtures/probe.html`・harness の `/go/N` を置いて実行する。コンテナ使用率は `基準% + 1件あたり% × 同時プローブ数` で模擬する。
+
 ### 自己テスト「操作の応答」（v0.1.59）
 端末側の測定の最後に、アプリ自身の応答を測る（約40秒）。`client.route`（`#/downloads`・`#/links`・`#/home`・`#/settings/…` へ hash を変えて対象の画面が見えるまで。通信不要のはずなので 250ms 超で注意）/ `client.toggle`（設定のスイッチ `rb_link_boxes` を押して見た目と状態が変わるまで 100ms 以内が合格、Hubの確定までの時間も併記、測定後に元へ戻す）/ `client.idle`（Downloads画面で30秒何もせず、`/api/state` の応答が3回以内で合格・6回超で失敗、全通信が15回超で注意）/ `client.open_rtt`（内蔵テストページを「ビューと最初のコピー付きの navigate」で開き、文書まで取得するのに要した要求数が3以内で合格）。判定は `selftest.client_evaluate`、レポートの「## 操作の応答」に出る。
 `tests/e2e/bench_firstload.py` は要求数ではなくミリ秒を測る（`--cdp-delay-ms` でNASの応答遅延を模擬）。
@@ -64,9 +71,9 @@ GitHubのE2Eでは実機のNAS・iPhone・実サイトを測れないため、�
 ボタン1つでHub（`selftest.py`）がNASの環境・NASブラウザの起動・内蔵テストページ（`https://selftest.example.com/` をRAMから返す仮想サイト）・任意の実サイトを測り、
 続けて端末（iPhone等）がリーダー描画・ミラー読み込み・`wireMirrorDoc` のpointer/click到達・ミラー差し替え・タイル・ライブ受信・Hubとの往復時間を測って `POST /api/selftest/client` で返す。
 判定は常にHub側。「結果をコピー」の本文（日本語＋English、秘密なし、URLはホスト名のみ、デバッグログ末尾50行つき）を開発者へ貼ると、実機でしか出ない不具合を直せる。
-結果はHubのRAMに直近5件だけ残り、ディスクへは書かない。上限は4分で、中止・エラー時もテスト用タブと一時的に入れたデバッグログを元に戻す。
+結果はHubのRAMに直近5件だけ残り、ディスクへは書かない。上限は6分（v0.1.65: 「タブの容量」「リンク解析キュー」を足したため）で、中止・エラー時もテスト用タブと一時的に入れたデバッグログを元に戻す。
 
-未対応: 長押しのhosterプローブ（`rapidgator.net` 等の実ドメインが必要でフィクスチャに向けられないため）。
+長押しのhosterプローブそのもの（実ドメイン）は未対応だが、v0.1.65 から「リンク解析キュー」の確認が仮想ページ（`selftest.example.com/go/N` が偽の Rapidgator ファイルページへ転送する）で行われる。
 
 ### スワイプの確認（v0.1.52）
 「スワイプがおかしい」を実機で再現するために、自己テストにスワイプの確認を持たせている（`selftest.py` が判定、`web/app.js` の `swipeAuto` / `swipeManual` が端末側）。

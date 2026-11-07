@@ -3761,3 +3761,265 @@ class SelftestHelperTests(BrowserBase):
         del self.ws.fail["Runtime.evaluate"]
         self.assertEqual(self.rb.selftest_scroll(tab, 100), 100)
         self.assertEqual(len(self.ws.calls("Page.createIsolatedWorld")), 3)    # 1 first, 1 retry (failed), 1 after
+
+
+class FakeOptionRules:
+    """The part of storage.Store the browser reads: settings() and site_rule_for()."""
+
+    def __init__(self, **options):
+        self.options = dict(options)
+
+    def settings(self):
+        return dict(self.options)
+
+    def site_rule_for(self, host):
+        return None
+
+
+class TabLimitTests(BrowserBase):
+    """v0.1.65: the tab limit is the option rb_max_tabs (1..20, default 3), not a constant."""
+
+    def limit(self, value):
+        self.rb.rules = FakeOptionRules(rb_max_tabs=value, rb_spare_tab=False)
+        self.rb.forget_settings_cache()
+
+    def test_default_is_three_without_a_setting_or_with_a_bad_one(self):
+        self.assertEqual(self.rb.max_tabs(), 3)
+        for bad in (0, 21, -1, "5", 5.0, True, None):
+            with self.subTest(value=bad):
+                self.limit(bad)
+                self.assertEqual(self.rb.max_tabs(), 3)
+
+    def test_the_setting_is_the_ceiling_and_the_refusal_names_it(self):
+        self.limit(5)
+        for i in range(5):
+            self.open("https://example.com/%d" % i)
+        with self.assertRaises(rb.BrowserError) as ctx:
+            self.open("https://example.com/x")
+        self.assertEqual(str(ctx.exception), "NASブラウザのタブは最大5枚です（設定で変更できます）。不要なタブを閉じてください")
+        self.assertEqual(len(self.ws.calls("Target.createTarget")), 5)
+        self.assertEqual(self.rb.status()["max_tabs"], 5)
+
+    def test_twenty_is_allowed_and_one_works(self):
+        self.limit(20)
+        self.assertEqual(self.rb.max_tabs(), 20)
+        self.limit(1)
+        self.open("https://example.com/a")
+        with self.assertRaises(rb.BrowserError) as ctx:
+            self.open("https://example.com/b")
+        self.assertIn("最大1枚", str(ctx.exception))
+
+    def test_a_changed_setting_applies_to_the_next_open_without_a_restart(self):
+        self.limit(2)
+        self.open("https://example.com/1")
+        self.open("https://example.com/2")
+        with self.assertRaises(rb.BrowserError):
+            self.open("https://example.com/3")
+        self.limit(3)
+        self.open("https://example.com/3")
+        self.assertEqual(len(self.rb.status()["tabs"]), 3)
+
+    def test_the_setting_is_read_at_most_every_two_seconds(self):
+        rules = FakeOptionRules(rb_max_tabs=4)
+        self.rb.rules = rules
+        self.assertEqual(self.rb.max_tabs(), 4)
+        rules.options["rb_max_tabs"] = 6
+        self.assertEqual(self.rb.max_tabs(), 4)                  # remembered
+        self.clock.now += rb.MAX_TABS_TTL + 0.1
+        self.assertEqual(self.rb.max_tabs(), 6)
+
+    def test_orphan_eviction_uses_the_setting(self):
+        self.limit(5)
+        for i in range(5):
+            self.open("https://example.com/%d" % i)
+            self.clock.now += 1
+        self.clock.now += rb.ORPHAN_IDLE
+        with self.rb._lock:
+            self.rb._tabs["b5"].last_poll = self.clock.now
+        self.open("https://example.com/new")
+        ids = [t["id"] for t in self.rb.status()["tabs"]]
+        self.assertEqual(len(ids), 5)
+        self.assertNotIn("b1", ids)                              # the oldest idle one made room
+        self.assertIn("b5", ids)
+        # below the ceiling nothing is evicted
+        self.limit(8)
+        self.clock.now += rb.ORPHAN_IDLE + 5
+        self.open("https://example.com/more")
+        self.assertEqual(len(self.rb.status()["tabs"]), 6)
+
+    def test_self_test_tabs_do_not_count_and_the_capacity_run_may_keep_several(self):
+        self.limit(1)
+        self.open("https://example.com/a")
+        fixture = lambda url: (200, "text/html", b"<title>x</title>")
+        selftest = {"fixture": fixture, "capacity": True}
+        for i in range(4):
+            self.rb.open_tab(rb.SELFTEST_ORIGIN + "/article?k=%d" % i, selftest=selftest)
+        self.assertEqual(len(self.rb.selftest_tabs()), 4)
+        with self.assertRaises(rb.BrowserError):
+            self.rb.open_tab(rb.SELFTEST_ORIGIN + "/article", selftest={"fixture": fixture})    # one at a time otherwise
+        self.assertEqual(len(self.rb.status()["tabs"]), 1)
+
+    def test_status_reason_and_the_spare_tab_follow_the_setting(self):
+        self.limit(2)
+        self.open("https://example.com/1")
+        self.assertIsNone(self.rb.status()["reason"])
+        self.open("https://example.com/2")
+        self.assertEqual(self.rb.status()["reason"], "NASブラウザのタブは最大2枚です（設定で変更できます）。不要なタブを閉じてください")
+        self.assertEqual(self.rb._spare_reason(), "タブが上限です")
+        self.limit(4)
+        self.assertNotEqual(self.rb._spare_reason(), "タブが上限です")
+
+    def test_the_memory_guard_still_refuses_below_the_ceiling(self):
+        self.limit(20)
+        self.open("https://example.com/1")
+        self.set_mem(2 * 1024 * 1024 - 1)
+        with self.assertRaises(rb.BrowserError) as ctx:
+            self.open("https://example.com/2")
+        self.assertIn("空きメモリが不足", str(ctx.exception))        # unchanged message
+
+
+class ProbeQueueRbTests(BrowserBase):
+    """v0.1.65: a long press queues a job; the browser analyses the links one at a time."""
+    HOSTER = "https://rapidgator.net/file/0123456789abcdef0123456789abcdef"
+
+    def setUp(self):
+        super().setUp()
+        self.open("https://example.com/a")
+        self.old = (rb.PROBE_SETTLE, rb.PROBE_TIMEOUT)
+        rb.PROBE_SETTLE = 0
+        self.addCleanup(lambda: (setattr(rb, "PROBE_SETTLE", self.old[0]), setattr(rb, "PROBE_TIMEOUT", self.old[1])))
+        self.active = []
+        self.max_active = 0
+        self.visited = []
+
+        def hook(message):
+            if message["method"] == "Page.navigate" and message.get("sessionId") != "SESSION1":
+                url = message["params"]["url"]
+                self.visited.append(url)
+                self.max_active = max(self.max_active, len(self.rb._probe_targets))
+                session = message["sessionId"]
+                self.ws.emit("Fetch.requestPaused", {"requestId": "r", "resourceType": "Document",
+                                                    "request": {"url": self.HOSTER}}, session)
+        self.ws.hook = hook
+
+    def press(self, n, **kw):
+        return self.rb.probe_enqueue("b1", None, None, href="https://blog.example.org/go/%d" % n, **kw)
+
+    def test_enqueue_answers_at_once_and_the_worker_finishes_every_job_in_order(self):
+        answers = [self.press(n, label="リンク%d" % n) for n in range(1, 13)]
+        self.assertEqual([a["position"] for a in answers[:3]], [1, 2, 3])
+        self.assertTrue(all(a["state"] == "queued" or a["state"] == "running" for a in answers))
+        self.assertTrue(self.rb.probes.wait_idle(20))
+        jobs = self.rb.probe_jobs("b1")["jobs"]
+        self.assertEqual([j["state"] for j in jobs], ["done"] * 12)
+        self.assertEqual([j["links"] for j in jobs], [[self.HOSTER]] * 12)
+        self.assertEqual(self.visited, ["https://blog.example.org/go/%d" % n for n in range(1, 13)])
+        self.assertEqual(self.max_active, 1)                   # never two hidden pages at once
+        self.assertEqual((self.rb._probes, self.rb._probe_targets, self.rb._probe_sessions), (0, {}, {}))
+        self.assertEqual(self.rb.probe_jobs("b1")["summary"]["done"], 12)
+
+    def test_the_same_link_is_not_queued_twice(self):
+        first = self.press(1)
+        again = self.press(1)
+        self.assertEqual((first["existing"], again["existing"], again["job"]), (False, True, first["job"]))
+
+    def test_a_rapidgator_link_needs_no_job(self):
+        out = self.rb.probe_enqueue("b1", None, None, href=self.HOSTER + "/x.rar.html")
+        self.assertEqual(out["direct"]["links"], [self.HOSTER])
+        self.assertEqual(self.rb.probe_jobs("b1")["jobs"], [])
+        self.assertEqual(self.visited, [])
+
+    def test_bad_input_is_refused_before_anything_is_queued(self):
+        for href in ("http://example.com/", "https://192.168.0.1/", "javascript:alert(1)", "", 5):
+            with self.subTest(href=href), self.assertRaises(rb.BrowserError):
+                self.rb.probe_enqueue("b1", None, None, href=href)
+        with self.assertRaises(rb.BrowserError):
+            self.rb.probe_enqueue("b1", None, None, href="https://hub.example/", url_check=lambda u: (_ for _ in ()).throw(ValueError("hub")))
+        with self.assertRaises(rb.TabGone):
+            self.rb.probe_enqueue("b9", None, None, href="https://example.org/")
+        self.assertEqual(self.rb.probe_jobs("b1")["jobs"], [])
+
+    def test_the_hit_test_still_resolves_a_point_at_press_time(self):
+        self.ws.eval_map = [("elementFromPoint", "https://blog.example.org/go/9")]
+        out = self.rb.probe_enqueue("b1", 10, 20)
+        self.assertEqual(out["host"], "blog.example.org")
+        self.assertTrue(self.rb.probes.wait_idle(10))
+        self.assertEqual(self.visited, ["https://blog.example.org/go/9"])
+
+    def test_a_job_that_hits_an_error_fails_with_the_reason_and_retry_runs_it_again(self):
+        self.ws.fail["Fetch.enable"] = "Target closed"
+        self.press(1)
+        self.assertTrue(self.rb.probes.wait_idle(10))
+        job = self.rb.probe_jobs("b1")["jobs"][0]
+        self.assertEqual(job["state"], "failed")
+        self.assertIn("Target closed", job["error"])
+        self.assertEqual((self.rb._probes, self.rb._probe_targets), (0, {}))
+        del self.ws.fail["Fetch.enable"]
+        self.assertEqual(self.rb.probe_retry("b1"), {"retried": 1})
+        self.assertTrue(self.rb.probes.wait_idle(10))
+        self.assertEqual(self.rb.probe_jobs("b1")["jobs"][0]["state"], "done")
+
+    def test_closing_the_tab_cancels_the_waiting_jobs(self):
+        gate = threading.Event()
+        inner = self.ws.hook
+
+        def hook(message):
+            if message["method"] == "Page.navigate" and message.get("sessionId") != "SESSION1":
+                gate.wait(10)
+            inner(message)
+        self.ws.hook = hook
+        for n in range(1, 5):
+            self.press(n)
+        deadline = time.time() + 5
+        while not self.rb._probe_targets and time.time() < deadline:
+            time.sleep(0.01)
+        self.rb.close_tab("b1")
+        gate.set()
+        self.assertTrue(self.rb.probes.wait_idle(10))
+        self.assertEqual(self.visited, ["https://blog.example.org/go/1"])     # the other three never ran
+        with self.assertRaises(rb.TabGone):
+            self.rb.probe_jobs("b1")
+        self.assertEqual(self.rb.probes.jobs("b1"), [])
+
+    def test_the_memory_guard_makes_jobs_wait_not_fail(self):
+        self.rb.probes._memory_reason = lambda: "NASブラウザのメモリ使用量が上限の85%に達しています（90%）"
+        self.press(1)
+        deadline = time.time() + 5
+        while self.rb.probe_jobs("b1")["jobs"][0]["wait"] != "memory" and time.time() < deadline:
+            time.sleep(0.02)
+        job = self.rb.probe_jobs("b1")["jobs"][0]
+        self.assertEqual((job["state"], job["wait"]), ("queued", "memory"))
+        self.assertIn("85%", job["note"])
+        self.assertEqual(self.visited, [])
+        self.rb.probes._memory_reason = lambda: None
+        self.assertTrue(self.rb.probes.wait_idle(10))
+        self.assertEqual(self.rb.probe_jobs("b1")["jobs"][0]["state"], "done")
+
+    def test_meta_carries_the_counts_and_a_change_wakes_the_long_poll(self):
+        meta = self.rb.page_meta("b1", wait=0)
+        self.assertEqual(meta["probes"]["total"], 0)
+        rev, pr = meta["rev"], meta["probes"]["rev"]
+        gate = threading.Event()
+        inner = self.ws.hook
+        self.ws.hook = lambda message: (gate.wait(10) if message["method"] == "Page.navigate" and message.get("sessionId") != "SESSION1" else None, inner(message))
+        woke = []
+
+        def poll():
+            started = time.time()
+            woke.append((self.rb.page_meta("b1", rev=rev, wait=5, pr=pr), time.time() - started))
+        thread = threading.Thread(target=poll, daemon=True)
+        thread.start()
+        time.sleep(0.2)
+        self.assertEqual(woke, [])                              # nothing changed: it keeps waiting
+        self.press(1)
+        thread.join(5)
+        self.assertTrue(woke and woke[0][1] < 3, woke)
+        self.assertGreater(woke[0][0]["probes"]["rev"], pr)
+        self.assertEqual(woke[0][0]["rev"], rev)                # the page itself did not change
+        gate.set()
+        self.assertTrue(self.rb.probes.wait_idle(10))
+
+    def test_the_synchronous_probe_still_works_for_tools(self):
+        result = self.rb.probe("b1", None, None, href="https://blog.example.org/go/1")
+        self.assertEqual(result["links"], [self.HOSTER])
+        self.assertNotIn("ended", result)

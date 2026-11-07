@@ -657,7 +657,7 @@ if (out !== want) { console.error(JSON.stringify(out)); process.exit(1); }
         for ident in ("probeSheet", "probeList", "probeSendAll", "probeAddAll", "probeClose",
                       "remoteRing"):
             self.assertIn('id="%s"' % ident, self.html)
-        for text in ("リンク先を確認しました", "すべてJD2へ送る", "リンクに追加"):
+        for text in ("リンク解析", "すべてJD2へ送る", "リンクに追加", "失敗を再試行", "待ちを取り消す"):
             self.assertIn(text, self.html + self.js)
         self.assertIn("/api/rb/probe", self.js)
         # a long press suppresses the tap, moving cancels it, the OS context menu is off
@@ -681,38 +681,38 @@ if (out !== want) { console.error(JSON.stringify(out)); process.exit(1); }
         self.assertNotIn("confirm(", send)
         self.assertIn("opts.confirmMany && links.length >= 5", self.js)
 
-    def test_v0127_parallel_probes_use_a_chip_and_never_a_blocking_sheet(self):
+    def test_v0164_long_press_queues_a_job_and_the_chip_shows_progress(self):
+        # v0.1.65 (was: parallel probes with held-open requests): a long press only adds a job on the Hub
         self.assertNotIn("probeOpen", self.html + self.js)
         self.assertNotIn("このタブで開く", self.html + self.js)
         self.assertNotIn("probeSeq", self.js)
+        self.assertNotIn("probeFlight", self.html + self.js)             # no request is held open and listed any more
         self.assertIn('id="probeChip"', self.html)
-        self.assertIn('id="probeFlight"', self.html)
-        self.assertIn("確認中 ", self.js)
+        self.assertIn('id="menuProbes"', self.html)
+        self.assertIn("リンク解析 ", self.js)
         self.assertNotIn("リンク先を確認しています", self.html + self.js)
         start = self.js.index("async function startProbe")
         body = self.js[start:self.js.index("// Pointer to page coordinates")]
-        # startProbe never shows the sheet while probing; it starts its own request at once
-        self.assertNotIn('setShown("probeSheet", true)', body)
-        self.assertNotIn("probeSheet", body)
-        self.assertNotIn("rb.probing", body)
-        self.assertNotIn("cancel", body.lower())
-        self.assertIn('await api("/api/rb/probe"', body)
-        self.assertIn("リンクは見つかりませんでした", body)
+        self.assertNotIn("probeFlight", body)
+        self.assertIn('await api("/api/rb/probe", body)', body)
+        self.assertIn("解析待ちに追加（", body)
+        self.assertIn("同じリンクは解析済みです", body)
+        self.assertIn("リンクは見つかりませんでした", body)         # a Rapidgator link is still answered at once
         self.assertIn("（最終: ", body)
-        # results that cannot be auto-sent are appended to one sheet
-        self.assertIn("state.probeResults = (state.probeResults || []).concat(", body)
         auto = self.js[self.js.index("async function autoSendProbe"):start]
         self.assertIn("JD2へ送信しました（", auto)
         self.assertNotIn("probeSheet", auto)
-        self.assertNotIn("state.probeSeq", auto)
-        self.assertNotIn("stageLinks", auto)
-        # the only place the sheet is shown is the post-result renderer
-        self.assertEqual(self.js.count('setShown("probeSheet", groups.length > 0)'), 1)
-        self.assertNotIn('setShown("probeSheet", true)', self.js)
+        # the counts ride on every meta answer; the list is read only on demand; no timer polls it
+        self.assertIn("noteProbes(tab, f.probes)", self.js)
+        self.assertEqual(self.js.count("probeQuery(rb)"), 5)               # every meta long-poll passes the revision it holds
+        self.assertIn('"/api/rb/probe/jobs?tab="', self.js.replace("'", '"'))
+        self.assertNotIn("setInterval", self.js)
+        for action in ("retry", "cancel", "dismiss"):
+            self.assertIn('probeAction("%s"' % action, self.js)
         css = (WEB / "style.css").read_text(encoding="utf-8")
         self.assertRegex(css, r"\.probe-chip\{[^}]*height:32px")
         self.assertRegex(css, r"\.probe-chip\{[^}]*safe-area-inset-bottom")
-        self.assertRegex(css, r"\.probe-sheet\{[^}]*max-height:40%")
+        self.assertRegex(css, r"\.probe-sheet\{[^}]*max-height:60%")
 
     def test_v0127_key_bar_is_hidden_until_the_page_focuses_an_editable_element(self):
         self.assertRegex(self.html, r'id="remoteTools"[^>]*\bhidden\b')
