@@ -42,7 +42,7 @@ jobs:
             exit 1
           fi
           gh release create v0.1.58-rc1 dist/QnapDownloader_0.1.58_x86_64.qpkg dist/SHA256SUMS \
-            --repo "${{ github.repository }}" --target "fcc9ecb00bf1db9a33384823060be94eb6c3a754" \
+            --repo "${{ github.repository }}" --target "34a5a6732fbc2e5772dc5146ef087f597d53d943" \
             --title "QnapDownloader v0.1.58-rc1: Display modes in two rows" \
             --prerelease \
             --notes "Experimental QNAP x86_64 build. The browse menu shows the five display modes in two rows so each is easy to tap."
