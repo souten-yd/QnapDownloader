@@ -8407,7 +8407,7 @@ function pageScrollsSideways(doc) {
     return view.getComputedStyle(doc.documentElement).overflowX !== "hidden" && view.getComputedStyle(doc.body).overflowX !== "hidden";
   } catch (e) { return false; }
 }
-function onWheelSwipe(event, doc) {
+function onWheelSwipe(event, doc, target = event.target) {
   if (event.ctrlKey || event.metaKey || event.defaultPrevented || !state.authed) return;
   const now = performance.now();
   if (now < wheelSwipe.quietUntil) { wheelSwipe.quietUntil = now + WHEEL_QUIET_MS; return; }
@@ -8415,7 +8415,7 @@ function onWheelSwipe(event, doc) {
   if (Math.abs(dx) < 1 || Math.abs(dx) < 1.5 * Math.abs(dy)) { wheelSwipe.sum = 0; return; }
   if (now - wheelSwipe.at > WHEEL_GAP_MS || Math.sign(dx) !== Math.sign(wheelSwipe.sum)) wheelSwipe.sum = 0;
   wheelSwipe.at = now;
-  if (!stepTab() || hScroller(event.target) || pageScrollsSideways(doc || document)) { wheelSwipe.sum = 0; return; }
+  if (!stepTab() || hScroller(target) || pageScrollsSideways(doc || document)) { wheelSwipe.sum = 0; return; }
   wheelSwipe.sum += dx;
   if (Math.abs(wheelSwipe.sum) < WHEEL_SWIPE_PX) return;
   const dir = wheelSwipe.sum < 0 ? -1 : 1;           // fingers to the right = deltaX < 0 = back
@@ -8525,7 +8525,23 @@ function wireShell() {
   // v0.1.63: PC / iPad keyboard, mouse buttons 4 / 5 and trackpad swipes (the mirror frame wires its own copy)
   document.addEventListener("keydown", onShortcutKey, true);
   for (const type of ["mousedown", "mouseup", "auxclick"]) window.addEventListener(type, onMouseNav, true);
-  document.addEventListener("wheel", event => onWheelSwipe(event, document), {passive: true});
+  document.addEventListener("wheel", event => {
+    // The passthrough page decides for itself (pt-helper.js): it knows whether it scrolls sideways.
+    if (event.target && event.target.id === "ptFrame") return;
+    // Some engines deliver a wheel over the mirror frame to this document: judge the mirror page, not the app.
+    const frame = $("mirrorFrame");
+    if (frame && event.target && (event.target === frame || event.target.id === "mirrorWrap")) {
+      const doc = (() => { try { return mirrorDoc(); } catch (e) { return null; } })();
+      if (doc) {
+        const r = frame.getBoundingClientRect();
+        let under = null;
+        try { under = doc.elementFromPoint(event.clientX - r.left, event.clientY - r.top); } catch (e) { under = null; }
+        onWheelSwipe(event, doc, under || doc.body);
+        return;
+      }
+    }
+    onWheelSwipe(event, document);
+  }, {passive: true});
   wireLinkMenu();
   // v0.1.63: wider than the NAS page (> 1600 px) the page is centred; the wheel over the empty sides still scrolls it
   $("mirrorWrap").addEventListener("wheel", event => {

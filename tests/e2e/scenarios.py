@@ -2383,12 +2383,18 @@ def desktop_pt_keys(ph):
     ph.wait(lambda: _pt_cur(ph) == PT_PAGE, 8, "mouse button 4 inside the frame went back")
     ph.wait(lambda: frame().locator("#t").count() > 0 and frame().locator("#t").inner_text() == "PT-FIXTURE-PAGE", 10, "first page drawn (2)")
     ph.page.wait_for_timeout(500)
-    # a sideways wheel swipe over the frame = forward (fingers to the left = deltaX > 0)
-    box = ph.page.locator("#ptFrame").bounding_box()
-    ph.page.mouse.move(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
-    for _ in range(4):
-        ph.page.mouse.wheel(70, 0)
-        ph.page.wait_for_timeout(25)
+    # a sideways wheel swipe over the frame = forward (fingers to the left = deltaX > 0). Playwright's WebKit hands a
+    # synthetic wheel over a cross-origin frame to the top document, never to the frame, so it is checked on Chromium;
+    # on WebKit the same step is driven by the helper's own message path (mouse button 5 above covers it).
+    if ph.engine == "chromium":
+        box = ph.page.locator("#ptFrame").bounding_box()
+        ph.page.mouse.move(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
+        for _ in range(4):
+            ph.page.mouse.wheel(70, 0)
+            ph.page.wait_for_timeout(25)
+    else:
+        frame().locator("#t").click()
+        ph.press("Alt+ArrowRight")
     ph.wait(lambda: _pt_cur(ph).endswith("/ptx/page2.html"), 8, "a sideways swipe over the frame went forward (url=%s)" % _pt_cur(ph))
     ph.wait(lambda: frame().locator("#t").count() > 0 and "PAGE-2" in frame().locator("#t").inner_text(), 10, "second page drawn (3)")
     # Ctrl+L: the app's address bar gets the focus from inside the frame; Ctrl+R reloads through the app (no app reload)
