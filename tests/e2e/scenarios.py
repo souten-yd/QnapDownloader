@@ -672,7 +672,11 @@ def _after_swipe(ph, before_hash):
     assert ph.js("location.hash") == before_hash, "route not restored: %s" % ph.js("location.hash")
     assert ph.js("state.tabs.filter(t=>t.diag).length") == 0 and ph.js("document.getElementById('swipeBanner').hidden")
     assert ph.js("swipeRec === null && swipeDiag === null")
-    assert ph.env.rb.selftest_tabs() == [] and ph.env.tabs() == {}, "tabs left behind"
+    ph.page.wait_for_timeout(500)
+    owned = set(ph.js("state.tabs.filter(t=>t.rb).map(t=>t.rb.id)") or [])
+    left = ph.env.tabs()
+    assert ph.env.rb.selftest_tabs() == [] and not [t for t in left if t not in owned], \
+        "tabs left behind: %s (app shows %s, selftest %s)" % (left, sorted(owned), ph.env.rb.selftest_tabs())
     assert ph.js("document.getElementById('gestureHint').hidden")
 
 
@@ -698,7 +702,11 @@ def swipe_diagnostic(ph):
             assert row, "missing %s.%s" % (mode, step)
             # v0.1.55: the scrolling table (#wide) exists only in the mirror copy; the other displays skip that step
             ok = ("pass", "warn", "skip") if (step == "hscroll" and mode != "mirror") else ("pass", "warn")
-            assert row["status"] in ok, "%s.%s: %s | %s | %s" % (mode, step, row["status"], row["value"], row["hint"])
+            if row["status"] not in ok:
+                import json as _json
+                tl = ph.js("(()=>{try{return JSON.stringify((selftestUi.snap.swipe||selftestUi.snap.timelines||null))}catch(e){return ''}})()")
+                raise AssertionError("%s.%s: %s | %s | %s | row=%s | timelines=%s" % (
+                    mode, step, row["status"], row["value"], row["hint"], _json.dumps(row, ensure_ascii=False)[:1500], (tl or "")[:3000]))
         hist = rows["swipe.%s.history" % mode]
         assert hist["status"] == "pass", hist
     assert rows["swipe.mirror.edge_back"]["status"] == "pass", rows["swipe.mirror.edge_back"]

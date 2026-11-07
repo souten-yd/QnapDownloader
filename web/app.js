@@ -75,7 +75,7 @@ const DISPLAY_CHIP_TITLE = {reader: "リーダー", mirror: "ミラー", tiles: 
 // v0.1.60: this file's own version. The Hub's version (from /api/state) is compared with it: a shell cache that is
 // older than the Hub (the app was updated while the home-screen app was closed) is dropped and the page reloaded.
 // tests/test_web_shell.py checks that it equals webapp.VERSION.
-const APP_VERSION = "0.1.68";
+const APP_VERSION = "0.1.69";
 const PT_DISPLAY_LABEL = "パススルー";      // v0.1.57: not a NAS-browser display, so not in RB_DISPLAY_LABELS
 const RB_PERF_WINDOW_MS = 5000;
 const RB_STREAM_FIRST_MS = 5000;     // MJPEG as the last stream (v0.1.68: after WebSocket and SSE): first picture within this, else polling
@@ -10200,7 +10200,7 @@ async function swipeFlick(ctx, o) {
   let cx = env.cx;
   if (o.sel) {                      // start on this element (v0.1.55: a scrolling table); not there in this display: nothing to test
     // the page's copy may still be arriving: wait for the element (and the document holding it) a moment
-    let el = null;
+    let el = null, asked = 0;
     await swipeWaitFor(() => {
       const e2 = swipeEnv(ctx.d, "view");
       if (e2 && e2.handlers) env = e2;
@@ -10208,6 +10208,11 @@ async function swipeFlick(ctx, o) {
       el = d0.querySelector ? d0.querySelector(o.sel) : null;
       if (!el && tabDisplay(ctx.d.tab) === "mirror") {          // the event target may still be the app's element
         try { const md = mirrorDoc(); el = md ? md.querySelector(o.sel) : null; if (el) env.target = el; } catch (e) { el = null; }
+      }
+      // a first copy of a long page is partial (v0.1.54): the lower part may still be empty boxes; ask for the full one
+      if (!el && tabDisplay(ctx.d.tab) === "mirror" && Date.now() - asked > 2000) {
+        asked = Date.now();
+        runMirror(ctx.d.tab, {force: true, immediate: true, quiet: true}).catch(() => {});
       }
       return Boolean(el);
     }, tabDisplay(ctx.d.tab) === "mirror" ? 10000 : 1500);   // mirror: a loaded CI runner delivers the copy late

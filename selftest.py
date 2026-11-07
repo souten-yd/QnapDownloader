@@ -2206,7 +2206,8 @@ class SelfTest:
         growth = mode.get("history_growth")
         if growth is not None:
             self._add_locked(run, sec, "swipe.%s.history" % name, "【%s】履歴の増え方（表示切替・戻る）" % label,
-                             PASS if growth == 0 else FAIL, "履歴 +%d" % growth, "増えないこと（ガードは1つだけ）",
+                             # v0.1.69: a shorter history (a back that dropped forward entries) is not the problem guarded here
+                             PASS if growth <= 0 else FAIL, "履歴 %+d" % growth, "増えないこと（ガードは1つだけ）",
                              hint_key="swipe.history")
         run.swipe["modes"][name] = {"display": shown, "synthetic": mode["synthetic"], "steps": results,
                                     "history_growth": growth}
