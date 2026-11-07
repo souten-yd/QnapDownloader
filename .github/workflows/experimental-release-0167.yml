@@ -42,7 +42,7 @@ jobs:
             exit 1
           fi
           gh release create v0.1.67-rc1 dist/QnapDownloader_0.1.67_x86_64.qpkg dist/SHA256SUMS \
-            --repo "${{ github.repository }}" --target "3d0d761d1d09d5a429ad7d0ddbdd957effe7f267" \
+            --repo "${{ github.repository }}" --target "04b5e0239f712c53335110fb91a1cd93692a9af2" \
             --title "QnapDownloader v0.1.67-rc1: Quiet automatic sending of link analyses" \
             --prerelease \
             --notes "Experimental QNAP x86_64 build. A long-press analysis that is sent to JD2 automatically no longer opens the result list."
