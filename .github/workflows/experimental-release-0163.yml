@@ -42,7 +42,7 @@ jobs:
             exit 1
           fi
           gh release create v0.1.63-rc1 dist/QnapDownloader_0.1.63_x86_64.qpkg dist/SHA256SUMS \
-            --repo "${{ github.repository }}" --target "717158570f29f21a03b77742a466f4f073ec3851" \
+            --repo "${{ github.repository }}" --target "a8c4e24d9829db2ad2f842fb2f79db557566d6c3" \
             --title "QnapDownloader v0.1.63-rc1: iPad and PC" \
             --prerelease \
             --notes "Experimental QNAP x86_64 build. Comfortable on iPad (touch-sized wide layout) and PC (Alt+arrows, mouse back and forward buttons, trackpad swipe, Ctrl+L, wide layouts)."
