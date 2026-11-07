@@ -470,7 +470,11 @@ def selftest(ph):
     assert checks["queue.sequential"]["status"] == "pass", checks["queue.sequential"]
     ph.notes.append("queue: " + checks["queue.finish"]["value"][:90] + " / " + checks["queue.sequential"]["value"][:60])
     assert checks["cleanup.tabs"]["status"] == "pass"
-    assert ph.env.rb.selftest_tabs() == [] and ph.env.tabs() == {}, "tabs left behind: %s" % list(ph.env.tabs())
+    # a NAS tab the app itself shows (a web tab re-attached while the self-test switched screens) is not a leftover
+    ph.page.wait_for_timeout(500)
+    owned = set(ph.js("state.tabs.filter(t=>t.rb).map(t=>t.rb.id)") or [])
+    leftover = [t for t in ph.env.tabs() if t not in owned]
+    assert ph.env.rb.selftest_tabs() == [] and not leftover, "tabs left behind: %s (app shows %s)" % (leftover, sorted(owned))
     # the view shows summary and tables; the copied text is a self-contained report
     assert "合格" in ph.js("document.getElementById('selftestSummary').textContent")
     assert ph.js("document.querySelectorAll('#selftestTables table').length") >= 4
