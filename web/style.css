@@ -300,7 +300,6 @@ label{display:block;margin:12px 0;color:var(--muted);font-size:13px}
 /* downloads */
 .empty-card{text-align:center;padding:40px 16px;background:var(--surface);border:1px solid var(--border);border-radius:12px;margin-top:12px}
 .empty-card p{margin:6px 0}
-.summary-line{margin:4px 0 8px;font-size:12.5px}
 .download-card.pkg{padding:10px 12px}
 .pkg-head{display:flex;align-items:center;gap:8px;width:100%;padding:0;border:0;background:none;color:var(--text);font:inherit;text-align:left;cursor:pointer;min-height:28px}
 .caret{flex:none;width:1em;color:var(--muted)}
@@ -797,3 +796,64 @@ h5.reader-h,h6.reader-h{font-size:1em}
 @media (prefers-reduced-motion:reduce){
   .toolbar,.mobile-bar{transition:none!important}
 }
+
+/* ---- v0.1.62: browse home, links, downloads summary, JD2 status card, progress line ---- */
+/* one thin progress line for app-screen loads that take > 300 ms (sticky at the top of the scrolling content) */
+.app-loading{position:sticky;top:0;z-index:7;margin-bottom:-2px;pointer-events:none}
+.home-block{margin-top:16px}
+.home-block>h2,.home-h2{margin:18px 0 8px}
+.tab-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(168px,1fr));gap:10px}
+.tab-card{position:relative;border:1px solid var(--border);border-radius:12px;background:var(--surface);overflow:hidden}
+.tab-card-main{display:flex;flex-direction:column;align-items:flex-start;gap:3px;width:100%;padding:0 0 9px;border:0;background:none;color:var(--text);font:inherit;text-align:left;cursor:pointer;min-height:var(--touch)}
+.tab-card-thumb{position:relative;display:block;width:100%;height:64px;margin-bottom:5px;overflow:hidden;background:var(--accent-soft)}
+.tab-card-thumb img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;object-position:top;z-index:1}
+.tab-card-letter{position:absolute;inset:0;display:grid;place-items:center;color:var(--accent);font-weight:700;font-size:22px}
+.tab-card-title,.tab-card-meta{padding:0 38px 0 10px;max-width:100%}
+.tab-card-title{font-size:13px;line-height:1.35;overflow:hidden;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow-wrap:anywhere}
+.tab-card-meta{display:flex;flex-wrap:wrap;gap:2px 6px;align-items:center;font-size:11.5px;color:var(--muted)}
+.tab-card-host{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:100%}
+.tab-card-mode{padding:0 7px;border-radius:9px;background:var(--accent-soft);color:var(--accent);font-weight:700;font-size:10.5px}
+.tab-card-close{position:absolute;top:4px;right:4px;z-index:2;display:grid;place-items:center;width:32px;height:32px;border:0;border-radius:50%;background:rgba(255,255,255,.88);color:#1f2328;cursor:pointer}
+.tab-card-close .icon{width:15px;height:15px}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]) .tab-card-close{background:rgba(30,32,36,.86);color:#e6e9ed}}
+.home-chips{display:flex;flex-wrap:wrap;gap:8px;margin-top:14px}
+.chip-btn{min-height:var(--touch);padding:6px 16px;border:1px solid var(--accent);border-radius:22px;background:var(--accent-soft);color:var(--accent);font:inherit;font-weight:600;cursor:pointer}
+.recent-list{margin:0;gap:6px}
+.recent-row{display:flex;flex-direction:column;align-items:flex-start;gap:0;width:100%;min-height:var(--touch);padding:8px 13px;border:1px solid var(--border);border-radius:10px;background:var(--surface);color:var(--text);font:inherit;text-align:left;cursor:pointer}
+.recent-title{max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:13.5px}
+.recent-host{max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:11.5px;color:var(--muted)}
+.home-block .section-head h2{margin:18px 0 8px}
+
+/* links */
+.links-help{margin:0 0 10px}
+.paste-head{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:4px}
+.paste-head label{flex:1;min-width:0}
+.paste-actions{display:flex;flex-wrap:wrap;gap:8px}
+.state-chip.link-failed{background:var(--danger-soft);color:var(--danger);border-color:transparent}
+.state-chip.link-sending.is-live{background:var(--accent-soft);color:var(--accent)}
+.link-note{flex:1;min-width:0;font-size:12px;color:var(--danger);overflow-wrap:anywhere}
+
+/* downloads summary */
+.dl-summary{margin:6px 0 10px;padding:10px 12px;border:1px solid var(--border);border-radius:12px;background:var(--surface)}
+.dl-summary-main{display:flex;flex-wrap:wrap;align-items:baseline;gap:2px 12px}
+.dl-speed{font-size:18px;font-variant-numeric:tabular-nums}
+.dl-summary-counts{display:flex;flex-wrap:wrap;gap:4px 14px;margin-top:4px;font-size:12.5px;color:var(--muted)}
+.dl-count b{margin-right:3px;font-size:14px;color:var(--text);font-variant-numeric:tabular-nums}
+.dl-count.is-running b{color:var(--accent)}
+.dl-count.is-finished b{color:var(--ok)}
+.dl-summary.has-failed .dl-count.is-failed b{color:var(--danger)}
+.swipe-under-right .swipe-btn.start{background:var(--accent)}
+.swipe-under-right .swipe-btn.stop{background:var(--warn)}
+
+/* JD2 settings: status card + one collapsed section */
+.engine-card{padding:12px 14px}
+.engine-card .card-title{margin:0 0 6px;font-size:13px;color:var(--muted);font-weight:600}
+.engine-card .set-row{margin-top:8px}
+.engine-error-row{display:flex;align-items:center;gap:6px;margin:8px 0 0;padding:3px 4px 3px 10px;border-radius:6px;background:var(--danger-soft)}
+.engine-error-row .engine-error{flex:1;min-width:0;margin:0;padding:0;background:none;font-size:13px}
+.engine-error.is-clamped{display:-webkit-box;-webkit-line-clamp:1;-webkit-box-orient:vertical;overflow:hidden}
+.engine-error-row .btn{flex:none}
+#engineAdvanced>summary{font-size:14px;color:var(--text)}
+.adv-block{margin:0 0 14px;padding-top:10px;border-top:1px solid var(--border)}
+.adv-block>h3{margin:0 0 6px;font-size:13px;color:var(--muted)}
+.empty-state .empty-hint{font-size:12.5px}

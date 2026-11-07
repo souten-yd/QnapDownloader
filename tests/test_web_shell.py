@@ -172,7 +172,9 @@ if (bad.length) { console.error("mismatch: " + bad.join(",")); process.exit(1); 
         # v0.1.44 self-test: + the reader image and the first tile (blob: object URLs of the same Hub bytes, to
         # decode them on this device) and the stream <img> (same-origin MJPEG URL): 12. Its mirror frame is
         # navigated with location.replace of the validated /api/rb/mirror/doc URL, never with a src assignment.
-        self.assertEqual(len(re.findall(r"\.src\s*=", self.js)), 12)
+        # v0.1.62: + the open-tab card thumbnail on the browse home (`img.src = src`: a blob: URL of a tile the phone
+        # already holds, see tabThumb(); it fetches nothing): 13.
+        self.assertEqual(len(re.findall(r"\.src\s*=", self.js)), 13)
         self.assertNotIn("frame.src", self.js)
         self.assertIn("img.src = next;", self.js)
 
@@ -238,6 +240,7 @@ if (bad.length) { console.error("mismatch: " + bad.join(",")); process.exit(1); 
 const MAX_HOST_MODES = 100, HOST_MODE_KEY = "k";
 const REMOTE_FAST_MODE = "remote-fast", REMOTE_LIVE_MODE = "remote-live", REMOTE_READER_MODE = "remote-reader";
 const REMOTE_MODES = [REMOTE_FAST_MODE, REMOTE_LIVE_MODE, REMOTE_READER_MODE];
+const REMOTE_PT_MODE = "remote-pt";
 let store = null, broken = false;
 const readLocal = () => { if (broken) throw new Error("x"); return store; };
 const writeLocal = (k, v) => { store = v; };
@@ -255,6 +258,12 @@ rememberHostMode("z.example", "remote-fast");
 eq(JSON.parse(store), [["h.example", "remote-reader"], ["z.example", "remote-fast"]], "display choice stored");
 rememberHostMode("z.example", "compat");
 eq(JSON.parse(store), [["h.example", "remote-reader"]], "a non-display mode is never stored");
+// v0.1.62: one entry per site (registrable domain); passthrough is stored too
+rememberHostMode("www.shop.example.co.jp", "remote-live");
+rememberHostMode("a.shop.example.co.jp", "remote-pt");
+eq(JSON.parse(store), [["h.example", "remote-reader"], ["example.co.jp", "remote-pt"]], "one entry per site; passthrough kept");
+rememberHostMode("x.example.co.jp", "");
+eq(JSON.parse(store), [["h.example", "remote-reader"]], "forgetting a sub-domain removes the site entry");
 store = "not json";
 eq(readHostModes(), [], "garbage is harmless");
 broken = true;
@@ -471,11 +480,11 @@ if (out !== want) { console.error(JSON.stringify(out)); process.exit(1); }
     def test_v0122_image_source_is_only_a_blob_url_from_the_binary_api(self):
         assignments = re.findall(r"(\w+)\.src\s*=\s*(.+?);", self.js)
         self.assertEqual(sorted(a[0] for a in assignments),
-                         ["img", "img", "img", "img", "img", "img", "img", "img", "img", "mf", "probe"])
+                         ["img", "img", "img", "img", "img", "img", "img", "img", "img", "img", "mf", "probe"])
         # the only other <img> sources are the same-origin MJPEG stream URLs (v0.1.30)
         self.assertEqual(sorted(v for k, v in assignments if k == "img"),
-                         ["e.url", "next", "streamUrl(rb)", "streamUrl(rb)", "streamUrl({id: tab})", "t.url", "url", "url",
-                          "url"])
+                         ["e.url", "next", "src", "streamUrl(rb)", "streamUrl(rb)", "streamUrl({id: tab})", "t.url", "url",
+                          "url", "url"])
         self.assertIn("t.url = URL.createObjectURL(blob);", self.js)
         self.assertIn("e.url = URL.createObjectURL(blob);", self.js)       # reader image (v0.1.30)
         self.assertIn("/api/rb/tile.jpg?tab=", self.js)
