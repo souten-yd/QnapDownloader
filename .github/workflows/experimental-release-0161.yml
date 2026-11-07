@@ -42,7 +42,7 @@ jobs:
             exit 1
           fi
           gh release create v0.1.61-rc1 dist/QnapDownloader_0.1.61_x86_64.qpkg dist/SHA256SUMS \
-            --repo "${{ github.repository }}" --target "66a7fa915df9e77ce4f2909e84a6daa6f8dfbde1" \
+            --repo "${{ github.repository }}" --target "a2a298245263bf11e2dd9fb1c8d92f4e34d17a61" \
             --title "QnapDownloader v0.1.61-rc1: One-row web tab bar, instant feedback, app cache" \
             --prerelease \
             --notes "Experimental QNAP x86_64 build. The web tab bar is one row that hides while scrolling, shows the domain and the display mode; link taps respond at once; the app shell is cached on https for instant launches (reset in Settings › System)."
