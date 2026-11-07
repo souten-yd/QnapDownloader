@@ -75,7 +75,7 @@ const DISPLAY_CHIP_TITLE = {reader: "リーダー", mirror: "ミラー", tiles: 
 // v0.1.60: this file's own version. The Hub's version (from /api/state) is compared with it: a shell cache that is
 // older than the Hub (the app was updated while the home-screen app was closed) is dropped and the page reloaded.
 // tests/test_web_shell.py checks that it equals webapp.VERSION.
-const APP_VERSION = "0.1.66";
+const APP_VERSION = "0.1.67";
 const PT_DISPLAY_LABEL = "パススルー";      // v0.1.57: not a NAS-browser display, so not in RB_DISPLAY_LABELS
 const RB_PERF_WINDOW_MS = 5000;
 const RB_STREAM_FIRST_MS = 5000;     // MJPEG only (no SSE available): first picture within this, else polling
@@ -5454,14 +5454,19 @@ function announceProbes(tab, jobs) {
   const empty = done.filter(j => !j.links.length);
   const parts = [];
   if (sentCount) parts.push("JD2へ送信 " + sentCount + "件");
-  if (review.length) parts.push("要確認 " + review.length + "件");
+  const sending = Boolean(state.settings && state.settings.probe_autosend !== false) && jd2CanSend();
+  if (review.length) parts.push((sending ? "JD2へ送信中 " : "要確認 ") + review.length + "件");     // v0.1.67
   if (empty.length) parts.push("リンクなし " + empty.length + "件");
   if (done.length && !parts.length) parts.push("重複のため送信済み");
   if (failed.length) toast("リンク解析に失敗: " + failed.length + "件（" + (failed[0].label || failed[0].host) + "："
     + (failed[0].error || "不明") + "）。一覧から再試行できます", "error");
   if (done.length) flash("リンク解析が終わりました（" + parts.join("・") + "）");
-  if (review.length || failed.length) { probeUi.open = true; probeUi.tabId = tab.rb.id; renderProbeSheet(); }
-  if (review.length) probeAutosendFallback(tab, review.map(j => j.id));
+  // v0.1.67: with automatic sending on, an unsent result is not a decision for the user yet: the Hub records its send a
+  // moment after the job ends (this list may be read in between). The sheet opens only for failures, or for results
+  // the fallback below could not send.
+  const auto = Boolean(state.settings && state.settings.probe_autosend !== false) && jd2CanSend();
+  if (failed.length || (review.length && !auto)) { probeUi.open = true; probeUi.tabId = tab.rb.id; renderProbeSheet(); }
+  if (review.length && auto) probeAutosendFallback(tab, review.map(j => j.id));
 }
 
 // v0.1.66: the Hub sends finished results to JD2 by itself (probe_autosend). If one is still unsent a moment later (JD2
@@ -5485,6 +5490,7 @@ function probeAutosendFallback(tab, ids) {
       if (error) toast("JD2へ送れませんでした: " + error, "error");
       else if (sent) flash("リンク解析の結果をJD2へ送りました（" + sent + "件）");
       await loadProbeJobs(tab);
+      if (error) { probeUi.open = true; probeUi.tabId = rb.id; renderProbeSheet(); }    // now it needs the user
     }
   }), PROBE_FALLBACK_MS);
 }
@@ -5519,8 +5525,9 @@ function renderProbeSheet() {
     else if (job.note && job.state !== "queued") sub.push(job.note);
     if (job.sent && job.sent.error) sub.push("送信失敗: " + job.sent.error);
     if (sub.length) group.appendChild(element("div", sub.join(" · "), "probe-group-head"));
+    const jobSent = Boolean(job.sent && !job.sent.error);      // v0.1.67: already with JD2: not counted in 「すべて送る」
     for (const url of job.links || []) {
-      all.push(url);
+      if (!jobSent) all.push(url);
       const row = element("div", undefined, "probe-link");
       row.appendChild(element("span", url, "link-url"));
       const actions = element("span", undefined, "probe-link-actions");

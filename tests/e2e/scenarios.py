@@ -2507,6 +2507,25 @@ def probe_queue_burst(ph):
     assert not ph.js("document.querySelectorAll('#notice .toast.error').length"), "an error toast appeared"
 
 
+@scenario("probe-autosend-quiet")
+def probe_autosend_quiet(ph):
+    """v0.1.67: with automatic sending on and JD2 able to take links, a finished long-press analysis does not open the
+    result sheet (it opened for a moment-before-the-send read and showed 送信済み with send buttons); only a send that
+    still failed afterwards opens it."""
+    ph.page.set_viewport_size(NARROW)
+    ph.open("/probe.html")
+    ph.wait(lambda: "リンク1" in ph.mirror_text(), 20, "probe page")
+    href = ph.js("(()=>{const d=mirrorDoc();return d.querySelector('a[data-href]').dataset.href})()")
+    ph.js("()=>{window.jd2CanSend = () => true; state.settings.probe_autosend = true}")    # the harness has no JD2
+    ph.js("async(h)=>{await startProbe(activeWebTab(), {href: h})}", href)
+    ph.wait(lambda: ph.js("(()=>{const t=activeWebTab();const p=t&&t.rb&&t.rb.probes;return !!p && p.done>=1})()"), 30, "probe done")
+    ph.page.wait_for_timeout(1500)
+    assert ph.js("document.getElementById('probeSheet').hidden"), "the sheet opened although the result is being sent automatically"
+    # the harness cannot send: the fallback's failure opens the sheet with the reason
+    ph.wait(lambda: not ph.js("document.getElementById('probeSheet').hidden"), 10, "the sheet after the failed fallback send")
+    ph.take_errors("status of 400", "status of 409", "status of 429", "Failed to fetch", "Load failed")
+
+
 @scenario("probe-queue-cancel")
 def probe_queue_cancel(ph):
     """v0.1.65: 待ちを取り消す cancels what has not started; closing the tab drops that tab's jobs."""
