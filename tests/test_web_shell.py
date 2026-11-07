@@ -9,6 +9,17 @@ WEB = Path(__file__).resolve().parent.parent / "web"
 FORBIDDEN_SANDBOX = ("allow-popups", "allow-top-navigation",
                      "allow-downloads", "allow-modals")
 ORIGIN_TOKEN = "allow-same-origin"
+# v0.1.57: the passthrough display's one frame. Its content is the cross-origin passthrough listener (never the Hub's own
+# origin), so scripts run there but without top navigation, popups or the Hub's cookies. This exact attribute, once, in
+# index.html, is the only sandbox allowed; every other use of these tokens still fails.
+PT_SANDBOX = 'sandbox="allow-scripts allow-same-origin allow-forms allow-modals allow-downloads"'
+
+
+def without_pt_sandbox(path, body):
+    if path.name == "index.html":
+        assert body.count(PT_SANDBOX) == 1, "the passthrough frame's sandbox must appear exactly once"
+        return body.replace(PT_SANDBOX, "")
+    return body
 
 
 def text_files():
@@ -35,7 +46,7 @@ class WebShellStaticTests(unittest.TestCase):
 
     def test_forbidden_sandbox_tokens_absent_everywhere(self):
         for path in text_files():
-            body = path.read_text(encoding="utf-8")
+            body = without_pt_sandbox(path, path.read_text(encoding="utf-8"))
             for token in FORBIDDEN_SANDBOX:
                 with self.subTest(file=path.name, token=token):
                     self.assertNotIn(token, body)
@@ -44,18 +55,19 @@ class WebShellStaticTests(unittest.TestCase):
         # The page itself is never framed. Since v0.1.39 the only iframe is the Hub-made mirror copy:
         # sandbox exactly allow-same-origin (no script, form, popup or navigation permission).
         for path in text_files():
-            body = path.read_text(encoding="utf-8")
+            body = without_pt_sandbox(path, path.read_text(encoding="utf-8"))
             for token in ("SANDBOX_", "sandboxFor", "mountFrame", "compatAllowedFor",
                           "COMPAT_CONFIRM", "MODE_LABELS", "LEGACY_EXTERNAL_MODE", "enforceLiveLimit",
                           "MAX_LIVE_FRAMES", "setMode(", "normalizeMode", "applyHostMode", "openInTab",
                           "leaveRemote", "updateCfHint", "syncFrameVisibility", "allow-scripts"):
                 with self.subTest(file=path.name, token=token):
                     self.assertNotIn(token, body)
-        self.assertEqual(self.html.count("<iframe"), 1)
+        self.assertEqual(self.html.count("<iframe"), 2)             # v0.1.57: + the passthrough frame (ptFrame)
         # v0.1.41: no sandbox attribute (WebKit would drop the app's listeners); the document's own
         # CSP (default-src 'none') keeps every script out instead
         self.assertIn('<iframe id="mirrorFrame" class="mirror-frame" title=', self.html)
-        self.assertEqual(len(re.findall(r'sandbox="', self.html)), 0)
+        self.assertEqual(len(re.findall(r'sandbox="', self.html)), 1)          # v0.1.57: only the passthrough frame
+        self.assertIn('<iframe id="ptFrame" class="mirror-frame" title="パススルー表示のページ" referrerpolicy="no-referrer" ' + PT_SANDBOX, self.html)
         self.assertNotRegex(self.js, r"createElement\([\"']iframe[\"']\)")
         self.assertNotIn('setAttribute("sandbox"', self.js)
         self.assertNotIn(".sandbox", self.js)
@@ -363,7 +375,7 @@ const eq = (a, b, m) => { if (JSON.stringify(a) !== JSON.stringify(b)) { console
         order = re.findall(r'<a href="#/settings/(\w+)" data-section', self.html)
         self.assertEqual(order, ["jd2", "browser", "connection", "system", "diag"])
         subs = re.findall(r'data-sub="(\w+)"', self.html)
-        self.assertEqual(subs, ["engine", "accounts", "storage", "send", "nas", "rules", "bookmarks",
+        self.assertEqual(subs, ["engine", "accounts", "storage", "send", "nas", "pt", "rules", "bookmarks",
                                 "https", "share", "updates", "login", "about", "selftest", "tools", "disk", "debug"])
         self.assertRegex(self.js, r"AUTO_REFRESH_MS\s*=\s*5000\b")
         self.assertNotIn("BADGE_REFRESH_MS", self.js)
@@ -481,7 +493,7 @@ if (out !== want) { console.error(JSON.stringify(out)); process.exit(1); }
         for token in ("innerHTML", "outerHTML", "insertAdjacentHTML"):
             self.assertNotIn(token, self.js)
         for token in FORBIDDEN_SANDBOX:
-            self.assertNotIn(token, self.js + self.html)
+            self.assertNotIn(token, self.js + self.html.replace(PT_SANDBOX, "", 1))     # v0.1.57: the passthrough frame's own attribute
 
     def test_v0122_viewport_scroll_coalescing_and_intercept_sheet(self):
         # viewport is reported from the stage, validated ranges mirror the server

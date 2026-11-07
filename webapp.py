@@ -26,6 +26,8 @@ import browser_safety
 import container_runtime
 import debuglog
 import diskio
+import passthrough
+import pt_core
 import runtime_diagnostics
 import engine_supervisor
 import rb_mirror
@@ -36,7 +38,7 @@ import ttlcache
 import updater
 import webauthn
 
-VERSION = "0.1.56"
+VERSION = "0.1.57"
 PORT = 17864
 ROOT = Path(__file__).resolve().parent
 FILES = {"/": ("web/index.html", "text/html; charset=utf-8"),
@@ -51,6 +53,14 @@ FILES = {"/": ("web/index.html", "text/html; charset=utf-8"),
 # That response carries its own, stricter policy (rb_mirror.DOC_CSP_HEADER). External pages are never framed.
 CSP = ("default-src 'none'; img-src 'self' data: blob:; script-src 'self'; style-src 'self'; "
        "connect-src 'self'; frame-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'")
+# v0.1.57: with the passthrough display ON the app may frame (and ping) origin B, and nothing else.
+def app_csp(pt_origin=None):
+    if not pt_origin:
+        return CSP
+    return (CSP.replace("connect-src 'self';", "connect-src 'self' %s;" % pt_origin)
+               .replace("frame-src 'self';", "frame-src 'self' %s;" % pt_origin))
+
+
 FAILED = {}
 PASSKEY_BEGIN = {}     # per-address passkey login/begin timestamps (RAM only)
 PASSKEY_BEGIN_LIMIT, PASSKEY_BEGIN_WINDOW = 30, 300
@@ -436,7 +446,8 @@ def server_selftest(server):
             if runner is None:
                 runner = server.selftest = selftest.SelfTest(
                     server.rb, engine=getattr(server, "engine", None), jd2=getattr(server, "jd2", None),
-                    version=VERSION, data_dir=getattr(server, "data_dir", None))
+                    version=VERSION, data_dir=getattr(server, "data_dir", None),
+                    pt=lambda: passthrough.run_selftest(server_pt(server)))      # v0.1.57
     return runner
 
 
@@ -464,6 +475,24 @@ def passkey_rp_name_ok(name):
     configured = os.environ.get("DOWNLOADER_ALLOWED_HOSTS", "")
     return ("." in name and LABEL.fullmatch(name.split(".")[0]) is not None and
             name in {item.strip().lower() for item in configured.split(",") if item.strip()})
+
+
+def server_pt(server):
+    """v0.1.57: the passthrough manager (created on first use; its listener runs only while pt_enabled is on)."""
+    manager = getattr(server, "pt", None)
+    if manager is None:
+        with SESSION_LOCK:
+            manager = getattr(server, "pt", None)
+            if manager is None:
+                manager = server.pt = passthrough.PassthroughManager(
+                    server.store, VERSION,
+                    {"request_is_https": request_is_https, "loopback_peer": loopback_peer,
+                     "tailscale_name": tailscale_name},
+                    port=getattr(server, "pt_port", passthrough.PORT),
+                    test_upstream=getattr(server, "pt_test_upstream", None),
+                    tls_context=getattr(server, "pt_tls_context", None))
+                manager.sync()
+    return manager
 
 
 def server_state_hub(server):
@@ -520,7 +549,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("X-Frame-Options", "DENY")
         self.send_header("Referrer-Policy", "no-referrer")
         self.send_header("Permissions-Policy", "geolocation=(),camera=(),microphone=(),payment=()")
-        self.send_header("Content-Security-Policy", CSP)
+        self.send_header("Content-Security-Policy", self.app_csp())
 
     def stream_sse(self, tab_id):
         """Live display as an event stream (v0.1.46). Runs until the viewer leaves (or after 10 minutes)."""
@@ -604,11 +633,53 @@ class Handler(BaseHTTPRequestHandler):
         # cannot display a blob: URL. data: is kept unchanged (security invariant); the
         # JSON frame endpoint that used it was removed in v0.1.33. No other directive
         # changes (default-src 'none', no inline). Mirror documents and resources pass their own `csp`.
-        self.send_header("Content-Security-Policy", csp or CSP)
+        self.send_header("Content-Security-Policy", csp or self.app_csp())
         if getattr(self, "_cookie", None):
             self.send_header("Set-Cookie", self._cookie)
         self.end_headers()
         self.wfile.write(raw)
+
+    def pt_origin(self):
+        """(origin B of the passthrough listener as seen from this request, reason it is unavailable).
+
+        Production: the app must be reached over HTTPS under a *.ts.net name; origin B is the same name on pt_public_port.
+        `server.pt_test_host` (set only by the E2E harness, never by main()) swaps in http://<host>:<listener port> for a
+        loopback peer so Service Workers work on 127.0.0.1 / localhost.
+        """
+        manager = server_pt(self.server)
+        test_host = getattr(self.server, "pt_test_host", None)
+        if test_host:
+            if not loopback_peer(self.client_address[0]) or not manager.bound_port:
+                return None, "listener"
+            return "http://%s:%d" % (test_host, manager.bound_port), ""
+        if not request_is_https(self.client_address[0], self.headers):
+            return None, "https"
+        name = host_name(self.headers.get("Host", ""))
+        if not tailscale_name(name):
+            return None, "tsnet"
+        port = manager.public_port
+        return "https://%s%s" % (name, "" if port == 443 else ":%d" % port), ""
+
+    def app_origin(self):
+        host = self.headers.get("Host", "")
+        return ("https" if request_is_https(self.client_address[0], self.headers) or getattr(self.server, "secure_cookies", False)
+                else "http") + "://" + host
+
+    def app_csp(self):
+        manager = getattr(self.server, "pt", None)
+        if manager is None or not manager.enabled:
+            return CSP
+        return app_csp(self.pt_origin()[0])
+
+    def pt_status(self):
+        manager = server_pt(self.server)
+        origin, reason = self.pt_origin() if manager.enabled else (None, "disabled")
+        if origin:
+            manager.state.note_app_origin(self.app_origin())
+        data = manager.status()
+        data.update(origin=origin, reason=reason, https=request_is_https(self.client_address[0], self.headers),
+                    serve_command="tailscale serve --bg --https=%d http://127.0.0.1:%d" % (manager.public_port, passthrough.PORT))
+        return data
 
     def reject(self, message, code=400):
         self.send_data(code, {"error": message})
@@ -853,6 +924,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_state()
             if path == "/api/settings":
                 return self.send_data(200, self.store.settings())
+            if path == "/api/pt/status":
+                return self.send_data(200, self.pt_status())
             if path == "/api/diag/diskio":
                 return self.send_data(200, server_diskio(self.server).snapshot())
             if path == "/api/debug/log":
@@ -1127,6 +1200,46 @@ class Handler(BaseHTTPRequestHandler):
         except (OSError, ValueError, RuntimeError, KeyError, sqlite3.Error) as exc:
             return self.reject(str(exc))
         self.reject("APIが存在しません", 404)
+
+    def pt_ticket(self, body):
+        """POST /api/pt/ticket {url}: a one-time ticket (60 s) for origin B. Admin session + CSRF + Origin already checked."""
+        manager = server_pt(self.server)
+        if not manager.enabled:
+            raise ValueError("パススルーが有効ではありません（設定 › ブラウザ › パススルー）")
+        origin, reason = self.pt_origin()
+        if not origin:
+            raise ValueError("パススルーはHTTPSの *.ts.net で開いたアプリからだけ使えます" if reason in ("https", "tsnet")
+                             else "パススルーの待ち受けが動いていません")
+        url = body.get("url")
+        try:
+            target = pt_core.parse_target(url)
+        except pt_core.TargetError as exc:
+            raise ValueError(str(exc)) from None
+        why = pt_core.host_blocked_reason(target.host, manager.state.own_names)
+        if why or target.real_port not in pt_core.ALLOWED_PORTS:
+            raise ValueError("このアドレスはパススルーで開けません" + ("（%s）" % why if why else "（ポート）"))
+        app_origin = self.app_origin()
+        manager.state.note_app_origin(app_origin)
+        ticket = manager.state.new_ticket(app_origin)
+        return self.send_data(200, {"ticket": ticket, "origin": origin, "url": target.url,
+                                    "enter": "%s/pt/enter?t=%s&u=%s" % (origin, ticket, quote(target.url, safe=""))})
+
+    def pt_to_jd2(self, body):
+        """POST /api/pt/jd2 {id, send}: hand a passthrough download's URL to the Links path (the Hub re-validates it).
+
+        Only the URL travels: the JD2 link API takes no cookies or headers. `send` also asks JD2 to take it now."""
+        record = server_pt(self.server).state.get_download(body.get("id"))
+        if record is None:
+            raise ValueError("ダウンロードの有効期限が切れました。もう一度リンクを開いてください")
+        url = record["url"]
+        if body.get("send") is True:
+            try:
+                send_link(self.server, url=url, dedupe=True)
+            except AlreadySent:
+                return self.send_data(200, {"state": "dup", "name": record["name"]})
+            return self.send_data(200, {"state": "sent", "name": record["name"]})
+        self.store.add_link(url)
+        return self.send_data(200, {"state": "staged", "name": record["name"]})
 
     def note_failed(self, address, attempts):
         with SESSION_LOCK:
@@ -1405,7 +1518,14 @@ class Handler(BaseHTTPRequestHandler):
                 self.store.revoke_session(self.session_cookie())
                 self.set_cookie("", 0)
                 return self.send_data(200, {"ok": True})
+            if path == "/api/pt/ticket":
+                return self.pt_ticket(body)
+            if path == "/api/pt/clear-cookies":
+                return self.send_data(200, {"cleared": server_pt(self.server).state.clear_cookies()})
+            if path == "/api/pt/jd2":
+                return self.pt_to_jd2(body)
             if path == "/api/sessions/revoke-all":
+                server_pt(self.server).state.revoke_all()      # v0.1.57: passthrough sessions end with every login
                 count = self.store.revoke_all_sessions()
                 self.set_cookie("", 0)
                 return self.send_data(200, {"ok": True, "revoked": count})
@@ -1425,12 +1545,14 @@ class Handler(BaseHTTPRequestHandler):
                     raise ValueError("フォルダに書き込み権限がありません")
                 return self.send_data(200, self.store.set_download_dir(str(chosen)))
             if path == "/api/settings/options":
-                options = storage.BOOL_OPTIONS + tuple(storage.ENUM_OPTIONS)
+                options = storage.BOOL_OPTIONS + tuple(storage.ENUM_OPTIONS) + tuple(storage.INT_OPTIONS)
                 known = [key for key in options if key in body]
                 if not known or set(body) - set(options):
                     raise ValueError("変更できる設定項目を指定してください")
                 for key in known:
                     self.store.set_option(key, body[key])
+                if "pt_enabled" in known or "pt_public_port" in known:
+                    server_pt(self.server).sync()        # v0.1.57: the listener follows the switch at once
                 if "rb_resident" in known:
                     # v0.1.38: apply at once (start / let go of the resident NAS browser)
                     self.server.rb.set_resident(self.store.settings().get("rb_resident") is True)
@@ -1728,6 +1850,8 @@ def main():
     parser.add_argument("--port", type=int, default=PORT)
     parser.add_argument("--lan", action="store_true", help="Serve private LAN IPs; never port-forward to the Internet")
     parser.add_argument("--secure-cookie", action="store_true", help="For TLS reverse proxy deployments")
+    parser.add_argument("--pt-port", type=int, default=passthrough.PORT,
+                        help="loopback port of the passthrough listener (only runs while the setting is on)")
     parser.add_argument("--test-passkey-host", choices=("localhost",), default=None,
                         help="TEST ONLY (E2E): allow passkeys on http://localhost; never use in production")
     parser.add_argument("--data-dir", default=os.environ.get("DOWNLOADER_DATA_DIR", "./runtime"))
@@ -1740,6 +1864,8 @@ def main():
     server.data_dir = data
     server.secure_cookies = args.secure_cookie
     server.passkey_test_hosts = frozenset([args.test_passkey_host] if args.test_passkey_host else [])
+    server.pt_port = args.pt_port
+    server_pt(server)       # v0.1.57: starts the passthrough listener when pt_enabled is on
     remove_legacy_setup_token(data)
     server.updates = self_update.UpdateManager(data, ROOT, VERSION, "x86_64", args.port)
     server.engine = engine_supervisor.EngineManager(data, store)
@@ -1765,6 +1891,7 @@ def main():
         server.serve_forever(poll_interval=0.5)
     finally:
         server.server_close()
+        server.pt.stop()
         server.rb.shutdown()
         server.engine.shutdown()
         store.close()

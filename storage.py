@@ -36,10 +36,15 @@ DEFAULTS = {
     # v0.1.56: both OFF. Forget Links-tab rows once JD2 took them; clear finished/skipped JD2 entries.
     "auto_clear_links": False,
     "auto_clear_downloads": False,
+    # v0.1.57: passthrough display (the page is drawn by the phone, every request goes out from the NAS). OFF by default; the
+    # listener (127.0.0.1:17865) only runs while this is on. pt_public_port is the port `tailscale serve --https=` exposes it on.
+    "pt_enabled": False,
+    "pt_public_port": 8443,
 }
 BOOL_OPTIONS = ("send_autostart", "block_ads", "probe_autosend", "rb_link_boxes", "rb_resident",
-                "rb_spare_tab", "rb_no_webfonts", "auto_clear_links", "auto_clear_downloads")
+                "rb_spare_tab", "rb_no_webfonts", "auto_clear_links", "auto_clear_downloads", "pt_enabled")
 ENUM_OPTIONS = {"rb_default_mode": ("reader", "mirror", "fast", "live")}
+INT_OPTIONS = {"pt_public_port": (1, 65535)}
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY,value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS accounts(id INTEGER PRIMARY KEY CHECK(id=1),
@@ -184,6 +189,10 @@ class Store:
         """Boolean (or fixed-choice) option in the settings table; written only when it changes."""
         if key in ENUM_OPTIONS:
             if not isinstance(value, str) or value not in ENUM_OPTIONS[key]:
+                raise ValueError("設定の項目または値が不正です")
+        elif key in INT_OPTIONS:
+            low, high = INT_OPTIONS[key]
+            if type(value) is not int or not low <= value <= high:
                 raise ValueError("設定の項目または値が不正です")
         elif key not in BOOL_OPTIONS or type(value) is not bool:
             raise ValueError("設定の項目または値が不正です")

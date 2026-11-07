@@ -28,7 +28,7 @@ class SettingsStructureTests(unittest.TestCase):
                          ["jd2", "browser", "connection", "system", "diag"])
         body = settings_html()
         for section, subs in (("jd2", ["engine", "accounts", "storage", "send"]),
-                              ("browser", ["nas", "rules", "bookmarks"]),
+                              ("browser", ["nas", "pt", "rules", "bookmarks"]),
                               ("connection", ["https", "share"]),
                               ("system", ["updates", "login", "about"]),
                               ("diag", ["selftest", "tools", "disk", "debug"])):

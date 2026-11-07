@@ -81,11 +81,36 @@ class QpkgContractTests(unittest.TestCase):
         script = (ROOT / "scripts/build-qpkg.sh").read_text()
         for name in ("webapp.py", "webauthn.py", "ttlcache.py", "state_hub.py", "diskio.py", "debuglog.py", "storage.py", "durability.py",
                      "updater.py", "self_update.py", "jd2_policy.py",
-                     "jd2_control.py", "jd2_local.py", "engine_components.py", "engine_supervisor.py", "container_runtime.py", "jd2_transfer.py", "jd2_downloads.py", "jd2_accounts.py", "runtime_diagnostics.py", "rapidgator_extract.py", "browser_safety.py", "rb_blocklist.py", "rb_firstload.py", "rb_resident.py", "rb_mirror.py", "remote_browser.py", "selftest.py", "downloader_pid.py", "python3-path", "downloader-diagnose"):
+                     "jd2_control.py", "jd2_local.py", "engine_components.py", "engine_supervisor.py", "container_runtime.py", "jd2_transfer.py", "jd2_downloads.py", "jd2_accounts.py", "runtime_diagnostics.py", "rapidgator_extract.py", "browser_safety.py", "rb_blocklist.py", "rb_firstload.py", "rb_resident.py", "rb_mirror.py", "remote_browser.py", "selftest.py", "pt_core.py", "pt_proxy.py", "passthrough.py", "downloader_pid.py", "python3-path", "downloader-diagnose"):
             with self.subTest(name=name):
                 self.assertIn(name, script)
         self.assertIn('cp -R "$ROOT/web"', script)
         self.assertIn('cp -R "$ROOT/container"', script)
+
+    def test_passthrough_test_hooks_cannot_be_switched_on_in_a_package(self):
+        """v0.1.57: the test-only upstream mapping / origin override are plain attributes set by the E2E harness. No start
+        script, no command line flag and no environment variable can set them."""
+        import inspect
+        import re as _re
+        shared = [ROOT / "qpkg/shared" / n for n in ("downloader.sh", "downloader_pid.py", "python3-path", "downloader-diagnose")]
+        shared.append(ROOT / "qpkg/package_routines")
+        for path in shared:
+            text = path.read_text(encoding="utf-8")
+            for token in ("QD_PT", "pt_test", "test_upstream", "pt-test", "--pt-port", "PT_PORT"):
+                self.assertNotIn(token, text, "%s mentions %s" % (path.name, token))
+        main = inspect.getsource(webapp.main)
+        for token in ("pt_test_host", "pt_test_upstream", "pt_tls_context"):
+            self.assertNotIn(token, main)
+        for name in ("webapp.py", "passthrough.py", "pt_core.py", "pt_proxy.py"):
+            source = (ROOT / name).read_text(encoding="utf-8")
+            self.assertFalse(_re.search(r"environ[^\n]*(QD_PT|TEST_UPSTREAM|PT_TEST)", source, _re.I), name)
+        self.assertFalse(_re.search(r"add_argument\([^)]*(test.upstream|pt.test)", (ROOT / "webapp.py").read_text()))
+        # the listener only ever binds the loopback address
+        self.assertIn('("127.0.0.1", self.requested_port)', (ROOT / "passthrough.py").read_text())
+        self.assertIn("web/pt-sw.js", "web/pt-sw.js")
+        for name in ("pt-sw.js", "pt-helper.js", "pt-boot.js", "pt-download.js"):
+            self.assertTrue((ROOT / "web" / name).is_file())
+        self.assertIn('cp -R "$ROOT/web"', (ROOT / "scripts/build-qpkg.sh").read_text())      # web/ (and so the pt-*.js files) is packaged
 
     def test_scripts_are_syntactically_valid(self):
         for name in ("qpkg/shared/downloader.sh", "qpkg/shared/python3-path", "qpkg/shared/downloader-diagnose"):

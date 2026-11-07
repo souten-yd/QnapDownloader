@@ -114,6 +114,7 @@
        <button type="button" role="menuitemradio" data-action="display:mirror" data-display="mirror">ミラー</button>
        <button type="button" role="menuitemradio" data-action="display:tiles" data-display="tiles">高速</button>
        <button type="button" role="menuitemradio" data-action="display:live" data-display="live">ライブ</button>
+       <button type="button" role="menuitemradio" data-action="display:pt" data-display="pt" id="menuPt">パススルー</button>
       </div>
       <div class="menu-label" data-scope="quality">画質（高速・ライブ）</div>
       <div class="menu-seg" role="group" aria-label="画質" data-scope="quality">
@@ -470,6 +471,34 @@
        </div>
       </div>
 
+      <div class="sub" data-sub="pt">
+       <h2>パススルー</h2>
+       <div class="set-row">
+        <div class="set-main"><span class="set-label">パススルー（iPhoneで表示・通信はNAS経由）</span>
+         <span class="set-desc"><span class="set-text">ページはiPhoneのSafariで描画し、通信だけNASから出します</span>
+          <details class="hint"><summary aria-label="詳しい説明">ⓘ</summary><p>サイトにはNASのIPアドレスが見えるため、IPに紐づくダウンロードリンクをJD2で使えます。HTTPSの *.ts.net で開いたアプリでだけ使え、下のコマンドを1回実行する必要があります。すべてのサイトが1つのオリジン（アドレス）を共有するため、NASブラウザほどは隔離されません。</p></details></span></div>
+        <label class="switch" for="ptEnabled"><input type="checkbox" id="ptEnabled" role="switch" aria-label="パススルー"><span class="switch-track" aria-hidden="true"></span></label>
+       </div>
+       <p id="ptState" class="set-text muted" role="status"></p>
+       <p class="set-text">NASに追加で次のコマンドを実行します（アプリ用の https=443 とは別のポートです）。</p>
+       <div class="copy-row"><code id="ptCmd" class="code-box"></code><button type="button" id="ptCmdCopy" class="btn small">コピー</button></div>
+       <div class="engine-actions">
+        <button type="button" id="ptCheck" class="btn">接続を確認</button>
+        <button type="button" id="ptClear" class="btn quiet">パススルーのCookieを消す</button>
+       </div>
+       <p id="ptCheckResult" class="set-text muted" role="status"></p>
+       <details class="fold">
+        <summary>制限と注意</summary>
+        <ul class="guide">
+         <li>閲覧するすべてのサイトが同じオリジンを共有します。悪意のあるサイトは他のサイトのlocalStorageやJSが設定したCookieを読める場合があります。信用できないサイトには向きません。</li>
+         <li>CookieはNASのHubがサイトごとに保持します（メモリのみ。再起動やログアウトで消えます）。</li>
+         <li>WebSocket・WebRTC・サイト独自のService Workerは使えません。Cloudflareなどの確認が通らないサイトはNASブラウザを使ってください。</li>
+         <li>別オリジンのiframe（動画・CAPTCHA）は表示されません。</li>
+         <li>詳しくは docs/passthrough.md を参照してください。</li>
+        </ul>
+       </details>
+      </div>
+
       <div class="sub" data-sub="rules">
        <h2>サイト別ルール</h2>
        <p class="set-text muted">NASブラウザで開いたページのホストごとの設定（最大200件）</p>
@@ -719,6 +748,14 @@
      <div id="tileScroll" class="tile-scroll" aria-label="NASブラウザのページ（全体表示）" hidden></div>
      <div id="mirrorWrap" class="mirror-wrap" hidden>
       <iframe id="mirrorFrame" class="mirror-frame" title="NASブラウザのページ（ミラー表示）"></iframe>
+     </div>
+     <div id="ptWrap" class="mirror-wrap pt-wrap" hidden>
+      <iframe id="ptFrame" class="mirror-frame" title="パススルー表示のページ" referrerpolicy="no-referrer" sandbox="allow-scripts allow-same-origin allow-forms allow-modals allow-downloads"></iframe>
+     </div>
+     <div id="ptUnavailable" class="remote-idle remote-notready" role="status" hidden>
+      <p class="remote-notready-title">パススルーを使えません</p>
+      <p id="ptUnavailableText" class="remote-notready-text"></p>
+      <button type="button" id="ptUnavailableBtn" class="btn primary">NASブラウザで開く</button>
      </div>
      <div id="readerProgress" class="reader-progress" role="progressbar" aria-label="読み進み" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" hidden><div id="readerProgressFill" class="reader-progress-fill"></div></div>
      <div id="readerScroll" class="reader-scroll" aria-label="NASブラウザのページ（リーダー表示）" hidden>

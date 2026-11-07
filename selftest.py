@@ -53,7 +53,7 @@ STATUSES = (PASS, WARN, FAIL, SKIP)
 
 SECTIONS = (("env", "環境"), ("browser", "NASブラウザ起動"), ("builtin", "内蔵テストページ"),
             ("client", "この端末（スマホ）"), ("swipe", "スワイプ（自動）"), ("swipe_manual", "スワイプ（手動）"),
-            ("sites", "実サイト"),
+            ("sites", "実サイト"), ("pt", "パススルー"),
             ("cleanup", "後片付け"))
 SECTION_LABEL = dict(SECTIONS)
 
@@ -996,7 +996,7 @@ class SelfTest:
     def __init__(self, rb, *, engine=None, jd2=None, version="", data_dir=None, debug=None,
                  clock=time.monotonic, wall=time.time, sleep=None, meminfo=None,
                  cpuinfo="/proc/cpuinfo", statvfs=os.statvfs, hub_io=diskio.read_hub_io,
-                 container_io=None, fixtures=None, thread=True):
+                 container_io=None, fixtures=None, thread=True, pt=None):
         self.rb = rb
         self.engine = engine
         self.jd2 = jd2
@@ -1011,6 +1011,7 @@ class SelfTest:
         self._hub_io = hub_io
         self._container_io = container_io if container_io is not None else self._cgroup_io
         self._fixtures_factory = fixtures or Fixtures
+        self._pt = pt        # v0.1.57: callable -> [(id, name, status, value, threshold)] (the Hub's passthrough check)
         self._thread_on = thread
         self._cv = threading.Condition()
         self._run = None
@@ -1307,6 +1308,7 @@ class SelfTest:
                 self._add(run, "browser", "browser.skipped", "NASブラウザの確認", SKIP,
                           "NASブラウザを使えないため省略しました")
                 self._leave(run, "browser", skipped=True)
+            self._section_pt(run)
         except Cancelled:
             state = "cancelled"
         except RunTimeout:
@@ -1325,6 +1327,23 @@ class SelfTest:
             self._debug_off(run)
             with self._cv:
                 self._finish_locked(run, state)
+
+    # v0.1.57: パススルー (server side only; SKIP while the setting is off). Independent of the NAS browser.
+    def _section_pt(self, run):
+        if self._pt is None:                # no passthrough hook (unit tests): the section is just skipped
+            self._leave(run, "pt", skipped=True)
+            return
+        self._enter(run, "pt")
+        try:
+            rows = list(self._pt())
+        except Exception as error:      # a bug here must not stop the other sections
+            rows = [("pt.error", "パススルーの確認", FAIL, "%s: %s" % (type(error).__name__, _short(str(error), 100)), "")]
+        if not rows:
+            rows = [("pt.off", "パススルー", SKIP, "確認できません", "")]
+        for cid, name, status, value, threshold in rows:
+            self._guard(run)
+            self._add(run, "pt", cid, name, status if status in STATUSES else FAIL, value, threshold)
+        self._leave(run, "pt", skipped=all(r[2] == SKIP for r in rows))
 
     # -------------------------------------------------------------------- section 1: environment
     def _io_totals(self):

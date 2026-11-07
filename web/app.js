@@ -5,6 +5,8 @@
  *
  * Security notes (see "Security invariants" in the spec):
  *  - DOM is built only with createElement/createElementNS + textContent.
+ *  - v0.1.57: the one exception is the passthrough frame (#ptFrame): a sandboxed iframe on a separate origin that the
+ *    app only talks to by origin-checked postMessage (see "passthrough display" below).
  *  - There are no iframes: since v0.1.35 every http(s) web tab is shown by the NAS browser
  *    (Chromium in a NAS container); this page only displays JPEG frames / reader data the Hub
  *    produced. The URL is validated by /api/browser/validate before it is handed to the Hub.
@@ -67,6 +69,7 @@ const RB_QUALITY_KEY = "qnapdl.rbquality.v1";
 const RB_QUALITIES = ["speed", "standard", "high"];
 const RB_QUALITY_LABELS = {speed: "速度優先", standard: "標準", high: "高画質"};
 const RB_DISPLAY_LABELS = {reader: "リーダー", mirror: "ミラー", tiles: "高速（全体表示）", live: "ライブ"};
+const PT_DISPLAY_LABEL = "パススルー";      // v0.1.57: not a NAS-browser display, so not in RB_DISPLAY_LABELS
 const RB_PERF_WINDOW_MS = 5000;
 const RB_STREAM_FIRST_MS = 5000;     // MJPEG only (no SSE available): first picture within this, else polling
 const RB_MJPEG_FIRST_MS = 2500;      // v0.1.46: MJPEG first picture within this, else the event stream (SSE)
@@ -86,7 +89,7 @@ const TAB_STORAGE_KEY = "qnapdl.webtabs.v1";
 const LEGACY_AUTO_KEY = "qnapdl.downloads.auto";   // v0.1.11 switch; removed silently
 // v0.1.33: four sections, each with in-page subsections (#/settings/jd2/accounts scrolls to one).
 // v0.1.35 debug log (server ring, RAM only). The page batches entries while the server says it is on.
-const DEBUG_CATEGORIES = ["ui", "render", "net", "rb", "jd2", "engine", "disk", "http", "app"];
+const DEBUG_CATEGORIES = ["ui", "render", "net", "rb", "jd2", "engine", "disk", "http", "app", "pt"];
 const DEBUG_CATEGORY_LABELS = {ui: "画面", render: "描画", net: "通信", rb: "NASブラウザ", jd2: "JD2",
   engine: "エンジン", disk: "ディスク", http: "HTTP", app: "アプリ"};
 const DEBUG_LEVELS = ["debug", "info", "warn", "error"];
@@ -99,7 +102,7 @@ const DEBUG_VIEW_MS = 2000;        // the log sheet follows the server this ofte
 const DEBUG_VIEW_MAX = 1000;
 const DISK_REFRESH_MS = 10000;     // disk write table (the Hub samples every 10 s)
 const SETTINGS_SECTIONS = ["jd2", "browser", "connection", "system", "diag"];
-const SETTINGS_SUBS = {jd2: ["engine", "accounts", "storage", "send"], browser: ["nas", "rules", "bookmarks"],
+const SETTINGS_SUBS = {jd2: ["engine", "accounts", "storage", "send"], browser: ["nas", "pt", "rules", "bookmarks"],
   connection: ["https", "share"], system: ["updates", "login", "about"], diag: ["selftest", "tools", "disk", "debug"]};
 // Old one-section routes land on their new place.
 const SETTINGS_REDIRECTS = {engine: "jd2/engine", accounts: "jd2/accounts", storage: "jd2/storage",
@@ -138,6 +141,7 @@ const state = {
   rbQuality: loadRbQuality(), rbStream: null, rbPerf: false, rbPerfSamples: [],
   rbPerfSince: 0, probeResult: null, probeResults: [], siteRules: null, waiting: null,
   accounts: null, accountsTruncated: false, accountHosts: [], accountBusy: false, accountEditId: "",
+  pt: null,   // v0.1.57: /api/pt/status
 };
 
 // ------------------------------------------------------------------ helpers
@@ -613,8 +617,8 @@ function updateChrome() {
       display = tab.current || tab.history[tab.index] || "";
       iconName = tab.current ? "lock" : "globe";
     }
-    back = Boolean(tab.rb);       // history lives in the NAS browser tab
-    forward = Boolean(tab.rb);
+    back = Boolean(tab.rb || tab.pt);       // history lives in the NAS browser tab (v0.1.57: or in the app for passthrough)
+    forward = Boolean(tab.rb || tab.pt);
   } else if (route.view === "downloads") {
     display = "qnap://downloads"; iconName = "download";
   } else if (route.view === "links") {
@@ -703,10 +707,11 @@ function updateWebStatus(tab) {
   const box = $("webStatus");
   box.replaceChildren();
   if (!tab || !tab.history.length) return;
-  box.appendChild(element("span", "NASブラウザ", "mode-badge remote"));
+  box.appendChild(element("span", tab.pt ? "パススルー" : "NASブラウザ", "mode-badge remote"));
   const host = hostOf(tab.history[tab.index]);
   let text = host;
   if (tab.rb && tab.rb.title) text = tab.rb.title;
+  if (tab.pt && tab.ptTitle) text = tab.ptTitle;
   if (tab.error) text = host + " — 読み込めませんでした: " + tab.error;
   const label = element("span", text, "web-status-text");
   label.title = tab.current || text;
@@ -887,13 +892,14 @@ async function addBookmark(title, url) {
 // Every web tab is a NAS browser tab (v0.1.35): there is no in-phone iframe any more.
 function newTabRecord(id) {
   return {id, history: [], index: -1, current: "", loading: false, token: 0, error: "",
-    notReady: false, rb: null};
+    notReady: false, rb: null, pt: false, ptTitle: "", ptAwait: false, ptNative: {back: 0, fwd: 0}};   // v0.1.57: pt = passthrough display
 }
 
 function saveTabs() {
   // Only id / url history / index. No tokens, cookies or page data.
   const data = {v: 1, next: state.nextTabId, tabs: state.tabs.filter(t => !t.diag).map(t => ({
     id: t.id, history: t.history.slice(), index: t.index,
+    pt: t.pt === true,      // v0.1.57: passthrough display (the page lives in the phone's frame; no NAS tab)
     nas: t.rb ? t.rb.id : (t.savedNas || "")}))};   // v0.1.43: the NAS tab is reattached after a reload
   writeSession(TAB_STORAGE_KEY, JSON.stringify(data));
 }
@@ -907,8 +913,9 @@ function restoreTabs() {
     if (!raw || typeof raw.id !== "string" || !/^t\d+$/.test(raw.id) || findTab(raw.id)) continue;
     const tab = newTabRecord(raw.id);
     const history = Array.isArray(raw.history) ? raw.history : [];
+    tab.pt = raw.pt === true;
     tab.history = history.filter(u => typeof u === "string" && u.length <= 2048 &&
-      u.startsWith("https://")).slice(-MAX_HISTORY);
+      (u.startsWith("https://") || (tab.pt && u.startsWith("http://")))).slice(-MAX_HISTORY);
     const idx = Number.isInteger(raw.index) ? raw.index : tab.history.length - 1;
     tab.index = tab.history.length ? Math.min(Math.max(idx, 0), tab.history.length - 1) : -1;
     if (typeof raw.nas === "string" && /^b\d{1,9}$/.test(raw.nas)) tab.savedNas = raw.nas;
@@ -952,6 +959,7 @@ function closeTab(id) {
     while (state.closed.length > MAX_CLOSED_TABS) state.closed.shift();
   }
   tab.token++;
+  if (ptHost.tab === tab) ptDrop();     // v0.1.57
   releaseRemote(tab);   // closing the web tab closes the NAS browser tab (frees memory)
   state.tabs.splice(idx, 1);
   saveTabs();
@@ -1893,7 +1901,9 @@ function updateRemoteView(tab) {
   const remote = Boolean(tab && tab.history.length);
   if (remote) ensureRemote();
   setShown("remoteView", remote);
+  if (!(remote && tab.pt)) { setShown("ptUnavailable", false); setShown("ptWrap", false); if (ptHost.tab) ptDrop(); }   // v0.1.57
   if (!remote) { closeRemoteSheet(); setShown("interceptSheet", false); return; }
+  if (tab.pt) { updatePtView(tab); return; }
   const live = Boolean(tab.rb);
   const display = live ? tabDisplay(tab) : "tiles";
   const tiles = live && display === "tiles";
@@ -2326,6 +2336,8 @@ function tabDisplay(tab) {
 
 // 「表示: リーダー / 高速 / ライブ」 from the menu: remembered per host.
 function setUserDisplay(tab, mode) {
+  if (tab && mode === "pt") { perform(() => enterPt(tab)); return; }                      // v0.1.57
+  if (tab && tab.pt && MODE_OF_DISPLAY[mode]) { leavePt(tab, mode); return; }
   if (!tab || !tab.rb || !RB_DISPLAY_LABELS[mode]) return;
   const host = hostOf(tab.current || "");
   if (host) rememberHostMode(host, MODE_OF_DISPLAY[mode]);
@@ -5197,7 +5209,7 @@ function pushHistory(tab, url) {
 }
 
 const navigateTab = (tab, value) => openRemote(tab, value, url => pushHistory(tab, url));
-const reloadTab = tab => tab.rb ? rbInputFor(tab, {type: "reload"}) : openInRemote(tab);
+const reloadTab = tab => tab.pt ? ptReload(tab) : tab.rb ? rbInputFor(tab, {type: "reload"}) : openInRemote(tab);
 
 async function rbInputFor(tab, event) {
   try {
@@ -5211,6 +5223,7 @@ async function rbInputFor(tab, event) {
 // A browser back / forward of the NAS page (one page per gesture: the Hub skips redirects and check pages).
 // Nothing to go back to is told in one short toast; it never leaves the tab (v0.1.52).
 async function stepHistory(tab, delta) {
+  if (tab.pt) return ptStep(tab, delta);      // v0.1.57
   if (!tab.rb) return null;
   gestureTrace("step.call", {delta});
   let res = null;
@@ -5292,7 +5305,7 @@ function onPopState() {
   const m = /^#\/tab\/(t\d+)/.exec(location.hash);
   if (!m || m[1] !== r.tabId) {
     const tab = findTab(r.tabId);
-    if (tab && tab.rb && performance.now() - appNavAt > APP_NAV_MS) {
+    if (tab && (tab.rb || tab.pt) && performance.now() - appNavAt > APP_NAV_MS) {
       // Not the app's own navigation: the person swiped back. Stay on the tab, step the NAS page back.
       gestureTrace("pop.stay", {from: location.hash});
       skipHashChangeAt = performance.now();
@@ -5307,7 +5320,7 @@ function onPopState() {
     return;
   }
   const tab = findTab(r.tabId);
-  if (!tab || !tab.rb) { armBackGuard(); return; }
+  if (!tab || !(tab.rb || tab.pt)) { armBackGuard(); return; }
   if (!claimStep("pop")) { gestureTrace("pop.ignore", {why: "dup-flick"}); armBackGuard(); return; }
   perform(async () => {
     try { await stepHistory(tab, -1); } finally { armBackGuard(); }
@@ -5317,7 +5330,7 @@ function onPopState() {
 // Open a URL typed/clicked by the user: in the active web tab, else a new tab. Always the NAS browser.
 async function openWebUrl(value) {
   const tab = activeWebTab();
-  if (tab) { await navigateTab(tab, value); return; }
+  if (tab) { await (tab.pt ? ptNavigateTo(tab, value) : navigateTab(tab, value)); return; }   // v0.1.57: pt tabs stay in the frame
   if (tabLimitReached()) return;
   const url = await validateUrl(value);
   const fresh = createTab();
@@ -5328,6 +5341,271 @@ async function openWebUrl(value) {
   // open as "in flight" (as openInRemote does) keeps it to ONE NAS tab instead of two (the second used to wait
   // behind the first and then be closed again).
   await trackOpening(fresh, url, openRemote(fresh, url, u => { fresh.history[fresh.index] = u; }, {validated: true}));
+}
+
+// ------------------------------------------------------------- passthrough display (v0.1.57)
+// The page is drawn by this phone inside one iframe on a second origin ("origin B", the Hub's passthrough listener,
+// reached through its own `tailscale serve` port); a Service Worker there sends every request through the NAS. The
+// app only talks to the frame by postMessage with an exact origin and source check, and never trusts its content.
+const ptHost = {tab: null, origin: "", ready: false, seq: 0, loaded: false};
+const PT_HIDE = ["tileScroll", "readerScroll", "mirrorWrap", "remoteImg", "remoteIdle", "rbNotReady", "tileRefresh",
+  "chalStatus", "remoteLinks", "remotePopups"];
+
+async function refreshPt() {
+  try { state.pt = await api("/api/pt/status"); } catch (e) { state.pt = null; }
+}
+
+function ptAvailable() {
+  const p = state.pt;
+  return Boolean(p && p.enabled && p.listening && p.origin);
+}
+
+function ptReason() {
+  const p = state.pt;
+  if (!p || !p.enabled) return "設定 › ブラウザ › パススルー をオンにしてください";
+  if (p.reason === "https" || p.reason === "tsnet") return "パススルーはHTTPSの *.ts.net で開いたアプリからだけ使えます";
+  if (!p.listening) return p.error || "パススルーの待ち受けが動いていません";
+  return "パススルーを使えません";
+}
+
+// The <iframe id="ptFrame"> is in index.html (with its fixed sandbox). A load swaps in a fresh copy of it, and removing
+// the old one leaves no session history entries behind; the address is opened with location.replace, which adds none.
+function ptFrameSet(url) {
+  const fresh = $("ptFrame").cloneNode(false);
+  $("ptWrap").replaceChildren(fresh);
+  ptHost.loaded = Boolean(url);
+  if (!url) return;
+  try { fresh.contentWindow.location.replace(url); } catch (e) { ptHost.loaded = false; }
+}
+
+function ptDrop() {
+  ptHost.seq++;
+  ptHost.tab = null; ptHost.ready = false;
+  if (ptHost.loaded) ptFrameSet("");
+}
+
+function ptCommand(cmd, extra, force) {
+  const frame = $("ptFrame");
+  if ((!ptHost.ready && !force) || !ptHost.origin || !frame || !frame.contentWindow) return false;
+  try { frame.contentWindow.postMessage(Object.assign({qdPtApp: 1, cmd}, extra || {}), ptHost.origin); return true; }
+  catch (e) { return false; }
+}
+
+// Load `url` in a fresh frame through a one-time ticket (a new frame never adds a history entry to the app).
+async function ptLoad(tab, url) {
+  if (!ptAvailable() || !url) return;
+  const token = ++ptHost.seq;
+  ptHost.tab = tab; ptHost.ready = false; ptHost.origin = state.pt.origin;
+  tab.ptAwait = true; tab.ptNative = {back: 0, fwd: 0}; tab.error = ""; tab.loading = true;
+  let data;
+  try {
+    data = await api("/api/pt/ticket", {url});
+  } catch (e) {
+    if (token === ptHost.seq) { ptHost.tab = null; tab.loading = false; tab.error = e.message; updateRemoteView(tab); }
+    return;
+  }
+  if (token !== ptHost.seq || !state.tabs.includes(tab)) return;
+  ptHost.origin = data.origin;
+  ptFrameSet(data.enter);
+}
+
+function updatePtView(tab) {
+  for (const id of PT_HIDE) setShown(id, false);
+  closeRemoteSheet();
+  setShown("interceptSheet", false);
+  const ok = ptAvailable() && !tab.error;
+  setShown("ptUnavailable", !ok);
+  setShown("ptWrap", ok);
+  if (!ok) {
+    if (ptHost.tab === tab) ptDrop();
+    $("ptUnavailableText").textContent = tab.error || ptReason();
+  } else if (ptHost.tab !== tab) {
+    ptLoad(tab, tab.current || tab.history[tab.index] || "");
+  }
+  setShown("remoteLoading", Boolean(tab.loading));
+}
+
+async function enterPt(tab) {
+  if (state.pt === null) await refreshPt();
+  if (!ptAvailable()) { toast(ptReason(), "error"); return; }
+  if (!tab.history.length) return;
+  tab.token++;                          // an NAS open still in flight is dropped
+  releaseRemote(tab);
+  tab.pt = true; tab.error = ""; tab.notReady = false; tab.ptAwait = true;
+  tab.current = tab.history[tab.index] || tab.current;
+  saveTabs();
+  refreshAfterTabChange();
+  if (activeWebTab() === tab) updateRemoteView(tab);
+  flash("表示: " + PT_DISPLAY_LABEL);
+}
+
+function leavePt(tab, mode) {
+  if (ptHost.tab === tab) ptDrop();
+  tab.pt = false; tab.ptAwait = false; tab.error = ""; tab.loading = false; tab.reopenAt = 0;
+  tab.current = tab.history[tab.index] || tab.current;
+  const host = hostOf(tab.current || "");
+  if (mode && host) { rememberHostMode(host, MODE_OF_DISPLAY[mode]); renderRemoteHosts(); }
+  saveTabs();
+  refreshAfterTabChange();
+  if (activeWebTab() === tab) updateRemoteView(tab);   // the NAS tab reopens by itself (autoReopen)
+  flash("表示: " + (mode ? RB_DISPLAY_LABELS[mode] : "NASブラウザ"));
+}
+
+async function ptNavigateTo(tab, value) {
+  const url = await validateUrl(value);
+  pushHistory(tab, url);
+  tab.current = url; tab.ptTitle = "";
+  saveTabs();
+  await ptGo(tab, url);
+}
+
+async function ptGo(tab, url) {
+  tab.ptAwait = true; tab.ptNative = {back: 0, fwd: 0}; tab.loading = true; tab.error = "";
+  updateChrome();
+  if (ptHost.tab === tab && ptHost.ready && ptCommand("navigate", {url})) { refreshAfterTabChange(); return; }
+  await ptLoad(tab, url);
+  refreshAfterTabChange();
+}
+
+async function ptReload(tab) {
+  if (ptHost.tab === tab && ptCommand("reload")) { tab.loading = true; updateChrome(); return; }
+  await ptLoad(tab, tab.current || tab.history[tab.index]);
+}
+
+// One page back / forward. A step the frame's own history can do (pages reached by clicking in it) is sent to the page;
+// anything else is opened again from the app's list.
+async function ptStep(tab, delta) {
+  const target = tab.index + delta;
+  if (target < 0) { flash("これより前のページはありません"); return null; }
+  if (target >= tab.history.length) { flash("これより先のページはありません"); return null; }
+  const n = tab.ptNative || {back: 0, fwd: 0};
+  if ((delta < 0 ? n.back : n.fwd) > 0 && ptHost.tab === tab && ptCommand(delta < 0 ? "back" : "forward")) return null;
+  tab.index = target;
+  tab.current = tab.history[target];
+  tab.ptTitle = "";
+  saveTabs();
+  await ptGo(tab, tab.current);
+  return null;
+}
+
+// A report from the page: where it is now. The app keeps the list (the frame's own history only does the stepping).
+function ptNav(tab, m) {
+  if (m.kind === "title") {
+    tab.ptTitle = String(m.title || "").slice(0, 200);
+    if (activeWebTab() === tab) updateWebStatus(tab);
+    return;
+  }
+  const url = typeof m.url === "string" ? m.url : "";
+  if (url.length > 2048 || !/^https?:\/\//i.test(url)) return;
+  const n = tab.ptNative || (tab.ptNative = {back: 0, fwd: 0});
+  tab.loading = false;
+  tab.error = "";
+  tab.ptTitle = String(m.title || "").slice(0, 200);
+  const here = tab.history[tab.index];
+  if (tab.ptAwait) {                      // the page we asked for (its address may differ after redirects)
+    tab.ptAwait = false;
+    tab.history[tab.index] = url;
+  } else if (m.kind === "replace") {
+    tab.history[tab.index] = url;
+  } else if (url !== here) {
+    if (tab.index > 0 && tab.history[tab.index - 1] === url) { tab.index--; n.back = Math.max(0, n.back - 1); n.fwd++; }
+    else if (tab.history[tab.index + 1] === url) { tab.index++; n.fwd = Math.max(0, n.fwd - 1); n.back++; }
+    else { pushHistory(tab, url); n.back++; n.fwd = 0; }
+  }
+  tab.current = url;
+  saveTabs();
+  if (activeWebTab() === tab) { updateChrome(); updateWebStatus(tab); setShown("remoteLoading", false); }
+}
+
+// The download page of a proxied site asks to hand the link to JD2; the confirmation is the app's own.
+async function ptDownload(tab, m) {
+  const id = typeof m.id === "string" && /^[A-Za-z0-9_-]{8,64}$/.test(m.id) ? m.id : "";
+  if (!id) return;
+  const name = String(m.name || "ファイル").slice(0, 120);
+  const send = jd2CanSend();
+  let text;
+  if (!confirm("「" + name + "」を" + (send ? "JD2へ送ります" : "追加したリンクに入れます（JD2へは未送信）") +
+      "。\nリンクのアドレスだけをNASが渡します（Cookieは渡せません）。よろしいですか？")) {
+    text = "キャンセルしました";
+  } else {
+    try {
+      const r = await api("/api/pt/jd2", {id, send});
+      swrDrop("links");
+      text = r.state === "sent" ? "JD2へ送りました" : r.state === "dup" ? "すでに送信済みです" : "追加したリンクに入れました";
+    } catch (e) { text = e.message; }
+  }
+  ptCommand("download-result", {id, text}, true);    // the download page has no helper, so no "ready"
+}
+
+window.addEventListener("message", ev => {
+  const frame = $("ptFrame");
+  if (!ptHost.origin || ev.origin !== ptHost.origin || !frame || ev.source !== frame.contentWindow) return;
+  const m = ev.data;
+  const tab = ptHost.tab;
+  if (!m || m.qdPt !== 1 || typeof m.type !== "string" || !tab || !tab.pt || !state.tabs.includes(tab)) return;
+  if (m.type === "hello") { ptHost.ready = true; tab.loading = false; if (activeWebTab() === tab) setShown("remoteLoading", false); }
+  else if (m.type === "loading") { ptHost.ready = false; tab.loading = true; if (activeWebTab() === tab) setShown("remoteLoading", true); }
+  else if (m.type === "nav") ptNav(tab, m);
+  else if (m.type === "flick") {
+    if (activeWebTab() === tab && (m.dir === -1 || m.dir === 1) && claimStep("flick")) perform(() => stepHistory(tab, m.dir));
+  } else if (m.type === "download") perform(() => ptDownload(tab, m));
+});
+
+// ---- settings
+function renderPtSettings() {
+  const s = state.settings || {};
+  const port = Number.isInteger(s.pt_public_port) ? s.pt_public_port : 8443;
+  $("ptCmd").textContent = "tailscale serve --bg --https=" + port + " http://127.0.0.1:17865";
+  const p = state.pt;
+  let line = "";
+  if (!s.pt_enabled) line = "オフです。";
+  else if (p && p.listening) line = "待ち受け中（127.0.0.1:17865）。" + (p.origin ? "" : ptReason());
+  else line = (p && p.error) || "待ち受けを開始しています…";
+  $("ptState").textContent = line;
+}
+
+function wirePt() {
+  $("ptEnabled").addEventListener("change", () => perform(async () => {
+    const on = $("ptEnabled").checked;
+    try {
+      await saveOption("pt_enabled", on);
+    } catch (e) { $("ptEnabled").checked = !on; throw e; }
+    await refreshPt();
+    renderPtSettings();
+    if (on) {
+      flash("パススルーをオンにしました。画面を読み込み直します");
+      setTimeout(() => location.reload(), 700);     // the app's CSP only lists origin B once enabled
+    } else {
+      for (const tab of state.tabs) if (tab.pt) tab.error = "";
+      ptDrop();
+      const active = activeWebTab();
+      if (active) updateRemoteView(active);
+      flash("パススルーをオフにしました");
+    }
+  }));
+  $("ptCmdCopy").addEventListener("click", () => copyText($("ptCmd").textContent));
+  $("ptCheck").addEventListener("click", () => perform(async () => {
+    await refreshPt();
+    renderPtSettings();
+    const out = $("ptCheckResult");
+    if (!ptAvailable()) { out.textContent = "確認できません: " + ptReason(); return; }
+    out.textContent = "確認しています…";
+    try {
+      const res = await fetch(state.pt.origin + "/pt/ping", {mode: "cors", credentials: "omit", cache: "no-store"});
+      const data = await res.json();
+      out.textContent = data && data.ok === true ? "接続できました（" + state.pt.origin + "）" : "応答が正しくありません";
+    } catch (e) {
+      out.textContent = "接続できません。NASで上のコマンドを実行したか、アプリを読み込み直したか確認してください。";
+    }
+  }));
+  $("ptClear").addEventListener("click", () => perform(async () => {
+    await api("/api/pt/clear-cookies", {});
+    flash("パススルーのCookieを消しました");
+  }));
+  $("ptUnavailableBtn").addEventListener("click", () => {
+    const tab = activeWebTab();
+    if (tab && tab.pt) leavePt(tab, null);
+  });
 }
 
 // -------------------------------------------------------------- omnibox
@@ -5404,9 +5682,12 @@ function configureMenu() {
   }
   menu.querySelector("[data-action='reopen']").disabled = state.closed.length === 0;
   menu.querySelectorAll("[data-scope='remote']").forEach(n => { n.hidden = !web; });
-  const display = tab && tab.rb ? tabDisplay(tab) : "tiles";
+  const display = tab && tab.pt ? "pt" : tab && tab.rb ? tabDisplay(tab) : "tiles";
+  const ptOk = state.pt === null || ptAvailable() || Boolean(tab && tab.pt);       // unknown yet: not greyed out       // v0.1.57: the choice is greyed out with the reason as its tooltip
+  $("menuPt").disabled = !ptOk;
+  $("menuPt").title = ptOk ? "" : ptReason();
   // Picture quality only matters for the fast and live displays (v0.1.36).
-  menu.querySelectorAll("[data-scope='quality']").forEach(n => { n.hidden = !web || display === "reader" || display === "mirror"; });
+  menu.querySelectorAll("[data-scope='quality']").forEach(n => { n.hidden = !web || display === "reader" || display === "mirror" || display === "pt"; });
   menu.querySelectorAll("[data-quality]").forEach(n => {
     n.setAttribute("aria-checked", String(n.dataset.quality === state.rbQuality));
   });
@@ -5417,6 +5698,7 @@ function configureMenu() {
 }
 
 function openMenu() {
+  if (state.pt === null) refreshPt().then(() => { if (!$("menu").hidden) configureMenu(); });   // v0.1.57: first use only
   configureMenu();
   $("menu").hidden = false;
   $("menuButton").setAttribute("aria-expanded", "true");
@@ -6528,6 +6810,8 @@ function renderDownloadDir(s) {
   $("rbSpareTab").checked = s.rb_spare_tab !== false;
   $("rbNoWebfonts").checked = s.rb_no_webfonts !== false;
   $("rbResident").checked = s.rb_resident === true;
+  $("ptEnabled").checked = s.pt_enabled === true;       // v0.1.57
+  renderPtSettings();
   renderResidentQuick(s.rb_resident === true);
   $("selectedFolder").textContent = s.download_dir || "未選択";
   $("folderChange").textContent = s.download_dir ? "変更" : "選ぶ";
@@ -6570,7 +6854,8 @@ async function enterSettings(route, force = false) {
   } else if (section === "browser") {
     renderRemoteHosts();
     await Promise.all([loadBrowserStatus(force), loadSettings(force), loadBookmarks(force),
-      swr("site-rules", "/api/rb/site-rules", renderSiteRules, {force})]);
+      swr("site-rules", "/api/rb/site-rules", renderSiteRules, {force}), refreshPt()]);
+    renderPtSettings();       // v0.1.57
   } else if (section === "connection") {
     renderHttps();
     renderShareStatic();
@@ -7183,6 +7468,7 @@ async function go() {
       setShown("app", true);
       initShellState();
       await primeState();      // one request: engine, downloads, NAS browser, settings, bookmarks
+      if (state.tabs.some(t => t.pt)) await refreshPt();       // v0.1.57: only for a restored passthrough tab (no extra request at home)
       applyRoute();
       syncStateLoop();
     } else {
@@ -9595,6 +9881,7 @@ function residentLines(r) {
 }
 
 function wireBrowser() {
+  wirePt();      // v0.1.57
   $("rbResident").addEventListener("change", () => perform(() =>
     setResident($("rbResident").checked, () => { $("rbResident").checked = !$("rbResident").checked; })));
   $("rbRetry").addEventListener("click", () => perform(async () => {
