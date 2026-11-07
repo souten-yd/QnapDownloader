@@ -39,6 +39,7 @@ KILL_WAIT = 5.0
 RESTART_MAX = 5
 RESTART_WINDOW = 600.0
 AUTO_CLEAR_INTERVAL = 45.0     # v0.1.56: seconds between automatic finished/skipped sweeps
+WAITING_INTERVAL = 25.0        # v0.1.70: seconds between automatic starts of confirmed LinkGrabber links
 BACKOFF = (5.0, 15.0, 30.0, 60.0, 60.0)
 READY_TIMEOUT = 180.0
 API_CONFIG = {"deprecatedapienabled": True, "deprecatedapiport": 3128,
@@ -198,6 +199,9 @@ class EngineManager:
         self._leftover_cache = None
         self.adapter = jd2_local.LocalAdapter(self)
         self._auto_clear_at = -AUTO_CLEAR_INTERVAL    # v0.1.56
+        self._waiting_at = -WAITING_INTERVAL          # v0.1.70
+        self._missing_at = -AUTO_CLEAR_INTERVAL
+        self._missing_cleared = 0
         self.sweep_lock = threading.RLock()           # webapp sets it to the JD2 controller lock
         self._saved = None
         self._state = self._load_state()
@@ -883,6 +887,8 @@ class EngineManager:
                 self.check_packagizer()       # once per engine run (no periodic sweep: v0.1.49)
             if self._ready:
                 self.auto_sweep()
+                self.auto_start_waiting()
+                self.auto_clear_missing_downloads()
             if not self._ready:
                 try:
                     revision = self.adapter.core_revision()
@@ -933,6 +939,69 @@ class EngineManager:
         except Exception as error:
             debuglog.log("engine", "debug", "完了・スキップの自動消去に失敗", {"error": str(error)[:120]})
             return (0, 0)
+
+    def _note_missing(self, count):
+        with self._lock:
+            self._missing_cleared += count
+
+    def pop_missing_cleared(self):
+        """v0.1.70: how many "file not found" entries the sweeps removed since the last call (for one notice)."""
+        with self._lock:
+            count, self._missing_cleared = self._missing_cleared, 0
+        return count
+
+    def auto_start_waiting(self):
+        """v0.1.70: LinkGrabber housekeeping, at most once per WAITING_INTERVAL.
+
+        send_autostart: links JD2 keeps in the LinkGrabber although they were sent with autostart (e.g. the
+        link check finished after JD2's own pass) move to the download list and start. Only ONLINE, enabled links
+        that are not already in the download list move; OFFLINE, duplicate, disabled and still-unknown links stay.
+        auto_clear_missing: OFFLINE ("file not found") links are removed from the list (UNKNOWN never).
+        An empty LinkGrabber costs one cheap query; with both settings off nothing is sent.
+        Returns how many moved; never raises."""
+        now = self._now()
+        if now - self._waiting_at < WAITING_INTERVAL:
+            return 0
+        self._waiting_at = now
+        try:
+            settings = self.store.settings()
+            start = settings.get("send_autostart", True) is True
+            clear = settings.get("auto_clear_missing", True) is True
+            if not (start or clear) or not self.is_ours_running():
+                return 0
+            with self.sweep_lock:
+                result = self.adapter.sweep_waiting(start, clear)
+            moved, removed = result.get("moved", 0), result.get("removed", 0)
+            if removed:
+                self._note_missing(removed)
+            if moved or removed:
+                debuglog.log("engine", "debug", "待機中リンクの自動処理",
+                             {"moved": moved, "removed_missing": removed, "waiting": result.get("seen", 0)})
+            return moved
+        except Exception as error:
+            debuglog.log("engine", "debug", "待機中リンクの自動処理に失敗", {"error": str(error)[:120]})
+            return 0
+
+    def auto_clear_missing_downloads(self):
+        """v0.1.70: with auto_clear_missing, entries of the download list whose file is gone from the hoster
+        (JD2 OFFLINE / "File not found"; not temporary errors, not "already exists") leave the list, at most once
+        per AUTO_CLEAR_INTERVAL. List only; files stay. Returns the number removed; never raises."""
+        now = self._now()
+        if now - self._missing_at < AUTO_CLEAR_INTERVAL:
+            return 0
+        self._missing_at = now
+        try:
+            if self.store.settings().get("auto_clear_missing", True) is not True or not self.is_ours_running():
+                return 0
+            with self.sweep_lock:
+                removed = self.adapter.sweep_missing_downloads()
+            if removed:
+                self._note_missing(removed)
+                debuglog.log("engine", "debug", "ファイルがないダウンロードを一覧から消去", {"downloads": removed})
+            return removed
+        except Exception as error:
+            debuglog.log("engine", "debug", "ファイルがないダウンロードの消去に失敗", {"error": str(error)[:120]})
+            return 0
 
     def flatten_sweep(self):
         """Move not-yet-started packages out of per-package subfolders (cheap, 2 calls).

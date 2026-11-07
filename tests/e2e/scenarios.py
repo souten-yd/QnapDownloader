@@ -1018,6 +1018,7 @@ def downloads_header_layout(ph):
     ph.js("()=>{location.hash='#/settings/jd2'}")
     ph.wait(lambda: ph.js("!!$('autoClearLinks')"), 8, "settings")
     assert ph.js("()=>$('autoClearLinks').checked===false&&$('autoClearDownloads').checked===false")
+    assert ph.js("()=>$('autoClearMissing').checked===true")     # v0.1.70: default ON
 
 
 # ------------------------------------------------------------------ passthrough display (v0.1.57)
@@ -1912,7 +1913,7 @@ def settings_jd2_layout(ph):
            "accountsList accountEdit accountEditForm accountEditUser accountEditPass accountEditSave accountEditCancel accountsSecure "
            "accountForm accountHost accountUser accountPass accountAdd accountResult accountSchemaBox accountSchema accountSchemaCopy "
            "accountSchemaOut selectedFolder folderChange flattenNow flattenResult sendAutostart probeAutosend autoClearLinks "
-           "autoClearDownloads").split()
+           "autoClearDownloads autoClearMissing").split()
     missing = [i for i in ids if not ph.js("(i)=>!!document.getElementById(i)", i)]
     assert not missing, "controls missing: %s" % missing
     # the sections are in the agreed order on the page
@@ -2510,6 +2511,31 @@ def reader_wide(ph):
     title = ph.js("()=>{const r=document.getElementById('readerTitle').getBoundingClientRect();return r.left}")
     body = _rect(ph, "#readerBody")
     assert abs(title - body["l"]) <= 4, "the head does not line up with the column (%.0f vs %.0f)" % (title, body["l"])
+
+
+@scenario("waiting-reasons")
+def waiting_reasons(ph):
+    """v0.1.70: the 「JD2で待機中のリンク」 card says why each link waits (the reason text comes from the Hub), explains
+    when they start by themselves, and offers 「重複・オフラインを消す」 only when such links exist. The JD2 list is injected."""
+    ph.page.set_viewport_size(NARROW)
+    _go(ph, "#/downloads")
+    ph.wait(lambda: ph.js("!!document.querySelector('#view-downloads:not([hidden]) h1')"), 8, "downloads view")
+    _fake_downloads(ph)
+    ph.js("""()=>{
+      const it=(id,name,state,reason)=>({id:String(id),package_id:'1',name,host:'rapidgator.net',bytes_total:5,state,reason});
+      state.waiting={count:3,has_more:false,stuck:2,items:[it(11,'ok.rar','online','開始待ち（確認済み）'),
+        it(12,'gone.rar','offline','オフライン（ファイルが消えている可能性）'),it(13,'dup.rar','duplicate','同じファイルがダウンロード一覧にあります')]};
+      renderWaiting()}""")
+    res = ph.js("""()=>({
+      shown:!$('waitingBox').hidden, clean:!$('waitingClean').hidden, note:$('waitingNote').textContent,
+      reasons:[...document.querySelectorAll('#waitingList .waiting-reason')].map(e=>e.textContent),
+      stuck:[...document.querySelectorAll('#waitingList .waiting-reason.is-stuck')].length})""")
+    assert res["shown"] and res["clean"], res
+    assert res["reasons"] == ["開始待ち（確認済み）", "オフライン（ファイルが消えている可能性）", "同じファイルがダウンロード一覧にあります"], res
+    assert res["stuck"] == 2 and "自動" in res["note"], res
+    ph.js("()=>{state.waiting.stuck=0;state.waiting.items=state.waiting.items.slice(0,1);state.waiting.count=1;renderWaiting()}")
+    assert ph.js("()=>$('waitingClean').hidden") is True
+    ph.js("()=>{state.waiting=null;renderWaiting();state.engine=Object.assign({},state.engine,{phase:'stopped'});state.snapshot=null;state.downloadsSig='';renderDownloads()}")
 
 
 @scenario("downloads-offline-waiting")

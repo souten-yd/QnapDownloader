@@ -75,7 +75,7 @@ const DISPLAY_CHIP_TITLE = {reader: "リーダー", mirror: "ミラー", tiles: 
 // v0.1.60: this file's own version. The Hub's version (from /api/state) is compared with it: a shell cache that is
 // older than the Hub (the app was updated while the home-screen app was closed) is dropped and the page reloaded.
 // tests/test_web_shell.py checks that it equals webapp.VERSION.
-const APP_VERSION = "0.1.69";
+const APP_VERSION = "0.1.70";
 const PT_DISPLAY_LABEL = "パススルー";      // v0.1.57: not a NAS-browser display, so not in RB_DISPLAY_LABELS
 const RB_PERF_WINDOW_MS = 5000;
 const RB_STREAM_FIRST_MS = 5000;     // MJPEG as the last stream (v0.1.68: after WebSocket and SSE): first picture within this, else polling
@@ -4951,7 +4951,9 @@ function mirrorLoadDoc(docUrl, cover) {
       mf.removeEventListener("load", onLoad);
       if (ok) resolve(); else reject(new Error("ミラー表示を読み込めませんでした"));
     };
-    const onLoad = () => finish(Boolean(mirrorDoc()));
+    // v0.1.70: a load event of another document (an earlier copy, about:blank during a quick back) is not ours:
+    // keep waiting for this copy (until the timeout) instead of failing at once
+    const onLoad = () => { if (mirrorDoc()) finish(true); };
     const timer = setTimeout(() => finish(false), MIRROR_LOAD_TIMEOUT_MS);
     mf.addEventListener("load", onLoad);
     // v0.1.50: replace, never add, the frame's history entry. A new src adds an entry to the
@@ -7225,7 +7227,18 @@ async function waitingCall(action, items) {
   } finally {
     setPending(keys, false);
   }
-  await afterItemAction(action === "start" ? "開始しました" : "待機中の一覧から削除しました");
+  await afterItemAction(action === "start" ? "開始しました" : "LinkGrabberから消しました");
+}
+
+// v0.1.70: remove the waiting links that never start by themselves (offline / already in the list). List only.
+async function cleanWaiting() {
+  const w = state.waiting;
+  const stuck = w && Number.isInteger(w.stuck) ? w.stuck : 0;
+  if (!stuck || !confirm("オフラインのリンクと、ダウンロード一覧に同じファイルがあるリンク（" + stuck +
+      "件）をLinkGrabberから消します。保存されたファイルは消えません。よろしいですか？")) return;
+  const result = await api("/api/jd2/waiting/clean", {confirmed: true});
+  flash(result.count + "件をLinkGrabberから消しました");
+  await afterItemAction("");
 }
 
 function deleteOptions(kind, item) {
@@ -7284,7 +7297,7 @@ function rowTools(kind, item, line) {
 function waitingMenu(item, opener) {
   openSheet(item.name, [
     {label: "開始", run: () => waitingCall("start", [item])},
-    {label: "一覧から削除", primary: true, run: () => waitingCall("remove", [item])},
+    {label: "LinkGrabberから消す", primary: true, run: () => waitingCall("remove", [item])},
   ], opener);
 }
 
@@ -7292,6 +7305,11 @@ function waitingRow(item) {
   const body = element("div", undefined, "waiting-item");
   body.appendChild(element("span", item.name, "waiting-name"));
   if (item.host) body.appendChild(element("span", item.host, "muted"));
+  // v0.1.70: why this link waits (server text; offline / duplicate never start by themselves)
+  if (typeof item.reason === "string" && item.reason) {
+    body.appendChild(element("span", item.reason, "waiting-reason" +
+      (item.state === "offline" || item.state === "duplicate" ? " is-stuck" : "")));
+  }
   if (!item.id) return body;
   body.appendChild(menuButton(item.name, opener => waitingMenu(item, opener)));
   const wrap = swipeRow(body, {
@@ -7299,7 +7317,7 @@ function waitingRow(item) {
     onStart: () => perform(() => waitingCall("start", [item])),
     onDelete: () => perform(() => waitingCall("remove", [item])),
     onDeleteSheet: () => openSheet(item.name, [
-      {label: "一覧から削除", primary: true, run: () => waitingCall("remove", [item])}]),
+      {label: "LinkGrabberから消す", primary: true, run: () => waitingCall("remove", [item])}]),
     onLongPress: () => {},
   });
   wrap.classList.toggle("pending", swipeState.pending.has("waiting:" + item.id));
@@ -7555,6 +7573,14 @@ function renderWaiting() {
   $("downloadsToggle").textContent = state.dlRunning > 0 ? "停止" : "開始";
   if (!count) { $("waitingList").replaceChildren(); return; }
   $("waitingCount").textContent = (w.has_more ? count + "件以上" : count + "件");
+  // v0.1.70: say why links wait and whether they start by themselves
+  $("waitingNote").textContent = "リンクの確認が終わると、「送信時に自動開始」がオンなら自動で開始します。" +
+    (sendAutostartOn() ? "確認済みのものは約30秒以内に開始します。" : "いまはオフなので、「開始」で始めます。") +
+    ((state.settings && state.settings.auto_clear_missing === false)
+      ? "オフラインや同じファイルがあるものは開始されません。"
+      : "オフライン（File not found）は自動で消します。同じファイルがあるものは開始されず、理由を表示します。");
+  const stuck = Number.isInteger(w.stuck) ? w.stuck : 0;
+  setShown("waitingClean", stuck > 0);
   if (holdRender()) return;
   $("waitingList").replaceChildren(...w.items.slice(0, WAITING_MAX).map(waitingRow));
 }
@@ -7638,6 +7664,8 @@ async function loadDownloads(page, options = {}) {
     state.downloadsPage = snap.page;
     state.downloadsFails = 0;
     if (snap.page === 0) state.dlRunning = countRunning(snap);
+    // v0.1.70: the Hub removed entries whose file is gone from the hoster since the last look
+    if (Number.isInteger(snap.missing_cleared) && snap.missing_cleared > 0) flash("ファイルがない" + snap.missing_cleared + "件を一覧から消しました");
     if (snap.page === 0) await loadWaiting();
     renderDownloads();
     updateBadge();
@@ -7917,6 +7945,7 @@ function renderDownloadDir(s) {
   $("probeAutosend").checked = s.probe_autosend !== false;
   $("autoClearLinks").checked = s.auto_clear_links === true;           // v0.1.56
   $("autoClearDownloads").checked = s.auto_clear_downloads === true;   // v0.1.56
+  $("autoClearMissing").checked = s.auto_clear_missing !== false;      // v0.1.70: default ON
   $("blockAds").checked = s.block_ads !== false;
   $("rbDefaultMode").value = DISPLAY_OF_SETTING[s.rb_default_mode] ? s.rb_default_mode : "fast";
   $("rbLinkBoxes").checked = s.rb_link_boxes === true;
@@ -9015,6 +9044,7 @@ function wireDownloads() {
     else perform(startEngine);
   });
   $("waitingStart").addEventListener("click", () => perform(startWaiting));
+  $("waitingClean").addEventListener("click", () => perform(cleanWaiting));
   $("downloadsToggle").addEventListener("click", () => perform(toggleDownloads));
   $("downloadsClear").addEventListener("click", () => perform(clearFinished));
   $("downloadsPrev").addEventListener("click", () => loadDownloads(state.downloadsPage - 1));
@@ -11273,7 +11303,7 @@ const optionChain = new Map();
 const OPTION_CONTROL = {
   pt_enabled: "ptEnabled", rb_resident: "rbResident", block_ads: "blockAds", rb_default_mode: "rbDefaultMode",
   rb_max_tabs: "rbMaxTabs", rb_spare_tab: "rbSpareTab", home_recent: "homeRecentOn", rb_no_webfonts: "rbNoWebfonts", rb_link_boxes: "rbLinkBoxes", probe_autosend: "probeAutosend",
-  auto_clear_links: "autoClearLinks", auto_clear_downloads: "autoClearDownloads", send_autostart: "sendAutostart",
+  auto_clear_links: "autoClearLinks", auto_clear_downloads: "autoClearDownloads", auto_clear_missing: "autoClearMissing", send_autostart: "sendAutostart",
 };
 
 // Marks a control (and its switch label) as saving; returns the function that clears the mark.
@@ -11556,6 +11586,12 @@ function wireBrowser() {
       await saveOption("auto_clear_downloads", $("autoClearDownloads").checked);
       flash($("autoClearDownloads").checked ? "完了・スキップしたダウンロードを自動で消します（ファイルは残ります）" : "完了・スキップは手動で消します");
     } catch (e) { $("autoClearDownloads").checked = !$("autoClearDownloads").checked; throw e; }
+  }));
+  $("autoClearMissing").addEventListener("change", () => perform(async () => {
+    try {
+      await saveOption("auto_clear_missing", $("autoClearMissing").checked);
+      flash($("autoClearMissing").checked ? "ファイルがないリンクを自動で一覧から消します（ファイルは残ります）" : "ファイルがないリンクは一覧に残します");
+    } catch (e) { $("autoClearMissing").checked = !$("autoClearMissing").checked; throw e; }
   }));
   $("sendAutostart").addEventListener("change", () => perform(async () => {
     try {

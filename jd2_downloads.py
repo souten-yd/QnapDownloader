@@ -4,6 +4,7 @@ JD2's rich query response must never be passed to the browser directly:
 it can contain download passwords, URLs, filesystem paths or future fields.
 """
 import posixpath
+import re
 
 PAGE_SIZE = 30
 MAX_PAGE = 20
@@ -131,29 +132,116 @@ def snapshot(packages, links, page, base=None):
     }
 
 
+# v0.1.70: "the file does not exist on the hoster" in the download list. Conservative: JD2's definitive OFFLINE
+# states, or a FAILED link whose status text says the file is gone. Never temporary errors, never "already exists"
+# (FAILED_EXISTS, handled by the v0.1.56 sweep), never running or finished entries.
+MISSING_TEXT = re.compile(r"file not found|file (?:does not|doesn't) exist|file (?:has been|was|is) (?:removed|deleted|no longer)"
+                          r"|ファイルが(?:見つかりません|存在しません|削除)", re.I)
+
+
+def is_missing_link(link):
+    if not isinstance(link, dict) or link.get("running") is True or link.get("finished") is True:
+        return False
+    state = link.get("finalLinkState")
+    if state == "FAILED_EXISTS":
+        return False
+    availability = link.get("availability")
+    if state == "OFFLINE" or (isinstance(availability, str) and availability.upper() == "OFFLINE"):
+        return True
+    status = link.get("status")
+    return state == "FAILED" and isinstance(status, str) and MISSING_TEXT.search(status) is not None
+
+
 # ---- LinkGrabber (links JD2 holds but has not started) --------------------
 LINKGRABBER_MAX = 50
+# v0.1.70: availability (ONLINE / OFFLINE / UNKNOWN / TEMP_UNKNOWN) and enabled say why a link waits.
+# Still no url / saveTo / password: only names, hosts and ids reach the Hub, and only names and ids the browser.
 LINKGRABBER_FIELDS = {"name": True, "host": True, "bytesTotal": True, "uuid": True,
-                      "packageUUID": True}
+                      "packageUUID": True, "availability": True, "enabled": True}
+# v0.1.70: names of the download list, to spot a link JD2 already has (name + host only).
+DOWNLOAD_KEYS_MAX = 500
+DOWNLOAD_KEY_FIELDS = {"name": True, "host": True}
+
+WAITING_REASONS = {
+    "online": "開始待ち（確認済み）",
+    "offline": "オフライン（ファイルが消えている可能性）",
+    "unknown": "確認中",
+    "duplicate": "同じファイルがダウンロード一覧にあります",
+    "disabled": "無効",
+}
+# Waiting links that will never start by themselves; the card can clear them in one tap.
+WAITING_STUCK = ("offline", "duplicate")
 
 
 def linkgrabber_query_options():
     return [dict(LINKGRABBER_FIELDS, maxResults=LINKGRABBER_MAX, startAt=0)]
 
 
-def linkgrabber_snapshot(raw):
+def download_keys_query_options():
+    return [dict(DOWNLOAD_KEY_FIELDS, maxResults=DOWNLOAD_KEYS_MAX, startAt=0)]
+
+
+def _key_name(value):
+    return " ".join(value.casefold().split()) if isinstance(value, str) else ""
+
+
+def download_keys(raw):
+    """{(name, host)} of the download list (casefolded). Anything that is not a list gives none."""
+    keys = set()
+    if isinstance(raw, list):
+        for entry in raw[:DOWNLOAD_KEYS_MAX]:
+            if isinstance(entry, dict) and _key_name(entry.get("name")):
+                keys.add((_key_name(entry.get("name")), _key_name(entry.get("host"))))
+    return keys
+
+
+def _in_downloads(entry, keys):
+    name, host = _key_name(entry.get("name")), _key_name(entry.get("host"))
+    if not name or not keys:
+        return False
+    if (name, host) in keys:
+        return True
+    # one side without a host: the name alone decides
+    return any(n == name and (not host or not h) for n, h in keys)
+
+
+def waiting_state(entry, keys=frozenset()):
+    """v0.1.70: why a LinkGrabber link waits: online / offline / unknown / duplicate / disabled.
+
+    ONLINE and enabled means JD2 only has to move it (it normally does that itself with autostart);
+    a missing or unknown availability counts as "unknown" so that nothing unchecked is ever started."""
+    if entry.get("enabled") is False:
+        return "disabled"
+    availability = entry.get("availability")
+    availability = availability.upper() if isinstance(availability, str) else ""
+    if availability == "OFFLINE":
+        return "offline"
+    if _in_downloads(entry, keys):
+        return "duplicate"
+    if availability == "ONLINE":
+        return "online"
+    return "unknown"
+
+
+def linkgrabber_snapshot(raw, keys=frozenset()):
     """Names and ids only; URLs, paths and passwords never reach the browser."""
     if not isinstance(raw, list) or len(raw) > LINKGRABBER_MAX:
         raise ValueError("JD2のLinkGrabber情報が上限を超えています")
     items = []
+    stuck = 0
     for entry in raw:
         if not isinstance(entry, dict):
             raise ValueError("JD2のLinkGrabber情報の形式が不正です")
+        state = waiting_state(entry, keys)
+        stuck += state in WAITING_STUCK
         items.append({
             "id": _uuid(entry.get("uuid")),
             "package_id": _uuid(entry.get("packageUUID")),
             "name": _string(entry.get("name"), 240) or "ファイル（名称不明）",
             "host": _string(entry.get("host"), 120),
             "bytes_total": _nonnegative(entry.get("bytesTotal")),
+            "state": state,
+            "reason": WAITING_REASONS[state],
         })
-    return {"items": items, "count": len(items), "has_more": len(items) == LINKGRABBER_MAX}
+    return {"items": items, "count": len(items), "has_more": len(items) == LINKGRABBER_MAX,
+            "stuck": stuck}

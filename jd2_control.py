@@ -9,7 +9,7 @@ import re
 import threading
 
 import jd2_transfer
-from jd2_downloads import check_page
+from jd2_downloads import check_page, WAITING_STUCK
 from jd2_policy import build_preview, apply_preset, PresetUnavailable, PresetChanged
 
 
@@ -190,6 +190,20 @@ class JD2Controller:
             adapter.move_to_downloadlist(wanted, [])
             adapter.start_downloads()
             return {"ok": True, "count": len(wanted)}
+
+    def waiting_clean(self, *, confirmed=False):
+        """v0.1.70: remove the LinkGrabber links that will never start by themselves (offline or
+        already in the download list). The ids come from a snapshot read now, never from the browser;
+        only the list is edited, files are never touched."""
+        if confirmed is not True:
+            raise ValueError("待機中のリンクを消すには確認が必要です")
+        with self.lock:
+            adapter = self._require()
+            items = adapter.list_linkgrabber()["items"]
+            ids = [int(i["id"]) for i in items if i.get("id") is not None and i.get("state") in WAITING_STUCK]
+            for start in range(0, len(ids), 50):
+                adapter.remove_waiting(ids[start:start + 50])
+            return {"ok": True, "count": len(ids)}
 
     def start_downloads(self):
         with self.lock:

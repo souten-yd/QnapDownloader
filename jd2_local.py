@@ -785,9 +785,14 @@ class LocalAdapter:
 
     def _scan_links(self):
         """(finished_count, ids of "already exists" skips) from the link list (paged, read-only)."""
-        from jd2_downloads import PAGE_SIZE, MAX_PAGE
-        fields = {"uuid": True, "status": True, "skipped": True, "finalLinkState": True, "finished": True}
-        found, finished = [], 0
+        return self._scan_links_full()[:2]
+
+    def _scan_links_full(self):
+        """v0.1.70: (finished_count, "already exists" ids, "file not found" ids), one paged read-only scan."""
+        from jd2_downloads import PAGE_SIZE, MAX_PAGE, is_missing_link
+        fields = {"uuid": True, "status": True, "skipped": True, "finalLinkState": True, "finished": True,
+                  "availability": True, "running": True}
+        found, missing, finished = [], [], 0
         for page in range(MAX_PAGE + 1):
             batch = self._call("downloadsV2", "queryLinks",
                                dict(fields, maxResults=PAGE_SIZE, startAt=page * PAGE_SIZE))
@@ -803,9 +808,19 @@ class LocalAdapter:
                 if state == self.EXISTS_STATE or (link.get("skipped") is True and self.EXISTS_TEXT.search(status)):
                     if 0 <= link["uuid"] < ID_LIMIT:
                         found.append(link["uuid"])
+                elif is_missing_link(link) and 0 <= link["uuid"] < ID_LIMIT:
+                    missing.append(link["uuid"])
             if len(batch) < PAGE_SIZE:
                 break
-        return finished, found
+        return finished, found, missing
+
+    def sweep_missing_downloads(self):
+        """v0.1.70: remove download-list entries whose file is gone from the hoster (list only, files stay).
+        Returns how many were removed; nothing is sent when there are none."""
+        missing = self._scan_links_full()[2]
+        for i in range(0, len(missing), ITEM_IDS_MAX):
+            self._call("downloadsV2", "removeLinks", missing[i:i + ITEM_IDS_MAX], [])
+        return len(missing)
 
     def remove_skipped_existing(self):
         found = self._scan_links()[1]
@@ -903,10 +918,49 @@ class LocalAdapter:
                     return entry["saveTo"]
         return None
 
+    def _download_keys(self):
+        """v0.1.70: (name, host) of the download list for the duplicate check; empty when unavailable."""
+        from jd2_downloads import download_keys, download_keys_query_options
+        try:
+            return download_keys(self._call("downloadsV2", "queryLinks", *download_keys_query_options()))
+        except LocalUnavailable:
+            return frozenset()
+
     def list_linkgrabber(self):
         from jd2_downloads import linkgrabber_query_options, linkgrabber_snapshot
         raw = self._call("linkgrabberv2", "queryLinks", *linkgrabber_query_options())
-        return linkgrabber_snapshot(raw)
+        # one more cheap query (names only) and only when something waits
+        keys = self._download_keys() if isinstance(raw, list) and raw else frozenset()
+        return linkgrabber_snapshot(raw, keys)
+
+    def sweep_waiting(self, start=True, clear_missing=False):
+        """v0.1.70: housekeeping of the LinkGrabber in one cheap query.
+
+        clear_missing: remove OFFLINE ("file not found") links from the list (never UNKNOWN / TEMP_UNKNOWN, which
+        JD2 may still be checking; never duplicates or disabled ones; files are never touched).
+        start: move links that are ONLINE, enabled and not already in the download list to the download list
+        and start the controller. An empty LinkGrabber costs exactly one query; the download list is only read
+        when a link is ONLINE. Returns {"seen", "moved", "removed"}."""
+        from jd2_downloads import linkgrabber_query_options, waiting_state
+        raw = self._call("linkgrabberv2", "queryLinks", *linkgrabber_query_options())
+        entries = [e for e in raw if isinstance(e, dict)] if isinstance(raw, list) else []
+        result = {"seen": len(entries), "moved": 0, "removed": 0}
+        valid = lambda e: type(e.get("uuid")) is int and 0 <= e["uuid"] < ID_LIMIT
+        if clear_missing:
+            gone = [e["uuid"] for e in entries if valid(e) and waiting_state(e) == "offline"]
+            for i in range(0, len(gone), 50):
+                self.remove_waiting(gone[i:i + 50])
+            result["removed"] = len(gone)
+        if not start or not any(waiting_state(e) == "online" for e in entries):
+            return result
+        keys = self._download_keys()
+        ids = [e["uuid"] for e in entries if valid(e) and waiting_state(e, keys) == "online"]
+        for i in range(0, len(ids), 50):
+            self.move_to_downloadlist(ids[i:i + 50], [])
+        if ids:
+            self.start_downloads()
+        result["moved"] = len(ids)
+        return result
 
     def move_to_downloadlist(self, link_ids, package_ids):
         def check(values, maximum):

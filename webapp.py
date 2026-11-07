@@ -39,7 +39,7 @@ import updater
 import webauthn
 import ws_hub
 
-VERSION = "0.1.69"
+VERSION = "0.1.70"
 PORT = 17864
 ROOT = Path(__file__).resolve().parent
 FILES = {"/": ("web/index.html", "text/html; charset=utf-8"),
@@ -1166,9 +1166,14 @@ class Handler(BaseHTTPRequestHandler):
                 if not page_text.isdecimal() or len(page_text) > 2:
                     raise ValueError("表示ページが不正です")
                 page = int(page_text)
-                return self.send_data(200, self.cached(
-                    "jd2:downloads:%d" % page, 2.0, lambda: self.server.jd2.downloads_snapshot(
-                        page, self.store.settings().get("download_dir"))))
+
+                def load_downloads():
+                    snap = self.server.jd2.downloads_snapshot(page, self.store.settings().get("download_dir"))
+                    if page == 0:
+                        # v0.1.70: one notice for the entries the Hub removed because their file is gone (no extra poll)
+                        snap["missing_cleared"] = self.server.engine.pop_missing_cleared()
+                    return snap
+                return self.send_data(200, self.cached("jd2:downloads:%d" % page, 2.0, load_downloads))
             if path == "/api/jd2/linkgrabber":
                 # Names and ids of links JD2 holds but has not started (max 50).
                 return self.send_data(200, self.cached("jd2:linkgrabber", 2.0,
@@ -1996,6 +2001,10 @@ class Handler(BaseHTTPRequestHandler):
                     confirmed=body.get("confirmed") is True))
             if path in ("/api/jd2/items/start", "/api/jd2/items/stop", "/api/jd2/items/remove"):
                 return self.send_data(200, self.item_action(path.rsplit("/", 1)[1], body))
+            if path == "/api/jd2/waiting/clean":
+                # v0.1.70: offline / duplicate LinkGrabber links; ids are chosen server-side
+                return self.send_data(200, self.server.jd2.waiting_clean(
+                    confirmed=body.get("confirmed") is True))
             if path in ("/api/jd2/waiting/remove", "/api/jd2/waiting/start"):
                 ids = self.body_ids(body)
                 if path.endswith("/remove"):
