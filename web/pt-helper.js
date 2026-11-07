@@ -209,6 +209,52 @@
     }
     return false;
   }
+  // ---- v0.1.63: PC / iPad keyboard and mouse inside the frame (key and mouse events do not reach the app from here):
+  // Alt+<- / Alt+-> / Cmd+[ / Cmd+] / mouse buttons 4 5 / a sideways two-finger swipe step the app's history; Ctrl/Cmd+L
+  // and Ctrl/Cmd+R / F5 are the app's address bar and reload. The app checks who sent the message, and decides.
+  document.addEventListener("keydown", function (event) {
+    if (event.defaultPrevented || window.parent === window) return;
+    var key = String(event.key || ""), code = String(event.code || ""), mod = event.ctrlKey || event.metaKey;
+    var step = 0, name = "";
+    if (event.altKey && !mod && !event.shiftKey && key === "ArrowLeft") step = -1;
+    else if (event.altKey && !mod && !event.shiftKey && key === "ArrowRight") step = 1;
+    else if (event.metaKey && !event.ctrlKey && !event.altKey && !event.shiftKey && (key === "[" || code === "BracketLeft")) step = -1;
+    else if (event.metaKey && !event.ctrlKey && !event.altKey && !event.shiftKey && (key === "]" || code === "BracketRight")) step = 1;
+    else if (mod && !event.altKey && !event.shiftKey && key.toLowerCase() === "l") name = "omnibox";
+    else if ((mod && !event.altKey && key.toLowerCase() === "r") || (key === "F5" && !mod && !event.altKey)) name = "reload";
+    else return;
+    var t = event.target, typing = t && (t.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName || ""));
+    if (typing && name !== "omnibox") return;
+    event.preventDefault();
+    if (event.repeat) return;
+    if (step) post({type: "step", dir: step}); else post({type: "shortcut", name: name});
+  }, true);
+  ["mousedown", "mouseup", "auxclick"].forEach(function (type) {
+    document.addEventListener(type, function (event) {
+      if ((event.button !== 3 && event.button !== 4) || window.parent === window) return;
+      event.preventDefault();
+      if (type === "mouseup") post({type: "step", dir: event.button === 3 ? -1 : 1});
+    }, true);
+  });
+  var wsum = 0, wat = 0, wquiet = 0;
+  document.addEventListener("wheel", function (event) {
+    if (event.ctrlKey || event.metaKey || window.parent === window) return;
+    var now = Date.now();
+    if (now < wquiet) { wquiet = now + 450; return; }
+    var dx = event.deltaX, dy = event.deltaY;
+    if (Math.abs(dx) < 1 || Math.abs(dx) < 1.5 * Math.abs(dy)) { wsum = 0; return; }
+    if (now - wat > 180 || (dx < 0) !== (wsum < 0)) wsum = 0;
+    wat = now;
+    var el = document.scrollingElement || document.documentElement;
+    if (scrollsSideways(event.target) || (el.scrollWidth > el.clientWidth + 2 && getComputedStyle(document.documentElement).overflowX !== "hidden" &&
+        getComputedStyle(document.body).overflowX !== "hidden")) { wsum = 0; return; }
+    wsum += dx;
+    if (Math.abs(wsum) < 160) return;
+    var dir = wsum < 0 ? -1 : 1;
+    wsum = 0; wquiet = now + 450;
+    post({type: "step", dir: dir});
+  }, {passive: true});
+
   document.addEventListener("touchstart", function (event) {
     start = null;
     if (event.touches.length !== 1) return;

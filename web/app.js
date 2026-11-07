@@ -75,7 +75,7 @@ const DISPLAY_CHIP_TITLE = {reader: "リーダー", mirror: "ミラー", tiles: 
 // v0.1.60: this file's own version. The Hub's version (from /api/state) is compared with it: a shell cache that is
 // older than the Hub (the app was updated while the home-screen app was closed) is dropped and the page reloaded.
 // tests/test_web_shell.py checks that it equals webapp.VERSION.
-const APP_VERSION = "0.1.62";
+const APP_VERSION = "0.1.63";
 const PT_DISPLAY_LABEL = "パススルー";      // v0.1.57: not a NAS-browser display, so not in RB_DISPLAY_LABELS
 const RB_PERF_WINDOW_MS = 5000;
 const RB_STREAM_FIRST_MS = 5000;     // MJPEG only (no SSE available): first picture within this, else polling
@@ -534,6 +534,7 @@ function toast(message, kind = "success", opts = {}) {
     const close = element("button", undefined, "toast-close");
     close.type = "button";
     close.setAttribute("aria-label", "通知を閉じる");
+    close.title = "閉じる";
     close.appendChild(icon("x"));
     close.addEventListener("click", clearToast);
     node.appendChild(close);
@@ -753,7 +754,8 @@ function updateChrome() {
 
 
 // ---------------------------------------------------- v0.1.60: collapse the bars while reading
-// Phone width only (the PC / iPad bar stays). Scrolling the page down hides the top bar (and the bottom tab bar);
+// v0.1.63: phone widths AND touch devices of any width (iPad; `(pointer: coarse)`), never a mouse. On a wide screen the
+// tab strip goes with the toolbar. Scrolling the page down hides the top bar (and the bottom tab bar);
 // scrolling up, reaching the top, opening the menu or focusing the address bar shows them again, like Safari.
 // The toolbar and the tab bar move with transform only. The content area grows into the freed space in ONE layout
 // step: the content is moved with a compensating transform first and then slides, so the page never jumps and no
@@ -761,7 +763,12 @@ function updateChrome() {
 // does not change (stageViewport subtracts chromeExtra()), so collapsing never makes the NAS re-layout.
 const CHROME_HIDE_PX = 36, CHROME_SHOW_PX = 24, CHROME_MIN_TOP = 90, CHROME_MUTE_MS = 150;
 const chrome = {collapsed: false, key: "", last: 0, down: 0, up: 0, mute: 0, h: 0, pad: 0, settle: 0};
-const chromeNarrow = typeof window.matchMedia === "function" ? window.matchMedia("(max-width: 759px)") : null;
+const chromeNarrow = typeof window.matchMedia === "function" ? window.matchMedia("(max-width: 759px), (pointer: coarse)") : null;
+// v0.1.63: height of everything that slides away: the toolbar and, on a wide screen, the tab strip above it
+function chromeBarHeight() {
+  const bar = document.querySelector(".toolbar"), strip = $("tabstrip");
+  return Math.round(bar.offsetHeight + (strip && strip.offsetParent !== null ? strip.offsetHeight : 0));
+}
 const chromeReduced = typeof window.matchMedia === "function" ? window.matchMedia("(prefers-reduced-motion: reduce)") : null;
 
 function chromeExtra() { return chrome.collapsed ? chrome.h + chrome.pad : 0; }
@@ -778,8 +785,8 @@ function chromeCan() {
 
 function chromeSet(on, instant = false) {
   if (chrome.collapsed === on) return;
-  const body = document.body, content = $("content"), bar = document.querySelector(".toolbar");
-  chrome.h = Math.round(bar.offsetHeight);
+  const body = document.body, content = $("content");
+  chrome.h = chromeBarHeight();
   const padBefore = parseFloat(getComputedStyle(content).paddingBottom) || 0;
   document.documentElement.style.setProperty("--bar-h", chrome.h + "px");
   const slide = !instant && !(chromeReduced && chromeReduced.matches);
@@ -866,6 +873,7 @@ function renderWebTabs() {
     const close = element("button", undefined, "tab-close");
     close.type = "button";
     close.setAttribute("aria-label", "タブを閉じる: " + tabTitle(tab));
+    close.title = "タブを閉じる";                // v0.1.63: tooltip for the mouse
     close.appendChild(icon("x"));
     close.addEventListener("click", () => closeTab(tab.id));
     wrap.appendChild(close);
@@ -895,6 +903,7 @@ function updateWebStatus(tab) {
   const close = element("button", undefined, "icon-btn small");
   close.type = "button";
   close.setAttribute("aria-label", "閉じる");
+  close.title = "閉じる";
   close.appendChild(icon("x"));
   const dismiss = () => { tab.errorSeen = tab.error; updateWebStatus(tab); };
   close.addEventListener("click", dismiss);
@@ -1129,6 +1138,7 @@ function renderHomeTabs() {
     const close = element("button", undefined, "tab-card-close");
     close.type = "button";
     close.setAttribute("aria-label", "タブを閉じる: " + info.title);
+    close.title = "タブを閉じる";
     close.appendChild(icon("x"));
     close.addEventListener("click", () => closeTab(tab.id));
     card.append(main, close);
@@ -5240,7 +5250,18 @@ function wireMirrorDoc(doc) {
     handleTap(event);
   });
   doc.addEventListener("pointercancel", () => { tap.id = null; stopPress(); });
-  doc.addEventListener("contextmenu", event => { event.preventDefault(); });
+  // v0.1.63: a right click (mouse) on a link opens the app's own menu; a long press (touch) keeps the link check
+  doc.addEventListener("contextmenu", event => {
+    event.preventDefault();
+    if (probe || !(event.button === 2 || event.ctrlKey)) return;
+    const tab = tabNow();
+    const link = tab && mirrorClosest(event.target, "[data-href]");
+    const url = link && link.getAttribute("data-href");
+    if (!url || !/^https?:\/\/\S+$/i.test(url)) { closeLinkMenu(); return; }
+    const o = offset();
+    openLinkMenu(tab, url, event.clientX + o.left, event.clientY + o.top);
+  });
+  wireInputDoc(doc);                 // v0.1.63: keys, mouse buttons 4 / 5 and sideways trackpad swipes inside the frame
   doc.addEventListener("submit", event => { event.preventDefault(); });
   // The copy's controls are inert: no focus, no keyboard of their own (typing goes to the NAS browser).
   doc.addEventListener("mousedown", event => {
@@ -5927,6 +5948,11 @@ async function openWebUrl(value) {
     return;
   }
   if (tab) { await (tab.pt ? ptNavigateTo(tab, value) : navigateTab(tab, value)); return; }   // v0.1.57: pt tabs stay in the frame
+  await openInFreshTab(value);
+}
+
+// v0.1.63: always a NEW web tab (the omnibox opens in the active tab; the link menu's 新しいタブで開く opens here).
+async function openInFreshTab(value) {
   if (tabLimitReached()) return;
   // v0.1.59: an address that looks right goes straight into the tabs request (the Hub validates it there and
   // answers the same message /api/browser/validate would); only odd input still takes the separate check first.
@@ -6168,6 +6194,10 @@ window.addEventListener("message", ev => {
   }
   else if (m.type === "flick") {
     if (activeWebTab() === tab && (m.dir === -1 || m.dir === 1) && claimStep("flick")) perform(() => stepHistory(tab, m.dir));
+  } else if (m.type === "step") {           // v0.1.63: Alt+arrows / Cmd+[ ] / mouse buttons 4 5 / trackpad swipe inside the frame
+    if (activeWebTab() === tab && (m.dir === -1 || m.dir === 1)) inputStep(m.dir, "input");
+  } else if (m.type === "shortcut") {       // v0.1.63: Ctrl/Cmd+L, Ctrl/Cmd+R, F5 inside the frame
+    if (activeWebTab() === tab && (m.name === "omnibox" || m.name === "reload")) runShortcut(m.name, false);
   } else if (m.type === "download") perform(() => ptDownload(tab, m));
 });
 
@@ -6390,6 +6420,7 @@ async function bookmarkTab(tab) {
 async function logout() {
   for (const tab of state.tabs) releaseRemote(tab);
   await api("/api/logout", {});
+  removeLocal(RECENT_KEY);      // v0.1.63: 最近見たページ is this device's history: a shared device must not keep it
   writeSession(TAB_STORAGE_KEY, null);
   writeSession(SHELL_KEY, null);
   history.replaceState(null, "", "#/home");
@@ -6426,6 +6457,7 @@ function renderSwitcher() {
     const close = element("button", undefined, "switch-close");
     close.type = "button";
     close.setAttribute("aria-label", "タブを閉じる: " + tabTitle(tab));
+    close.title = "タブを閉じる";
     close.appendChild(icon("x"));
     close.addEventListener("click", () => closeTab(tab.id));
     card.appendChild(main);
@@ -6738,6 +6770,7 @@ function menuButton(name, onOpen) {
   const button = element("button", "⋯", "row-menu");
   button.type = "button";
   button.setAttribute("aria-label", name + " の操作メニュー");
+  button.title = "操作メニュー";
   button.setAttribute("aria-haspopup", "dialog");
   button.addEventListener("click", e => { e.stopPropagation(); onOpen(button); });
   return button;
@@ -7042,7 +7075,10 @@ function bulkDeleteSheet() {
 
 // v0.1.62: JD2 has no "failed" flag in the snapshot: an item that is neither running nor finished and whose status
 // text names a problem is counted as failed (and left out of 待機).
-const FAILED_STATUS = /error|fail|offline|invalid|incorrect|expired|not\s*found|エラー|失敗|オフライン|見つかりません|期限|無効なリンク/i;
+// v0.1.63: "Offline" / "オフライン" ALONE is the hoster's state of a link that is waiting (JD2 shows it before it has
+// checked or while it waits for a slot): that is 待機, not 失敗. It only counts as a failure together with a real
+// failure word ("File not found (offline)", "エラー: オフライン").
+const FAILED_STATUS = /error|fail|invalid|incorrect|expired|not\s*found|エラー|失敗|見つかりません|期限|無効なリンク/i;
 function isFailed(item) {
   return item.finished !== true && item.running !== true && typeof item.status === "string" && FAILED_STATUS.test(item.status);
 }
@@ -7093,6 +7129,7 @@ function renderDownloadsSummary(snap, hasItems) {
 
 function matchesFilter(item) {
   if (state.filter === "failed") { if (!isFailed(item)) return false; }
+  else if (state.filter === "waiting") { if (itemState(item) !== "waiting" || isFailed(item)) return false; }    // v0.1.63: as the counts
   else if (state.filter !== "all" && itemState(item) !== state.filter) return false;
   const q = state.query.trim().toLowerCase();
   return !q || String(item.name).toLowerCase().includes(q);
@@ -7849,6 +7886,7 @@ async function revokeAllSessions() {
   if (!confirm("すべての端末（この端末を含む）からログアウトします。パスキーは残ります。よろしいですか？")) return;
   for (const tab of state.tabs) releaseRemote(tab);
   await api("/api/sessions/revoke-all", {});
+  removeLocal(RECENT_KEY);      // v0.1.63: the same as a logout
   swrDrop("passkeys");
   writeSession(TAB_STORAGE_KEY, null);
   writeSession(SHELL_KEY, null);
@@ -8256,8 +8294,11 @@ function isTypingTarget(node) {
 function onKeydown(event) {
   if (!state.authed) return;
   if (event.key === "Escape") {
+    if (!$("linkMenu").hidden) { closeLinkMenu(); return; }          // v0.1.63
     if (!$("menu").hidden) { closeMenu(); return; }
     if (!$("tabSwitcher").hidden) { closeSwitcher(); return; }
+    if (!$("probeSheet").hidden) { closeProbeSheet(); return; }       // v0.1.63: dialogs close with Esc too
+    if (!$("remoteSheet").hidden) { closeRemoteSheet(); return; }
     if (event.target === $("omnibox")) { restoreOmnibox(); $("omnibox").blur(); }
     return;
   }
@@ -8268,6 +8309,171 @@ function onKeydown(event) {
     event.preventDefault();
     focusOmnibox();
   }
+}
+
+// ---------------------------------------------------------------- v0.1.63: keyboard, mouse buttons, trackpad
+// PC (mouse + keyboard) and iPad with a hardware keyboard get the same actions as the touch gestures. They are
+// callers of the same function the flick uses (stepHistory through inputStep), so the decisions stay in one place:
+//   Alt+← / Alt+→, Cmd+[ / Cmd+], mouse buttons 4 / 5, a sideways two-finger swipe  = back / forward of the NAS page
+//   Ctrl/Cmd+L = address bar     Ctrl/Cmd+R, F5 = reload the NAS page (inside a web tab only)
+// A web tab is never left by any of them (the "nothing earlier" toast is the only effect at the first page).
+function stepTab() {
+  const tab = activeWebTab();
+  return tab && (tab.rb || tab.pt) && tab.history.length ? tab : null;
+}
+
+// kind: "key" | "mouse" | "wheel" | "frame" (dedupes with a popstate / flick that arrives together)
+function inputStep(dir, kind) {
+  const tab = stepTab();
+  if (!tab || !$("tabSwitcher").hidden || !$("readerViewer").hidden) return false;
+  // a popstate that follows the browser's own handling of the same input within 400 ms is the same step: dropped
+  if (!claimStep(kind === "frame" ? "flick" : "input")) { gestureTrace("input.reject", {why: "dup", kind}); return true; }
+  state.gestureAt = Date.now();
+  gestureTrace("input.step", {kind, dir});
+  dlog("ui", "info", "input", {kind, dir: dir < 0 ? "back" : "forward"});
+  gestureHint(dir < 0 ? "← 戻る" : "進む →");
+  setTimeout(() => gestureHint(""), 600);
+  perform(() => stepHistory(tab, dir));
+  return true;
+}
+
+// Which app action a key press means ("" = none). Meta is the Mac command key.
+function shortcutOf(event) {
+  const key = String(event.key || ""), code = String(event.code || "");
+  const mod = event.ctrlKey || event.metaKey;
+  if (event.altKey && !mod && !event.shiftKey && (key === "ArrowLeft" || key === "ArrowRight")) return key === "ArrowLeft" ? "back" : "forward";
+  if (event.metaKey && !event.ctrlKey && !event.altKey && !event.shiftKey) {
+    if (key === "[" || code === "BracketLeft") return "back";
+    if (key === "]" || code === "BracketRight") return "forward";
+  }
+  if (mod && !event.altKey && !event.shiftKey && key.toLowerCase() === "l") return "omnibox";
+  if (mod && !event.altKey && key.toLowerCase() === "r") return "reload";
+  if (key === "F5" && !mod && !event.altKey) return "reload";
+  return "";
+}
+
+// Runs the action; true = it was the app's (the caller prevents the browser's own handling).
+function runShortcut(name, typing) {
+  if (!state.authed) return false;
+  if (name === "omnibox") { focusOmnibox(); return true; }
+  if (typing) return false;                       // a text field keeps its own Alt+arrows / Cmd+[ / reload
+  const tab = stepTab();
+  if (!tab || !$("readerViewer").hidden) return false;     // outside a web tab the browser's own action stays
+  if (name === "back" || name === "forward") return inputStep(name === "back" ? -1 : 1, "key");
+  if (name === "reload") { perform(() => reloadTab(tab)); return true; }
+  return false;
+}
+
+function onShortcutKey(event) {
+  const name = shortcutOf(event);
+  if (!name || event.defaultPrevented) return;
+  if (event.repeat && name !== "omnibox") {         // a held key is one step, not thirty
+    if (stepTab() && !isTypingTarget(event.target)) event.preventDefault();
+    return;
+  }
+  if (runShortcut(name, isTypingTarget(event.target))) event.preventDefault();
+}
+
+// v0.1.63: the tooltips of the bar buttons name their keys (the Mac wording on Apple devices)
+function shortcutTitles() {
+  let apple = false;
+  try { apple = /Mac|iPhone|iPad|iPod/.test(navigator.platform || "") || /Mac OS X/.test(navigator.userAgent || ""); } catch (e) { apple = false; }
+  const set = (id, text) => { const el = $(id); if (el) { el.title = text; } };
+  set("navBack", apple ? "戻る（⌘[ / ⌥←）" : "戻る（Alt+←）");
+  set("navForward", apple ? "進む（⌘] / ⌥→）" : "進む（Alt+→）");
+  set("navReload", apple ? "再読み込み（⌘R）" : "再読み込み（Ctrl+R）");
+  set("omnibox", apple ? "アドレスバー（⌘L または /）" : "アドレスバー（Ctrl+L または /）");
+}
+
+// Mouse buttons 4 / 5. preventDefault on all three events so that the browser does not also go back (that would
+// leave the app); only a web tab takes them, elsewhere the browser's own back / forward stays.
+function onMouseNav(event) {
+  if (event.button !== 3 && event.button !== 4) return;
+  if (!state.authed || !stepTab()) return;
+  event.preventDefault();
+  if (event.type === "mouseup") inputStep(event.button === 3 ? -1 : 1, "mouse");
+}
+
+// A sideways two-finger swipe on a trackpad (wheel events with a large deltaX) = back / forward. Not while the page
+// itself can scroll sideways (a wide table, a horizontal scroller: v0.1.55 hScroller / a page wider than the window),
+// and after one step the rest of the swipe's inertia is ignored until the wheel has been quiet for a moment.
+const WHEEL_SWIPE_PX = 160, WHEEL_GAP_MS = 180, WHEEL_QUIET_MS = 450;
+const wheelSwipe = {sum: 0, at: 0, quietUntil: 0};
+function pageScrollsSideways(doc) {
+  try {
+    const el = doc.scrollingElement || doc.documentElement;
+    if (!(el.scrollWidth > el.clientWidth + 2)) return false;
+    const view = doc.defaultView;
+    return view.getComputedStyle(doc.documentElement).overflowX !== "hidden" && view.getComputedStyle(doc.body).overflowX !== "hidden";
+  } catch (e) { return false; }
+}
+function onWheelSwipe(event, doc) {
+  if (event.ctrlKey || event.metaKey || event.defaultPrevented || !state.authed) return;
+  const now = performance.now();
+  if (now < wheelSwipe.quietUntil) { wheelSwipe.quietUntil = now + WHEEL_QUIET_MS; return; }
+  const dx = event.deltaX, dy = event.deltaY;
+  if (Math.abs(dx) < 1 || Math.abs(dx) < 1.5 * Math.abs(dy)) { wheelSwipe.sum = 0; return; }
+  if (now - wheelSwipe.at > WHEEL_GAP_MS || Math.sign(dx) !== Math.sign(wheelSwipe.sum)) wheelSwipe.sum = 0;
+  wheelSwipe.at = now;
+  if (!stepTab() || hScroller(event.target) || pageScrollsSideways(doc || document)) { wheelSwipe.sum = 0; return; }
+  wheelSwipe.sum += dx;
+  if (Math.abs(wheelSwipe.sum) < WHEEL_SWIPE_PX) return;
+  const dir = wheelSwipe.sum < 0 ? -1 : 1;           // fingers to the right = deltaX < 0 = back
+  wheelSwipe.sum = 0;
+  wheelSwipe.quietUntil = now + WHEEL_QUIET_MS;
+  inputStep(dir, "wheel");
+}
+
+// The same inputs for a document that does not bubble into the app (the mirror frame).
+function wireInputDoc(doc) {
+  doc.addEventListener("keydown", event => { onShortcutKey(event); if (!event.defaultPrevented) onKeydown(event); });
+  for (const type of ["mousedown", "mouseup", "auxclick"]) doc.addEventListener(type, onMouseNav, true);
+  doc.addEventListener("wheel", event => onWheelSwipe(event, doc), {passive: true});
+  try { doc.documentElement.style.overscrollBehaviorX = "none"; } catch (e) { /* ignore */ }
+}
+
+// ---- right-click on a link in the mirror: the app's own small menu (never the browser's)
+const linkMenu = {url: "", tab: null};
+function closeLinkMenu() {
+  linkMenu.url = ""; linkMenu.tab = null;
+  setShown("linkMenu", false);
+}
+function openLinkMenu(tab, url, x, y) {
+  linkMenu.url = url; linkMenu.tab = tab;
+  const menu = $("linkMenu");
+  menu.hidden = false;
+  const w = menu.offsetWidth, h = menu.offsetHeight;
+  menu.style.left = Math.max(4, Math.min(x, window.innerWidth - w - 4)) + "px";
+  menu.style.top = Math.max(4, Math.min(y, window.innerHeight - h - 4)) + "px";
+  const first = menu.querySelector("button");
+  if (first) first.focus({preventScroll: true});
+}
+async function linkMenuAction(act) {
+  const url = linkMenu.url;
+  closeLinkMenu();
+  if (!/^https?:\/\/\S+$/i.test(url) || url.length > 2048) return;
+  if (act === "copy") await copyText(url);
+  else if (act === "add") {
+    await api("/api/links", {url});          // the same local, deletable staging as ⋮ › このURLをリンクに追加
+    swrDrop("links");
+    flash("追加したリンクに入れました（JD2へは未送信）");
+  } else if (act === "open") await openInFreshTab(url);
+}
+function wireLinkMenu() {
+  const menu = $("linkMenu");
+  menu.addEventListener("click", event => {
+    const b = event.target.closest("[data-link-act]");
+    if (b) perform(() => linkMenuAction(b.dataset.linkAct));
+  });
+  menu.addEventListener("keydown", event => {
+    if (event.key !== "ArrowDown" && event.key !== "ArrowUp") return;
+    const items = Array.from(menu.querySelectorAll("button"));
+    const at = items.indexOf(document.activeElement);
+    event.preventDefault();
+    items[(at + (event.key === "ArrowDown" ? 1 : -1) + items.length) % items.length].focus();
+  });
+  document.addEventListener("pointerdown", event => { if (!menu.hidden && !menu.contains(event.target)) closeLinkMenu(); }, true);
+  window.addEventListener("blur", closeLinkMenu);       // a click into the mirror frame is a window blur for this document
 }
 
 function onMenuKeydown(event) {
@@ -8316,10 +8522,24 @@ function wireShell() {
     sched.kick();
   });
   document.addEventListener("keydown", onKeydown);
+  // v0.1.63: PC / iPad keyboard, mouse buttons 4 / 5 and trackpad swipes (the mirror frame wires its own copy)
+  document.addEventListener("keydown", onShortcutKey, true);
+  for (const type of ["mousedown", "mouseup", "auxclick"]) window.addEventListener(type, onMouseNav, true);
+  document.addEventListener("wheel", event => onWheelSwipe(event, document), {passive: true});
+  wireLinkMenu();
+  // v0.1.63: wider than the NAS page (> 1600 px) the page is centred; the wheel over the empty sides still scrolls it
+  $("mirrorWrap").addEventListener("wheel", event => {
+    if (event.target !== $("mirrorWrap")) return;
+    const doc = mirrorDoc();
+    if (!doc) return;
+    const sc = mirrorScroller(doc);
+    sc.scrollTop += event.deltaY; sc.scrollLeft += event.deltaX;
+  }, {passive: true});
   document.addEventListener("click", event => {
     if (!$("menu").hidden && !event.target.closest(".menu-wrap, #modeBtn")) closeMenu(false);
   });
   $("tabstrip").addEventListener("keydown", onTabstripKeydown);
+  shortcutTitles();
   $("newTab").addEventListener("click", createBlankTab);
 
   $("navBack").addEventListener("click", () => {

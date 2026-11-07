@@ -26,6 +26,20 @@ def phone_options(playwright, engine):
     raise SystemExit("unknown engine: %s" % engine)
 
 
+def device_options(playwright, engine, device="phone"):
+    """v0.1.63: (context kwargs) for a scenario's device. phone = iPhone (above); ipad = touch tablet 820x1180;
+    desktop = mouse + keyboard 1280x800 (no touch)."""
+    if device == "phone":
+        return phone_options(playwright, engine)[2]
+    if device == "ipad":
+        if engine == "webkit":
+            return dict(playwright.devices["iPad Pro 11"], viewport={"width": 820, "height": 1180})
+        return dict(viewport={"width": 820, "height": 1180}, device_scale_factor=2, has_touch=True, is_mobile=True)
+    if device == "desktop":
+        return dict(viewport={"width": 1280, "height": 800}, device_scale_factor=1, has_touch=False, is_mobile=False)
+    raise SystemExit("unknown device: %s" % device)
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--engines", default="chromium", help="comma list: chromium,webkit (webkit skips cleanly when not installed)")
@@ -93,7 +107,7 @@ def main(argv=None):
                     if engine not in sc["engines"]:
                         rows.append((engine, sc["name"], "SKIP", 0.0, "not applicable to %s" % engine))
                         continue
-                    rows.append(run_one(env, browser, ctx_kw, engine, sc, out, args.keep_shots))
+                    rows.append(run_one(env, browser, device_options(p, engine, sc.get("device", "phone")), engine, sc, out, args.keep_shots))
                 browser.close()
     finally:
         env.close()

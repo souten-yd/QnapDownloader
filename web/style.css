@@ -782,13 +782,19 @@ h5.reader-h,h6.reader-h{font-size:1em}
   .toolbar{min-height:52px}
   .menu-nav{display:grid}
   .mode-chip{min-width:30px;height:30px;border-radius:15px;font-size:12px}
-  body.chrome-collapsed .toolbar{transform:translateY(-100%);transition:transform .2s ease}
-  body:not(.chrome-collapsed) .toolbar{transition:transform .2s ease}
-  body.chrome-collapsed .content{margin-top:calc(-1 * var(--bar-h,52px));padding-bottom:env(safe-area-inset-bottom)}
   .mobile-bar{transition:transform .2s ease}
   body.chrome-collapsed .mobile-bar{transform:translateY(100%)}
-  body.chrome-collapsed .chrome-peek{display:block;position:fixed;left:0;right:0;top:0;height:14px;z-index:35;background:none;border:0;padding:0;margin:0;cursor:pointer}
   body.chrome-collapsed .toasts{bottom:calc(12px + env(safe-area-inset-bottom))}
+}
+/* v0.1.63: the bars collapse on phone widths AND on touch devices of any width (iPad); a mouse keeps them. On wide
+   screens the tab strip goes with the toolbar (--bar-h is the height of both). */
+@media (max-width:759px),(pointer:coarse){
+  body.chrome-collapsed .toolbar{transform:translateY(calc(-1 * var(--bar-h,52px)));transition:transform .2s ease}
+  body:not(.chrome-collapsed) .toolbar{transition:transform .2s ease}
+  body.chrome-collapsed .tabstrip{transform:translateY(-100%);transition:transform .2s ease}
+  body:not(.chrome-collapsed) .tabstrip{transition:transform .2s ease}
+  body.chrome-collapsed .content{margin-top:calc(-1 * var(--bar-h,52px));padding-bottom:env(safe-area-inset-bottom)}
+  body.chrome-collapsed .chrome-peek{display:block;position:fixed;left:0;right:0;top:0;height:14px;z-index:35;background:none;border:0;padding:0;margin:0;cursor:pointer}
 }
 @media (min-width:441px) and (max-width:759px){
   .nav-fwd{display:inline-grid}
@@ -857,3 +863,99 @@ h5.reader-h,h6.reader-h{font-size:1em}
 .adv-block{margin:0 0 14px;padding-top:10px;border-top:1px solid var(--border)}
 .adv-block>h3{margin:0 0 6px;font-size:13px;color:var(--muted)}
 .empty-state .empty-hint{font-size:12.5px}
+
+
+/* ================= v0.1.63: iPad (touch, wide) and PC (mouse, keyboard) ================= */
+:root{--nas-max:1600px}
+
+/* safe areas: the home-screen app on iPad / iPhone (notch, rounded corners, status bar when it overlaps) */
+.tabstrip{padding-top:calc(6px + env(safe-area-inset-top));padding-left:max(8px,env(safe-area-inset-left));padding-right:max(8px,env(safe-area-inset-right))}
+.toolbar{padding-left:max(10px,env(safe-area-inset-left));padding-right:max(10px,env(safe-area-inset-right))}
+.mobile-bar{padding-left:env(safe-area-inset-left);padding-right:env(safe-area-inset-right)}
+@media (max-width:759px){
+  .toolbar{padding-left:max(8px,env(safe-area-inset-left));padding-right:max(8px,env(safe-area-inset-right));padding-top:calc(6px + env(safe-area-inset-top))}
+}
+/* a web tab keeps its name between 760 and 900 px (only the pinned tabs go icon-only) */
+@media (min-width:760px) and (max-width:900px){
+  .web-tab .tab-label{display:inline}
+  .web-tab{min-width:120px;max-width:180px}
+}
+
+/* a mouse or trackpad swipe must not trigger the browser's own history navigation: the app does it */
+@media (pointer:fine){html,body{overscroll-behavior-x:none}}
+
+/* ---- touch on a wide screen (iPad): finger-sized targets (44 px), the wide bar stays ---- */
+@media (pointer:coarse) and (min-width:760px){
+  .tabstrip{min-height:54px;gap:4px;align-items:flex-end}
+  .tab{height:44px;padding:0 16px}
+  .web-tab{padding:0}
+  .pinned-tab[aria-selected="true"],.web-tab.active{height:45px}
+  .tab-link{padding-left:14px}
+  .tab-close{width:44px;height:44px;margin-right:0}
+  .tab-close .icon{width:15px;height:15px}
+  .brand{width:44px;height:44px;margin-bottom:0}
+  #newTab{margin:0 0 0 2px}
+  .icon-btn,.icon-btn.small{width:44px;height:44px}
+  .toolbar{min-height:60px;gap:8px}
+  .omnibox{height:44px;border-radius:22px}
+  .omnibox input{font-size:16px}
+  .omnibox .icon-btn.small{margin-right:-2px}
+  .mode-chip{position:relative;height:34px;min-width:44px;border-radius:17px}
+  .btn,.chip,.btn.small{min-height:44px}
+  input:not([type=checkbox]):not([type=radio]):not([type=range]),select,.search{min-height:44px}
+  .omnibox input{min-height:0}
+  .menu button,.menu .menu-seg button,.menu .menu-seg[data-scope] button{min-height:44px}
+  .bookmark-chip{height:40px}
+  .settings-nav a{min-height:44px;display:flex;align-items:center}
+  .tab-card-close{width:44px;height:44px}
+  .tab-card-title,.tab-card-meta{padding-right:48px}
+  .chip-btn,.recent-row{min-height:48px}
+  .remote-tools{min-height:48px}
+}
+
+/* ---- wide screens (PC and iPad landscape): use the width without empty acres ---- */
+@media (min-width:760px){
+  .recent-list{grid-template-columns:repeat(auto-fill,minmax(320px,1fr))}
+  .settings-nav{position:sticky;top:0;align-self:flex-start;border-right:0}
+  .settings-body{border-left:1px solid var(--border)}
+  .dial{grid-template-columns:repeat(auto-fill,minmax(150px,1fr))}
+}
+@media (min-width:1100px){
+  #view-home .page,#view-links .page,#view-downloads .page{max-width:1240px}
+  .settings-layout{max-width:1240px}
+  /* downloads: the list on the left; the summary and the filters stay in view on the right */
+  #downloadsBody{display:grid;grid-template-columns:minmax(0,1fr) 300px;column-gap:24px;align-items:start}
+  #downloadsBody>*{grid-column:1}
+  #downloadsBody>.dl-side{grid-column:2;grid-row:1 / span 8;position:sticky;top:12px;display:flex;flex-direction:column;margin-top:8px}
+  .dl-side #downloadsSummary{order:-1;margin-top:0}
+  .dl-side #downloadsTools{flex-direction:column;align-items:stretch;margin:0}
+  .dl-side .search{width:100%}
+  /* links: paste on the left, the added links on the right */
+  .links-cols{display:grid;grid-template-columns:minmax(0,5fr) minmax(0,6fr);column-gap:28px;align-items:start}
+  .links-queue .section-head:first-child h2{margin-top:0}
+}
+
+/* ---- the NAS page is never stretched beyond what the NAS laid out (it is at most 1600 px wide): on a wider
+   window the page stays centred at that width, so nothing is upscaled and nothing scrolls sideways ---- */
+.mirror-frame{margin:0 auto;max-width:var(--nas-max)}
+.tile-canvas{max-width:var(--nas-max);margin:0 auto}
+.remote-img{max-width:var(--nas-max)}
+@media (min-width:1601px){.mirror-wrap,.tile-scroll{background:var(--surface-2)}}
+
+/* ---- reader: a readable column on wide screens (never wider than ~720-780 px), head aligned with it ---- */
+.reader-body{max-width:min(var(--rd-w),max(720px,30em))}
+.reader-head{padding-left:max(16px,calc((100% + 32px - min(var(--rd-w),max(720px,30em))) / 2));padding-right:max(16px,calc((100% + 32px - min(var(--rd-w),max(720px,30em))) / 2))}
+
+/* ---- mouse: hover feedback (a finger has no hover) ---- */
+@media (hover:hover){
+  .tab-card:hover,.recent-row:hover,.dial-tile:hover,.switch-card:hover{border-color:var(--accent)}
+  .download-card:hover{box-shadow:0 1px 8px rgba(20,30,45,.14)}
+  .chip:hover:not([aria-pressed="true"]){background:var(--surface-2)}
+  .chip-btn:hover{filter:brightness(.97)}
+  .mode-chip:hover{filter:brightness(.95)}
+  .tab-card-close:hover,.tab-close:hover,.switch-close:hover{background:var(--border)}
+  .settings-nav a:hover,.menu button:hover:not(:disabled){cursor:pointer}
+  .icon-btn:hover:not(:disabled){background:var(--strip-hover)}
+  .toolbar .icon-btn:hover:not(:disabled){background:var(--surface-2);filter:brightness(.96)}
+}
+.link-menu{position:fixed;right:auto;top:0;left:0;z-index:70;min-width:200px}

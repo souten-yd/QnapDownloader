@@ -149,6 +149,13 @@
 
  <div id="bookmarkBar" class="bookmark-bar" aria-label="ブックマークバー" hidden></div>
 
+ <!-- v0.1.63: right-click menu for a link in the mirror (mouse only) -->
+ <div id="linkMenu" class="menu link-menu" role="menu" aria-label="リンクの操作" hidden>
+  <button type="button" role="menuitem" data-link-act="open">新しいタブで開く</button>
+  <button type="button" role="menuitem" data-link-act="add">リンクに追加</button>
+  <button type="button" role="menuitem" data-link-act="copy">URLをコピー</button>
+ </div>
+
  <main id="content" class="content">
   <!-- v0.1.62: one thin progress line for app-screen data loads that take longer than 300 ms (the web tab has its own #webLoading) -->
   <div id="appLoading" class="loading-bar app-loading" role="progressbar" aria-label="読み込み中" hidden></div>
@@ -227,6 +234,8 @@
       </div>
       <div id="waitingList" class="waiting-list"></div>
      </section>
+     <!-- v0.1.63: filters + summary form a sticky side column on wide screens -->
+     <div class="dl-side">
      <div id="downloadsTools" class="toolbar-row" hidden>
       <div class="chips" role="group" aria-label="状態で絞り込み">
        <button type="button" class="chip" data-filter="all" aria-pressed="true">すべて</button>
@@ -246,6 +255,7 @@
        <span class="dl-count is-finished"><b id="dlCountFinished">0</b>完了</span>
        <span class="dl-count is-failed"><b id="dlCountFailed">0</b>失敗</span>
       </div>
+     </div>
      </div>
      <div id="downloadList" class="items"></div>
      <details id="orphanFiles" class="fold" hidden>
@@ -268,6 +278,9 @@
      <span class="head-tools"><button type="button" id="linksMore" class="icon-btn small" aria-label="リンクの操作" aria-haspopup="dialog" title="履歴の削除" hidden><svg class="icon" aria-hidden="true"><use href="#i-more"/></svg></button></span>
     </div>
     <p class="muted links-help">コピーしたリンクを「貼り付け」で入れると、見つかった件数をすぐ表示します。「追加」で一覧に保存、「JD2へ送る」でそのままダウンロードを始めます。</p>
+    <!-- v0.1.63: two columns on wide screens (paste on the left, the added links on the right); one column otherwise -->
+    <div class="links-cols">
+     <div class="links-col links-paste">
     <div class="paste-head">
      <label for="pasteBox">リンクを貼り付け（URL・テキスト・HTML）</label>
      <button type="button" id="pasteButton" class="btn small">貼り付け</button>
@@ -281,11 +294,15 @@
       <button type="button" id="pasteSend" class="btn primary" disabled hidden>追加してJD2へ送る</button>
      </div>
     </div>
+     </div>
+     <div class="links-col links-queue">
     <div class="section-head">
      <h2>追加したリンク</h2>
      <button type="button" id="sendAll" class="btn small" hidden>すべてJD2へ送る</button>
     </div>
     <div id="queueItems" class="items"></div>
+     </div>
+    </div>
    </div>
   </section>
 
@@ -821,7 +838,7 @@
        <div id="readerTitle" class="reader-title" role="heading" aria-level="1"></div>
        <div class="reader-sub">
         <span id="readerHost" class="reader-host"></span>
-        <button type="button" id="readerAppearance" class="btn small aa" aria-haspopup="dialog" aria-label="表示設定（文字・テーマ・画像など）">Aa</button>
+        <button type="button" id="readerAppearance" class="btn small aa" title="表示設定（文字・テーマ・画像など）" aria-haspopup="dialog" aria-label="表示設定（文字・テーマ・画像など）">Aa</button>
         <button type="button" id="readerOriginal" class="btn small">元のページ表示に切替</button>
        </div>
       </div>
@@ -865,7 +882,7 @@
     <div id="probeSheet" class="remote-sheet probe-sheet" role="dialog" aria-label="リンク先を確認しました" hidden>
      <div class="remote-sheet-head">
       <strong id="probeTitle">リンク先を確認しました</strong>
-      <button type="button" id="probeClose" class="btn small" aria-label="閉じる">×</button>
+      <button type="button" id="probeClose" class="btn small" title="閉じる" aria-label="閉じる">×</button>
      </div>
      <div id="probeList" class="remote-sheet-list"></div>
      <div class="remote-sheet-actions intercept-actions">
@@ -952,10 +969,10 @@
  </div>
  <div class="rv-bar">
   <span id="rvCount" class="rv-count"></span>
-  <button type="button" id="rvClose" class="rv-btn" aria-label="閉じる"><svg class="icon" aria-hidden="true"><use href="#i-x"/></svg></button>
+  <button type="button" id="rvClose" class="rv-btn" title="閉じる（Esc）" aria-label="閉じる"><svg class="icon" aria-hidden="true"><use href="#i-x"/></svg></button>
  </div>
- <button type="button" id="rvPrev" class="rv-btn rv-nav rv-prev" aria-label="前の画像"><svg class="icon" aria-hidden="true"><use href="#i-back"/></svg></button>
- <button type="button" id="rvNext" class="rv-btn rv-nav rv-next" aria-label="次の画像"><svg class="icon" aria-hidden="true"><use href="#i-forward"/></svg></button>
+ <button type="button" id="rvPrev" class="rv-btn rv-nav rv-prev" title="前の画像（←）" aria-label="前の画像"><svg class="icon" aria-hidden="true"><use href="#i-back"/></svg></button>
+ <button type="button" id="rvNext" class="rv-btn rv-nav rv-next" title="次の画像（→）" aria-label="次の画像"><svg class="icon" aria-hidden="true"><use href="#i-forward"/></svg></button>
  <div id="rvCaption" class="rv-caption"></div>
 </div>
 <div id="folderSheet" class="sheet-backdrop" hidden>

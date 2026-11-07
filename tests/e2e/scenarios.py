@@ -11,10 +11,11 @@ from harness import BASE, PASSWORD, Skip
 SCENARIOS = []
 
 
-def scenario(name, engines=("chromium", "webkit"), display="mirror"):
-    """Register a scenario. ``display`` is the Settings default display the phone starts with."""
+def scenario(name, engines=("chromium", "webkit"), display="mirror", device="phone"):
+    """Register a scenario. ``display`` is the Settings default display the phone starts with.
+    v0.1.63: ``device`` = "phone" (iPhone, touch), "ipad" (820x1180 touch) or "desktop" (1280x800, mouse + keyboard)."""
     def deco(fn):
-        SCENARIOS.append({"name": name, "fn": fn, "engines": engines, "display": display})
+        SCENARIOS.append({"name": name, "fn": fn, "engines": engines, "display": display, "device": device})
         return fn
     return deco
 
@@ -1329,15 +1330,15 @@ def bar_collapse_mirror(ph):
     scroll(1300); scroll(1500); scroll(1700)
     ph.page.wait_for_timeout(500)
     assert not collapsed(), "scrolling must not hide the bar while the address bar has focus"
-    # the PC / iPad bar never collapses
+    # v0.1.63: the width no longer decides (this context is a touch device): a wide touch screen (iPad) collapses too.
+    # The mouse case (a PC keeps its bars) is in desktop-layout, the iPad one in ipad-layout.
     ph.js("document.getElementById('omnibox').blur()")
     ph.page.set_viewport_size({"width": 1180, "height": 820})
     ph.page.wait_for_timeout(300)
-    for y in (100, 300, 500, 700):
+    for y in (0, 100, 300, 500, 700):
         scroll(y)
         ph.page.wait_for_timeout(60)
-    ph.page.wait_for_timeout(300)
-    assert not collapsed(), "a wide screen must keep its bar"
+    ph.wait(collapsed, 3, "a wide touch screen collapses its bars as well")
 
 
 @scenario("bar-collapse-reader", display="reader")
@@ -1630,17 +1631,18 @@ def downloads_summary(ph):
       const nodata=summarizeDownloads({packages:[mk({running:true,bytes_total:null})],links:[],has_more:true});
       return {a,idle,nodata}}""")
     a = sums["a"]
-    assert (a["running"], a["waiting"], a["finished"], a["failed"]) == (2, 1, 1, 2), a
+    # v0.1.63: a status of just "Offline" is a waiting link (the hoster's state), only real failure words are failures
+    assert (a["running"], a["waiting"], a["finished"], a["failed"]) == (2, 2, 1, 1), a
     assert a["speed"] == 400, a
-    # remaining: (1000-500) + (1000-900) + 1000 (waiting) = 1600 bytes at 400 B/s -> 4 s
-    assert a["eta"] == 4, a
+    # remaining: (1000-500) + (1000-900) + 1000 + 1000 (the two waiting ones) = 2600 bytes at 400 B/s -> 6.5 -> 7 s
+    assert a["eta"] == 7, a
     assert sums["idle"]["eta"] is None and sums["idle"]["speed"] == 0, sums["idle"]
     assert sums["nodata"]["eta"] is None and sums["nodata"]["hasMore"] is True, sums["nodata"]
     # the numbers on the page (no request is made for them)
     ph.js("""()=>{state.engine=Object.assign({},state.engine,{phase:'running'});
       const mk=(n,o)=>Object.assign({name:n,status:'',bytes_loaded:1048576*100,bytes_total:1048576*500,speed_bytes:null,eta_seconds:null,running:false,
         finished:false,progress:20,id:'1'+n.length+Math.random().toString().slice(2,7),child_count:1,folder:{flat:true}},o);
-      const p=[mk('Pack A',{running:true,speed_bytes:2097152,eta_seconds:200}),mk('Pack B',{}),mk('Pack C',{finished:true,progress:100,bytes_loaded:1048576*500}),mk('Pack D',{status:'Offline'})];
+      const p=[mk('Pack A',{running:true,speed_bytes:2097152,eta_seconds:200}),mk('Pack B',{}),mk('Pack C',{finished:true,progress:100,bytes_loaded:1048576*500}),mk('Pack D',{status:'エラー'})];
       const l=p.map(x=>Object.assign({},x,{package_id:x.id,id:x.id+'9',host:'rapidgator.net'}));
       window.__apiBefore=reqStats.all;
       state.snapshot={page:0,packages:p,links:l,has_more:false};state.snapshotJson=JSON.stringify(state.snapshot);
@@ -1857,3 +1859,547 @@ def toast_above_bar(ph):
     held.pop().continue_()
     ph.wait(lambda: ph.js("document.getElementById('appLoading').hidden"), 5, "the line is gone when the load ends")
     ph.page.unroute("**/api/bookmarks")
+
+
+# ------------------------------------------------------------------ v0.1.63: iPad and PC
+# Two more kinds of device: "ipad" (820x1180, touch, hardware keyboard possible) and "desktop" (1280x800, mouse + keyboard,
+# no touch). An iPad scenario is skipped on an engine whose touch emulation does not report (pointer: coarse).
+
+def _app(ph, hash_):
+    """An in-app navigation (the way a tap on a #-link does it); a bare location.hash from a web tab would be a page back."""
+    ph.js("(h)=>navigate(h)", hash_)
+
+
+def _no_hscroll(ph, label):
+    m = ph.js("()=>({sw:document.documentElement.scrollWidth,cw:document.documentElement.clientWidth,bw:document.body.scrollWidth})")
+    assert m["sw"] <= m["cw"] + 1 and m["bw"] <= m["cw"] + 1, "%s: the page scrolls sideways %s" % (label, m)
+
+
+def _rect(ph, selector):
+    return ph.js("""(s)=>{const e=document.querySelector(s);if(!e)return null;const r=e.getBoundingClientRect();
+      return {l:r.left,t:r.top,r:r.right,b:r.bottom,w:r.width,h:r.height}}""", selector)
+
+
+def _fake_downloads(ph, extra=None):
+    """The JD2 harness is not running: inject a list the way a running engine would deliver it."""
+    ph.js("""(extra)=>{state.engine=Object.assign({},state.engine,{phase:'running'});
+      const mk=(n,o)=>Object.assign({name:n,status:'',bytes_loaded:1048576*100,bytes_total:1048576*500,speed_bytes:null,eta_seconds:null,
+        running:false,finished:false,progress:20,id:'1'+n.length+Math.random().toString().slice(2,7),child_count:1,folder:{flat:true}},o);
+      const p=[mk('Pack A',{running:true,speed_bytes:2097152,eta_seconds:200}),mk('Pack B',{}),mk('Pack C',{finished:true,progress:100,bytes_loaded:1048576*500})]
+        .concat((extra||[]).map(e=>mk(e.name,e)));
+      const l=p.map(x=>Object.assign({},x,{package_id:x.id,id:x.id+'9',host:'rapidgator.net'}));
+      state.snapshot={page:0,packages:p,links:l,has_more:false};state.snapshotJson=JSON.stringify(state.snapshot);
+      setShown('downloadsEmpty',false);setShown('downloadsBody',true);setShown('downloadsTools',true);
+      state.downloadsSig='';renderDownloads();}""", extra or [])
+
+
+def _scroll_steps(ph, ys):
+    for y in ys:
+        ph.js("(y)=>{const d=mirrorDoc();mirrorScroller(d).scrollTop=y}", y)
+        ph.page.wait_for_timeout(60)
+
+
+def _collapse_check(ph, label):
+    """Scroll the mirror down: the bars (tab strip + toolbar when wide) slide away, the NAS viewport does not change; scroll
+    up: they return."""
+    collapsed = lambda: ph.js("document.body.classList.contains('chrome-collapsed')")
+    view0 = ph.js("stageViewport()")
+    _scroll_steps(ph, (0, 60, 140, 260, 380, 520))
+    ph.wait(collapsed, 3, "%s: the bars collapse when the page is scrolled down" % label)
+    ph.page.wait_for_timeout(450)
+    assert ph.js("document.querySelector('.toolbar').getBoundingClientRect().bottom") <= 1, "%s: the toolbar is still on screen" % label
+    if ph.js("getComputedStyle(document.getElementById('tabstrip')).display") != "none":
+        assert ph.js("document.getElementById('tabstrip').getBoundingClientRect().bottom") <= 1, "%s: the tab strip is still on screen" % label
+    assert ph.js("document.getElementById('remoteStage').getBoundingClientRect().top") <= 1, "%s: the page does not start at the top" % label
+    assert ph.js("stageViewport()") == view0, "%s: the NAS viewport changed with the collapse" % label
+    _scroll_steps(ph, (500, 440, 380, 330))
+    ph.wait(lambda: not collapsed(), 3, "%s: the bars return when scrolling up" % label)
+    ph.page.wait_for_timeout(450)
+    assert ph.js("document.querySelector('.toolbar').getBoundingClientRect().top") >= 0 and ph.js("stageViewport()") == view0
+    _scroll_steps(ph, (0,))
+
+
+@scenario("ipad-layout", device="ipad")
+def ipad_layout(ph):
+    """v0.1.63 iPad (touch): portrait 820x1180 and landscape 1180x820 keep the wide layout with finger-sized targets (>= 44 px),
+    one top row, no sideways scrolling, and the bars collapse on scroll (a mouse would keep them); Split View widths
+    (500-700) use the phone layout."""
+    ph.require_touch()
+    tab = ph.open("/long1.html")
+    ph.wait(lambda: "長いページ 1" in ph.mirror_text(), 15, "long page in mirror")
+    ph.page.wait_for_timeout(500)
+    web_hash = ph.js("location.hash")
+    for width, height in ((820, 1180), (1180, 820)):
+        ph.page.set_viewport_size({"width": width, "height": height})
+        ph.page.wait_for_timeout(350)
+        label = "%dx%d" % (width, height)
+        # top bar: one row, every button of the wide bar present, nothing under 44 px
+        bar = _rect(ph, ".toolbar")
+        assert bar["h"] <= 66, "%s: the toolbar is %.0f px high" % (label, bar["h"])
+        ids = ("navBack", "navForward", "navReload", "omniForm", "starBtn", "dlButton", "menuButton", "newTab")
+        tops = []
+        for ident in ids:
+            r = _rect(ph, "#" + ident)
+            assert r and r["w"] > 0, "%s: #%s is not shown" % (label, ident)
+            assert r["w"] >= 43.5 and r["h"] >= 43.5, "%s: #%s is %.0fx%.0f px (a finger needs 44)" % (label, ident, r["w"], r["h"])
+            if ident != "newTab":
+                tops.append(r["t"] + r["h"] / 2)
+        assert max(tops) - min(tops) <= 6, "%s: the bar buttons are not on one row: %s" % (label, tops)
+        for selector in (".pinned-tab", ".web-tab .tab-link", ".web-tab .tab-close", ".brand"):
+            r = _rect(ph, selector)
+            assert r and r["h"] >= 43.5 and r["w"] >= 43.5, "%s: %s is %s" % (label, selector, r)
+        assert ph.js("document.querySelector('.web-tab .tab-label').getBoundingClientRect().width") > 20, "%s: the web tab lost its name" % label
+        assert bar["t"] >= ph.js("document.getElementById('tabstrip').getBoundingClientRect().bottom") - 1, "%s: the tab strip is not above the bar" % label
+        # the menu: touch-sized rows
+        ph.js("openMenu()")
+        small = ph.js("""()=>[...document.querySelectorAll('#menu button')].filter(b=>b.offsetParent!==null).map(b=>b.getBoundingClientRect().height).filter(h=>h<43.5)""")
+        assert not small, "%s: menu rows under 44 px: %s" % (label, small)
+        ph.js("closeMenu(false)")
+        _no_hscroll(ph, label + " web tab")
+        # the collapse follows the finger, not the width
+        _collapse_check(ph, label)
+    # app screens: no sideways scroll, targets, settings as two columns
+    ph.page.set_viewport_size({"width": 1180, "height": 820})
+    _fake_downloads(ph)
+    for route in ("#/home", "#/downloads", "#/links", "#/settings/jd2", "#/settings/browser", "#/settings/system"):
+        _app(ph, route)
+        ph.page.wait_for_timeout(300)
+        _no_hscroll(ph, route)
+        if route == "#/downloads":
+            small = ph.js("()=>[...document.querySelectorAll('#downloadsTools .chip,#downloadsTools .search')].map(e=>e.getBoundingClientRect().height).filter(h=>h<43.5)")
+            assert not small, "downloads filters under 44 px: %s" % small
+        if route.startswith("#/settings"):
+            nav, body = _rect(ph, ".settings-nav"), _rect(ph, ".settings-body")
+            assert nav["r"] <= body["l"] + 1 and abs(nav["t"] - body["t"]) <= 40, "settings is not two columns: %s %s" % (nav, body)
+            assert ph.js("[...document.querySelectorAll('.settings-nav a')].every(a=>a.getBoundingClientRect().height>=43.5)"), "settings nav under 44 px"
+    # Split View / Slide Over widths: the phone layout (bottom tab bar, no tab strip), still one bar and the collapse
+    for width in (500, 600, 700):
+        ph.page.set_viewport_size({"width": width, "height": 900})
+        _app(ph, web_hash)
+        ph.page.wait_for_timeout(350)
+        assert ph.js("getComputedStyle(document.getElementById('tabstrip')).display") == "none", "%d: the tab strip is shown" % width
+        assert _visible(ph, ".mobile-bar") == 1, "%d: no bottom bar" % width
+        assert _rect(ph, ".toolbar")["h"] <= 66, "%d: toolbar too high" % width
+        _no_hscroll(ph, "split %d" % width)
+        r = _rect(ph, ".mobile-bar")
+        assert r["h"] >= 44 and abs(r["b"] - 900) <= 1, "%d: bottom bar %s" % (width, r)
+    _collapse_check(ph, "split 600")
+    ph.take_errors("status of 400", "status of 503")     # the injected 'running' engine / a JD2 that is off
+
+
+@scenario("ipad-keys", device="ipad")
+def ipad_keys(ph):
+    """v0.1.63: an iPad with a hardware keyboard has the same shortcuts (Alt+arrows, Cmd+[ / ], Ctrl/Cmd+L, Esc)."""
+    ph.require_touch()
+    _keys_back_forward(ph)
+
+
+def _keys_back_forward(ph):
+    tab = ph.open("/article.html")
+    ph.wait(lambda: "E2E テスト記事" in ph.mirror_text(), 15, "mirror content")
+    ph.post("/api/rb/navigate", {"tab": tab, "url": BASE + "/article2.html"})
+    ph.wait(lambda: ph.env.nas_url(tab).endswith("/article2.html"), 10, "navigated to article2")
+    ph.wait(lambda: "E2E 二つ目の記事" in ph.mirror_text(), 10, "article2 in mirror")
+    ph.js("document.activeElement && document.activeElement.blur()")
+    tabs_before, hash_before = ph.js("state.tabs.length"), ph.js("location.hash")
+    ph.press("Alt+ArrowLeft")
+    ph.wait(lambda: ph.env.nas_url(tab).endswith("/article.html"), 8, "Alt+← went back (url=%s)" % ph.env.nas_url(tab))
+    ph.wait(lambda: "E2E テスト記事" in ph.mirror_text(), 10, "article in mirror again")
+    ph.press("Alt+ArrowRight")
+    ph.wait(lambda: ph.env.nas_url(tab).endswith("/article2.html"), 8, "Alt+→ went forward")
+    ph.wait(lambda: "E2E 二つ目の記事" in ph.mirror_text(), 10, "article2 in mirror again")
+    ph.press("Meta+BracketLeft")
+    ph.wait(lambda: ph.env.nas_url(tab).endswith("/article.html"), 8, "Cmd+[ went back")
+    ph.wait(lambda: "E2E テスト記事" in ph.mirror_text(), 10, "article in mirror (3)")
+    ph.press("Meta+BracketRight")
+    ph.wait(lambda: ph.env.nas_url(tab).endswith("/article2.html"), 8, "Cmd+] went forward")
+    ph.wait(lambda: "E2E 二つ目の記事" in ph.mirror_text(), 10, "article2 in mirror (4)")
+    # the same with the keyboard focus INSIDE the mirror frame (its key events do not reach the app document)
+    ph.js("mirrorDoc().defaultView.focus()")
+    ph.press("Alt+ArrowLeft")
+    ph.wait(lambda: ph.env.nas_url(tab).endswith("/article.html"), 8, "Alt+← with the focus in the mirror went back")
+    ph.wait(lambda: "E2E テスト記事" in ph.mirror_text(), 10, "article in mirror (5)")
+    # at the first page: only a toast, the app stays on the tab
+    ph.press("Alt+ArrowLeft")
+    ph.wait(lambda: ph.js("[...document.querySelectorAll('#notice .toast')].some(t=>t.textContent.includes('前のページはありません'))"), 5, "no earlier page: a toast")
+    assert ph.js("location.hash") == hash_before and ph.js("state.tabs.length") == tabs_before, "the app left the tab"
+    assert ph.env.nas_url(tab).endswith("/article.html")
+    # the address bar: Ctrl+L / Cmd+L / "/" ; Esc gives it back
+    for combo in ("Control+l", "Meta+l"):
+        ph.js("document.activeElement && document.activeElement.blur()")
+        ph.press(combo)
+        assert ph.js("document.activeElement && document.activeElement.id") == "omnibox", "%s did not focus the address bar" % combo
+        ph.press("Escape")
+        assert ph.js("document.activeElement && document.activeElement.id") != "omnibox"
+    ph.js("document.getElementById('app').focus && document.body.focus()")
+    ph.press("Slash")
+    assert ph.js("document.activeElement && document.activeElement.id") == "omnibox", "/ did not focus the address bar"
+    ph.press("Escape")
+    # Esc closes the menu
+    ph.js("openMenu()")
+    assert not ph.js("document.getElementById('menu').hidden")
+    ph.press("Escape")
+    assert ph.js("document.getElementById('menu').hidden"), "Esc did not close the menu"
+    # typing in the address bar keeps its own Alt+arrows
+    ph.js("focusOmnibox()")
+    ph.press("Alt+ArrowRight")
+    ph.page.wait_for_timeout(500)
+    assert ph.env.nas_url(tab).endswith("/article.html"), "a shortcut fired while typing in the address bar"
+
+
+@scenario("desktop-keys", device="desktop")
+def desktop_keys(ph):
+    """v0.1.63 PC: Alt+←/→, Cmd+[ / ], Ctrl/Cmd+L, / and Esc; Ctrl+R reloads the NAS page and not the app."""
+    ph.require_mouse()
+    _keys_back_forward(ph)
+    tab = ph.tab_id()
+    # Ctrl+R inside a web tab reloads the NAS page, never the app page
+    ph.js("window.__noReload = 'still here'")
+    ph.js("document.activeElement && document.activeElement.blur()")
+    hits = ph.env.fx.count("/article.html")
+    ph.press("Control+r")
+    ph.wait(lambda: ph.env.fx.count("/article.html") > hits, 10, "Ctrl+R reloaded the NAS page")
+    ph.page.wait_for_timeout(300)
+    assert ph.js("window.__noReload") == "still here", "Ctrl+R reloaded the app"
+    hits = ph.env.fx.count("/article.html")
+    ph.press("F5")
+    ph.wait(lambda: ph.env.fx.count("/article.html") > hits, 10, "F5 reloaded the NAS page")
+    assert ph.js("window.__noReload") == "still here", "F5 reloaded the app"
+    assert ph.tab_id() == tab
+
+
+def _mouse_nav(ph, button, in_mirror=False):
+    """Mouse button 3 (back) / 4 (forward) as the browser delivers it to a page: mousedown, mouseup, auxclick. (Chromium's CDP
+    'back' button goes straight to the browser's history without any DOM event, so a real event cannot be made here.)
+    `in_mirror` sends them inside the mirror frame's document. Returns the list of [type, cancelled]."""
+    return ph.js("""(a)=>{const d=a.mirror?mirrorDoc():document;const out=[];
+      for(const t of ['mousedown','mouseup','auxclick']){const e=new MouseEvent(t,{button:a.b,bubbles:true,cancelable:true,view:d.defaultView});
+        d.body.dispatchEvent(e);out.push([t,e.defaultPrevented])}
+      return out}""", {"b": button, "mirror": in_mirror})
+
+
+@scenario("desktop-mouse-nav", device="desktop")
+def desktop_mouse_nav(ph):
+    """v0.1.63 PC: mouse buttons 4 / 5 = back / forward of the NAS page, the app stays on the tab; the trackpad's sideways
+    swipe (wheel deltaX) does the same, but not over a horizontally scrolling element and not on a page that scrolls
+    sideways itself."""
+    ph.require_mouse()
+    tab = ph.open("/article.html")
+    ph.wait(lambda: "E2E テスト記事" in ph.mirror_text(), 15, "mirror content")
+    ph.post("/api/rb/navigate", {"tab": tab, "url": BASE + "/article2.html"})
+    ph.wait(lambda: ph.env.nas_url(tab).endswith("/article2.html"), 10, "navigated to article2")
+    ph.wait(lambda: "E2E 二つ目の記事" in ph.mirror_text(), 10, "article2 in mirror")
+    hash_before, tabs_before = ph.js("location.hash"), ph.js("state.tabs.length")
+    # the events are cancelled (the browser must not also go back) and move the NAS page
+    seen = _mouse_nav(ph, 3)
+    assert all(prevented for _, prevented in seen), "mouse button 4 was not cancelled: %s" % seen
+    ph.wait(lambda: ph.env.nas_url(tab).endswith("/article.html"), 8, "mouse button 4 went back (url=%s)" % ph.env.nas_url(tab))
+    ph.wait(lambda: "E2E テスト記事" in ph.mirror_text(), 10, "article in mirror")
+    seen = _mouse_nav(ph, 4)
+    assert all(prevented for _, prevented in seen), "mouse button 5 was not cancelled: %s" % seen
+    ph.wait(lambda: ph.env.nas_url(tab).endswith("/article2.html"), 8, "mouse button 5 went forward")
+    ph.wait(lambda: "E2E 二つ目の記事" in ph.mirror_text(), 10, "article2 in mirror (2)")
+    # the same inside the mirror frame's document
+    _mouse_nav(ph, 3, in_mirror=True)
+    ph.wait(lambda: ph.env.nas_url(tab).endswith("/article.html"), 8, "mouse button 4 inside the mirror went back")
+    ph.wait(lambda: "E2E テスト記事" in ph.mirror_text(), 10, "article in mirror (2)")
+    _mouse_nav(ph, 4, in_mirror=True)
+    ph.wait(lambda: ph.env.nas_url(tab).endswith("/article2.html"), 8, "mouse button 5 inside the mirror went forward")
+    ph.wait(lambda: "E2E 二つ目の記事" in ph.mirror_text(), 10, "article2 in mirror (3)")
+    assert ph.js("location.hash") == hash_before and ph.js("state.tabs.length") == tabs_before, "the app left the tab"
+    # trackpad: a sideways wheel swipe over the mirror = back (fingers to the right = deltaX < 0), forward the other way
+    pt = ph.mirror_point("doc=>doc.querySelector('h1')")
+    ph.page.mouse.move(pt["x"] + 200, pt["y"] + 100)
+    for _ in range(4):
+        ph.page.mouse.wheel(-70, 0)
+        ph.page.wait_for_timeout(25)
+    ph.wait(lambda: ph.env.nas_url(tab).endswith("/article.html"), 8, "a sideways swipe went back (url=%s)" % ph.env.nas_url(tab))
+    ph.wait(lambda: "E2E テスト記事" in ph.mirror_text(), 10, "article in mirror (3)")
+    ph.page.wait_for_timeout(900)                   # the swipe's inertia is over
+    for _ in range(4):
+        ph.page.mouse.wheel(70, 0)
+        ph.page.wait_for_timeout(25)
+    ph.wait(lambda: ph.env.nas_url(tab).endswith("/article2.html"), 8, "a sideways swipe went forward")
+    ph.wait(lambda: "E2E 二つ目の記事" in ph.mirror_text(), 10, "article2 in mirror (4)")
+    ph.page.wait_for_timeout(900)
+    # a vertical wheel with a little sideways drift is a scroll, not a swipe
+    for _ in range(6):
+        ph.page.mouse.wheel(40, 60)
+        ph.page.wait_for_timeout(25)
+    ph.page.wait_for_timeout(500)
+    assert ph.env.nas_url(tab).endswith("/article2.html"), "a diagonal scroll moved the page"
+    # over a horizontally scrolling element: it scrolls, the NAS page does not move
+    ph.post("/api/rb/navigate", {"tab": tab, "url": BASE + "/scroller.html"})
+    ph.wait(lambda: ph.env.nas_url(tab).endswith("/scroller.html"), 10, "navigated to scroller")
+    ph.wait(lambda: "E2E 横スクロールの表" in ph.mirror_text(), 10, "scroller in mirror")
+    ph.page.wait_for_timeout(900)
+    pt = ph.wait(lambda: ph.mirror_point("doc=>doc.querySelector('#wide')"), 5, "the scrolling table")
+    ph.page.mouse.move(pt["x"], pt["y"])
+    for _ in range(5):
+        ph.page.mouse.wheel(-90, 0)
+        ph.page.wait_for_timeout(25)
+    ph.page.wait_for_timeout(700)
+    assert ph.env.nas_url(tab).endswith("/scroller.html"), "a swipe over the scrolling table moved the NAS page: %s" % ph.env.nas_url(tab)
+    # a page that is itself wider than the window: the sideways wheel scrolls it
+    ph.post("/api/rb/navigate", {"tab": tab, "url": BASE + "/hwide.html"})
+    ph.wait(lambda: ph.env.nas_url(tab).endswith("/hwide.html"), 10, "navigated to hwide")
+    ph.wait(lambda: "E2E 横に長いページ" in ph.mirror_text(), 10, "hwide in mirror")
+    ph.page.wait_for_timeout(900)
+    assert ph.js("(()=>{const e=mirrorScroller(mirrorDoc());return e.scrollWidth>e.clientWidth+50})()"), "the fixture does not scroll sideways in the mirror"
+    pt = ph.mirror_point("doc=>doc.querySelector('h1')")
+    ph.page.mouse.move(pt["x"] + 100, pt["y"] + 100)
+    for _ in range(5):
+        ph.page.mouse.wheel(-90, 0)
+        ph.page.wait_for_timeout(25)
+    ph.page.wait_for_timeout(700)
+    assert ph.env.nas_url(tab).endswith("/hwide.html"), "a sideways swipe on a page that scrolls sideways moved the NAS page"
+    assert ph.js("location.hash") == hash_before
+
+
+@scenario("desktop-link-menu", device="desktop")
+def desktop_link_menu(ph):
+    """v0.1.63 PC: a right click on a link in the mirror opens the app's own menu (新しいタブで開く / リンクに追加 / URLをコピー),
+    not the browser's; Esc closes it; an ordinary right click on text opens nothing."""
+    ph.require_mouse()
+    tab = ph.open("/article.html")
+    ph.wait(lambda: "E2E テスト記事" in ph.mirror_text(), 15, "mirror content")
+    ph.page.wait_for_timeout(800)
+    # not on a link: no menu
+    pt = ph.mirror_point("doc=>doc.querySelector('h1')")
+    ph.click(pt["x"], pt["y"], "right")
+    ph.page.wait_for_timeout(200)
+    assert ph.js("document.getElementById('linkMenu').hidden"), "a menu opened for a right click on text"
+    link = ph.wait(lambda: ph.mirror_point("doc=>doc.querySelector('a[data-href$=\"/article2.html\"]')"), 8, "a link in the mirror")
+    ph.click(link["x"], link["y"], "right")
+    ph.wait(lambda: not ph.js("document.getElementById('linkMenu').hidden"), 3, "the link menu")
+    labels = ph.js("[...document.querySelectorAll('#linkMenu button')].map(b=>b.textContent.trim())")
+    assert labels == ["新しいタブで開く", "リンクに追加", "URLをコピー"], labels
+    box = _rect(ph, "#linkMenu")
+    assert box["l"] >= 0 and box["r"] <= ph.js("innerWidth") and box["t"] >= 0 and box["b"] <= ph.js("innerHeight"), box
+    assert ph.env.nas_url(tab).endswith("/article.html"), "a right click followed the link"
+    ph.press("Escape")
+    assert ph.js("document.getElementById('linkMenu').hidden"), "Esc did not close the link menu"
+    # URLをコピー: the app's copy path (clipboard or the hidden-textarea fallback) reports success and the menu closes
+    ph.click(link["x"], link["y"], "right")
+    ph.wait(lambda: not ph.js("document.getElementById('linkMenu').hidden"), 3, "the link menu (2)")
+    ph.page.click("#linkMenu [data-link-act=copy]")
+    ph.wait(lambda: ph.js("document.getElementById('linkMenu').hidden"), 3, "the menu closed after copy")
+    ph.wait(lambda: ph.js("[...document.querySelectorAll('#notice .toast')].some(t=>t.textContent.includes('コピー'))"), 5, "a copy toast")
+    # リンクに追加: the same staging as the ⋮ menu
+    ph.click(link["x"], link["y"], "right")
+    ph.wait(lambda: not ph.js("document.getElementById('linkMenu').hidden"), 3, "the link menu (3)")
+    ph.page.click("#linkMenu [data-link-act=add]")
+    ph.wait(lambda: ph.js("[...document.querySelectorAll('#notice .toast')].some(t=>t.textContent.includes('追加したリンクに入れました'))"), 5, "added toast")
+    staged = ph.js("fetch('/api/links').then(r=>r.json()).then(j=>JSON.stringify(j))")
+    assert "/article2.html" in staged, staged
+    # 新しいタブで開く: a second web tab with that page, the first one stays
+    ph.click(link["x"], link["y"], "right")
+    ph.wait(lambda: not ph.js("document.getElementById('linkMenu').hidden"), 3, "the link menu (4)")
+    ph.page.click("#linkMenu [data-link-act=open]")
+    ph.wait(lambda: ph.js("state.tabs.length") == 2, 8, "a new web tab")
+    ph.wait(lambda: any(t.url.endswith("/article2.html") for t in ph.env.tabs().values()), 15, "the new tab loaded the link")
+    assert ph.env.tabs()[tab].url.endswith("/article.html"), "the first tab was navigated"
+    ph.post("/api/links/clear", {"include_staged": True})
+
+
+@scenario("desktop-layout", device="desktop")
+def desktop_layout(ph):
+    """v0.1.63 PC (mouse): one dense top row, tooltips naming the keys, NO collapse on scroll, two-column settings /
+    downloads / links on wide windows, the mirror centred at <= 1600 px without sideways scrolling."""
+    ph.require_mouse()
+    ph.open("/long1.html")
+    ph.wait(lambda: "長いページ 1" in ph.mirror_text(), 15, "long page in mirror")
+    ph.page.wait_for_timeout(500)
+    for width, height in ((1280, 800), (1920, 1080)):
+        ph.page.set_viewport_size({"width": width, "height": height})
+        ph.page.wait_for_timeout(350)
+        label = "%dx%d" % (width, height)
+        assert _rect(ph, ".toolbar")["h"] <= 56, "%s: the bar is %.0f px high" % (label, _rect(ph, ".toolbar")["h"])
+        assert _visible(ph, "#navBack, #navForward, #navReload, #starBtn, #dlButton, #menuButton") == 6, "%s: a bar button is missing" % label
+        # tooltips: every icon button says what it does
+        missing = ph.js("""()=>[...document.querySelectorAll('.icon-btn, .tab-close, .mode-chip')].filter(b=>b.offsetParent!==null&&!(b.title||'').trim()).map(b=>b.id||b.className)""")
+        assert not missing, "%s: icon buttons without a tooltip: %s" % (label, missing)
+        titles = ph.js("({b:navBack.title,f:navForward.title,r:navReload.title,o:omnibox.title})")
+        assert "Alt" in titles["b"] or "⌘" in titles["b"], titles
+        assert "L" in titles["o"], titles
+        # the page: centred, at most as wide as the NAS laid it out, no sideways scroll, wheel scrolls it
+        fr = _rect(ph, "#mirrorFrame")
+        assert fr["w"] <= 1600 + 1 and abs(fr["l"] - (width - fr["r"])) <= 2, "%s: the mirror is not centred / too wide: %s" % (label, fr)
+        assert ph.js("stageViewport().width") == min(width, 1600), "%s: viewport %s" % (label, ph.js("stageViewport()"))
+        assert ph.js("(()=>{const e=mirrorScroller(mirrorDoc());return e.scrollWidth<=e.clientWidth+1})()"), "%s: the mirror scrolls sideways" % label
+        _no_hscroll(ph, label + " mirror")
+        ph.page.mouse.move(fr["l"] + 300, fr["t"] + 300)
+        ph.page.mouse.wheel(0, 500)
+        ph.wait(lambda: ph.mirror_scroll_top() > 100, 3, "%s: the wheel scrolls the mirror" % label)
+        # a mouse keeps its bars
+        _scroll_steps(ph, (100, 300, 500, 700, 900))
+        ph.page.wait_for_timeout(400)
+        assert not ph.js("document.body.classList.contains('chrome-collapsed')"), "%s: a mouse layout collapsed its bars" % label
+        _scroll_steps(ph, (0,))
+        if width > 1600:                              # the empty sides still scroll the page
+            before = ph.mirror_scroll_top()
+            ph.page.mouse.move(40, 400)
+            ph.page.mouse.wheel(0, 400)
+            ph.wait(lambda: ph.mirror_scroll_top() > before + 100, 3, "the wheel over the side gutter scrolls the mirror")
+            _scroll_steps(ph, (0,))
+    # app screens on a wide window
+    _fake_downloads(ph)
+    for width, height in ((1280, 800), (1920, 1080)):
+        ph.page.set_viewport_size({"width": width, "height": height})
+        label = "%dx%d" % (width, height)
+        for route in ("#/home", "#/downloads", "#/links", "#/settings/jd2", "#/settings/browser", "#/settings/system"):
+            _app(ph, route)
+            if route == "#/downloads":
+                _fake_downloads(ph)
+            ph.page.wait_for_timeout(300)
+            _no_hscroll(ph, "%s %s" % (label, route))
+            if route == "#/downloads":
+                side, first = _rect(ph, ".dl-side"), _rect(ph, "#downloadList .download-card")
+                assert side["l"] >= first["r"] + 10 and abs(side["t"] - first["t"]) <= 60, "%s: downloads is not two columns: %s %s" % (label, side, first)
+                assert side["r"] <= width and first["w"] >= 500, (side, first)
+            elif route == "#/links":
+                a, b = _rect(ph, ".links-paste"), _rect(ph, ".links-queue")
+                assert b["l"] >= a["r"] + 10 and abs(a["t"] - b["t"]) <= 30, "%s: links is not two columns: %s %s" % (label, a, b)
+            elif route.startswith("#/settings"):
+                nav, body = _rect(ph, ".settings-nav"), _rect(ph, ".settings-body")
+                assert nav["r"] <= body["l"] + 1 and abs(nav["t"] - body["t"]) <= 40, "%s: settings is not two columns: %s %s" % (label, nav, body)
+                assert nav["w"] <= 260 and body["w"] >= 600, (nav, body)
+    # a narrow desktop window falls back to one column
+    ph.page.set_viewport_size({"width": 1000, "height": 800})
+    _app(ph, "#/downloads")
+    ph.page.wait_for_timeout(300)
+    side, first = _rect(ph, ".dl-side"), _rect(ph, "#downloadList .download-card")
+    assert side["b"] <= first["t"] + 1, "at 1000 px the downloads side column should sit above the list: %s %s" % (side, first)
+    _no_hscroll(ph, "1000 downloads")
+    ph.take_errors("status of 400", "status of 503")     # the injected 'running' engine / a JD2 that is off
+
+
+@scenario("reader-wide", device="desktop", display="reader")
+def reader_wide(ph):
+    """v0.1.63: on a 1920 px window the reader keeps a readable, centred column (<= ~780 px) for every text-size option;
+    the head lines up with it."""
+    ph.require_mouse()
+    ph.page.set_viewport_size({"width": 1920, "height": 1080})
+    ph.open("/article.html")
+    ph.wait(lambda: ph.js("document.querySelectorAll('#readerBody .reader-p').length") >= 3, 15, "reader paragraphs")
+    for size in (13, 16, 22, 26):
+        ph.js("(n)=>{readerPrefs=Object.assign({},readerPrefs,{size:n});applyReaderPrefs()}", size)
+        ph.page.wait_for_timeout(150)
+        body, scroller = _rect(ph, "#readerBody"), _rect(ph, "#readerScroll")
+        assert 300 <= body["w"] <= 781, "size %d: the reader column is %.0f px wide" % (size, body["w"])
+        left, right = body["l"] - scroller["l"], scroller["r"] - body["r"]
+        assert abs(left - right) <= 18, "size %d: the column is not centred (%.0f / %.0f)" % (size, left, right)
+        sc = ph.js("(()=>{const e=document.getElementById('readerScroll');return e.scrollWidth-e.clientWidth})()")
+        assert sc <= 1, "size %d: the reader scrolls sideways" % size
+    ph.js("()=>{readerPrefs=Object.assign({},readerPrefs,{size:16});applyReaderPrefs()}")
+    ph.page.wait_for_timeout(150)
+    title = ph.js("()=>{const r=document.getElementById('readerTitle').getBoundingClientRect();return r.left}")
+    body = _rect(ph, "#readerBody")
+    assert abs(title - body["l"]) <= 4, "the head does not line up with the column (%.0f vs %.0f)" % (title, body["l"])
+
+
+@scenario("downloads-offline-waiting")
+def downloads_offline_waiting(ph):
+    """v0.1.63: a status of just "Offline" is the hoster's state of a link that is waiting: 待機, not 失敗. Real failure
+    words (also together with Offline) still count as 失敗; a running or finished item is never a failure."""
+    ph.page.set_viewport_size(NARROW)
+    _go(ph, "#/downloads")
+    ph.wait(lambda: ph.js("!!document.querySelector('#view-downloads:not([hidden]) h1')"), 8, "downloads view")
+    res = ph.js("""()=>{
+      const mk=(o)=>Object.assign({name:'x',status:'',bytes_loaded:0,bytes_total:1000,speed_bytes:null,eta_seconds:null,running:false,finished:false,progress:0},o);
+      const count=(items)=>{const s=summarizeDownloads({packages:items,links:[],has_more:false});return [s.waiting,s.failed]};
+      return {
+        offline:count([mk({status:'Offline'})]), offlineJa:count([mk({status:'オフライン'})]), offlineLower:count([mk({status:' offline '})]),
+        notfound:count([mk({status:'ファイルが見つかりません'})]), both:count([mk({status:'File not found (Offline)'})]),
+        err:count([mk({status:'エラー: オフライン'})]), failed:count([mk({status:'Failed'})]), plain:count([mk({status:''})]),
+        runningOffline:(()=>{const s=summarizeDownloads({packages:[mk({status:'Offline',running:true,speed_bytes:5})],links:[],has_more:false});return [s.running,s.failed]})(),
+        finishedErr:(()=>{const s=summarizeDownloads({packages:[mk({status:'Error',finished:true})],links:[],has_more:false});return [s.finished,s.failed]})()}}""")
+    assert res["offline"] == [1, 0] and res["offlineJa"] == [1, 0] and res["offlineLower"] == [1, 0], res
+    assert res["notfound"] == [0, 1] and res["both"] == [0, 1] and res["err"] == [0, 1] and res["failed"] == [0, 1], res
+    assert res["plain"] == [1, 0] and res["runningOffline"] == [1, 0] and res["finishedErr"] == [1, 0], res
+    # on the page: the counts, the 待機 filter shows the Offline item, the 失敗 filter does not
+    _fake_downloads(ph, [{"name": "Pack Offline", "status": "Offline"}, {"name": "Pack Gone", "status": "ファイルが見つかりません"}])
+    txt = ph.js("()=>({w:$('dlCountWaiting').textContent,f:$('dlCountFailed').textContent})")
+    assert txt == {"w": "2", "f": "1"}, txt
+    ph.js("()=>{setFilter('waiting')}")
+    names = ph.js("[...document.querySelectorAll('#downloadList .download-card .row-name')].map(e=>e.textContent)")
+    assert "Pack Offline" in names and "Pack Gone" not in names, names
+    ph.js("()=>{setFilter('failed')}")
+    names = ph.js("[...document.querySelectorAll('#downloadList .download-card .row-name')].map(e=>e.textContent)")
+    assert names == ["Pack Gone"], names
+    ph.js("()=>{setFilter('all');state.engine=Object.assign({},state.engine,{phase:'stopped'});state.snapshot=null;state.downloadsSig='';renderDownloads()}")
+
+
+@scenario("recent-cleared-on-logout")
+def recent_cleared_on_logout(ph):
+    """v0.1.63: 最近見たページ is this device's history; logging out clears it (a shared device), and the next login
+    starts with none. The tab strip / session data go as before."""
+    ph.open("/article.html")
+    ph.wait(lambda: "E2E テスト記事" in ph.mirror_text(), 15, "mirror content")
+    ph.wait(lambda: ph.js("(localStorage.getItem('qnapdl.recent.v1')||'').includes('article.html')"), 8, "the visited page is remembered")
+    _app(ph, "#/home")
+    ph.wait(lambda: ph.js("document.querySelectorAll('#homeRecentList .recent-row').length") >= 1, 5, "a recent page on the home screen")
+    ph.js("()=>logout()")
+    ph.wait(lambda: not ph.js("state.authed"), 10, "logged out")
+    ph.take_errors("status of 401")            # the state long-poll answers 401 once the session is gone
+    assert ph.js("localStorage.getItem('qnapdl.recent.v1')") is None, "the history survived the logout"
+    ph.login()
+    ph.wait(lambda: ph.js("state.authed === true"), 10, "logged in again")
+    _app(ph, "#/home")
+    ph.page.wait_for_timeout(400)
+    assert ph.js("document.querySelectorAll('#homeRecentList .recent-row').length") == 0, "recent pages after a new login"
+    assert ph.js("document.getElementById('homeRecent').hidden"), "the recent block is shown with nothing in it"
+
+
+@scenario("desktop-pt-keys", device="desktop")
+def desktop_pt_keys(ph):
+    """v0.1.63 PC: inside the passthrough frame (another origin, so its key / mouse / wheel events never reach the app) Alt+←/→,
+    mouse buttons 4 / 5 and a sideways wheel swipe step the app's history, Ctrl+L focuses the app's address bar and Ctrl+R
+    reloads through the app. pt-helper.js posts the intent; the app checks origin and source as for every message."""
+    ph.require_mouse()
+    _pt_local(ph)
+    fr = _pt_open(ph)
+    fr.locator("#l2").click()
+    ph.wait(lambda: _pt_cur(ph).endswith("/ptx/page2.html"), 10, "link followed")
+    ph.wait(lambda: "PT-FIXTURE-PAGE-2" in (_pt_frame(ph).locator("#t").inner_text() if _pt_frame(ph).locator("#t").count() else ""), 10, "second page drawn")
+    ph.page.wait_for_timeout(600)
+
+    def frame():
+        return _pt_frame(ph)
+    frame().locator("#t").click()                       # keyboard focus inside the frame
+    ph.press("Alt+ArrowLeft")
+    ph.wait(lambda: _pt_cur(ph) == PT_PAGE, 8, "Alt+← inside the frame went back (url=%s)" % _pt_cur(ph))
+    ph.wait(lambda: frame().locator("#t").count() > 0 and frame().locator("#t").inner_text() == "PT-FIXTURE-PAGE", 10, "first page drawn")
+    ph.page.wait_for_timeout(500)
+    frame().locator("#t").click()
+    ph.press("Alt+ArrowRight")
+    ph.wait(lambda: _pt_cur(ph).endswith("/ptx/page2.html"), 8, "Alt+→ inside the frame went forward")
+    ph.wait(lambda: frame().locator("#t").count() > 0 and "PAGE-2" in frame().locator("#t").inner_text(), 10, "second page drawn (2)")
+    ph.page.wait_for_timeout(500)
+    # mouse buttons 4 / 5 inside the frame: cancelled, one step
+    out = frame().evaluate("""()=>{const o=[];for(const t of ['mousedown','mouseup','auxclick']){const e=new MouseEvent(t,{button:3,bubbles:true,cancelable:true});
+      document.body.dispatchEvent(e);o.push(e.defaultPrevented)}return o}""")
+    assert all(out), "mouse button 4 in the frame was not cancelled: %s" % out
+    ph.wait(lambda: _pt_cur(ph) == PT_PAGE, 8, "mouse button 4 inside the frame went back")
+    ph.wait(lambda: frame().locator("#t").count() > 0 and frame().locator("#t").inner_text() == "PT-FIXTURE-PAGE", 10, "first page drawn (2)")
+    ph.page.wait_for_timeout(500)
+    # a sideways wheel swipe over the frame = forward (fingers to the left = deltaX > 0)
+    box = ph.page.locator("#ptFrame").bounding_box()
+    ph.page.mouse.move(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
+    for _ in range(4):
+        ph.page.mouse.wheel(70, 0)
+        ph.page.wait_for_timeout(25)
+    ph.wait(lambda: _pt_cur(ph).endswith("/ptx/page2.html"), 8, "a sideways swipe over the frame went forward (url=%s)" % _pt_cur(ph))
+    ph.wait(lambda: frame().locator("#t").count() > 0 and "PAGE-2" in frame().locator("#t").inner_text(), 10, "second page drawn (3)")
+    # Ctrl+L: the app's address bar gets the focus from inside the frame; Ctrl+R reloads through the app (no app reload)
+    ph.js("window.__noReload = 'still here'")
+    frame().locator("#t").click()
+    ph.press("Control+l")
+    ph.wait(lambda: ph.js("document.activeElement && document.activeElement.id") == "omnibox", 5, "Ctrl+L in the frame focused the address bar")
+    ph.press("Escape")
+    frame().locator("#t").click()
+    hits = len(ph.env.fx.pt_seen)
+    ph.press("Control+r")
+    ph.wait(lambda: len(ph.env.fx.pt_seen) > hits, 10, "Ctrl+R in the frame reloaded the page through the passthrough")
+    assert ph.js("window.__noReload") == "still here", "Ctrl+R reloaded the app"
+    assert ph.js("state.route.view") == "tab"
