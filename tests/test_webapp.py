@@ -170,6 +170,49 @@ class HttpTests(unittest.TestCase):
                 self.assertEqual(self.req("/api/rb/tabs", {"url": url})[0], 400)
         self.assertEqual([c for c in self.rb_fake.docker_calls() if c[0] == "run"], [])
 
+    def test_v0159_tabs_validates_in_the_same_request_and_returns_the_first_copy(self):
+        self.login()
+        # validation is folded into the tabs request: the same 400 the validate endpoint gives
+        _, expected = self.req("/api/browser/validate?url=" + urllib.parse.quote("http://example.com/"))
+        code, body = self.req("/api/rb/tabs", {"url": "http://example.com/", "first": "mirror"})
+        self.assertEqual(code, 400)
+        self.assertEqual(body["error"], expected["error"])
+        self.assertEqual(self.req("/api/rb/tabs", {"url": "https://example.com/", "first": "tiles"})[0], 400)
+        self.assertEqual(self.req("/api/rb/tabs", {"url": "https://example.com/", "view": {"width": 5}})[0], 400)
+        self.assertEqual(self.server.rb._tabs, {})                     # nothing was created by a refused request
+        copy = {"rev": 4, "doc": "/api/rb/mirror/doc?tab=b1&rev=4", "stats": {"nodes": 9}}
+
+        def page_loads():
+            for _ in range(200):
+                if self.server.rb._tabs:
+                    break
+                time.sleep(0.01)
+            time.sleep(0.1)
+            self.rb_ws.emit("Page.frameStartedLoading", {"frameId": "F"}, "SESSION1")
+            self.rb_ws.emit("Page.frameNavigated", {"frame": {"url": "https://example.com/a"}}, "SESSION1")
+            self.rb_ws.emit("Page.domContentEventFired", {}, "SESSION1")
+
+        loader = threading.Thread(target=page_loads)
+        loader.start()
+        with patch.object(self.server.rb, "mirror", return_value=copy) as mirror:
+            code, tab = self.req("/api/rb/tabs", {"url": "https://example.com/a", "first": "mirror",
+                                                  "view": {"width": 390, "height": 700, "dpr": 3}})
+        loader.join()
+        self.assertEqual(code, 201)
+        self.assertEqual((tab["id"], tab["url"]), ("b1", "https://example.com/a"))
+        self.assertEqual(tab["first"]["mirror"], copy)
+        self.assertTrue(tab["first"]["meta"]["dcl"])
+        mirror.assert_called_once_with("b1", full=False, partial=True)
+        self.assertEqual(self.rb_ws.calls("Emulation.setDeviceMetricsOverride")[0]["params"]["width"], 390)
+        # without `first` the answer is the old one
+        code, plain = self.req("/api/rb/tabs", {"url": "https://example.com/b"})
+        self.assertEqual((code, sorted(plain)), (201, ["id", "url"]))
+        # navigate takes the same two options
+        self.assertEqual(self.req("/api/rb/navigate", {"tab": "b1", "url": "https://example.org/", "first": "x"})[0], 400)
+        code, moved = self.req("/api/rb/navigate", {"tab": "b2", "url": "https://example.org/",
+                                                    "view": {"width": 390, "height": 700, "dpr": 3}})
+        self.assertEqual((code, sorted(moved)), (200, ["id", "url"]))
+
     def test_rb_tab_frame_input_links_close_flow(self):
         self.login()
         code, tab = self.req("/api/rb/tabs", {"url": "https://example.com/a"})
@@ -491,7 +534,7 @@ class HttpTests(unittest.TestCase):
                                          headers={"Host": "192.168.68.57:17864"})
         with self.client.open(request, timeout=4) as response:
             self.assertEqual(response.status, 200)
-            self.assertEqual(json.load(response)["version"], "0.1.58")
+            self.assertEqual(json.load(response)["version"], "0.1.59")
         with self.client.open(self.url + "/icon.svg", timeout=4) as response:
             self.assertEqual(response.status, 200)
             self.assertEqual(response.headers.get_content_type(), "image/svg+xml")
@@ -1405,7 +1448,7 @@ class HttpTests(unittest.TestCase):
         self.assertFalse(info["supported"])
         code, _ = self.req("/api/update/apply", {"version": "v0.1.8"})
         self.assertEqual(code, 400)
-        self.assertEqual(self.req("/api/health")[1]["version"], "0.1.58")
+        self.assertEqual(self.req("/api/health")[1]["version"], "0.1.59")
         self.assertFalse(self.req("/api/jd2/status")[1]["connected"])
         self.assertEqual(self.req("/api/jd2/update/apply", {"confirmed": True})[0], 400)
         self.assertEqual(self.req("/api/jd2/preset/apply", {"confirmed": True})[0], 400)

@@ -161,6 +161,8 @@ SNAP_CDP_TIMEOUT = 20.0
 TAP_NAV_WAIT = 0.6             # after a click: wait this long for a navigation to start
 TAP_SETTLE_MAX = 10.0          # ... and at most this long for it to finish
 META_WAIT_MAX = 10.0
+FIRST_WAIT_MAX = 8.0           # v0.1.59: a tab-open / navigate request may wait this long for the first copy
+FIRST_WAITERS_MAX = 4          # v0.1.59: at most this many requests wait for a first copy at once
 SNAP_ID = re.compile(r"s[0-9]{1,9}\Z")
 SNAP_URL_MAX = 2048
 CHALLENGE_TITLES = ("just a moment", "しばらくお待ちください")
@@ -1097,6 +1099,7 @@ class Tab:
         self.client_dpr = 2.0      # the viewer's device pixel ratio (image choice)
         self.timeline = None       # v0.1.54: rb_firstload.Timeline of the page open (RAM only)
         self.dcl = False           # v0.1.54: DOMContentLoaded fired for the current document
+        self.nav_same_doc = False  # v0.1.59: the last navigate() only changed the #fragment (no new document, no DCL)
         self.selftest = False      # v0.1.44: opened by the self-test (not a user tab; closed at its end)
         self.fixture = None        # self-test fixture tab: callable(url) -> (status, content type, bytes) | None
 
@@ -1226,6 +1229,7 @@ class RemoteBrowser:
         self._spare = None         # {"target", "session", "view", "ads", "at"} of the waiting blank tab
         self._spare_lock = threading.Lock()
         self._spare_pending = False
+        self._first_waiters = threading.BoundedSemaphore(FIRST_WAITERS_MAX)   # v0.1.59
         self._last_view = None     # (width, height, dpr, quality mode) of the newest viewport the phone set
 
     @staticmethod
@@ -2088,7 +2092,7 @@ class RemoteBrowser:
             raise TabGone("このタブはすでに閉じられています")
         return tab
 
-    def open_tab(self, url, selftest=None):
+    def open_tab(self, url, selftest=None, view=None):
         """Opens a tab. `selftest` (v0.1.44, only the self-test passes it) is a dict: the tab is marked as a
         self-test tab (not counted as a user tab) and, with a "fixture" callable, `url` is a virtual page
         under SELFTEST_ORIGIN that the Hub itself answers (no validation of user input is skipped:
@@ -2126,15 +2130,38 @@ class RemoteBrowser:
             if not running:
                 self._start()
                 self.wd.succeeded()       # a pending automatic restart is done by this open
-            created = self._create_tab(checked, selftest, timeline)
+            created = self._create_tab(checked, selftest, timeline, self.parse_view(view))
             debuglog.log("rb", "info", "tab open", {"tab": created.get("id"), "host": self._host_of(checked),
                                                     "selftest": selftest is not None})
             return created
 
-    def _create_tab(self, checked, selftest=None, timeline=None):
+    def parse_view(self, view):
+        """v0.1.59: {width,height,dpr[,quality]} sent with a tab-open / navigate request -> (w, h, dpr, mode) or None."""
+        if view is None:
+            return None
+        if not isinstance(view, dict):
+            raise BrowserError("viewが不正です")
+        width = self._dimension(view.get("width"), VIEWPORT_W, "width")
+        height = self._dimension(view.get("height"), VIEWPORT_H, "height")
+        dpr = view.get("dpr")
+        if (isinstance(dpr, bool) or not isinstance(dpr, (int, float)) or dpr != dpr or
+                not VIEWPORT_DPR[0] <= dpr <= VIEWPORT_DPR[1]):
+            raise BrowserError("dprは1〜3で指定してください")
+        quality = view.get("quality")
+        if quality is not None and (not isinstance(quality, str) or quality not in QUALITY_MODES):
+            raise BrowserError("画質はspeed・standard・highのいずれかで指定してください")
+        return (width, height, float(dpr), quality or DEFAULT_QUALITY)
+
+    def _create_tab(self, checked, selftest=None, timeline=None, view=None):
         if selftest is None and self._spare_enabled():
             adopted = self._adopt_spare(checked, timeline)
             if adopted is not None:
+                if view is not None:
+                    try:
+                        self.set_viewport(adopted["id"], view[0], view[1], view[2], view[3])
+                    except BrowserError as error:
+                        self.log("viewport of the adopted spare tab: %s" % error)
+                    adopted = dict(adopted, view=self._tabs[adopted["id"]].viewport is not None)
                 return adopted
         created = self._call("Target.createTarget", {
             "url": "about:blank", "newWindow": True,
@@ -2173,12 +2200,27 @@ class RemoteBrowser:
                         ("Emulation.setEmulatedMedia", REDUCED_MOTION)]
             if ads:
                 commands += self._ads_commands(True)
+            # v0.1.59: the viewer's size is applied before the navigation (no separate viewport request, no reflow)
+            vscale, vmobile, vcmds = None, False, ()
+            if view is not None and selftest is None:
+                vscale = min(view[2], QUALITY_MODES[view[3]][0])
+                vmobile = view[0] < MOBILE_WIDTH
+                vcmds = [("Emulation.setDeviceMetricsOverride", {
+                    "width": view[0], "height": view[1], "deviceScaleFactor": vscale, "mobile": vmobile})]
+                if vmobile:
+                    vcmds.append(("Emulation.setTouchEmulationEnabled", {"enabled": True}))
+                commands += vcmds
             if timeline is not None:
                 timeline.mark("target")
             commands.append(("Page.navigate", {"url": checked}))
             answers = self._call_many(commands, session)
+            view_ok = bool(vcmds)
             for (method, _), (_, error) in zip(commands, answers):
                 if error is None:
+                    continue
+                if method.startswith("Emulation.set") and method in [c[0] for c in vcmds]:
+                    view_ok = False
+                    self.log("%s failed: %s" % (method, error))
                     continue
                 if method in ("Page.enable", "Emulation.setFocusEmulationEnabled", "Page.navigate"):
                     raise BrowserError("ブラウザの操作に失敗しました（%s: %s）" % (method, error))
@@ -2191,11 +2233,18 @@ class RemoteBrowser:
                     ads = False
                     self.log("ad blocking failed: %s" % error)
             tab.ads = ads
+            if view_ok:
+                with self._lock:
+                    tab.viewport, tab.touch, tab.quality = (view[0], view[1], vscale, view[3]), vmobile, view[3]
+                    tab.client_dpr = view[2]
+                    self._last_view = (view[0], view[1], view[2], view[3])
         except BrowserError:
             self._drop_tab(tab, close=True)
             raise
         self._touch()
         self._spare_schedule()
+        if view is not None:
+            return {"id": tab.id, "url": checked, "view": tab.viewport is not None}   # v0.1.59: was the size applied?
         return {"id": tab.id, "url": checked}
 
     # ------------------------------------------------------------ spare tab (v0.1.54)
@@ -2455,16 +2504,58 @@ class RemoteBrowser:
         debuglog.log("rb", "info", "tab close", {"tab": ident})
         return True
 
-    def navigate(self, ident, url):
+    def navigate(self, ident, url, view=None):
         checked = browser_safety.validate(url)
+        view = self.parse_view(view)
         tab = self._tab(ident)
         self._touch()
+        if view is not None:
+            self.set_viewport(ident, view[0], view[1], view[2], view[3])    # v0.1.59: a no-op when unchanged
         tab.blocked = None
         tab.snap_gen += 1
+        # v0.1.59: a link to "#section" of this very page commits no document: nothing to wait for
+        tab.nav_same_doc = "#" in checked and checked.split("#")[0] == (tab.url or "").split("#")[0]
         tab.dcl = False
         tab.timeline = rb_firstload.Timeline(self._clock, tab.timeline.kind if tab.timeline else "mirror")
         self._call("Page.navigate", {"url": checked}, session=tab.session)
         return {"id": tab.id, "url": checked}
+
+    # ------------------------------------------------------------ first copy inline (v0.1.59)
+    def wait_first(self, ident, kind, timeout=FIRST_WAIT_MAX):
+        """After a tab open / navigation: waits (at most `timeout` s, and only while one of FIRST_WAITERS_MAX
+        slots is free) until the new document reached DOMContentLoaded, then makes the first mirror copy
+        (kind "mirror", partial) or reader extraction (kind "reader") and returns it with the tab metadata the
+        viewer would otherwise long-poll for: {"meta": ..., "mirror" | "reader": data | None}. Anything that
+        goes wrong (timeout, busy, capture error) yields data None: the viewer then continues as before."""
+        if kind not in ("mirror", "reader"):
+            raise BrowserError("firstはmirrorまたはreaderを指定してください")
+        tab = self._tab(ident)
+        data = None
+        if not tab.nav_same_doc and self._first_waiters.acquire(blocking=False):
+            try:
+                deadline = time.monotonic() + max(0.0, min(float(timeout), FIRST_WAIT_MAX))
+                with self._cv:
+                    while self._tabs.get(tab.id) is tab and self._state == "running":
+                        tl = tab.timeline
+                        if tl is not None and tl.has("commit") and (tab.dcl or not tab.loading):
+                            break
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            tl = None
+                            break
+                        self._cv.wait(min(remaining, 0.5))
+                    else:
+                        tl = None
+                if tl is not None:
+                    try:
+                        data = self.mirror(tab.id, full=False, partial=True) if kind == "mirror" \
+                            else self.reader(tab.id)
+                    except BrowserError as error:
+                        debuglog.log("render", "info", "first copy inline failed", {"tab": tab.id, "kind": kind,
+                                                                                     "error": str(error)[:120]})
+            finally:
+                self._first_waiters.release()
+        return {"meta": self.page_meta(tab.id, wait=0), kind: data}
 
     # ------------------------------------------------------------ first-load timeline (v0.1.54)
     @staticmethod
@@ -2482,14 +2573,14 @@ class RemoteBrowser:
         tl = tab.timeline
         return None if tl is None else tl.breakdown(stages, capture_kind)
 
-    def first_load_report(self, ident, marks):
+    def first_load_report(self, ident, marks, rtts=None):
         """The phone's marks (ms since the tap) merged into the timeline; logs and returns the breakdown."""
         tab = self._tab(ident)
         tl = tab.timeline
         if tl is None or not isinstance(marks, dict):
             raise BrowserError("計測データがありません")
         if not tl.reported:
-            tl.set_client(marks)
+            tl.set_client(marks, rtts)
             data = tl.breakdown()
             debuglog.log("render", "info", "first load", rb_firstload.debug_fields(data))
         else:

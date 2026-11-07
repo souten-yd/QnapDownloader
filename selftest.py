@@ -29,8 +29,8 @@ import diskio
 import rb_firstload
 import rb_resident
 
-HARD_TIMEOUT = 240.0           # seconds for the whole run
-CLIENT_WAIT = 90.0             # how long the server waits for the phone's measurements
+HARD_TIMEOUT = 300.0           # seconds for the whole run
+CLIENT_WAIT = 150.0             # how long the server waits for the phone's measurements
 HISTORY_MAX = 5                # finished runs kept in RAM
 MAX_URLS = 5
 SITES_DEADLINE = 190.0         # no new real site is started after this many seconds
@@ -52,7 +52,7 @@ PASS, WARN, FAIL, SKIP = "pass", "warn", "fail", "skip"
 STATUSES = (PASS, WARN, FAIL, SKIP)
 
 SECTIONS = (("env", "環境"), ("browser", "NASブラウザ起動"), ("builtin", "内蔵テストページ"),
-            ("client", "この端末（スマホ）"), ("swipe", "スワイプ（自動）"), ("swipe_manual", "スワイプ（手動）"),
+            ("client", "この端末（スマホ）"), ("response", "操作の応答"), ("swipe", "スワイプ（自動）"), ("swipe_manual", "スワイプ（手動）"),
             ("sites", "実サイト"), ("pt", "パススルー"),
             ("cleanup", "後片付け"))
 SECTION_LABEL = dict(SECTIONS)
@@ -93,6 +93,17 @@ CLIENT_READER_WARN_MS = 1500
 CLIENT_MIRROR_LOAD_WARN_MS = 4000
 CLIENT_MORPH_WARN_MS = 300
 CLIENT_TILE_WARN_MS = 4000
+# v0.1.59: 「操作の応答」 (responsiveness of the app on this phone)
+RESPONSE_IDS = ("client.route", "client.toggle", "client.idle", "client.open_rtt")
+CLIENT_ROUTE_WARN_MS = 250        # hash change -> target view visible (all local: no request is needed)
+CLIENT_ROUTE_FAIL_MS = 1500
+CLIENT_TOGGLE_WARN_MS = 100       # tap on a settings switch -> the change is visible (optimistic, before the reply)
+CLIENT_TOGGLE_FAIL_MS = 300
+IDLE_STATE_PASS = 3               # /api/state answers in 30 s with nothing happening
+IDLE_STATE_WARN = 6
+IDLE_TOTAL_WARN = 15              # all /api requests in the same 30 s
+OPEN_RTT_PASS = 3                 # requests between the tap and the first paint of a page (mirror)
+OPEN_RTT_WARN = 5
 
 # -------------------------------------------------------------------------------------------- hints
 # Concrete Japanese advice for every check that is not a pass (key: check id, optionally "id:variant").
@@ -137,6 +148,10 @@ HINTS = {
     "client.tiles": "高速表示のタイルの表示が遅いです。Hubへの通信速度を確認し、画質を速度優先にしてください。",
     "client.live": "ライブ表示のフレームが届きません。経路（プロキシ）がストリームを溜め込んでいる可能性があります。この結果を開発者へ送ってください。",
     "client.live:polling": "ストリーム（MJPEG・SSE）がこの端末へ届かず、静止画ポーリング（5fps未満）で動いています。経由しているプロキシがストリームを溜め込んでいる可能性があります。画質を速度優先にし、この結果を開発者へ送ってください。",
+    "client.route": "画面の切り替えが遅いです（通信なしで切り替わるはずです）。この端末の負荷（他のタブ・アプリ）を確認し、この結果を開発者へ送ってください。",
+    "client.toggle": "スイッチを押してから見た目が変わるまでが遅いです。端末が忙しいか、画面の描き直しが重い可能性があります。この結果を開発者へ送ってください。",
+    "client.idle": "何もしていないのにHubへの問い合わせが多いです（/api/state が30秒に3回を超えています）。NASブラウザのメモリ表示などが変化として扱われている可能性があります。デバッグログを有効にしてこの結果を開発者へ送ってください。",
+    "client.open_rtt": "ページを開くまでの通信回数が多いです（3回以内が目標）。Hubが古い版のままか、先読みが効いていません。この結果を開発者へ送ってください。",
     "client.error": "端末側のテストが途中で止まりました。この結果を開発者へ送ってください。",
     "client.missing": "端末側の結果が届きませんでした（画面を閉じた・通信が切れた等）。もう一度実行してください。",
     "site.open": "ページの読み込み（DOMContentLoaded）が遅いか、完了しませんでした。NASの回線か、サイト側の混雑かもしれません。",
@@ -151,7 +166,7 @@ HINTS = {
     "swipe.display": "要求した表示に切り替わりませんでした（リーダー抽出に失敗すると高速表示になります）。そのモードの判定は参考値です。",
     "swipe.history": "表示の切り替えや戻る操作でブラウザの履歴が増えました。戻る操作が何度も必要になる原因です。この結果を開発者へ送ってください。",
     "run.error": "セルフテストが途中で例外になりました。この結果を開発者へ送ってください。",
-    "run.timeout": "4分の上限に達したため途中で終了しました。NASの負荷が高い可能性があります。",
+    "run.timeout": "5分の上限に達したため途中で終了しました。NASの負荷が高い可能性があります。",
 }
 
 for _sid, _text in rb_firstload.HINTS.items():
@@ -169,11 +184,15 @@ CLIENT_NAMES = {
     "client.mirror_morph": "ミラーの差し替え",
     "client.tiles": "高速表示（タイル）",
     "client.live": "ライブ表示の受信",
+    "client.route": "画面の切り替え時間",
+    "client.toggle": "スイッチの反応（押してから見た目が変わるまで）",
+    "client.idle": "待機中の通信量（30秒）",
+    "client.open_rtt": "ページを開くまでの通信回数",
     "client.error": "端末側のエラー",
 }
 CLIENT_ID = re.compile(r"client\.[a-z_]{1,24}\Z")
 RUN_ID = re.compile(r"[A-Za-z0-9_-]{8,40}\Z")
-NUM_KEYS = ("ms", "n", "kb", "fps", "fps_mjpeg", "fps_sse", "fps_poll")
+NUM_KEYS = ("ms", "n", "kb", "fps", "fps_mjpeg", "fps_sse", "fps_poll", "state", "total")
 
 
 class Busy(RuntimeError):
@@ -455,6 +474,33 @@ def client_evaluate(item):
                 parts.append("%s 届かず" % name_ if not _num(figure) or figure <= 0 else "%s %s fps" % (name_, _fmt(figure)))
         value = "経路: %s / %s fps / %s KB毎フレーム（%s）" % (label, _fmt(fps), _fmt(kb), "、".join(parts) or "測定なし")
         threshold = "ストリーム(MJPEG/SSE)が届くこと。ポーリングなら >= %g fps" % FPS_WARN
+    elif cid == "client.route":
+        status = FAIL if item.get("ok") is not True else rate(ms, CLIENT_ROUTE_WARN_MS, CLIENT_ROUTE_FAIL_MS)
+        value = "最も遅い %s ms（%s 画面）" % (_fmt(ms), _fmt(n))
+        threshold = "<= %d ms" % CLIENT_ROUTE_WARN_MS
+    elif cid == "client.toggle":
+        status = FAIL if item.get("ok") is not True else rate(ms, CLIENT_TOGGLE_WARN_MS, CLIENT_TOGGLE_FAIL_MS)
+        value = "見た目が変わるまで %s ms / Hubの確定まで %s ms" % (_fmt(ms), _fmt(n))
+        threshold = "<= %d ms（返事を待たずに変わること）" % CLIENT_TOGGLE_WARN_MS
+    elif cid == "client.idle":
+        state_n, total = item.get("state"), item.get("total")
+        if item.get("ok") is not True or not _num(state_n):
+            status = FAIL
+        elif state_n > IDLE_STATE_WARN:
+            status = FAIL
+        elif state_n > IDLE_STATE_PASS or (_num(total) and total > IDLE_TOTAL_WARN):
+            status = WARN
+        value = "/api/state %s 回 · 全通信 %s 回（%s 秒間）" % (_fmt(state_n), _fmt(total), _fmt(round(ms / 1000.0)) if _num(ms) else "?")
+        threshold = "/api/state <= %d 回 / 30秒" % IDLE_STATE_PASS
+    elif cid == "client.open_rtt":
+        if item.get("ok") is not True or not _num(n):
+            status = FAIL
+        elif n > OPEN_RTT_WARN:
+            status = FAIL
+        elif n > OPEN_RTT_PASS:
+            status = WARN
+        value = "%s 回 · %s ms（タップから最初の描画まで）" % (_fmt(n), _fmt(ms))
+        threshold = "<= %d 回" % OPEN_RTT_PASS
     else:
         status, value = FAIL, "エラー"
         threshold = ""
@@ -1106,7 +1152,8 @@ class SelfTest:
                 if item["id"] == "client.live":
                     run.info["live_transport"] = live_transport(item.get("flags"))
                     run.info["live_fps"] = item.get("fps")
-                self._add_locked(run, "client", result["id"], result["name"], result["status"],
+                self._add_locked(run, "response" if result["id"] in RESPONSE_IDS else "client", result["id"],
+                                 result["name"], result["status"],
                                  result["value"], result["threshold"], hint_key=result["id"],
                                  variant=result.get("variant"))
             run.client = "received"
@@ -1917,6 +1964,7 @@ class SelfTest:
                 run.client = "none"
             self._add(run, sec, "client.missing", "端末側のテスト", SKIP, "この実行では端末側を行いません")
             self._leave(run, sec, skipped=True)
+            self._leave(run, "response", skipped=True)
             return
         try:
             self.rb.selftest_goto(tab, "/anim")
@@ -1953,6 +2001,7 @@ class SelfTest:
             self._add(run, sec, "client.missing", "端末側のテスト", WARN,
                       "%d 秒待ちましたが結果が届きませんでした" % CLIENT_WAIT, "結果が届くこと")
         self._leave(run, sec)
+        self._leave(run, "response", skipped=not received)
 
     # ------------------------------------------------------------ swipe (automatic, on the phone)
     def _swipe_only(self, run, fixtures):

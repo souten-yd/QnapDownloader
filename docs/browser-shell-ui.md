@@ -355,3 +355,10 @@ Cloudflare等で手元のブラウザ（iframe）では開けないサイトを�
 - **最初のコピー**: 3秒タイマーではなくDOMContentLoadedで開始。要素が1500以上のページは、最初に2画面分より下を空きの箱にした部分コピーを出し、続けて全体に置き換えます。リーダーも同じ時点で抽出します（本文が先、画像は遅延）。
 - **リソース**: Hubが画像16枚・フォント4つを先読み（1タブ6並列）。URLは内容ハッシュ付きの固定URLで `Cache-Control: private, max-age=86400, immutable`、ETag/304、タブ・ページをまたいで共有（TTL10分・48MB）。端末は先頭画像のpreload、残りは `loading=lazy decoding=async`。`font-display:swap` を追加し、設定›ブラウザ「Webフォントを使わない（速い）」（既定ON）では文字用のWebフォントを外します（アイコンフォントは残す）。
 - **ブロックリスト**: 同梱の静的リストにタグ管理・解析・セッション記録・広告配信・SNS/コメント・チャット/プッシュ系を追加（ダウンロードはしません）。サイト別の広告ブロック切替はそのまま。
+
+## v0.1.59: 応答速度（状態の安定化・往復の削減・楽観的UI）
+- **状態の安定化**: `/api/state` の `rev` は「UIが反応すべき変化」でだけ進む。エンジンの `sig` は `state_hub.engine_signature()`（フェーズ・モード・導入/自動起動・手順・コンポーネント・コンテナ状態など、時刻やカウンタを含まない）、NASブラウザの `sig` は `rb_signature()`（フェーズ・タブ・理由文の数字を除いた文・常駐/ウォッチドッグの状態）で作る。メモリ%・待機時MiB・Hub RSS・ウォッチドッグのカウントダウン・イベント時刻は `rev` を進めない（`rb.mem/idle_mib/cur_mib` は10%/50MiBの丸め値で応答には載るが `rev` の計算から除く。正確な値は設定›ブラウザが取得する `/api/rb/status`）。待機中のソース読みは、エンジンが running/stopped/not_installed のとき `docker inspect` を最大5秒に1回（`ENGINE_TTL_STABLE`）、起動中・設定中は2秒。
+- **クライアントの更新**: `applyState` はダウンロード件数（と `can_send`）・エンジン `sig`・NASブラウザ `sig` が変わった部分だけ再描画する（件数が同じならホームやリンク一覧を描き直さない）。
+- **ページを開く往復**: `POST /api/rb/tabs`・`/api/rb/navigate`・`/api/rb/mirror/click`（リンクのとき）は本文に `view`（幅・高さ・dpr・画質。タブ作成ではナビゲーション前に適用、ステージが測れない間は前回の寸法かウィンドウ寸法）と `first`（`"mirror"`/`"reader"`）を受け取れる。URL検証は同じリクエストの中で行い（拒否時のメッセージは `/api/browser/validate` と同じ）、`first` があるとHubは最大8秒（`FIRST_WAIT_MAX`）DOMContentLoadedを待って最初のミラー部分コピー（またはリーダー抽出）を作り、`{first: {meta, mirror|reader}}` として返す（待てる要求は同時4件まで、`FIRST_WAITERS_MAX`。#だけの遷移は待たない）。時間切れ・失敗時は `mirror/reader: null` とメタだけを返し、端末は従来のポーリングに続ける。端末は最初のコピーを `rb.seed` に置き、表示ループが最初のメタ取得・viewport送信・コピー要求を省いて処理する。タップ→最初のミラー文字は `tabs` ＋ 文書の2往復（以前は validate・tabs・viewport・meta・meta×2・mirror・doc の約7往復）。
+- **往復数の計測**: 端末は `/api/`（長いポーリングと後追いの報告を除く）へのリクエスト数を数え、最初の描画までの数を `POST /api/rb/firstload` の `rtts` で報告する。速度表示の行に「往復 N回」が出る。
+- **楽観的UI**: 設定スイッチは `saveOption()` が先に `state.settings` を更新して画面へ反映し、保存中は `aria-busy` と淡い表示（`.is-saving`）だけ。失敗するとstateとスイッチを元に戻してエラーを出す。同じキーの保存は順番に送る。サイト別ルールのスイッチ・エンジン自動起動も同じ保存中表示。

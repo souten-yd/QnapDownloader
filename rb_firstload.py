@@ -64,6 +64,7 @@ class Timeline:
         self.kind = kind
         self.marks = {"req": 0}
         self.client = {}
+        self.rtts = None          # v0.1.59: HTTP requests the phone made between the tap and the first paint
         self.capture_ms = {}      # kind ("mirror" / "reader") -> duration of its first capture / extraction
         self.blocked = 0          # requests the ad/tracker block list cancelled on this page
         self.reported = False     # the phone's marks were merged
@@ -79,8 +80,10 @@ class Timeline:
     def has(self, name):
         return name in self.marks
 
-    def set_client(self, values):
-        """Merges the phone's marks (already validated numbers, milliseconds since the tap)."""
+    def set_client(self, values, rtts=None):
+        """Merges the phone's marks (already validated numbers, milliseconds since the tap) and its request count."""
+        if isinstance(rtts, int) and not isinstance(rtts, bool) and 0 <= rtts <= 999:
+            self.rtts = rtts
         for key in CLIENT_MARKS:
             value = values.get(key)
             if isinstance(value, (int, float)) and not isinstance(value, bool) and 0 <= value <= MARK_MAX_MS:
@@ -117,6 +120,7 @@ class Timeline:
             "load_ms": self.stage_ms("commit", "load"),
             "marks": dict(self.marks),
             "client": dict(self.client),
+            "rtts": self.rtts,
             "blocked": self.blocked,
         }
 
@@ -143,6 +147,8 @@ def line(data):
     tail = [("%s %.1fs" % (CLIENT_LABELS[k], client[k] / 1000.0)) for k in CLIENT_MARKS if k in client]
     if tail:
         text += (" │ " if text else "") + "端末(タップから) " + " · ".join(tail)
+    if data.get("rtts") is not None:
+        text += (" │ " if text else "") + "往復 %d回" % data["rtts"]
     load_ms = data.get("load_ms")
     if load_ms is not None:
         text += " │ load %.1fs" % (load_ms / 1000.0)
@@ -158,6 +164,7 @@ def debug_fields(data):
         out[row["id"]] = row["ms"]
     for key, value in (data.get("client") or {}).items():
         out["c_" + key] = value
+    out["rtts"] = data.get("rtts")
     out["load"] = data.get("load_ms")
     out["blocked"] = data.get("blocked", 0)
     return out

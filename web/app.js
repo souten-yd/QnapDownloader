@@ -125,7 +125,7 @@ const state = {
   filter: "all", query: "", downloadsFails: 0,
   dlRunning: null, expanded: new Set(),
   live: null, stateRev: null, stateGen: 0, stateRunning: false, stateAbort: null, stateFails: 0,
-  settingsRev: null, engineSig: "", rbSig: "", localWriteAt: 0,
+  settingsRev: null, engineSig: "", rbSig: "", localWriteAt: 0, dlKey: null, lastStage: null,
   settings: null, jd2: null, queueData: null, pasteSeq: 0, pasteTimer: null, paste: null,
   pickerOpen: false, stepsMode: "",
   selectedVersion: "", selectedChannel: "rc",
@@ -311,6 +311,26 @@ function swrReset() {
 }
 
 // ---------------------------------------------------------------------- API
+// v0.1.59: HTTP requests to /api/ that the app made (long-polls of the state and background reports excluded):
+// the first-load line shows how many were needed between the tap and the first paint.
+const RTT_PASSIVE = /^\/api\/(state|debug\/log|rb\/firstload|rb\/mirror\/res|rb\/mirror\/release|rb\/snapshot\/release|selftest\/)/;
+let rttCount = 0;
+const reqStats = {state: 0, all: 0};          // v0.1.59: idle-traffic probe of the self-test
+if (typeof window.fetch === "function") {
+  const nativeFetch = window.fetch.bind(window);
+  window.fetch = function (input, init) {
+    try {
+      const path = new URL(typeof input === "string" ? input : input.url, location.href).pathname;
+      if (path.startsWith("/api/")) {
+        if (!path.startsWith("/api/selftest/") && path !== "/api/debug/log") reqStats.all++;
+        if (path === "/api/state") reqStats.state++;
+        else if (!RTT_PASSIVE.test(path)) rttCount++;
+      }
+    } catch (e) { /* counting only */ }
+    return nativeFetch(input, init);
+  };
+}
+
 async function api(path, body = null, extra = null) {
   const headers = {};
   const opts = Object.assign({credentials: "same-origin", headers}, extra || {});
@@ -1007,7 +1027,7 @@ function newRbRecord(id, tab) {
     readerEarly: "", readerFail: null, readerErr: false, tilesFor: "", snapEarly: "", loadUrl: "", loadSince: 0,
     mirror: null, mirrorBusy: false, mirrorAgain: false, mirrorPending: false, mirrorEarly: "", mirrorFail: null, mirrorFollow: false, tl: null,
     mirrorAt: 0, mirrorMs: 0, mirrorTimer: 0, mirrorTouch: false, mirrorDeferred: false, mirrorPos: {},
-    stream: null, streamFailed: false, perf: {}};
+    stream: null, streamFailed: false, perf: {}, seed: null, firstPending: false, heldMeta: null, vpSent: null};
 }
 
 // v0.1.43: after a reload of this page the NAS tab usually still exists: use it again instead of
@@ -1036,8 +1056,8 @@ async function reattachRemote(tab) {
 // ---- first-load timeline (v0.1.54): milliseconds since the tap, sent once to the Hub (POST
 // /api/rb/firstload), which merges them with its own stages, logs them (category render) and answers the
 // breakdown line shown in the speed overlay.
-function tlStart(rb, t0, createdAt) {
-  rb.tl = {t0, marks: {}, sent: false, result: null};
+function tlStart(rb, t0, createdAt, r0) {
+  rb.tl = {t0, marks: {}, sent: false, result: null, r0: Number.isFinite(r0) ? r0 : rttCount, rtts: null};
   if (createdAt) tlMark(rb, "created", createdAt);
 }
 
@@ -1051,7 +1071,7 @@ function tlFlush(rb) {
   const tl = rb && rb.tl;
   if (!tl || tl.sent) return;
   tl.sent = true;
-  api("/api/rb/firstload", {tab: rb.id, marks: tl.marks}).then(data => {
+  api("/api/rb/firstload", {tab: rb.id, marks: tl.marks, rtts: tl.rtts}).then(data => {
     if (rb.tl !== tl || !data || typeof data.line !== "string") return;
     tl.result = data;
     dlog("render", "info", "first load line", {line: data.line.slice(0, 200)});
@@ -1066,6 +1086,7 @@ function tlWatchMirror(rb, doc) {
   if (!tl || tl.sent || tl.watching) return;
   tl.watching = true;
   tlMark(rb, "doc");
+  tl.rtts = rttCount - tl.r0;
   const view = doc.defaultView;
   const height = (view && view.innerHeight) || 800;
   const began = performance.now();
@@ -1093,6 +1114,7 @@ function tlWatchReader(rb) {
   if (!tl || tl.sent || tl.watching) return;
   tl.watching = true;
   tlMark(rb, "doc");
+  tl.rtts = rttCount - tl.r0;
   const scroller = $("readerScroll");
   const height = scroller.clientHeight || 800;
   const began = performance.now();
@@ -1121,21 +1143,67 @@ function firstLoadLine(rb) {
   return "";
 }
 
+// v0.1.59: the viewer's size sent along with a tab-open / navigate request (the Hub applies it before the page
+// loads, so no separate /api/rb/viewport round trip). When the stage cannot be measured (the tab view is not
+// shown yet) the last measured size, else the window size, is used; the viewport loop corrects it afterwards.
+const STAGE_KEY = "qd.stage";
+function rememberStage(view) {
+  const same = state.lastStage && state.lastStage.width === view.width && state.lastStage.height === view.height &&
+    state.lastStage.dpr === view.dpr;
+  state.lastStage = view;
+  if (!same) writeLocal(STAGE_KEY, JSON.stringify(view));
+}
+function recallStage() {
+  try {
+    const v = JSON.parse(readLocal(STAGE_KEY) || "null");
+    if (v && Number.isInteger(v.width) && Number.isInteger(v.height) && Number(v.dpr) >= 1 &&
+        v.width >= 320 && v.width <= 1600 && v.height >= 320 && v.height <= 2400) return {width: v.width, height: v.height, dpr: Number(v.dpr)};
+  } catch (e) { /* none */ }
+  return null;
+}
+
+function rbViewBody() {
+  let view = stageViewport();
+  if (view) rememberStage(view);
+  else view = state.lastStage || recallStage();
+  if (!view) {
+    const dpr = Math.min(3, Math.max(1, Number(window.devicePixelRatio) || 1));
+    view = {width: Math.min(1600, Math.max(320, document.documentElement.clientWidth || 390)),
+      height: Math.min(2400, Math.max(320, (window.innerHeight || 800) - 130)), dpr: Math.round(dpr * 100) / 100};
+  }
+  return Object.assign({quality: state.rbQuality}, view);
+}
+
+function rbViewKey(view) {
+  return view.width + "x" + view.height + "@" + view.dpr + "/" + view.quality;
+}
+
+// The display a page opened in `tab` will be shown with, decided before the tab exists (v0.1.59).
+function plannedDisplay(tab, url) {
+  if (tab.diag && tab.diag.mode) return tab.diag.mode;
+  const remembered = DISPLAY_OF_MODE[rememberedMode(hostOf(url))];
+  if (remembered) return remembered;
+  return DISPLAY_OF_SETTING[state.settings && state.settings.rb_default_mode] || "tiles";
+}
+
+// opts.validated: `value` already came from validateUrl(); otherwise the Hub validates it inside the tabs /
+// navigate request itself (v0.1.59: no separate /api/browser/validate round trip) and answers the canonical URL.
 async function openRemote(tab, value, commit, opts = {}) {
   ensureRemote();
   const tapAt = performance.now();
+  const r0 = rttCount;
   let madeAt = 0;
   const token = ++tab.token;
   tab.error = "";
   tab.notReady = false;
   tab.loading = true;
   updateChrome();
-  let url;
+  let url = value, reply = null, view = null, first = null;
   try {
-    url = opts.validated ? value : await validateUrl(value);
-    if (token !== tab.token || !state.tabs.includes(tab)) return;
     if (state.rbReady === false) {
       // Not set up (or the image is outdated): one clear state in the tab, nothing is started.
+      url = opts.validated ? value : await validateUrl(value);
+      if (token !== tab.token || !state.tabs.includes(tab)) return;
       commit(url);
       tab.current = url;
       tab.notReady = true;
@@ -1146,36 +1214,91 @@ async function openRemote(tab, value, commit, opts = {}) {
     }
     if (!state.settings) await loadSettings().catch(() => {});   // the default display comes from Settings
     if (token !== tab.token || !state.tabs.includes(tab)) return;
+    view = rbViewBody();
+    const planned = plannedDisplay(tab, value);
+    first = planned === "mirror" || planned === "reader" ? planned : null;
+    const body = {url: value, view};
+    if (first) body.first = first;
     if (tab.rb) {
+      const rb = tab.rb;
+      rb.firstPending = Boolean(first);       // the loop must not fetch the same first copy a second time
       try {
-        await api("/api/rb/navigate", {tab: tab.rb.id, url});
+        reply = await api("/api/rb/navigate", Object.assign({tab: rb.id}, body));
       } catch (e) {
+        firstDone(tab, rb, null);
         if (e.status !== 404) throw e;
         tab.rb = null;   // closed on the NAS meanwhile (idle stop): open a fresh one
       }
     }
     if (!tab.rb) {
-      const made = await api("/api/rb/tabs", {url});
+      reply = await api("/api/rb/tabs", body);
       madeAt = performance.now();
       if (token !== tab.token || !state.tabs.includes(tab)) {
-        api("/api/rb/tabs/close", {id: made.id}).catch(() => {});
+        api("/api/rb/tabs/close", {id: reply.id}).catch(() => {});
         return;
       }
-      tab.rb = newRbRecord(made.id, tab);
+      tab.rb = newRbRecord(reply.id, tab);
+      tab.rb.vp = reply.view === true ? rbViewKey(view) : "";
+      tab.rb.vpSent = reply.view === true ? view : null;
     }
+    if (typeof reply.url === "string") url = reply.url;
   } catch (e) {
+    if (tab.rb) firstDone(tab, tab.rb, null);
     if (token === tab.token) { tab.loading = false; tab.error = e.message; updateChrome(); }
     throw e;
   }
+  if (tab.rb) { tab.rb.firstPending = false; tab.rb.heldMeta = null; }
+  // (before commit(): updateChrome() may already start the display loop, which takes the seed at its start)
+  if (first && reply.first && typeof reply.first === "object") tab.rb.seed = {kind: first, first: reply.first};
   commit(url);
   tab.current = url;
   tab.loading = false;
   tab.rb.seq = 0;
   tab.rb.rev = null;
-  tlStart(tab.rb, tapAt, madeAt);
+  tlStart(tab.rb, tapAt, madeAt, r0);
   saveTabs();
   swrDrop("rb-status");
   refreshAfterTabChange();
+  if (tab.rb.seed) applySeed(tab);        // a loop that was already running takes the first copy now
+}
+
+// v0.1.59: the request that carried (or should have carried) the first copy is over. With a copy: use it. Without
+// one: the metadata the loop had to hold back meanwhile is handled now, as the loop would have done.
+function firstDone(tab, rb, seed) {
+  rb.firstPending = false;
+  const held = rb.heldMeta;
+  rb.heldMeta = null;
+  if (!tab || tab.rb !== rb) return;
+  if (seed) { applySeed(tab, seed); return; }
+  if (!held) return;
+  const display = tabDisplay(tab);
+  if (display === "mirror" && mirrorAction(rb, held, Date.now()) === "run") runMirror(tab, {quiet: true}).catch(() => {});
+  else if (display === "reader" && readerAction(rb, held, Date.now()) === "run") runReader(tab, {quiet: true}).catch(() => {});
+}
+
+// v0.1.59: the first copy / extraction that came with the tab-open / navigate answer, handled exactly like the
+// loop would handle the metadata and the capture it asks for next (without the requests).
+function takeSeed(rb, kind) {
+  const seed = rb && rb.seed;
+  if (!seed) return null;
+  rb.seed = null;
+  return seed.kind === kind ? seed : null;
+}
+
+function applySeed(tab, seed = null) {
+  const rb = tab && tab.rb;
+  if (!rb) return;
+  if (!seed) seed = takeSeed(rb, tabDisplay(tab));
+  if (!seed || !seed.first || !seed.first.meta) return;
+  rb.seed = null;
+  const meta = seed.first.meta;
+  applyRemoteMeta(tab, Object.assign({}, meta, {seq: rb.seq}));
+  if (tab.rb !== rb || tabDisplay(tab) !== seed.kind) return;
+  if (seed.kind === "mirror") {
+    if (mirrorAction(rb, meta, Date.now()) === "run") runMirror(tab, {quiet: true, prefetched: seed.first.mirror}).catch(() => {});
+  } else if (readerAction(rb, meta, Date.now()) === "run") {
+    runReader(tab, {quiet: true, prefetched: seed.first.reader}).catch(() => {});
+  }
 }
 
 // Free the NAS-side tab (renderer memory). Fire-and-forget; the Hub also
@@ -1474,8 +1597,19 @@ async function sendViewport(tab) {
   const rb = tab.rb;
   const view = stageViewport();
   if (!rb || !view) return;
+  rememberStage(view);
   const key = view.width + "x" + view.height + "@" + view.dpr + "/" + state.rbQuality;
   if (key === rb.vp) return;
+  // v0.1.59: the size sent with the tab-open request was an estimate (the stage was not on screen yet): a height
+  // that is a few pixels off does not matter for a copy or the reader text, so no extra request for it.
+  const sent = rb.vpSent;
+  rb.vpSent = null;
+  const display = tabDisplay(tab);
+  if (sent && sent.width === view.width && sent.dpr === view.dpr && sent.quality === state.rbQuality &&
+      Math.abs(sent.height - view.height) <= 80 && (display === "mirror" || display === "reader")) {
+    rb.vp = key;
+    return;
+  }
   rb.vp = key;
   try {
     const r = await api("/api/rb/viewport", Object.assign({tab: rb.id, quality: state.rbQuality}, view));
@@ -3921,6 +4055,7 @@ function loadedLongEnough(rb, meta, now, eventDriven) {
 // "run" when the reader should be fetched for this metadata, else "". When it ran while loading it
 // runs once more when loading turns false (same URL).
 function readerAction(rb, meta, now) {
+  if (rb.firstPending) { rb.heldMeta = meta; return ""; }     // v0.1.59: see mirrorAction
   if (meta.loading === true) {
     rb.readerPending = true;
     if (rb.readerEarly !== meta.url && loadedLongEnough(rb, meta, now, true)) {
@@ -3978,7 +4113,7 @@ async function runReader(tab, opts = {}) {
   snapBusy(rb, 1);
   try {
     const started = performance.now();
-    const raw = await api("/api/rb/reader", {tab: rb.id});
+    const raw = opts.prefetched || await api("/api/rb/reader", {tab: rb.id});     // v0.1.59: may come with the tab-open answer
     rb.perf.extractMs = performance.now() - started;
     dlog("render", "debug", "reader fetched", {ms: Math.round(rb.perf.extractMs)});
     rb.perf.imgs = 0; rb.perf.imgMs = 0;
@@ -4034,11 +4169,18 @@ async function runReader(tab, opts = {}) {
 // the reader data is fetched again.
 async function readerLoop(tab, gen) {
   let fails = 0, first = true;
+  const seed = takeSeed(tab.rb, "reader");        // v0.1.59: see mirrorLoop
   tlMark(tab.rb, "choose");
   await nextPaint();
   await nextPaint();
   if (gen !== state.rbGen || !tab.rb) return;
-  await sendViewport(tab).catch(() => {});
+  if (seed) {
+    first = false;
+    applySeed(tab, seed);
+    sendViewport(tab).catch(() => {});
+  } else {
+    await sendViewport(tab).catch(() => {});
+  }
   while (gen === state.rbGen && tab.rb) {
     const rb = tab.rb;
     try {
@@ -4080,10 +4222,13 @@ async function readerLoop(tab, gen) {
 async function readerNavigate(tab, href) {
   const rb = tab && tab.rb;
   if (!rb) return;
+  rb.firstPending = true;                          // v0.1.59: see mirrorNavigate
   try {
-    await api("/api/rb/navigate", {tab: rb.id, url: href});
+    const r = await api("/api/rb/navigate", {tab: rb.id, url: href, first: "reader"});
     rb.readerPending = true;
+    firstDone(tab, rb, r.first ? {kind: "reader", first: r.first} : null);
   } catch (e) {
+    firstDone(tab, rb, null);
     if (e.status === 404) remoteLost(tab);
     else throw e;
   }
@@ -4306,6 +4451,7 @@ function mirrorLoadDoc(docUrl, cover) {
     // page's session history, so the browser back (the iOS edge swipe) stepped through earlier
     // copies of the mirror ("goes back to the same page").
     mf.dataset.doc = docUrl;
+    rttCount++;                    // v0.1.59: the document is a request of its own
     try {
       mf.contentWindow.location.replace(new URL(docUrl, location.href).href);
     } catch (e) {
@@ -4393,7 +4539,9 @@ async function runMirror(tab, opts = {}) {
     const started = performance.now();
     const doc0 = mirrorDoc();
     const fresh = navigation || !doc0;
-    const data = await api("/api/rb/mirror", {tab: rb.id, full: !fresh, force: opts.force === true, partial: fresh});
+    // v0.1.59: the first copy of a page may already have come with the tab-open / navigate answer
+    const early = fresh && opts.force !== true ? opts.prefetched : null;
+    const data = early || await api("/api/rb/mirror", {tab: rb.id, full: !fresh, force: opts.force === true, partial: fresh});
     const elapsed = performance.now() - started;
     if (tab.rb !== rb || tabDisplay(tab) !== "mirror") return;
     if (!data || !Number.isFinite(data.rev) || !data.stats || !Number.isFinite(data.stats.nodes)) {
@@ -4497,6 +4645,7 @@ function scheduleMirror(tab, ms, force) {
 
 // "run" when a capture is due for this metadata, else "".
 function mirrorAction(rb, meta, now) {
+  if (rb.firstPending) { rb.heldMeta = meta; return ""; }     // v0.1.59: the answer of the request in flight carries the copy
   const m = rb.mirror;
   const changed = Boolean(m) && Number.isFinite(meta.mirror_rev) && meta.mirror_rev !== m.rev;
   if (meta.loading === true) {
@@ -4518,11 +4667,18 @@ function mirrorAction(rb, meta, now) {
 
 async function mirrorLoop(tab, gen) {
   let fails = 0, first = true;
+  const seed = takeSeed(tab.rb, "mirror");        // v0.1.59: the first copy came with the tab-open answer
   tlMark(tab.rb, "choose");
   await nextPaint();
   await nextPaint();
   if (gen !== state.rbGen || !tab.rb) return;
-  await sendViewport(tab).catch(() => {});
+  if (seed) {
+    first = false;
+    applySeed(tab, seed);
+    sendViewport(tab).catch(() => {});             // only a correction when the size sent with the request differed
+  } else {
+    await sendViewport(tab).catch(() => {});
+  }
   while (gen === state.rbGen && tab.rb) {
     const rb = tab.rb;
     try {
@@ -4563,10 +4719,13 @@ async function mirrorLoop(tab, gen) {
 async function mirrorNavigate(tab, href) {
   const rb = tab && tab.rb;
   if (!rb) return;
+  rb.firstPending = true;                          // v0.1.59: the answer carries the first copy of the new page
   try {
-    await api("/api/rb/navigate", {tab: rb.id, url: href});
+    const r = await api("/api/rb/navigate", {tab: rb.id, url: href, first: "mirror"});
     rb.mirrorPending = true;
+    firstDone(tab, rb, r.first ? {kind: "mirror", first: r.first} : null);
   } catch (e) {
+    firstDone(tab, rb, null);
     if (e.status === 404) remoteLost(tab);
     else throw e;
   }
@@ -4583,11 +4742,16 @@ async function mirrorClick(tab, el, event) {
   const fy = Math.round(unit(event.clientY, box.top, box.height) * 1000) / 1000;
   snapBusy(rb, 1);
   try {
-    const res = await api("/api/rb/mirror/click", {tab: rb.id, m, fx, fy});
+    rb.firstPending = true;                        // v0.1.59: a tapped link answers with the new page's first copy
+    const res = await api("/api/rb/mirror/click", {tab: rb.id, m, fx, fy, first: "mirror"});
+    const seed = res.navigated === true && res.first ? {kind: "mirror", first: res.first} : null;
+    if (seed) rb.mirrorPending = true;
+    firstDone(tab, rb, seed);
     if (tab.rb !== rb) return;
     if (typeof res.editable === "boolean") setEditable(tab, res.editable, true);
     if (res.navigated !== true) scheduleMirror(tab, MIRROR_CLICK_REFRESH_MS, true);
   } catch (e) {
+    firstDone(tab, rb, null);
     if (tab.rb !== rb) return;
     if (e.status === 410) {            // the element is gone: the page changed since this copy
       flash("表示を更新しました。もう一度タップしてください");
@@ -5333,7 +5497,10 @@ async function openWebUrl(value) {
   const tab = activeWebTab();
   if (tab) { await (tab.pt ? ptNavigateTo(tab, value) : navigateTab(tab, value)); return; }   // v0.1.57: pt tabs stay in the frame
   if (tabLimitReached()) return;
-  const url = await validateUrl(value);
+  // v0.1.59: an address that looks right goes straight into the tabs request (the Hub validates it there and
+  // answers the same message /api/browser/validate would); only odd input still takes the separate check first.
+  const plain = value.length <= 2048 && /^https:\/\/[^\s]+$/i.test(value);
+  const url = plain ? value : await validateUrl(value);
   const fresh = createTab();
   pushHistory(fresh, url);
   saveTabs();
@@ -5341,7 +5508,17 @@ async function openWebUrl(value) {
   // v0.1.54: the route change above makes autoReopen() ask for the same page a moment later; registering this
   // open as "in flight" (as openInRemote does) keeps it to ONE NAS tab instead of two (the second used to wait
   // behind the first and then be closed again).
-  await trackOpening(fresh, url, openRemote(fresh, url, u => { fresh.history[fresh.index] = u; }, {validated: true}));
+  try {
+    await trackOpening(fresh, url, openRemote(fresh, url, u => { fresh.history[fresh.index] = u; }, {validated: !plain}));
+  } catch (e) {
+    if (plain && e.status === 400 && !fresh.rb) {      // refused by the Hub's URL check: no tab is left behind
+      const remembered = state.closed.length;
+      closeTab(fresh.id);
+      if (state.closed.length > remembered || state.closed.length === MAX_CLOSED_TABS) state.closed.pop();
+      throw e;
+    }
+    throw e;
+  }
 }
 
 // ------------------------------------------------------------- passthrough display (v0.1.57)
@@ -7368,7 +7545,7 @@ function teardownSession() {
   state.authed = false;
   state.shellReady = false;
   stopStateLoop();
-  state.live = null; state.stateRev = null; state.settingsRev = null; state.engineSig = ""; state.rbSig = "";
+  state.live = null; state.stateRev = null; state.settingsRev = null; state.engineSig = ""; state.rbSig = ""; state.dlKey = null;
   clearTimeout(state.pasteTimer);
   clearToast();
   state.pasteSeq++;
@@ -7782,8 +7959,12 @@ function applyState(d) {
   if (d.bookmarks) swrSeed("bookmarks", {items: d.bookmarks}, renderBookmarks);
   const e = d.engine;
   // download counts for the badge / home line
+  // v0.1.59: parts whose sub-signature did not change are not rendered again.
+  const dlKey = JSON.stringify(d.downloads) + "|" + (e.can_send === true);
+  const dlChanged = dlKey !== state.dlKey;
+  state.dlKey = dlKey;
   state.dlRunning = d.downloads ? d.downloads.running : null;
-  updateBadge();
+  if (dlChanged || first) updateBadge();
   // engine: the full record only where it is shown, the compact block otherwise
   const engineChanged = e.sig !== state.engineSig;
   state.engineSig = e.sig;
@@ -7795,10 +7976,10 @@ function applyState(d) {
     } else {
       applyEngineLight(e);
     }
-  } else {
+  } else if (dlChanged) {
     renderHome();
   }
-  if (state.queueData && state.route.view === "links") renderQueue(state.queueData);
+  if ((engineChanged || dlChanged) && state.queueData && state.route.view === "links") renderQueue(state.queueData);
   // NAS browser: refetch the status only while its settings are on screen
   if (typeof d.rb.ready === "boolean") setRbReady(d.rb.ready);
   if (d.debug) setDebugState(d.debug);
@@ -9419,6 +9600,11 @@ async function selftestClient(snap) {
     await step("client.mirror_morph", () => selftestMirrorMorph(tab, created));
     await step("client.tiles", () => selftestTilesStep(tab, created));
     await step("client.live", () => selftestLiveStep(tab, holder));
+    // v0.1.59: 「操作の応答」 - how the app itself responds on this phone (about 40 s in all)
+    await step("client.open_rtt", () => selftestOpenRttStep(tab, view));
+    await step("client.route", () => selftestRouteStep());
+    await step("client.toggle", () => selftestToggleStep());
+    await step("client.idle", () => selftestIdleStep());
   } catch (e) {
     checks.push({id: "client.error", ok: false, note: note(e && e.message ? e.message : e)});
   } finally {
@@ -9435,9 +9621,97 @@ async function selftestClient(snap) {
   }
 }
 
-const CLIENT_STEP_LABEL = {"client.rtt": "Hubとの通信", "client.reader": "リーダー表示", "client.mirror_load": "ミラーの読み込み",
+const CLIENT_STEP_LABEL = {"client.route": "画面の切り替え", "client.toggle": "スイッチの反応", "client.idle": "待機中の通信（30秒）",
+  "client.open_rtt": "ページを開く通信回数", "client.rtt": "Hubとの通信", "client.reader": "リーダー表示", "client.mirror_load": "ミラーの読み込み",
   "client.mirror_events": "ミラー内のタップ", "client.mirror_morph": "ミラーの差し替え", "client.tiles": "高速表示",
   "client.live": "ライブ表示（MJPEG・SSE・ポーリング）"};
+
+// ---- v0.1.59: 「操作の応答」 ----
+const nextFrame2 = async () => { await nextPaint(); await nextPaint(); };
+
+// Hash change -> the target view is on screen, for the main screens; the selftest screen is shown again afterwards.
+async function selftestRouteStep() {
+  const home = location.hash || "#/home";
+  const targets = [["#/downloads", "downloads", "ダウンロード"], ["#/links", "links", "リンク"], ["#/home", "home", "ブラウズ"],
+    ["#/settings/storage", "settings", "設定"]];
+  const times = [], notes = [];
+  try {
+    for (const [hash, view, label] of targets) {
+      if (location.hash === hash) { location.hash = "#/links"; await nextFrame2(); }
+      const t0 = performance.now();
+      location.hash = hash;
+      const shown = await selftestWaitFor(() => state.route.view === view && !$("view-" + view).hidden, 4000, 8);
+      await nextPaint();
+      const ms = Math.round(performance.now() - t0);
+      if (!shown) throw new Error(label + "の画面に切り替わりませんでした");
+      times.push(ms);
+      notes.push(label + " " + ms + "ms");
+    }
+  } finally {
+    location.hash = home;
+    await selftestWaitFor(() => location.hash === home, 2000, 20);
+    await nextFrame2();
+  }
+  return {ok: true, ms: Math.max(...times), n: times.length, note: notes.join(" / ")};
+}
+
+// A tap on a settings switch (rb_link_boxes, put back afterwards): when does the change show, when does the Hub confirm?
+async function selftestToggleStep() {
+  const input = $("rbLinkBoxes");
+  if (!input || !state.settings) throw new Error("スイッチを見つけられません");
+  const key = "rb_link_boxes", initial = state.settings[key] === true;
+  const t0 = performance.now();
+  input.click();                                        // like a tap: the native change, then the app's handler
+  const flipped = () => (state.settings[key] === true) !== initial && input.checked !== initial;
+  const seen = await selftestWaitFor(flipped, 1500, 4);
+  await nextPaint();
+  const feedback = Math.round(performance.now() - t0);
+  const busy = input.getAttribute("aria-busy") === "true";
+  await selftestWaitFor(() => !input.hasAttribute("aria-busy"), 8000, 20);
+  const confirm = Math.round(performance.now() - t0);
+  const settled = (state.settings[key] === true) !== initial;
+  try {
+    input.click();                                       // back to how it was
+    await selftestWaitFor(() => (state.settings[key] === true) === initial && !input.hasAttribute("aria-busy"), 8000, 20);
+  } catch (e) { /* the final check below reports it */ }
+  const restored = (state.settings[key] === true) === initial;
+  return {ok: seen && settled && restored, ms: feedback, n: confirm,
+    note: (busy ? "" : "保存中の印なし ") + (restored ? "" : "元に戻せませんでした")};
+}
+
+// The app idle on the Downloads screen for 30 s: how many /api/state answers and requests in all?
+async function selftestIdleStep() {
+  const home = location.hash || "#/home";
+  location.hash = "#/downloads";
+  const shown = await selftestWaitFor(() => state.route.view === "downloads", 3000, 20);
+  await delay(2000);                                     // answers caused by the screen change itself
+  const s0 = reqStats.state, a0 = reqStats.all, t0 = performance.now();
+  while (performance.now() - t0 < 30000) {
+    await delay(500);
+    const now = selftestUi.snap;
+    if (!now || now.state !== "running") break;          // cancelled meanwhile
+  }
+  const out = {ok: shown, ms: Math.round(performance.now() - t0), state: reqStats.state - s0, total: reqStats.all - a0};
+  location.hash = home;
+  await selftestWaitFor(() => location.hash === home, 2000, 20);
+  return out;
+}
+
+// The virtual page of the self-test opened the way the app opens a page in the mirror display: requests until
+// its copy is on this phone (navigate with viewport + first copy, then the copy document).
+async function selftestOpenRttStep(tab, view) {
+  const r0 = rttCount, t0 = performance.now();
+  const reply = await api("/api/rb/navigate", {tab, url: "https://selftest.example.com/article",
+    view: {width: view.width, height: view.height, dpr: view.dpr, quality: state.rbQuality}, first: "mirror"});
+  const copy = reply.first && reply.first.mirror;
+  if (!copy || typeof copy.doc !== "string" || !MIRROR_DOC_RE.test(copy.doc)) {
+    throw new Error("最初のコピーが応答に含まれていません");
+  }
+  const res = await fetch(copy.doc, {cache: "no-store", credentials: "same-origin"});
+  const text = await res.text();
+  const ok = res.ok && text.length > 200;
+  return {ok, ms: Math.round(performance.now() - t0), n: rttCount - r0};
+}
 
 async function selftestReaderStep(tab, holder) {
   const t0 = performance.now();
@@ -9713,7 +9987,8 @@ function ruleToggle(label, checked, onChange) {
   input.setAttribute("role", "switch");
   input.checked = checked;
   input.addEventListener("change", () => perform(async () => {
-    try { await onChange(input.checked); } catch (e) { input.checked = !input.checked; throw e; }
+    const done = busyControl(input);          // v0.1.59: already shows the new state, dimmed until confirmed
+    try { await onChange(input.checked); } catch (e) { input.checked = !input.checked; throw e; } finally { done(); }
   }));
   wrap.appendChild(input);
   wrap.appendChild(element("span", undefined, "switch-track"));
@@ -9762,13 +10037,63 @@ function renderSiteRules(data) {
   }));
 }
 
+// v0.1.59: optimistic. The setting takes effect in the app (state, home line, NAS-browser sync) and the control
+// shows a subtle busy mark at once; the Hub's answer only confirms it. A failure puts the old value back (state and
+// control) and throws, so the caller's own toast / revert code still runs. Saves of one key are sent in order.
+const optionChain = new Map();
+const OPTION_CONTROL = {
+  pt_enabled: "ptEnabled", rb_resident: "rbResident", block_ads: "blockAds", rb_default_mode: "rbDefaultMode",
+  rb_spare_tab: "rbSpareTab", rb_no_webfonts: "rbNoWebfonts", rb_link_boxes: "rbLinkBoxes", probe_autosend: "probeAutosend",
+  auto_clear_links: "autoClearLinks", auto_clear_downloads: "autoClearDownloads", send_autostart: "sendAutostart",
+};
+
+// Marks a control (and its switch label) as saving; returns the function that clears the mark.
+function busyControl(control) {
+  const el = typeof control === "string" ? $(control) : control;
+  if (!el) return () => {};
+  const n = Number(el.dataset.saving || 0) + 1;
+  el.dataset.saving = String(n);
+  el.setAttribute("aria-busy", "true");
+  const holder = el.closest("label, .set-row");
+  if (holder) holder.classList.add("is-saving");
+  return () => {
+    const left = Math.max(0, Number(el.dataset.saving || 1) - 1);
+    el.dataset.saving = String(left);
+    if (left === 0) {
+      el.removeAttribute("aria-busy");
+      if (holder) holder.classList.remove("is-saving");
+    }
+  };
+}
+
 async function saveOption(key, value) {
-  const saved = await api("/api/settings/options", {[key]: value});
-  swrDrop("settings", "status");
-  state.settings = saved;
+  const before = state.settings ? state.settings[key] : undefined;
+  state.settings = Object.assign({}, state.settings, {[key]: value});
   renderHome();
   syncRemoteSettings();
-  return saved;
+  const done = busyControl(OPTION_CONTROL[key]);
+  const previous = optionChain.get(key) || Promise.resolve();
+  const request = previous.catch(() => {}).then(() => api("/api/settings/options", {[key]: value}));
+  optionChain.set(key, request);
+  try {
+    const saved = await request;
+    swrDrop("settings", "status");
+    if (optionChain.get(key) === request) state.settings = saved;     // a newer save of this key is still in flight
+    else state.settings = Object.assign({}, saved, state.settings, {[key]: state.settings[key]});
+    renderHome();
+    syncRemoteSettings();
+    return saved;
+  } catch (e) {
+    if (optionChain.get(key) === request) {
+      state.settings = Object.assign({}, state.settings, {[key]: before});
+      renderHome();
+      syncRemoteSettings();
+    }
+    throw e;
+  } finally {
+    done();
+    if (optionChain.get(key) === request) optionChain.delete(key);
+  }
 }
 
 // Whether the NAS browser image exists (null = not known yet). A change updates the shown tab:
@@ -10014,12 +10339,13 @@ function wireEngine() {
   }));
   $("engineAutostart").addEventListener("change", () => perform(async () => {
     const wanted = $("engineAutostart").checked;
+    const done = busyControl("engineAutostart");
     try {
       await api("/api/engine/autostart", {enabled: wanted});
     } catch (e) {
       $("engineAutostart").checked = !wanted;
       throw e;
-    }
+    } finally { done(); }
     swrDrop("engine");
     flash(wanted ? "Hub起動時にエンジンも起動します" : "自動起動をOFFにしました");
   }));

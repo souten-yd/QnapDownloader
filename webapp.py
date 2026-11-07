@@ -38,7 +38,7 @@ import ttlcache
 import updater
 import webauthn
 
-VERSION = "0.1.58"
+VERSION = "0.1.59"
 PORT = 17864
 ROOT = Path(__file__).resolve().parent
 FILES = {"/": ("web/index.html", "text/html; charset=utf-8"),
@@ -688,6 +688,16 @@ class Handler(BaseHTTPRequestHandler):
         host = self.headers.get("Host", "")
         return (private_peer_allowed(self.client_address[0]) and
                 bool(host) and public_host_allowed(host, self.client_address[0]))
+
+    @staticmethod
+    def first_kind(body):
+        """v0.1.59: "mirror" / "reader" when the client wants the first copy inline, else None."""
+        first = body.get("first")
+        if first is None or first is False:
+            return None
+        if first not in ("mirror", "reader"):
+            raise ValueError("firstはmirrorまたはreaderを指定してください")
+        return first
 
     def reject_hub_origin(self, checked_url):
         """Never let the NAS browser be pointed at the Hub itself or at a tailnet name.
@@ -1637,13 +1647,22 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/rb/tabs":
                 checked = browser_safety.validate(body.get("url"))
                 self.reject_hub_origin(checked)
-                return self.send_data(201, self.server.rb.open_tab(checked))
+                first = self.first_kind(body)
+                created = self.server.rb.open_tab(checked, view=body.get("view"))
+                if first:
+                    # v0.1.59: the first copy / extraction and the tab metadata ride on this answer
+                    created = dict(created, first=self.server.rb.wait_first(created["id"], first))
+                return self.send_data(201, created, compress=bool(first))
             if path == "/api/rb/tabs/close":
                 return self.send_data(200, {"closed": self.server.rb.close_tab(body.get("id"))})
             if path == "/api/rb/navigate":
                 checked = browser_safety.validate(body.get("url"))
                 self.reject_hub_origin(checked)
-                return self.send_data(200, self.server.rb.navigate(body.get("tab"), checked))
+                first = self.first_kind(body)
+                moved = self.server.rb.navigate(body.get("tab"), checked, view=body.get("view"))
+                if first:
+                    moved = dict(moved, first=self.server.rb.wait_first(body.get("tab"), first))
+                return self.send_data(200, moved, compress=bool(first))
             if path == "/api/rb/input":
                 return self.send_data(200, self.server.rb.send_input(body.get("tab"), body))
             if path == "/api/rb/viewport":
@@ -1674,14 +1693,19 @@ class Handler(BaseHTTPRequestHandler):
                     # A link: the NAS browser goes there, through the same checks as every navigation.
                     checked = browser_safety.validate(href)
                     self.reject_hub_origin(checked)
+                    first = self.first_kind(body)
                     self.server.rb.navigate(body.get("tab"), checked)
                     result = {"ok": True, "navigated": True, "url": checked}
+                    if first:
+                        result["first"] = self.server.rb.wait_first(body.get("tab"), first)
+                    return self.send_data(200, result, compress=bool(first))
                 return self.send_data(200, result)
             if path == "/api/rb/mirror/release":
                 return self.send_data(200, self.server.rb.mirror_release(body.get("tab")))
             if path == "/api/rb/firstload":
                 # v0.1.54: the phone's side of the first-load timeline (numbers only, validated by the Hub)
-                return self.send_data(200, self.server.rb.first_load_report(body.get("tab"), body.get("marks")))
+                return self.send_data(200, self.server.rb.first_load_report(
+                    body.get("tab"), body.get("marks"), body.get("rtts")))
             if path == "/api/rb/probe":
                 result = self.server.rb.probe(
                     body.get("tab"), body.get("x"), body.get("y"), url_check=self.reject_hub_origin,
