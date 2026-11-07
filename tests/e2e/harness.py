@@ -13,6 +13,7 @@ used for that test browser only. The app itself keeps validating URLs as in prod
 use real-looking public https names without a port.
 """
 import re
+import hashlib
 import json
 import os
 import select
@@ -169,6 +170,15 @@ class FixtureServer:
                     wait = 0
                 if wait:
                     time.sleep(wait / 1000.0)         # v0.1.54: a slow resource (the NAS's line is slower than ours)
+                if path.startswith("/go/"):
+                    # v0.1.65: a hoster redirect for the long-press probe scenarios: /go/<n>[?delay=ms] answers 302 to the
+                    # n-th Rapidgator file (the NAS Chrome intercepts that request before any network access).
+                    # /go/none ends on a plain page without hoster links.
+                    ident = path[4:]
+                    if ident == "none":
+                        return self.reply(302, b"", "text/plain", [("Location", "/article2.html")])
+                    return self.reply(302, b"", "text/plain", [(
+                        "Location", "https://rapidgator.net/file/%s" % hashlib.md5(ident.encode()).hexdigest())])
                 if path.endswith(".js"):
                     return self.reply(200, b"/* tag */", "application/javascript")
                 if path.startswith("/font/"):
@@ -382,6 +392,46 @@ class Env:
                     pass
         threading.Thread(target=run, daemon=True).start()
 
+    def chrome_pss_mib(self):
+        """v0.1.65: proportional memory (Pss, MiB) of every process of the NAS-side Chrome (found by its user-data-dir)."""
+        total = 0
+        marker = ("--user-data-dir=" + self.chrome_udd).encode()
+        for entry in os.listdir("/proc"):
+            if not entry.isdigit():
+                continue
+            try:
+                with open("/proc/%s/cmdline" % entry, "rb") as handle:
+                    if marker not in handle.read():
+                        continue
+                with open("/proc/%s/smaps_rollup" % entry) as handle:
+                    for line in handle:
+                        if line.startswith("Pss:"):
+                            total += int(line.split()[1])
+                            break
+            except (OSError, ValueError):
+                continue
+        return total / 1024.0
+
+    def model_container_memory(self, on=True, limit_mib=2048, base_mib=0.0):
+        """v0.1.65: the fake `docker stats` shows the real memory (Pss) of the NAS-side Chrome plus `base_mib`, against a
+        `limit_mib` container limit, every 100 ms (the real container's cgroup is not there). Scenarios that measure
+        memory (the self-test 「タブの容量」) switch it on."""
+        if not on:
+            stop = getattr(self, "_mem_model", None)
+            if stop is not None:
+                stop.set()
+                self._mem_model = None
+            return
+        if getattr(self, "_mem_model", None) is not None:
+            return
+        stop = self._mem_model = threading.Event()
+
+        def run():
+            while not stop.wait(0.1):
+                used = self.chrome_pss_mib() + base_mib
+                self.fake_docker.stats_out = "%dMiB / %dGiB|%.2f%%" % (used, limit_mib // 1024, used * 100.0 / limit_mib)
+        threading.Thread(target=run, daemon=True).start()
+
     def _wrap_streams(self, webapp):
         """Scenarios can make a live transport 'buffered by a proxy': the request is accepted and the response
         never starts (no headers, no byte), until the phone gives up and closes the connection."""
@@ -439,6 +489,7 @@ class Env:
 
     def close(self):
         self.shake(False)
+        self.model_container_memory(False)
         for fn in (lambda: self.rb.shutdown(), lambda: self.server.shutdown(), lambda: self.server.server_close(),
                    lambda: self.store.close(), lambda: self.fx.close()):
             try:

@@ -40,11 +40,16 @@ DEFAULTS = {
     # listener (127.0.0.1:17865) only runs while this is on. pt_public_port is the port `tailscale serve --https=` exposes it on.
     "pt_enabled": False,
     "pt_public_port": 8443,
+    # v0.1.65: the most NAS-browser tabs open at once (a ceiling, not a promise: the memory guard still refuses new tabs).
+    "rb_max_tabs": 3,
+    # v0.1.65: the browse home's 「最近見たページ」 (kept on each device only). OFF: not shown and nothing recorded.
+    "home_recent": True,
 }
 BOOL_OPTIONS = ("send_autostart", "block_ads", "probe_autosend", "rb_link_boxes", "rb_resident",
-                "rb_spare_tab", "rb_no_webfonts", "auto_clear_links", "auto_clear_downloads", "pt_enabled")
+                "rb_spare_tab", "rb_no_webfonts", "auto_clear_links", "auto_clear_downloads", "pt_enabled",
+                "home_recent")
 ENUM_OPTIONS = {"rb_default_mode": ("reader", "mirror", "fast", "live")}
-INT_OPTIONS = {"pt_public_port": (1, 65535)}
+INT_OPTIONS = {"pt_public_port": (1, 65535), "rb_max_tabs": (1, 20)}
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY,value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS accounts(id INTEGER PRIMARY KEY CHECK(id=1),

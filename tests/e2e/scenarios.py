@@ -419,6 +419,7 @@ def selftest(ph):
     ph.wait(lambda: ph.js("(()=>{const b=document.getElementById('selftestRun');return !!b&&!b.hidden&&b.offsetParent!==null})()"),
             10, "self-test button")
     ph.page.fill("#selftestUrls", BASE + "/article.html")
+    ph.env.model_container_memory(True, limit_mib=2048)       # v0.1.65: the fake `docker stats` follows the real Chrome's memory
     ph.page.click("#selftestRun")
     ph.wait(lambda: ph.js("!!(selftestUi.snap&&selftestUi.snap.state==='running')"), 10, "run started")
     # while it runs the progress list is shown and cancel is offered
@@ -452,6 +453,22 @@ def selftest(ph):
     sites = [c for c in snap["checks"] if c["section"] == "sites"]
     assert [c["id"] for c in sites][:1] == ["site.1.open"] and not [c for c in sites if c["status"] == "fail"], sites
     assert "DOMContentLoaded" in checks["site.1.open"]["value"], checks["site.1.open"]
+    # v0.1.65: 「タブの容量」: one line per page (4 built-in pages + the real-looking site) and a recommendation
+    cap = [c for c in snap["checks"] if c["section"] == "capacity"]
+    pages = [c for c in cap if c["id"].startswith("capacity.page.")]
+    assert "capacity.base" in checks and "capacity.summary" in checks, [c["id"] for c in cap]
+    assert len(pages) == 5 and all("MiB" in c["value"] and "JSヒープ" in c["value"] for c in pages), [c["value"] for c in pages]
+    summary = checks["capacity.summary"]
+    assert summary["status"] in ("pass", "warn") and "1ページあたり 平均" in summary["value"] and "推奨タブ枚数" in summary["value"], summary
+    assert ph.env.rb.tab_reco and 1 <= ph.env.rb.tab_reco["tabs"] <= 20, ph.env.rb.tab_reco
+    for c in pages:
+        ph.notes.append("cap: " + c["value"][:80])
+    ph.notes.append("cap: " + summary["value"][:90])
+    # v0.1.65: 「リンク解析キュー」: 10 virtual presses queued at once finish one after another
+    assert checks["queue.enqueue"]["status"] == "pass", checks["queue.enqueue"]
+    assert checks["queue.finish"]["status"] == "pass" and "10/10件完了" in checks["queue.finish"]["value"], checks["queue.finish"]
+    assert checks["queue.sequential"]["status"] == "pass", checks["queue.sequential"]
+    ph.notes.append("queue: " + checks["queue.finish"]["value"][:90] + " / " + checks["queue.sequential"]["value"][:60])
     assert checks["cleanup.tabs"]["status"] == "pass"
     assert ph.env.rb.selftest_tabs() == [] and ph.env.tabs() == {}, "tabs left behind: %s" % list(ph.env.tabs())
     # the view shows summary and tables; the copied text is a self-contained report
@@ -461,7 +478,7 @@ def selftest(ph):
     ph.wait(lambda: len(ph.js("selftestUi.text")) > 500, 10, "report text")
     text = ph.js("selftestUi.text")
     for needle in ("== QnapDownloader 自己テスト", "app: v" + ph.env.version, "[NAS] cpu=", "[Phone] ua=", "viewport=",
-                   "## 環境", "## 内蔵テストページ", "## この端末", "## 操作の応答", "## 実サイト", "## 後片付け", "builtin.reader", "client.mirror_events",
+                   "## 環境", "## 内蔵テストページ", "## この端末", "## 操作の応答", "## 実サイト", "## タブの容量", "## リンク解析キュー", "queue.finish", "capacity.summary", "推奨タブ枚数", "## 後片付け", "builtin.reader", "client.mirror_events",
                    "value:", "threshold:", "## debug log (last 50 lines", "[Source] cgroup=", "[Live] transport=", "env.cgroup",
                    "client.secure"):
         assert needle in text, "report lacks %r" % needle
@@ -1570,6 +1587,15 @@ def home_tabs_recent(ph):
     ph.page.locator("#homeRecentClear").tap()
     ph.wait(lambda: ph.js("document.getElementById('homeRecent').hidden"), 3, "recent list hidden")
     assert ph.js("localStorage.getItem('qnapdl.recent.v1')") is None
+    # v0.1.65: the list can be switched off (Settings > Browser): nothing shown, nothing recorded
+    ph.post("/api/settings/options", {"home_recent": False})
+    ph.js("()=>loadSettings()")
+    ph.wait(lambda: ph.js("state.settings && state.settings.home_recent === false"), 5, "home_recent off")
+    ph.js("()=>noteVisit('https://a.example.com/off.html', 'off')")
+    assert ph.js("localStorage.getItem('qnapdl.recent.v1')") is None, "recorded while off"
+    assert ph.js("document.getElementById('homeRecent').hidden"), "shown while off"
+    ph.post("/api/settings/options", {"home_recent": True})
+    ph.js("()=>loadSettings()")
     # a refused clipboard read focuses the address bar (no error, no tab)
     _fake_clipboard(ph, None)
     before = ph.js("state.tabs.length")
@@ -2421,3 +2447,117 @@ def desktop_pt_keys(ph):
     ph.wait(lambda: len(ph.env.fx.pt_seen) > hits, 10, "Ctrl+R in the frame reloaded the page through the passthrough")
     assert ph.js("window.__noReload") == "still here", "Ctrl+R reloaded the app"
     assert ph.js("state.route.view") == "tab"
+
+
+# ------------------------------------------------------------------ v0.1.65: link-probe queue, tab limit setting
+
+@scenario("probe-queue-burst")
+def probe_queue_burst(ph):
+    """v0.1.65: 12 long presses in quick succession. Each one only adds a job on the Hub (answered at once, with its
+    place in the queue); the Hub runs them one after another; all 12 end "done"; the phone shows the progress (pill
+    "リンク解析 n/12") and a sheet that lists them. At no time are two hidden pages open for the probes (the old design
+    ran up to 4 at once and held one HTTP request per press)."""
+    import threading
+    ph.page.set_viewport_size(NARROW)
+    ph.open("/probe.html")
+    ph.wait(lambda: "リンク12" in ph.mirror_text(), 20, "probe page")
+    hrefs = ph.js("(()=>{const d=mirrorDoc();return Array.from(d.querySelectorAll('a[data-href]')).map(a=>a.dataset.href)})()")
+    assert len(hrefs) >= 12, hrefs
+    peak = {"targets": 0}
+    stop = threading.Event()
+
+    def watch():
+        while not stop.wait(0.05):
+            peak["targets"] = max(peak["targets"], len(ph.env.rb._probe_targets))
+    threading.Thread(target=watch, daemon=True).start()
+    try:
+        started = ph.js("""async(hrefs)=>{
+          const t = activeWebTab(); const t0 = performance.now(); const answers = [];
+          for (const h of hrefs.slice(0, 12)) {
+            const s = performance.now();
+            await startProbe(t, {href: h});
+            answers.push(Math.round(performance.now() - s));
+          }
+          return {answers, total: Math.round(performance.now() - t0)};
+        }""", hrefs)
+        ph.log("12 presses answered in %s ms (each %s)" % (started["total"], started["answers"]))
+        assert max(started["answers"]) < 2000, "a long press waited for the probe itself: %s" % started
+        ph.wait(lambda: ph.js("(()=>{const c=document.getElementById('probeChip');return !!c && !c.hidden && /\\/12/.test(c.textContent)})()"),
+                10, "the pill with the progress /12")
+        chip = ph.js("document.getElementById('probeChip').textContent")
+        ph.log("pill: %s" % chip)
+        ph.wait(lambda: ph.js("(()=>{const t=activeWebTab();const p=t&&t.rb&&t.rb.probes;return !!p && p.total===12 && p.done===12})()"),
+                90, "all 12 probes done")
+        peak_now = peak["targets"]
+    finally:
+        stop.set()
+    assert peak_now <= 1, "%d probe pages were open at once (the queue runs one job at a time)" % peak_now
+    jobs = ph.js("""async()=>{const t=activeWebTab();const r=await fetch('/api/rb/probe/jobs?tab='+t.rb.id,{credentials:'same-origin'});return (await r.json()).jobs}""")
+    assert len(jobs) == 12 and all(j["state"] == "done" and j["links"] for j in jobs), [(j["state"], j.get("error")) for j in jobs]
+    spans = sorted((j["started"], j["finished"]) for j in jobs)
+    assert all(b[0] >= a[1] - 0.05 for a, b in zip(spans, spans[1:])), "jobs overlapped: %s" % spans
+    # the pill opens the list; every row has its links and the send / add actions
+    ph.js("document.getElementById('probeChip').click()")
+    ph.wait(lambda: ph.js("!document.getElementById('probeSheet').hidden"), 5, "the sheet")
+    rows = ph.js("document.querySelectorAll('#probeList .probe-job').length")
+    assert rows == 12, "the sheet lists %s jobs" % rows
+    text = ph.js("document.getElementById('probeSheet').innerText")
+    assert "追加" in text and "リンク解析" in text, text[:300]
+    ph.take_errors("status of 429", "ERR_ABORTED", "Failed to fetch", "Load failed")
+    assert not ph.js("document.querySelectorAll('#notice .toast.error').length"), "an error toast appeared"
+
+
+@scenario("probe-queue-cancel")
+def probe_queue_cancel(ph):
+    """v0.1.65: 待ちを取り消す cancels what has not started; closing the tab drops that tab's jobs."""
+    ph.page.set_viewport_size(NARROW)
+    tab = ph.open("/probe.html")
+    ph.wait(lambda: "リンク12" in ph.mirror_text(), 20, "probe page")
+    hrefs = ph.js("(()=>{const d=mirrorDoc();return Array.from(d.querySelectorAll('a[data-href]')).map(a=>a.dataset.href.replace('delay=700','delay=2500'))})()")
+    for h in hrefs[:8]:
+        res = ph.post("/api/rb/probe", {"tab": tab, "href": h, "label": "x"})
+        assert res["status"] == 202, res
+    again = ph.post("/api/rb/probe", {"tab": tab, "href": hrefs[1]})
+    assert again["status"] == 202 and '"existing": true' in again["text"].replace('":true', '": true'), again   # the same link is not queued twice
+    res = ph.post("/api/rb/probe/cancel", {"tab": tab})
+    assert res["status"] == 200, res
+    jobs = ph.js("""async(t)=>{const r=await fetch('/api/rb/probe/jobs?tab='+t,{credentials:'same-origin'});return (await r.json()).jobs}""", tab)
+    assert not [j for j in jobs if j["state"] == "queued"], "queued jobs remain after the cancel: %s" % [j["state"] for j in jobs]
+    ph.post("/api/rb/probe", {"tab": tab, "href": hrefs[9], "label": "y"})
+    res = ph.post("/api/rb/tabs/close", {"id": tab})
+    assert res["status"] == 200, res
+    assert not ph.env.rb.probes.jobs(tab), "the closed tab still has jobs"
+    ph.take_errors("status of 429", "ERR_ABORTED", "Failed to fetch", "Load failed", "status of 400", "status of 404")
+
+
+@scenario("tab-limit-setting")
+def tab_limit_setting(ph):
+    """v0.1.65: Settings › ブラウザ › 「NASブラウザのタブの上限」. With 5 the Hub opens 5 NAS tabs and refuses the 6th with the
+    message that names the setting; the control round-trips (reload keeps it); 「推奨値にする」 applies the self-test's number."""
+    ph.js("()=>{location.hash='#/settings/browser'}")
+    ph.wait(lambda: ph.js("!!document.querySelector('#view-settings:not([hidden])') && !!document.getElementById('rbMaxTabs')"), 8, "browser settings")
+    assert ph.js("document.getElementById('rbMaxTabs').value") == "3", "default is not 3"
+    assert ph.js("document.getElementById('rbMaxTabs').options.length") == 20
+    ph.page.select_option("#rbMaxTabs", "5")
+    ph.wait(lambda: ph.js("state.settings.rb_max_tabs") == 5, 5, "saved on the phone")
+    ph.page.reload()
+    ph.wait(lambda: ph.js("typeof state !== 'undefined' && state.authed === true && !!document.getElementById('rbMaxTabs')"), 15, "app reloaded")
+    ph.js("()=>{location.hash='#/settings/browser'}")
+    ph.wait(lambda: ph.js("document.getElementById('rbMaxTabs').value") == "5", 8, "the setting survived a reload")
+    ids = []
+    for n in range(5):
+        res = ph.post("/api/rb/tabs", {"url": "https://a.example.com/article.html?n=%d" % n})
+        assert res["status"] == 201, "tab %d: %s" % (n + 1, res)
+        ids.append(res["text"])
+    assert len(ph.env.tabs()) == 5, ph.env.tabs()
+    res = ph.post("/api/rb/tabs", {"url": "https://a.example.com/article.html?n=6"})
+    assert res["status"] >= 400 and "タブは最大5枚です（設定で変更できます）。不要なタブを閉じてください" in res["text"], res
+    # the recommendation (as the self-test stores it) is offered and applied by the button
+    ph.env.rb.tab_reco = {"tabs": 9, "avg_mib": 80.0, "max_mib": 120.0, "at": 0}
+    ph.js("()=>{state.rbStatus = Object.assign({}, state.rbStatus || {}, {tab_reco: {tabs: 9, avg_mib: 80, max_mib: 120}}); renderMaxTabs()}")
+    ph.wait(lambda: ph.js("!document.getElementById('rbMaxTabsRecoRow').hidden"), 5, "recommendation row")
+    assert "9枚" in ph.js("document.getElementById('rbMaxTabsReco').textContent")
+    ph.page.locator("#rbMaxTabsApply").click()
+    ph.wait(lambda: ph.js("state.settings.rb_max_tabs") == 9 and ph.js("document.getElementById('rbMaxTabs').value") == "9", 5, "the recommendation applied")
+    ph.setting("rb_max_tabs", 3)
+    ph.take_errors("status of 4", "status of 5")

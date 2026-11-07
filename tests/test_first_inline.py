@@ -67,6 +67,18 @@ class FirstInlineTests(BrowserBase):
         self.assertIn("rev", out["meta"])
         self.assertTrue(out["meta"]["dcl"])
 
+    def test_wait_first_skips_a_check_page(self):
+        # v0.1.65: a Cloudflare-like check page is not the page: no first copy is taken of it
+        tab = self.rb.open_tab("https://example.com/a")
+        self.navigated()
+        self.dcl()
+        with mock.patch.object(self.rb, "_challenge", return_value=True), \
+                mock.patch.object(self.rb, "mirror") as mirror:
+            out = self.rb.wait_first(tab["id"], "mirror", timeout=2)
+        mirror.assert_not_called()
+        self.assertIsNone(out["mirror"])
+        self.assertIn("rev", out["meta"])
+
     def test_wait_first_reader(self):
         tab = self.rb.open_tab("https://example.com/a")
         self.navigated()

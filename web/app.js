@@ -15,7 +15,7 @@
  */
 
 // ---------------------------------------------------------------- constants
-const MAX_WEB_TABS = 6;
+const MAX_WEB_TABS = 6;            // v0.1.65: the least web tabs the app allows; the setting rb_max_tabs (1-20) can raise it
 const SWR_TTL_MS = 10000;
 const MAX_HOST_MODES = 100;
 const UPDATE_POLL_MS = 2000;
@@ -75,7 +75,7 @@ const DISPLAY_CHIP_TITLE = {reader: "リーダー", mirror: "ミラー", tiles: 
 // v0.1.60: this file's own version. The Hub's version (from /api/state) is compared with it: a shell cache that is
 // older than the Hub (the app was updated while the home-screen app was closed) is dropped and the page reloaded.
 // tests/test_web_shell.py checks that it equals webapp.VERSION.
-const APP_VERSION = "0.1.64";
+const APP_VERSION = "0.1.65";
 const PT_DISPLAY_LABEL = "パススルー";      // v0.1.57: not a NAS-browser display, so not in RB_DISPLAY_LABELS
 const RB_PERF_WINDOW_MS = 5000;
 const RB_STREAM_FIRST_MS = 5000;     // MJPEG only (no SSE available): first picture within this, else polling
@@ -1074,7 +1074,10 @@ function readRecent() {
 }
 
 // Remember a page the NAS browser / passthrough finished loading: newest first, one row per address.
+function recentOn() { return !(state.settings && state.settings.home_recent === false); }    // v0.1.65
+
 function noteVisit(url, title) {
+  if (!recentOn()) return;                // v0.1.65: switched off: nothing is recorded
   if (typeof url !== "string" || !/^https?:\/\//i.test(url) || url.length > 2048) return;
   if (/__cf_chl|\/cdn-cgi\/challenge/i.test(url)) return;      // Cloudflare check pages are not worth remembering
   const list = readRecent();
@@ -1148,7 +1151,7 @@ function renderHomeTabs() {
 }
 
 function renderHomeRecent() {
-  const list = readRecent();
+  const list = recentOn() ? readRecent() : [];
   const sig = JSON.stringify(list);
   if (sig === state.homeRecentSig) return;
   state.homeRecentSig = sig;
@@ -1286,7 +1289,7 @@ function restoreTabs() {
   try { data = JSON.parse(readSession(TAB_STORAGE_KEY) || "null"); } catch (e) { data = null; }
   if (!data || data.v !== 1 || !Array.isArray(data.tabs)) return;
   let maxId = 0;
-  for (const raw of data.tabs.slice(0, MAX_WEB_TABS)) {
+  for (const raw of data.tabs.slice(0, Math.max(MAX_WEB_TABS, 20))) {   // v0.1.65: the setting may allow more than 6
     if (!raw || typeof raw.id !== "string" || !/^t\d+$/.test(raw.id) || findTab(raw.id)) continue;
     const tab = newTabRecord(raw.id);
     const history = Array.isArray(raw.history) ? raw.history : [];
@@ -1310,9 +1313,16 @@ function createTab() {
   return tab;
 }
 
+// v0.1.65: the number of web tabs follows the Hub setting rb_max_tabs (NAS browser tabs, 1-20), but never goes below
+// MAX_WEB_TABS so tabs that are not loaded (restored, passthrough) keep working as before.
+function webTabLimit() {
+  const n = state.settings && Number(state.settings.rb_max_tabs);
+  return Number.isInteger(n) && n >= 1 && n <= 20 ? Math.max(MAX_WEB_TABS, n) : MAX_WEB_TABS;
+}
+
 function tabLimitReached() {
-  if (state.tabs.length < MAX_WEB_TABS) return false;
-  toast("Webタブは最大" + MAX_WEB_TABS + "枚です。端末とNASのメモリを考慮した上限です。不要なタブを閉じてください。", "error");
+  if (state.tabs.length < webTabLimit()) return false;
+  toast("Webタブは最大" + webTabLimit() + "枚です（設定›ブラウザで変更できます）。端末とNASのメモリを考慮した上限です。不要なタブを閉じてください。", "error");
   return true;
 }
 
@@ -1884,6 +1894,7 @@ function applyRemoteMeta(tab, f) {
     fetchIntercepts(tab).catch(() => {});
   }
   if (typeof f.challenge === "boolean") syncChallenge(tab, f.challenge);
+  if (f.probes) noteProbes(tab, f.probes);          // v0.1.65: the long-press analysis queue of this tab
   if (Number.isFinite(f.linksRev)) noteLinksRev(tab, f.linksRev);
   if (url !== "" && changed) applyDisplay(tab);
   if (changed) updateChrome();
@@ -2285,7 +2296,7 @@ async function streamLoop(tab, gen, kind = "mjpeg") {
     const rb = tab.rb;
     try {
       let target = "/api/rb/meta?tab=" + encodeURIComponent(rb.id) + "&wait=" + (first ? 0 : RB_STREAM_META_S);
-      if (!first && rb.rev !== null) target += "&rev=" + rb.rev;
+      if (!first && rb.rev !== null) target += "&rev=" + rb.rev + probeQuery(rb);
       first = false;
       const res = await fetch(target, {credentials: "same-origin", cache: "no-store"});
       if (gen !== state.rbGen || tab.rb !== rb) return;
@@ -2642,7 +2653,7 @@ async function handlePopupOpened(tab, item) {
     flash("ポップアップ（" + host + "）をこのタブで開きました");
     return;
   }
-  if (state.tabs.length < MAX_WEB_TABS) {
+  if (state.tabs.length < webTabLimit()) {
     const fresh = createTab();
     try {
       await openRemote(fresh, item.url, url => pushHistory(fresh, url));
@@ -3162,7 +3173,7 @@ async function tileLoop(tab, gen) {
     try {
       const wait = rb.loading === true && rb.snapEarly !== rb.url ? RB_EARLY_POLL_S : RB_META_WAIT_S;
       let target = "/api/rb/meta?tab=" + encodeURIComponent(rb.id) + "&wait=" + wait;
-      if (rb.rev !== null) target += "&rev=" + rb.rev;
+      if (rb.rev !== null) target += "&rev=" + rb.rev + probeQuery(rb);
       const res = await fetch(target, {credentials: "same-origin", cache: "no-store"});
       if (gen !== state.rbGen || tab.rb !== rb) return;
       if (res.status === 401 && state.authed) {
@@ -4566,7 +4577,7 @@ async function readerLoop(tab, gen) {
     try {
       const wait = first ? 0 : rb.loading === true && rb.readerEarly !== rb.url ? RB_EARLY_POLL_S : RB_META_WAIT_S;
       let target = "/api/rb/meta?tab=" + encodeURIComponent(rb.id) + "&wait=" + wait;
-      if (!first && rb.rev !== null) target += "&rev=" + rb.rev;
+      if (!first && rb.rev !== null) target += "&rev=" + rb.rev + probeQuery(rb);
       first = false;
       const res = await fetch(target, {credentials: "same-origin", cache: "no-store"});
       if (gen !== state.rbGen || tab.rb !== rb) return;
@@ -4662,7 +4673,8 @@ function wireReader() {
       $("remoteRing").classList.add("is-done");
       setTimeout(hidePressRing, 350);
       const href = press.a.dataset.href;
-      perform(() => startProbe(tab, {href}));      // the exact address is known: no hit test needed
+      const label = (press.a.textContent || "").trim();          // v0.1.65: the link's text names the job in the analysis list
+      perform(() => startProbe(tab, {href, label}));      // the exact address is known: no hit test needed
     }, RB_LONGPRESS_MS);
   });
   body.addEventListener("pointermove", event => {
@@ -4936,7 +4948,7 @@ async function runMirror(tab, opts = {}) {
       // An early copy (taken at DOMContentLoaded or with the tab-open answer since v0.1.54 / v0.1.59) or a copy of a
       // page that is still loading may be empty: look again. Only two empty copies of a loaded page mean that the
       // page cannot be mirrored (it was switched to the fast display after one early empty copy before).
-      const settled = rb.loading !== true && data.partial !== true && !early;
+      const settled = rb.loading !== true && data.partial !== true && !early && !rb.chal;   // v0.1.65: not during a check
       dlog("render", "debug", "mirror empty copy", {settled, partial: data.partial === true, early: Boolean(early)});
       if (!settled || !mirrorFailed(rb, url, false)) { scheduleMirror(tab, 1000, true); return; }
       console.error("mirror: 0 nodes", data.url);
@@ -5078,7 +5090,7 @@ async function mirrorLoop(tab, gen) {
     try {
       const wait = first ? 0 : rb.loading === true && rb.mirrorEarly !== rb.url ? RB_EARLY_POLL_S : RB_META_WAIT_S;
       let target = "/api/rb/meta?tab=" + encodeURIComponent(rb.id) + "&wait=" + wait;
-      if (!first && rb.rev !== null) target += "&rev=" + rb.rev;
+      if (!first && rb.rev !== null) target += "&rev=" + rb.rev + probeQuery(rb);
       first = false;
       const res = await fetch(target, {credentials: "same-origin", cache: "no-store"});
       if (gen !== state.rbGen || tab.rb !== rb) return;
@@ -5232,7 +5244,8 @@ function wireMirrorDoc(doc) {
       $("remoteRing").classList.add("is-done");
       setTimeout(() => { hidePressRing(); }, 350);
       const href = press.el.getAttribute("data-href");
-      perform(() => startProbe(tab, {href}));         // the exact address is known: no hit test needed
+      const label = (press.el.textContent || "").trim();          // v0.1.65: the link's text names the job in the analysis list
+      perform(() => startProbe(tab, {href, label}));         // the exact address is known: no hit test needed
     }, RB_LONGPRESS_MS);
   });
   doc.addEventListener("pointermove", event => {
@@ -5336,49 +5349,151 @@ function wireMirrorDoc(doc) {
   }, doc, () => mirrorScroller(doc).scrollTop);
 }
 
-// ---- parallel long-press probes (v0.1.27) ----
-// Every long press starts its own request at once (the server queues beyond its limits).
-// While probing only the small chip is shown; the sheet appears solely when a finished
-// probe cannot be auto-sent, and then it collects the results of all such probes.
-let probeSerial = 0;
-const probeFlight = new Map();   // id -> {n, started}
-let probeFlightOpen = false;
+// ---- long-press link analysis queue (v0.1.65) ----
+// A long press only ADDS A JOB on the Hub (POST /api/rb/probe answers at once with {job, position}); the Hub analyses
+// the links one by one, waits for memory instead of failing, keeps the results for 30 minutes and (setting
+// probe_autosend) sends what it finds to JD2 by itself. This side shows the counts (they ride on the tab's meta
+// long-poll: rb.probes = {rev, queued, running, done, failed, total, review}), a pill while something is going on,
+// and a sheet that lists the jobs (GET /api/rb/probe/jobs) only when the user opens it or a result needs a decision.
+// A Rapidgator link needs no analysis: the Hub answers with the finished result and it is handled as before.
+const probeUi = {open: false, jobs: [], local: [], tabId: "", notified: new Set(), loading: false, gen: 0};
+
+function probeCounts(tab) {
+  const p = tab && tab.rb && tab.rb.probes;
+  return p && Number.isFinite(p.total) ? p : null;
+}
+
+// "&pr=<rev>": the meta long-poll also ends when one of the tab's analysis jobs changes (v0.1.65).
+function probeQuery(rb) {
+  return rb && rb.probes && Number.isFinite(rb.probes.rev) ? "&pr=" + rb.probes.rev : "";
+}
 
 function closeProbeSheet() {
-  state.probeResults = [];
+  probeUi.open = false;
+  probeUi.local = [];
   state.probeResult = null;
   setShown("probeSheet", false);
 }
 
 function renderProbeChip() {
-  const count = probeFlight.size;
-  $("probeChip").textContent = "確認中 " + count + "件";
-  setShown("probeChip", count > 0);
-  if (!count) probeFlightOpen = false;
-  renderProbeFlight();
-  sched.kick();
+  const tab = remoteTab();
+  const p = probeCounts(tab);
+  const active = p ? p.queued + p.running : 0;
+  const show = Boolean(p && (active > 0 || p.failed > 0 || p.review > 0));
+  if (show) {
+    $("probeChip").textContent = "リンク解析 " + (p.done + p.failed) + "/" + p.total + (p.failed ? "・失敗" + p.failed : "") +
+      (active === 0 && p.review ? "・要確認" : "");
+  }
+  setShown("probeChip", show);
+  const item = $("menuProbes");
+  if (item) {
+    item.hidden = !(p && p.total > 0);
+    if (p) item.textContent = "リンク解析の一覧（" + p.total + "件）";
+  }
 }
 
-function renderProbeFlight() {
-  const box = $("probeFlight");
-  box.hidden = !(probeFlightOpen && probeFlight.size);
-  if (box.hidden) return;
-  const now = Date.now();
-  box.replaceChildren(...Array.from(probeFlight.values()).map(p =>
-    element("div", "リンク" + p.n + " · " + Math.floor((now - p.started) / 1000) + "秒"
-      + (p.url ? " · " + p.url : ""))));
+// Called with every meta answer of a tab: remembers the counts and refreshes the pill. The list is fetched (one request,
+// after a short pause so a burst makes one) only while the sheet is open, or once the queue has run dry with results
+// nobody was told about: then ONE toast says what happened (nothing is announced while jobs are still running).
+const PROBE_FETCH_MS = 700;
+
+function noteProbes(tab, p) {
+  const rb = tab.rb;
+  if (!rb || !p || !Number.isFinite(p.rev)) return;
+  const before = rb.probes || null;
+  rb.probes = p;
+  const finished = (p.done || 0) + (p.failed || 0);
+  if (rb.probeAnnounced === undefined) {
+    rb.probeAnnounced = finished;          // results from before this page was loaded are listed, not announced
+    if (finished) probeFetchSoon(tab, false);
+  }
+  if (tab === remoteTab()) renderProbeChip();
+  if (before && before.rev === p.rev) return;
+  const idle = p.queued + p.running === 0;
+  const news = idle && finished > rb.probeAnnounced;
+  if (news || (probeUi.open && probeUi.tabId === rb.id)) probeFetchSoon(tab, news);
 }
 
-function renderProbe() {
-  const results = state.probeResults || [];
+function probeFetchSoon(tab, announce) {
+  const rb = tab.rb;
+  if (!rb) return;
+  rb.probeFetchAnnounce = Boolean(rb.probeFetchAnnounce || announce);
+  if (rb.probeFetch) return;
+  rb.probeFetch = setTimeout(() => {
+    rb.probeFetch = 0;
+    const wanted = rb.probeFetchAnnounce;
+    rb.probeFetchAnnounce = false;
+    if (tab.rb !== rb) return;
+    if (wanted && rb.probes) rb.probeAnnounced = (rb.probes.done || 0) + (rb.probes.failed || 0);
+    loadProbeJobs(tab, {announce: wanted}).catch(() => {});
+  }, PROBE_FETCH_MS);
+}
+
+async function loadProbeJobs(tab, opts = {}) {
+  const rb = tab && tab.rb;
+  if (!rb) return;
+  const gen = ++probeUi.gen;
+  const data = await api("/api/rb/probe/jobs?tab=" + encodeURIComponent(rb.id));
+  if (tab.rb !== rb || gen !== probeUi.gen) return;
+  probeUi.jobs = data.jobs || [];
+  probeUi.tabId = rb.id;
+  const fresh = probeUi.jobs.filter(j => (j.state === "done" || j.state === "failed") && !probeUi.notified.has(j.id));
+  for (const j of fresh) probeUi.notified.add(j.id);
+  if (probeUi.notified.size > 500) probeUi.notified = new Set(Array.from(probeUi.notified).slice(-250));
+  if (probeUi.open) renderProbeSheet();
+  if (opts.announce && fresh.length) announceProbes(tab, fresh);
+}
+
+// A result is ready: say so in one toast; open the sheet when links need a decision (not sent to JD2 by the Hub).
+function announceProbes(tab, jobs) {
+  const failed = jobs.filter(j => j.state === "failed");
+  const done = jobs.filter(j => j.state === "done");
+  const sentJobs = done.filter(j => j.sent && !j.sent.error && j.sent.sent > 0);
+  const sentCount = sentJobs.reduce((n, j) => n + j.sent.sent, 0);
+  const review = done.filter(j => j.links.length && !(j.sent && !j.sent.error));
+  const empty = done.filter(j => !j.links.length);
+  const parts = [];
+  if (sentCount) parts.push("JD2へ送信 " + sentCount + "件");
+  if (review.length) parts.push("要確認 " + review.length + "件");
+  if (empty.length) parts.push("リンクなし " + empty.length + "件");
+  if (done.length && !parts.length) parts.push("重複のため送信済み");
+  if (failed.length) toast("リンク解析に失敗: " + failed.length + "件（" + (failed[0].label || failed[0].host) + "："
+    + (failed[0].error || "不明") + "）。一覧から再試行できます", "error");
+  if (done.length) flash("リンク解析が終わりました（" + parts.join("・") + "）");
+  if (review.length || failed.length) { probeUi.open = true; probeUi.tabId = tab.rb.id; renderProbeSheet(); }
+}
+
+const PROBE_STATE_LABEL = {queued: "待機", running: "解析中", done: "完了", failed: "失敗", cancelled: "取り消し"};
+
+function probeJobRows() {
+  return probeUi.local.concat(probeUi.jobs.filter(j => j.state !== "cancelled"));
+}
+
+function renderProbeSheet() {
   const canSend = jd2CanSend();
+  const rows = probeJobRows();
   const all = [];
-  const groups = results.map(item => {
-    const group = element("div", undefined, "probe-group");
-    group.appendChild(element("div", "リンク" + item.n + " · リダイレクト " + item.result.redirects +
-      "回 · 最終: " + (hostLabel(item.result.final_url) || "不明") +
-      (item.error ? " · 送信失敗: " + item.error : ""), "probe-group-head"));
-    for (const url of item.result.links) {
+  const groups = rows.map(job => {
+    const group = element("div", undefined, "probe-group probe-job is-" + job.state);
+    const head = element("div", undefined, "probe-job-head");
+    head.appendChild(element("span", job.label || job.host || "リンク", "probe-job-label"));
+    let status = PROBE_STATE_LABEL[job.state] || job.state;
+    if (job.state === "queued") status = job.wait === "memory" ? "メモリ待ち" : "待機 " + job.position + "番目";
+    if (job.state === "done" && job.sent && !job.sent.error && job.sent.sent) status = "送信済み " + job.sent.sent + "件";
+    head.appendChild(element("span", status, "probe-job-state"));
+    group.appendChild(head);
+    const sub = [];
+    if (job.host && job.label !== job.host) sub.push(job.host);
+    if (job.state === "done") {
+      sub.push("リダイレクト " + job.redirects + "回");
+      if (job.final_url) sub.push("最終: " + (hostLabel(job.final_url) || "不明"));
+    }
+    if (job.state === "queued" && job.wait === "memory" && job.note) sub.push(job.note);
+    if (job.state === "failed" && job.error) sub.push(job.error);
+    else if (job.note && job.state !== "queued") sub.push(job.note);
+    if (job.sent && job.sent.error) sub.push("送信失敗: " + job.sent.error);
+    if (sub.length) group.appendChild(element("div", sub.join(" · "), "probe-group-head"));
+    for (const url of job.links || []) {
       all.push(url);
       const row = element("div", undefined, "probe-link");
       row.appendChild(element("span", url, "link-url"));
@@ -5399,18 +5514,48 @@ function renderProbe() {
       row.appendChild(actions);
       group.appendChild(row);
     }
+    if (job.state === "failed" && job.id && !job.local) {
+      const retry = element("button", "再試行", "btn small");
+      retry.type = "button";
+      retry.addEventListener("click", () => perform(() => probeAction("retry", job.id)));
+      group.appendChild(retry);
+    }
     return group;
   });
-  $("probeList").replaceChildren(...groups);
+  $("probeList").replaceChildren(...(groups.length ? groups : [element("div", "リンク解析はありません", "muted")]));
+  const counts = {queued: 0, failed: 0};
+  for (const job of rows) { if (job.state === "queued") counts.queued++; if (job.state === "failed" && !job.local) counts.failed++; }
   state.probeResult = {links: all};
+  $("probeTitle").textContent = "リンク解析" + (rows.length ? "（" + rows.length + "件）" : "");
   $("probeSendAll").textContent = "すべてJD2へ送る（" + all.length + "件）";
   $("probeAddAll").textContent = "リンクに追加（" + all.length + "件）";
+  $("probeRetryAll").textContent = "失敗を再試行（" + counts.failed + "件）";
+  $("probeCancelAll").textContent = "待ちを取り消す（" + counts.queued + "件）";
   setShown("probeSendAll", canSend && all.length > 0);
   setShown("probeAddAll", all.length > 0);
-  setShown("probeSheet", groups.length > 0);
+  setShown("probeRetryAll", counts.failed > 0);
+  setShown("probeCancelAll", counts.queued > 0);
+  setShown("probeClear", rows.some(j => j.state === "done" || j.state === "failed"));
+  setShown("probeSheet", true);
 }
 
-// Long press found hoster links: hand them to JD2 without a dialog (setting probe_autosend).
+async function probeAction(kind, job) {
+  const tab = remoteTab();
+  if (!tab) return;
+  const rb = tab.rb;
+  await api("/api/rb/probe/" + kind, job ? {tab: rb.id, job} : {tab: rb.id});
+  await loadProbeJobs(tab);
+}
+
+async function openProbeSheet(tab) {
+  if (!tab || !tab.rb) return;
+  probeUi.open = true;
+  probeUi.tabId = tab.rb.id;
+  renderProbeSheet();
+  await loadProbeJobs(tab);
+}
+
+// Long press found hoster links of a RAPIDGATOR link (no analysis): hand them to JD2 without a dialog (setting probe_autosend).
 // Returns true when handled (toast shown); false means the result goes to the sheet.
 async function autoSendProbe(result, rb, item) {
   if (!result.links.length || !result.probe_id) return false;
@@ -5435,31 +5580,43 @@ async function autoSendProbe(result, rb, item) {
   }
 }
 
+let probeLocalSerial = 0;
+
 async function startProbe(tab, point) {
   const rb = tab.rb;
   if (!rb) return;
-  const item = {n: ++probeSerial, started: Date.now()};
-  const id = item.n;
-  probeFlight.set(id, item);
-  renderProbeChip();
+  const body = point.href ? {tab: rb.id, href: point.href} :
+    point.snap ? {tab: rb.id, x: point.x, y: point.y, snap: point.snap} : {tab: rb.id, x: point.x, y: point.y};
+  if (point.label) body.label = String(point.label).slice(0, 80);
   try {
-    const result = await api("/api/rb/probe", point.href ? {tab: rb.id, href: point.href} :
-      point.snap ? {tab: rb.id, x: point.x, y: point.y, snap: point.snap} : {tab: rb.id, x: point.x, y: point.y});
-    probeFlight.delete(id);
-    renderProbeChip();
+    const result = await api("/api/rb/probe", body);
     if (tab.rb !== rb) return;
+    if (!Array.isArray(result.links)) {
+      // queued: answer at once. The counts follow with the next meta answer; show them now.
+      const p = rb.probes || {rev: 0, queued: 0, running: 0, done: 0, failed: 0, total: 0, review: 0};
+      if (!result.existing) rb.probes = Object.assign({}, p, {queued: p.queued + 1, total: p.total + 1});
+      renderProbeChip();
+      if (result.existing) {
+        flash(result.state === "done" ? "同じリンクは解析済みです" : "同じリンクはすでに解析待ちです（" + result.position + "件目）");
+        if (result.state === "done") openProbeSheet(tab).catch(() => {});
+      } else {
+        flash("解析待ちに追加（" + result.position + "件目）");
+      }
+      return;
+    }
     if (!result.links.length) {
       const host = hostLabel(result.final_url);
       flash("リンクは見つかりませんでした" + (host ? "（最終: " + host + "）" : ""));
       return;
     }
-    if (await autoSendProbe(result, rb, item)) return;
+    if (await autoSendProbe(result, rb, null)) return;
     if (tab.rb !== rb) return;
-    state.probeResults = (state.probeResults || []).concat([{n: item.n, result}]);
-    renderProbe();
+    probeUi.local.push({id: "L" + (++probeLocalSerial), local: true, state: "done", label: hostLabel(result.start_url) || "リンク",
+      host: hostLabel(result.start_url), links: result.links, redirects: result.redirects || 0, final_url: result.final_url});
+    probeUi.open = true;
+    probeUi.tabId = rb.id;
+    renderProbeSheet();
   } catch (e) {
-    probeFlight.delete(id);
-    renderProbeChip();
     if (e.status === 404) remoteLost(tab);
     else throw e;
   }
@@ -5747,7 +5904,13 @@ function wireRemote() {
   $("popupToastAllow").addEventListener("click", () => perform(() => popupRule("allow")));
   $("popupToastBlock").addEventListener("click", () => perform(() => popupRule("block")));
   $("probeClose").addEventListener("click", closeProbeSheet);
-  $("probeChip").addEventListener("click", () => { probeFlightOpen = !probeFlightOpen; renderProbeFlight(); });
+  $("probeChip").addEventListener("click", () => perform(() => openProbeSheet(remoteTab())));
+  $("probeRetryAll").addEventListener("click", () => perform(() => probeAction("retry")));
+  $("probeCancelAll").addEventListener("click", () => perform(() => probeAction("cancel")));
+  $("probeClear").addEventListener("click", () => perform(async () => {
+    probeUi.local = [];
+    await probeAction("dismiss");
+  }));
   $("probeSendAll").addEventListener("click", () => perform(async () => {
     if (state.probeResult) await sendUrls(state.probeResult.links.slice());
   }));
@@ -6369,6 +6532,7 @@ function configureMenu() {
   const site = web ? siteKey(hostOf(tab.current || tab.history[tab.index] || "")) : "";
   forget.hidden = !(web && hasSiteDisplay(tab.current || tab.history[tab.index] || ""));
   forget.textContent = "このサイトの表示を忘れる" + (site ? "（" + site + "）" : "");
+  renderProbeChip();         // v0.1.65: 「リンク解析の一覧」 is offered while the tab has analysis jobs
 }
 
 function openMenu() {
@@ -6390,6 +6554,7 @@ async function menuAction(action) {
   else if (action.startsWith("display:")) setUserDisplay(tab, action.slice(8));
   else if (action === "perf") setPerf(!state.rbPerf);
   else if (action === "forgetSite" && tab) forgetSiteDisplay(tab);
+  else if (action === "probeList" && tab) await openProbeSheet(tab);          // v0.1.65
   else if (action === "stageUrl" && tab) await stageTabUrl(tab);
   else if (action === "bookmark" && tab) await bookmarkTab(tab);
   else if (action === "closeTab" && tab) closeTab(tab.id);
@@ -7613,6 +7778,8 @@ function renderDownloadDir(s) {
   $("rbDefaultMode").value = DISPLAY_OF_SETTING[s.rb_default_mode] ? s.rb_default_mode : "fast";
   $("rbLinkBoxes").checked = s.rb_link_boxes === true;
   $("rbSpareTab").checked = s.rb_spare_tab !== false;
+  $("homeRecentOn").checked = s.home_recent !== false;      // v0.1.65
+  renderMaxTabs();
   $("rbNoWebfonts").checked = s.rb_no_webfonts !== false;
   $("rbResident").checked = s.rb_resident === true;
   $("ptEnabled").checked = s.pt_enabled === true;       // v0.1.57
@@ -8764,7 +8931,6 @@ function registerTasks() {
   sched.add("debug-fps", 10000, () => state.debug.enabled, debugFps);
   sched.add("debug-remaining", 5000, () => state.debug.enabled && diagVisible(), renderDebugCard);
   sched.add("rb-perf", 1000, () => state.rbPerf, renderPerf);
-  sched.add("probe-flight", 1000, () => probeFlight.size > 0 && probeFlightOpen, renderProbeFlight);
 }
 
 function stateWanted() { return state.authed && document.visibilityState === "visible"; }
@@ -9897,6 +10063,9 @@ async function swipeFlick(ctx, o) {
       if (e2 && e2.handlers) env = e2;
       const d0 = env.target.ownerDocument || env.target;       // the whole page, not the element under the centre
       el = d0.querySelector ? d0.querySelector(o.sel) : null;
+      if (!el && tabDisplay(ctx.d.tab) === "mirror") {          // the event target may still be the app's element
+        try { const md = mirrorDoc(); el = md ? md.querySelector(o.sel) : null; if (el) env.target = el; } catch (e) { el = null; }
+      }
       return Boolean(el);
     }, tabDisplay(ctx.d.tab) === "mirror" ? 10000 : 1500);   // mirror: a loaded CI runner delivers the copy late
     if (!el) return "none";
@@ -10244,7 +10413,7 @@ function renderSelftest(snap) {
   const state = $("selftestState");
   if (!snap.run_id) state.textContent = "まだ実行していません";
   else if (running) state.textContent = (snap.current || "実行中") + "（" + selftestSecondsText(snap.elapsed_ms) + "）";
-  else state.textContent = {done: "完了しました", cancelled: "中止しました", timeout: "4分の上限で終了しました",
+  else state.textContent = {done: "完了しました", cancelled: "中止しました", timeout: "6分の上限で終了しました",
     error: "途中でエラーになりました"}[snap.state] + "（" + selftestSecondsText(snap.elapsed_ms) + "）";
   const progress = $("selftestProgress");
   progress.hidden = !snap.run_id;
@@ -10925,7 +11094,7 @@ function renderSiteRules(data) {
 const optionChain = new Map();
 const OPTION_CONTROL = {
   pt_enabled: "ptEnabled", rb_resident: "rbResident", block_ads: "blockAds", rb_default_mode: "rbDefaultMode",
-  rb_spare_tab: "rbSpareTab", rb_no_webfonts: "rbNoWebfonts", rb_link_boxes: "rbLinkBoxes", probe_autosend: "probeAutosend",
+  rb_max_tabs: "rbMaxTabs", rb_spare_tab: "rbSpareTab", home_recent: "homeRecentOn", rb_no_webfonts: "rbNoWebfonts", rb_link_boxes: "rbLinkBoxes", probe_autosend: "probeAutosend",
   auto_clear_links: "autoClearLinks", auto_clear_downloads: "autoClearDownloads", send_autostart: "sendAutostart",
 };
 
@@ -10989,6 +11158,29 @@ function setRbReady(ready) {
   if (state.authed) updateChrome();
 }
 
+// v0.1.65: the tab limit (1-20) and, once the self-test 「タブの容量」 has measured it, the recommended number.
+function renderMaxTabs() {
+  const select = $("rbMaxTabs");
+  if (!select) return;
+  if (!select.options.length) {
+    for (let n = 1; n <= 20; n++) {
+      const option = element("option", n + "枚");
+      option.value = String(n);
+      select.appendChild(option);
+    }
+  }
+  const s = state.settings || {};
+  if (Number.isInteger(s.rb_max_tabs)) select.value = String(s.rb_max_tabs);
+  const reco = state.rbStatus && state.rbStatus.tab_reco;
+  const row = $("rbMaxTabsRecoRow");
+  const valid = reco && Number.isInteger(reco.tabs) && reco.tabs >= 1 && reco.tabs <= 20;
+  row.hidden = !valid;
+  if (!valid) return;
+  $("rbMaxTabsReco").textContent = reco.tabs + "枚（1ページあたり 平均 " + Math.round(reco.avg_mib) + " MiB・最大 " + Math.round(reco.max_mib) +
+    " MiB で自己テストが算出" + (reco.partial ? "・途中まで測定" : "") + "）";
+  $("rbMaxTabsApply").disabled = Number(s.rb_max_tabs) === reco.tabs;
+}
+
 function renderBrowserStatus(r) {
   state.rbStatus = r;
   if (typeof r.image_ready === "boolean") setRbReady(r.image_ready);
@@ -11029,6 +11221,7 @@ function renderBrowserStatus(r) {
   if (typeof r.available_mib === "number") parts.push("NAS空きメモリ " + r.available_mib + " MiB");
   parts.push("タブ " + (r.tabs || []).length + " / " + r.max_tabs);
   $("rbMemory").textContent = parts.join(" · ");
+  renderMaxTabs();
   const reason = (r.image_ready || r.update_needed) && r.reason ? r.reason : "";
   $("rbReason").hidden = !reason;
   $("rbReason").textContent = reason ? (r.update_needed ? reason : "いまは開けません: " + reason) : "";
@@ -11121,6 +11314,33 @@ function wireBrowser() {
       renderDownloadDir(state.settings || {});
       throw e;
     }
+  }));
+  renderMaxTabs();
+  $("rbMaxTabs").addEventListener("change", () => perform(async () => {
+    const n = Number($("rbMaxTabs").value);
+    try {
+      await saveOption("rb_max_tabs", n);
+      flash("NASブラウザのタブは最大" + n + "枚にしました");
+      renderMaxTabs();
+    } catch (e) { renderMaxTabs(); throw e; }
+  }));
+  $("rbMaxTabsApply").addEventListener("click", () => perform(async () => {
+    const reco = state.rbStatus && state.rbStatus.tab_reco;
+    if (!reco || !Number.isInteger(reco.tabs)) return;
+    try {
+      await saveOption("rb_max_tabs", reco.tabs);
+      flash("タブの上限を推奨の" + reco.tabs + "枚にしました");
+    } finally { renderMaxTabs(); }
+  }));
+  $("homeRecentOn").addEventListener("change", () => perform(async () => {      // v0.1.65
+    const on = $("homeRecentOn").checked;
+    try {
+      await saveOption("home_recent", on);
+      if (!on) removeLocal(RECENT_KEY);        // off also forgets what this device kept
+      state.homeRecentSig = null;
+      renderHomeRecent();
+      flash(on ? "最近見たページを表示します" : "最近見たページを表示しません（一覧も消しました）");
+    } catch (e) { $("homeRecentOn").checked = !on; throw e; }
   }));
   $("rbSpareTab").addEventListener("change", () => perform(async () => {
     try {

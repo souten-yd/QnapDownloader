@@ -231,6 +231,19 @@ class SiteRuleTests(unittest.TestCase):
         self.assertIs(settings["probe_autosend"], True)
         self.assertIs(settings["block_ads"], True)
 
+    def test_v0164_tab_limit_defaults_to_three_and_accepts_one_to_twenty_only(self):
+        self.assertEqual(self.s.settings()["rb_max_tabs"], 3)
+        self.assertIn("rb_max_tabs", storage.INT_OPTIONS)
+        before = self.revision()
+        self.s.set_option("rb_max_tabs", 3)                      # the default: nothing is written
+        self.assertEqual(self.revision(), before)
+        for good in (1, 5, 20):
+            self.assertEqual(self.s.set_option("rb_max_tabs", good)["rb_max_tabs"], good)
+        for bad in (0, 21, -3, 2.0, "4", True, None, [3]):
+            with self.subTest(value=bad), self.assertRaises(ValueError):
+                self.s.set_option("rb_max_tabs", bad)
+        self.assertEqual(self.s.settings()["rb_max_tabs"], 20)
+
     def test_v0130_display_options_default_and_validate(self):
         settings = self.s.settings()
         self.assertEqual((settings["rb_default_mode"], settings["rb_link_boxes"]), ("fast", False))

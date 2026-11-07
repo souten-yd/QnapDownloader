@@ -31,9 +31,12 @@ import rapidgator_extract
 import rb_blocklist
 import rb_firstload
 import rb_mirror
+import rb_probe_queue
 import rb_resident
 
-MAX_TABS = 3
+MAX_TABS = 3                   # v0.1.65: the default of the option rb_max_tabs (1..MAX_TABS_LIMIT); see RemoteBrowser.max_tabs()
+MAX_TABS_LIMIT = 20
+MAX_TABS_TTL = 2.0             # v0.1.65: how long the option rb_max_tabs is remembered between reads
 MIN_AVAILABLE_KIB = cr.BROWSER_MIN_AVAILABLE_KIB     # MemAvailable >= 2 GiB
 MEM_LIMIT_PERCENT = 80.0
 STATS_TTL = 5.0
@@ -75,7 +78,8 @@ FETCH_PATTERNS = tuple({"urlPattern": pattern, "resourceType": "Document"} for p
 # (Fetch.fulfillRequest); nothing is fetched from the network. A real, valid-looking public https name
 # is used so the normal validators (mirror, reader) treat the page like any other.
 SELFTEST_ORIGIN = "https://selftest.example.com"
-SELFTEST_TABS = 1              # self-test tabs open at once (they do not count against MAX_TABS)
+SELFTEST_TABS = 1              # self-test tabs open at once (they do not count against the tab limit)
+SELFTEST_CAPACITY_TABS = 24    # v0.1.65: ... except the 「タブの容量」 measurement, which keeps several pages open
 ORPHAN_IDLE = 90.0             # v0.1.60: at the tab cap, a tab nobody polled for this long is closed to make room
 OPEN_NONCE_TTL = 120.0         # v0.1.60: a repeated tab-open request with the same nonce returns the same tab
 INTERCEPT_CAP = 20             # events kept per tab (RAM only)
@@ -1058,6 +1062,7 @@ class Tab:
         self.quality = DEFAULT_QUALITY
         self.probing = 0           # probes running now (<= MAX_PROBES_PER_TAB)
         self.probe_waiting = 0     # probes queued behind the limits
+        self.probe_rev = 0         # v0.1.65: bumped when one of the tab's analysis jobs changes (wakes the meta long-poll)
         self.editable = False      # the page's focused element accepts text (after the last input)
         self.snaps = {}            # snapshot id -> Snapshot (newest last, <= SNAP_KEEP)
         self.snap_seq = 0
@@ -1144,6 +1149,7 @@ class Probe:
         self.loading = set()
         self.popups = set()        # popup target ids opened by the probe page
         self.activity = now
+        self.fixture = None        # v0.1.65: the self-test's virtual site, when its tab started this probe
 
 
 def ttl_or(ttl):
@@ -1209,6 +1215,13 @@ class RemoteBrowser:
         self._probe_targets = {}   # probe target id -> Probe
         self._probe_sessions = {}  # CDP session id -> Probe
         self._probe_popups = {}    # popup target id -> Probe
+        # v0.1.65: long presses are queued jobs (rb_probe_queue); `on_probe_done(job)` (set by the Hub) may send the links
+        self.on_probe_done = None
+        self._max_tabs_cache = None
+        self.tab_reco = None       # v0.1.65: latest 「タブの容量」 recommendation of the self-test (RAM only)
+        self.probes = rb_probe_queue.ProbeQueue(
+            self._probe_job_execute, memory_reason=self.probe_memory_reason, tab_alive=self._tab_alive,
+            on_change=self._probe_changed, on_done=self._probe_done)
         # v0.1.38: resident mode, watchdog and memory figures (RAM only)
         self._wall = wall
         self._cgroup_root = cgroup_root
@@ -1413,6 +1426,32 @@ class RemoteBrowser:
                         "タブを閉じてから開いてください" % (limit_percent, stats["percent"]))
         return None
 
+    # ------------------------------------------------------------- tab limit (v0.1.65)
+    def max_tabs(self):
+        """v0.1.65: the most user tabs open at once = the option rb_max_tabs (1..20, default 3), read at most every
+        MAX_TABS_TTL seconds. A ceiling, not a promise: the memory guard still refuses a tab when memory is short."""
+        now = self._clock()
+        cached = self._max_tabs_cache
+        if cached is not None and now - cached[0] < MAX_TABS_TTL:
+            return cached[1]
+        value = MAX_TABS
+        if self.rules is not None:
+            try:
+                raw = self.rules.settings().get("rb_max_tabs")
+            except Exception:
+                raw = None
+            if type(raw) is int and 1 <= raw <= MAX_TABS_LIMIT:
+                value = raw
+        self._max_tabs_cache = (now, value)
+        return value
+
+    def forget_settings_cache(self):
+        """The Hub changed an option: the next max_tabs() reads it again."""
+        self._max_tabs_cache = None
+
+    def tab_limit_message(self):
+        return "NASブラウザのタブは最大%d枚です（設定で変更できます）。不要なタブを閉じてください" % self.max_tabs()
+
     def probe_memory_reason(self):
         return self.memory_reason(PROBE_MIN_AVAILABLE_KIB, PROBE_MEM_LIMIT_PERCENT)
 
@@ -1455,8 +1494,8 @@ class RemoteBrowser:
         if ready and state in ("stopped", "running"):
             reason = (self.memory_reason(stats_ttl=STATUS_STATS_TTL) if fresh_memory
                       else self.memory_reason(cached_only=True))
-            if reason is None and len(tabs) >= MAX_TABS:
-                reason = "NASブラウザのタブは最大%d枚です" % MAX_TABS
+            if reason is None and len(tabs) >= self.max_tabs():
+                reason = self.tab_limit_message()
         if bool(station) and not ready and stale and not setup:
             reason = UPDATE_NEEDED
         resident = self.resident_status(allow_stats=fresh_memory)
@@ -1471,7 +1510,8 @@ class RemoteBrowser:
             "steps": steps,
             "error": error,
             "tabs": tabs,
-            "max_tabs": MAX_TABS,
+            "max_tabs": self.max_tabs(),
+            "tab_reco": self.tab_reco,
             "memory": memory,
             "available_mib": None if available is None else available // 1024,
             "can_open": bool(ready and reason is None),
@@ -1682,6 +1722,8 @@ class RemoteBrowser:
             except cr.ContainerError:
                 pass
         with self._cv:
+            for gone in list(self._tabs):
+                self.probes.tab_closed(gone)       # v0.1.65: the container is gone: no analysis can run
             self._tabs.clear()
             self._by_session.clear()
             self._popups.clear()
@@ -1720,6 +1762,7 @@ class RemoteBrowser:
 
     def shutdown(self):
         self._monitor_evt.set()
+        self.probes.close()
         try:
             self.stop()
         except Exception:
@@ -2016,7 +2059,7 @@ class RemoteBrowser:
             value = found
         else:
             try:
-                stats = self._stats() if allow_stats else self._cached_stats()
+                stats = self._stats(0.0 if fresh else None) if allow_stats else self._cached_stats()   # v0.1.65: fresh = a new reading
                 if stats is not None:
                     value = {"used_bytes": stats["used_bytes"], "anon_bytes": None, "file_bytes": None,
                              "source": "docker stats"}
@@ -2106,6 +2149,7 @@ class RemoteBrowser:
             checked = url
         else:
             checked = browser_safety.validate(url)
+        limit = self.max_tabs()
         with self._open_lock:
             self._touch()
             # v0.1.60: tabs whose opener never got the answer (a dropped or aborted request) are nobody's: at the
@@ -2118,9 +2162,10 @@ class RemoteBrowser:
                 if self._state == "stopping":
                     raise BrowserError("停止処理中です。数秒後にもう一度お試しください")
                 if selftest is None:
-                    if sum(1 for t in self._tabs.values() if not t.selftest) >= MAX_TABS:
-                        raise BrowserError("NASブラウザのタブは最大%d枚です。不要なタブを閉じてください" % MAX_TABS)
-                elif sum(1 for t in self._tabs.values() if t.selftest) >= SELFTEST_TABS:
+                    if sum(1 for t in self._tabs.values() if not t.selftest) >= limit:
+                        raise BrowserError(self.tab_limit_message())
+                elif sum(1 for t in self._tabs.values() if t.selftest) >= (
+                        SELFTEST_CAPACITY_TABS if selftest.get("capacity") else SELFTEST_TABS):
                     raise BrowserError("セルフテスト用のタブがすでに開いています")
                 running = self._state == "running"
             if not running:
@@ -2269,10 +2314,11 @@ class RemoteBrowser:
 
     def _spare_reason(self):
         """Why no spare tab may be kept now (Japanese text), or None. Stricter than the tab-open guard."""
+        limit = self.max_tabs()
         with self._lock:
             if self._state != "running":
                 return "NASブラウザが動いていません"
-            if sum(1 for t in self._tabs.values() if not t.selftest) >= MAX_TABS:
+            if sum(1 for t in self._tabs.values() if not t.selftest) >= limit:
                 return "タブが上限です"
         return self.memory_reason(MIN_AVAILABLE_KIB + SPARE_EXTRA_KIB, MEM_LIMIT_PERCENT - SPARE_MEM_MARGIN, fast=True)
 
@@ -2481,6 +2527,7 @@ class RemoteBrowser:
         return [("Network.setBlockedURLs", {"urls": []})]
 
     def _drop_tab(self, tab, close):
+        self.probes.tab_closed(tab.id)        # v0.1.65: a closed tab's waiting analyses never run, its results go
         with self._cv:
             self._tabs.pop(tab.id, None)
             if tab.session:
@@ -2506,11 +2553,12 @@ class RemoteBrowser:
                 self._schedule_trim()
 
     def _orphans_for_room(self):
-        """v0.1.60: the user tabs to close so one more fits under MAX_TABS (only ones idle >= ORPHAN_IDLE)."""
+        """v0.1.60: the user tabs to close so one more fits under the tab limit (only ones idle >= ORPHAN_IDLE)."""
+        limit = self.max_tabs()
         now = self._clock()
         with self._lock:
             user = [t for t in self._tabs.values() if not t.selftest]
-            excess = len(user) - MAX_TABS + 1
+            excess = len(user) - limit + 1
             if excess <= 0:
                 return []
             idle = sorted((t for t in user if t.pollers == 0 and now - t.last_poll >= ORPHAN_IDLE),
@@ -2566,6 +2614,11 @@ class RemoteBrowser:
                         self._cv.wait(min(remaining, 0.5))
                     else:
                         tl = None
+                if tl is not None and self._challenge(tab):
+                    # v0.1.65: a Cloudflare (or similar) check page is not the page: no first copy of it; the phone
+                    # waits for the real page as it does for any check
+                    debuglog.log("render", "info", "first copy skipped (check page)", {"tab": tab.id, "kind": kind})
+                    tl = None
                 if tl is not None:
                     try:
                         data = self.mirror(tab.id, full=False, partial=True) if kind == "mirror" \
@@ -2621,6 +2674,28 @@ class RemoteBrowser:
             return {"url": tab.url, "title": tab.title, "loading": bool(tab.loading), "rev": tab.rev,
                     "seq": tab.seq, "screencast": tab.screencast, "challenge": bool(tab.page_challenge),
                     "dcl": tab.dcl_n}
+
+    def selftest_heap(self, ident):
+        """v0.1.65: the JavaScript heap in use (bytes) of a self-test tab, or None (Runtime.getHeapUsage, else
+        Performance.getMetrics). The secondary number of the 「タブの容量」 check."""
+        tab = self._tab(ident)
+        if not tab.selftest or not tab.session:
+            raise BrowserError("セルフテスト用のタブではありません")
+        try:
+            used = self._call("Runtime.getHeapUsage", session=tab.session, timeout=PROBE_CDP_TIMEOUT).get("usedSize")
+            if isinstance(used, (int, float)) and not isinstance(used, bool):
+                return int(used)
+        except BrowserError:
+            pass
+        try:
+            self._call("Performance.enable", session=tab.session, timeout=PROBE_CDP_TIMEOUT)
+            metrics = self._call("Performance.getMetrics", session=tab.session, timeout=PROBE_CDP_TIMEOUT).get("metrics")
+            for item in metrics if isinstance(metrics, list) else []:
+                if isinstance(item, dict) and item.get("name") == "JSHeapUsedSize" and isinstance(item.get("value"), (int, float)):
+                    return int(item["value"])
+        except BrowserError:
+            pass
+        return None
 
     def selftest_keep(self, ident, seconds):
         """Keeps the screencast of a self-test tab running (no idle stop) for `seconds`, and starts it."""
@@ -3106,9 +3181,10 @@ class RemoteBrowser:
     def _popup_allow(self, owner, checked):
         """An "allow" site: a NEW tab when the tab and memory limits permit, else
         the opener tab itself. Runs off the CDP reader thread (it may call docker)."""
+        limit = self.max_tabs()
         with self._lock:
             alive = self._tabs.get(owner.id) is owner
-            room = sum(1 for t in self._tabs.values() if not t.selftest) < MAX_TABS
+            room = sum(1 for t in self._tabs.values() if not t.selftest) < limit
         if not alive:
             return
         if room and self.memory_reason() is None:
@@ -3733,20 +3809,23 @@ class RemoteBrowser:
                 self._cv.wait(min(remaining, 0.25))
         return started
 
-    def page_meta(self, ident, rev=None, wait=META_WAIT_MAX, links=False, vp=None, fresh=False):
+    def page_meta(self, ident, rev=None, wait=META_WAIT_MAX, links=False, vp=None, fresh=False, pr=None):
         """Long-poll of tab metadata (no screencast): returns when `rev` is out of date.
 
         With `links` the visible viewport's link map is added (live display); `vp` is the map
         revision the viewer already holds and `fresh` rescans the page even if nothing is flagged.
+        v0.1.65: `pr` is the analysis-queue revision the viewer holds (a change of one of the tab's long-press jobs ends
+        the wait too); the answer always carries the compact `probes` summary.
         """
         tab = self._tab(ident)
         wait = max(0.0, min(float(wait), META_WAIT_MAX))
         self._touch()
         deadline = self._clock() + wait
         if tab.mirror_on and rev is not None and wait > 0:
-            self._mirror_wait(tab, rev, deadline)       # v0.1.39: DOM changes of a mirrored page end the wait
+            self._mirror_wait(tab, rev, deadline, pr)   # v0.1.39: DOM changes of a mirrored page end the wait
         with self._cv:
-            while (rev is not None and tab.rev == rev and self._tabs.get(tab.id) is tab and
+            while (rev is not None and tab.rev == rev and (pr is None or tab.probe_rev == pr) and
+                   self._tabs.get(tab.id) is tab and
                    self._state == "running"):
                 remaining = deadline - self._clock()
                 if remaining <= 0:
@@ -3763,6 +3842,7 @@ class RemoteBrowser:
                 "streams": tab.streams, "frame_bytes": tab.stream_bytes,
                 "mirror_rev": tab.mirror_rev, "dcl": tab.dcl,
             }
+        result["probes"] = self.probes.summary(tab.id)
         result["fps"] = self.stream_fps(tab) if tab.streams else 0.0
         result["challenge"] = self._challenge(tab)
         if links:
@@ -4341,16 +4421,17 @@ class RemoteBrowser:
         finally:
             tab.mirror_lock.release()
 
-    def _mirror_wait(self, tab, rev, deadline):
+    def _mirror_wait(self, tab, rev, deadline, pr=None):
         while True:
             with self._cv:
-                if tab.rev != rev or self._tabs.get(tab.id) is not tab or self._state != "running":
+                if (tab.rev != rev or (pr is not None and tab.probe_rev != pr) or
+                        self._tabs.get(tab.id) is not tab or self._state != "running"):
                     return
                 remaining = deadline - self._clock()
                 if remaining <= 0:
                     return
                 self._cv.wait(min(remaining, MIRROR_POLL))
-                if tab.rev != rev:
+                if tab.rev != rev or (pr is not None and tab.probe_rev != pr):
                     return
             self._mirror_poll(tab)
 
@@ -4883,6 +4964,10 @@ class RemoteBrowser:
             self._cv.notify_all()
 
     def _probe_paused(self, probe, request_id, url, resource_type, conn):
+        if probe.fixture is not None and url.startswith(SELFTEST_ORIGIN + "/") and conn is not None:
+            # v0.1.65: the self-test's queue check follows a virtual page (answered from RAM, never the network)
+            self._serve_fixture(probe.fixture, probe.session, request_id, url, conn)
+            return
         normalized = rapidgator_extract.normalize(url) if len(url) <= 4096 else None
         try:
             if resource_type != "Document" or normalized is None or conn is None:
@@ -5058,16 +5143,8 @@ class RemoteBrowser:
             self._probes -= 1
             self._cv.notify_all()
 
-    def probe(self, ident, x, y, url_check=None, href=None, snap=None):
-        """Follow the link under (x, y) in a hidden target; see the section comment.
-
-        `url_check(url)` may raise ValueError to refuse a start URL (the Hub's own
-        origin). Several probes run at once (per tab and overall limits, the rest wait
-        in a FIFO queue); each has its own hidden target. Returns
-        {start_url, final_url, links, redirects}.
-        """
-        tab = self._tab(ident)
-        self._touch()
+    def _probe_start(self, tab, x, y, url_check, href, snap):
+        """The validated start URL of a long press: the link under (x, y), or `href` when the phone knows it."""
         if href is not None:
             # Fast display: the phone already knows the link under the finger (from the
             # snapshot's link map). It is text from a remote page, so it gets exactly the
@@ -5094,17 +5171,99 @@ class RemoteBrowser:
                 url_check(start)
         except ValueError:
             raise BrowserError("リンク先は公開されたhttpsのアドレスだけ確認できます") from None
+        return start
+
+    def probe(self, ident, x, y, url_check=None, href=None, snap=None):
+        """Follow the link under (x, y) in a hidden target and WAIT for the answer; see the section comment.
+
+        v0.1.65: the Hub no longer uses this (a long press queues a job: probe_enqueue); it stays as the synchronous
+        form of the same mechanics (tests, tools). `url_check(url)` may raise ValueError to refuse a start URL (the
+        Hub's own origin). Several probes run at once (per tab and overall limits, the rest wait in a FIFO queue);
+        each has its own hidden target. Returns {start_url, final_url, links, redirects}.
+        """
+        tab = self._tab(ident)
+        self._touch()
+        start = self._probe_start(tab, x, y, url_check, href, snap)
         direct = rapidgator_extract.normalize(start)
         if direct is not None:
             return {"start_url": start, "final_url": start, "links": [direct], "redirects": 0}
         self._probe_acquire(tab)
         try:
-            return self._run_probe(tab, start)
+            result = self._run_probe(tab, start)
+        finally:
+            self._probe_release(tab)
+        result.pop("ended", None)
+        return result
+
+    # ------------------------------------------------------------ probe queue (v0.1.65)
+    def probe_enqueue(self, ident, x, y, url_check=None, href=None, snap=None, label=None):
+        """A long press: validate now, queue the analysis, answer at once.
+
+        Returns {"direct": {start_url, final_url, links, redirects}} for a Rapidgator link (nothing to analyse, instant),
+        else {"job": id, "position": n, "state": ..., "existing": bool, "label": ..., "host": ...}. Raises ProbeQueueFull
+        (HTTP 429) only when the whole queue (QUEUE_CAP jobs) is still waiting or running.
+        """
+        tab = self._tab(ident)
+        self._touch()
+        start = self._probe_start(tab, x, y, url_check, href, snap)
+        direct = rapidgator_extract.normalize(start)
+        if direct is not None:
+            return {"direct": {"start_url": start, "final_url": start, "links": [direct], "redirects": 0}}
+        try:
+            job, existing = self.probes.enqueue(tab.id, start, label)
+        except rb_probe_queue.QueueFull as error:
+            raise ProbeQueueFull(str(error)) from None
+        return {"job": job["id"], "position": job["position"], "state": job["state"], "existing": existing,
+                "label": job["label"], "host": job["host"]}
+
+    def probe_jobs(self, ident):
+        """{"jobs": [...], "summary": {...}} of one tab (the list sheet; the meta long-poll carries only the summary)."""
+        tab = self._tab(ident)
+        return {"jobs": self.probes.jobs(tab.id), "summary": self.probes.summary(tab.id)}
+
+    def probe_cancel(self, ident, job=None):
+        tab = self._tab(ident)
+        return {"cancelled": self.probes.cancel(tab.id, job if isinstance(job, str) else None)}
+
+    def probe_retry(self, ident, job=None):
+        tab = self._tab(ident)
+        return {"retried": self.probes.retry(tab.id, job if isinstance(job, str) else None)}
+
+    def probe_dismiss(self, ident, job=None):
+        tab = self._tab(ident)
+        return {"dismissed": self.probes.dismiss(tab.id, job if isinstance(job, str) else None)}
+
+    def _tab_alive(self, ident):
+        with self._lock:
+            return self._state == "running" and ident in self._tabs
+
+    def _probe_changed(self, ident):
+        with self._cv:
+            tab = self._tabs.get(ident)
+            if tab is not None:
+                tab.probe_rev = self.probes.revision(ident)
+            self._cv.notify_all()
+
+    def _probe_done(self, job):
+        hook = self.on_probe_done
+        if hook is not None:
+            hook(job)
+
+    def _probe_job_execute(self, ident, href):
+        """The queue worker runs one job: the memory guard was already waited for by the queue."""
+        tab = self._tab(ident)
+        with self._cv:
+            tab.probing += 1
+            self._probes += 1
+        try:
+            return self._run_probe(tab, href)
         finally:
             self._probe_release(tab)
 
     def _run_probe(self, tab, start):
         probe = Probe(tab.id, self._clock())
+        if tab.fixture is not None and start.startswith(SELFTEST_ORIGIN + "/"):
+            probe.fixture = tab.fixture        # v0.1.65: only a self-test tab's own virtual site
         try:
             created = self._call("Target.createTarget", {"url": "about:blank", "background": True})
             target = created.get("targetId")
@@ -5130,7 +5289,7 @@ class RemoteBrowser:
                 except BrowserError as error:
                     self.log("probe ad blocking failed: %s" % error)
             self._call("Page.navigate", {"url": start}, session=session)
-            self._wait_probe(probe, self._clock() + PROBE_TIMEOUT)
+            ended = self._wait_probe(probe, self._clock() + PROBE_TIMEOUT)
             if not probe.links:
                 self._probe_read_popups(probe)
             final = None
@@ -5161,6 +5320,6 @@ class RemoteBrowser:
                 except ValueError:
                     continue
             return {"start_url": start, "final_url": final_url, "links": links,
-                    "redirects": redirects}
+                    "redirects": redirects, "ended": ended}
         finally:
             self._probe_close(probe)

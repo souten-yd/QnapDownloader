@@ -415,7 +415,7 @@ class StateMachineTests(unittest.TestCase):
         snap = runner.status()
         self.assertEqual(snap["state"], "timeout")
         self.assertEqual(snap["checks"][-1]["id"], "run.timeout")
-        self.assertEqual(selftest.HARD_TIMEOUT, 300.0)
+        self.assertEqual(selftest.HARD_TIMEOUT, 360.0)
 
     def test_stuck_worker_is_reaped_by_status(self):
         clock = Clock()
@@ -1351,3 +1351,291 @@ class EnvCgroupAndReportTests(unittest.TestCase):
             run.state = "running"
         runner._client_phase(run, "t1")
         self.assertEqual(calls, [("t1", selftest.CLIENT_WAIT + 15.0)])
+
+
+class RecommendationTests(unittest.TestCase):
+    """v0.1.65: recommended tab count from the measured per-page cost."""
+
+    def test_container_limit_decides_when_it_is_the_tighter_one(self):
+        # 2048 MiB container, 80 % guard = 1638 MiB; browser alone 700 MiB; a page = 150 MiB * 1.25
+        rec = selftest.recommend_tabs(150, 700, 2048, 9000)
+        self.assertEqual((rec["tabs"], rec["by_container"]), (5, 5))
+        self.assertGreater(rec["by_host"], 20)
+
+    def test_free_memory_of_the_nas_can_decide_instead(self):
+        # only 3 GiB free and 2 GiB must stay free: room for (3072-2048)/(100*1.25) = 8 pages
+        rec = selftest.recommend_tabs(100, 300, 8192, 3072)
+        self.assertEqual((rec["tabs"], rec["by_host"]), (8, 8))
+
+    def test_open_tabs_are_part_of_the_base_and_count_towards_the_answer(self):
+        without = selftest.recommend_tabs(100, 500, 2048, 6000)
+        withtabs = selftest.recommend_tabs(100, 500 + 2 * 100, 2048, 6000 - 2 * 100, open_tabs=2)
+        self.assertEqual(withtabs["tabs"], without["tabs"])             # 2 tabs open do not change what fits in total
+
+    def test_clamped_to_one_through_twenty(self):
+        self.assertEqual(selftest.recommend_tabs(900, 1500, 2048, 9000)["tabs"], 1)        # nothing fits: still one
+        self.assertEqual(selftest.recommend_tabs(40, 300, 65536, 60000)["tabs"], 20)
+        self.assertEqual(selftest.recommend_tabs(5, 300, 65536, 60000)["tabs"],
+                         selftest.recommend_tabs(selftest.CAPACITY_FLOOR_MIB, 300, 65536, 60000)["tabs"])    # noise floor
+
+    def test_unknown_limits_are_left_out_and_without_a_cost_there_is_no_answer(self):
+        self.assertEqual(selftest.recommend_tabs(100, 300, None, None)["tabs"], 20)
+        self.assertEqual(selftest.recommend_tabs(100, 300, 2048, None)["by_host"], None)
+        for bad in (None, 0, -5, float("nan"), "x"):
+            self.assertIsNone(selftest.recommend_tabs(bad, 300, 2048, 9000))
+
+    def test_page_costs_skip_the_first_pages_renderer_start_and_prefer_real_sites(self):
+        samples = [("軽い仮想ページ", 150.0, False), ("重い仮想ページ1", 100.0, False), ("重い仮想ページ2", 120.0, False)]
+        stats = selftest.page_costs(samples)
+        self.assertEqual((stats["avg"], stats["max"], stats["per_tab"], stats["basis"]), (110.0, 120.0, 120.0, "virtual"))
+        stats = selftest.page_costs(samples + [("実サイト1", 200.0, True), ("実サイト2", 90.0, True)])
+        self.assertEqual((stats["per_tab"], stats["basis"], stats["n"]), (200.0, "real", 5))
+        self.assertAlmostEqual(stats["avg"], (100 + 120 + 200 + 90) / 4)
+        single = selftest.page_costs([("軽い仮想ページ", 80.0, False)])
+        self.assertEqual((single["avg"], single["per_tab"]), (80.0, 80.0))
+        self.assertEqual(selftest.page_costs([])["per_tab"], None)
+        self.assertEqual(selftest.page_costs([("a", -20.0, False), ("b", -5.0, False)])["max"], 0.0)   # noise never goes negative
+
+
+class FakeCapacityRB:
+    """RemoteBrowser as the 「タブの容量」 check sees it: every open page adds memory; the guard may refuse."""
+
+    def __init__(self, clock, base=500.0, costs=(80, 100, 120, 110, 90), limit_mib=2048, refuse_after=None, tabs=()):
+        self.clock, self.base, self.costs = clock, base, list(costs)
+        self.used = base
+        self.n = 0
+        self.limit = limit_mib
+        self.refuse_after = refuse_after
+        self.open_ids, self.closed, self.opened = [], [], []
+        self.user_tabs = list(tabs)
+        self.tab_reco = None
+        self.max = 3
+
+    def container_memory(self, fresh=False, allow_stats=True):
+        assert fresh, "the capacity check must read a fresh value"
+        return {"used_bytes": int(self.used * 1024 * 1024), "anon_bytes": None, "file_bytes": None, "source": "cgroup"}
+
+    def status(self):
+        return {"tabs": [{"id": t} for t in self.user_tabs], "memory": {"used_mib": 1, "limit_mib": self.limit},
+                "available_mib": 9000}
+
+    def memory_reason(self, *args, **kwargs):
+        if self.refuse_after is not None and self.n >= self.refuse_after:
+            return "NASブラウザのメモリ使用量が上限の80%に達しています（85%）。タブを閉じてから開いてください"
+        return None
+
+    def max_tabs(self):
+        return self.max
+
+    def open_tab(self, url, selftest=None):
+        assert selftest and selftest.get("capacity") is True
+        self.opened.append(url)
+        self.used += self.costs[self.n] if self.n < len(self.costs) else 100
+        self.n += 1
+        tab = "s%d" % self.n
+        self.open_ids.append(tab)
+        return {"id": tab}
+
+    def set_viewport(self, *a):
+        pass
+
+    def selftest_info(self, tab):
+        return {"loading": False, "url": self.opened[int(tab[1:]) - 1], "title": "", "rev": 1, "seq": 0,
+                "screencast": False, "challenge": False, "dcl": 1}
+
+    def selftest_heap(self, tab):
+        return 4 * 1024 * 1024
+
+    def close_tab(self, tab):
+        self.closed.append(tab)
+        self.open_ids.remove(tab)
+
+    def selftest_tabs(self):
+        return list(self.open_ids)
+
+
+class FakeQueueRB(FakeCapacityRB):
+    """v0.1.65: adds the probe queue API the 「リンク解析キュー」 check uses; jobs finish one per poll."""
+
+    def __init__(self, clock, mode="ok", **kw):
+        super().__init__(clock, **kw)
+        self.mode = mode
+        self.jobs = []
+        self.enqueued = []
+        self.tab_closed_for = []
+        self.probes = self
+
+    def tab_closed(self, tab):
+        self.tab_closed_for.append(tab)
+
+    def open_tab(self, url, selftest=None):
+        self.opened.append(url)
+        self.n += 1
+        tab = "q%d" % self.n
+        self.open_ids.append(tab)
+        return {"id": tab}
+
+    def probe_enqueue(self, tab, x, y, href=None, label=None, **kw):
+        self.enqueued.append(href)
+        job = {"id": "j%d" % len(self.jobs), "state": "queued", "links": [], "started": None, "finished": None, "error": None}
+        self.jobs.append(job)
+        return {"job": job["id"], "position": len(self.jobs)}
+
+    def probe_jobs(self, tab):
+        for job in self.jobs:                    # one job completes per poll
+            if job["state"] == "queued":
+                index = self.jobs.index(job)
+                job["started"] = 100.0 + index * (0.5 if self.mode != "overlap" else 0.1)
+                job["finished"] = job["started"] + 0.4
+                if self.mode == "fail" and index % 2:
+                    job["state"], job["error"] = "failed", "NASブラウザのメモリ使用量が上限の85%に達しています"
+                else:
+                    job["state"], job["links"] = "done", ["https://rapidgator.net/file/x"]
+                break
+        return {"jobs": [dict(j) for j in self.jobs], "summary": {}}
+
+
+class QueueCheckTests(unittest.TestCase):
+    def run_queue(self, mode="ok"):
+        clock = Clock()
+        runner = make_runner(clock=clock, sleep=lambda s: setattr(clock, "now", clock.now + s))
+        runner.rb = FakeQueueRB(clock, mode=mode)
+        runner.start({"client": False, "urls": []})
+        run = runner._run
+        runner._queue(run, selftest.Fixtures())
+        return runner, run, {c["id"]: c for c in run.checks if c["section"] == "queue"}
+
+    def test_ten_virtual_presses_finish_one_after_another(self):
+        runner, run, checks = self.run_queue()
+        self.assertEqual(len(runner.rb.enqueued), selftest.QUEUE_PROBES)
+        self.assertTrue(all(h.startswith("https://selftest.example.com/go/") for h in runner.rb.enqueued))
+        self.assertEqual(checks["queue.enqueue"]["status"], "pass")
+        self.assertEqual(checks["queue.finish"]["status"], "pass")
+        self.assertIn("10/10件完了", checks["queue.finish"]["value"])
+        self.assertEqual(checks["queue.sequential"]["status"], "pass")
+        self.assertEqual(runner.rb.tab_closed_for, ["q1"])               # the check's tab and jobs are gone afterwards
+        self.assertEqual(runner.rb.open_ids, [])
+
+    def test_failures_and_overlap_are_reported(self):
+        _, _, checks = self.run_queue("fail")
+        self.assertEqual(checks["queue.finish"]["status"], "warn")
+        self.assertIn("メモリ使用量", checks["queue.finish"]["value"])
+        self.assertTrue(checks["queue.finish"]["hint"])
+        _, _, checks = self.run_queue("overlap")
+        self.assertEqual(checks["queue.sequential"]["status"], "fail")
+
+    def test_virtual_redirect_page_forwards_to_a_file_page(self):
+        answer = selftest.Fixtures()(selftest.remote_browser_origin() + "/go/3")
+        self.assertEqual(answer[0], 200)
+        self.assertIn(b"https://rapidgator.net/file/", answer[2])
+        self.assertIsNone(selftest.Fixtures()(selftest.remote_browser_origin() + "/go/abc"))
+
+
+class CapacityTests(unittest.TestCase):
+    def run_capacity(self, urls=(), **rb_kwargs):
+        clock = Clock()
+        runner = make_runner(clock=clock, sleep=lambda s: setattr(clock, "now", clock.now + s))
+        runner.rb = FakeCapacityRB(clock, **rb_kwargs)
+        runner.start({"client": False, "urls": [{"url": u, "host": u.split("/")[2]} for u in urls]})
+        run = runner._run
+        runner._capacity(run, selftest.Fixtures())
+        return runner, run, {c["id"]: c for c in run.checks}
+
+    def test_one_line_per_page_a_summary_and_everything_is_closed_again(self):
+        runner, run, checks = self.run_capacity()
+        pages = [c for c in run.checks if c["id"].startswith("capacity.page.")]
+        self.assertEqual(len(pages), 4)                                 # the light page and the heavy one three times
+        self.assertIn("+80 MiB", pages[0]["value"])
+        self.assertIn("ブラウザの描画プロセスの起動を含む", pages[0]["value"])
+        self.assertIn("JSヒープ 4.0 MiB", pages[1]["value"])
+        self.assertIn("コンテナ合計 680 MiB", pages[1]["value"])
+        summary = checks["capacity.summary"]
+        # average of pages 2..4 = 110, maximum 120 -> container: (2048*0.8 - 500)/(120*1.25) = 7
+        self.assertIn("1ページあたり 平均 110 MiB・最大 120 MiB → 推奨タブ枚数 7枚（現在の上限 3枚）", summary["value"])
+        self.assertEqual(summary["status"], PASS)
+        self.assertEqual(runner.rb.tab_reco["tabs"], 7)
+        self.assertEqual(runner.rb.open_ids, [])
+        self.assertEqual(sorted(runner.rb.closed), sorted("s%d" % n for n in range(1, 5)))
+        self.assertEqual(checks["capacity.base"]["status"], PASS)
+        self.assertEqual(run.info["tab_reco"]["basis"], "virtual")
+
+    def test_real_sites_follow_the_virtual_pages_and_set_the_cost(self):
+        runner, run, checks = self.run_capacity(urls=("https://news.example/a", "https://shop.example/b"),
+                                                costs=(80, 100, 120, 110, 260, 90))
+        self.assertEqual(len([c for c in run.checks if c["id"].startswith("capacity.page.")]), 6)
+        self.assertEqual(runner.rb.opened[-2:], ["https://news.example/a", "https://shop.example/b"])
+        self.assertEqual(run.info["tab_reco"]["basis"], "real")
+        self.assertEqual(run.info["tab_reco"]["per_tab_mib"], 260.0)
+        self.assertIn("実サイトの最大", checks["capacity.summary"]["value"])
+        self.assertEqual(checks["capacity.page.5"]["site"], "news.example")       # only the host is reported
+        self.assertNotIn("/a", checks["capacity.page.5"]["name"])
+        self.assertEqual(runner.rb.open_ids, [])
+
+    def test_no_real_site_is_touched_without_the_users_urls(self):
+        runner, run, checks = self.run_capacity()
+        self.assertTrue(all(u.startswith(selftest.remote_browser_origin()) for u in runner.rb.opened))
+
+    def test_the_memory_guard_ends_the_measurement_early_and_says_so(self):
+        runner, run, checks = self.run_capacity(refuse_after=2)
+        self.assertEqual(len([c for c in run.checks if c["id"].startswith("capacity.page.")]), 2)
+        summary = checks["capacity.summary"]
+        self.assertEqual(summary["status"], WARN)
+        self.assertIn("メモリ保護のため 3 枚目で止めました", summary["value"])
+        self.assertTrue(summary["hint"])
+        self.assertTrue(runner.rb.tab_reco["partial"])
+        self.assertEqual(runner.rb.open_ids, [])
+
+    def test_a_current_limit_above_the_recommendation_is_a_warning_with_a_hint(self):
+        clock = Clock()
+        runner = make_runner(clock=clock, sleep=lambda s: setattr(clock, "now", clock.now + s))
+        runner.rb = FakeCapacityRB(clock, costs=(80, 350, 350, 350))
+        runner.rb.max = 20
+        runner.start({"client": False})
+        run = runner._run
+        runner._capacity(run, selftest.Fixtures())
+        summary = {c["id"]: c for c in run.checks}["capacity.summary"]
+        self.assertEqual(summary["status"], WARN)
+        self.assertIn(selftest.HINTS["capacity.recommend"], summary["hint"])
+        self.assertTrue(any(c["status"] == WARN and c["id"].startswith("capacity.page.") for c in run.checks))
+
+    def test_without_a_readable_container_memory_the_section_is_skipped(self):
+        clock = Clock()
+        runner = make_runner(clock=clock, sleep=lambda s: setattr(clock, "now", clock.now + s))
+        fake = FakeCapacityRB(clock)
+        fake.container_memory = lambda fresh=False, allow_stats=True: None
+        runner.rb = fake
+        runner.start({"client": False})
+        run = runner._run
+        runner._capacity(run, selftest.Fixtures())
+        self.assertEqual([c["status"] for c in run.checks if c["section"] == "capacity"], [SKIP])
+        self.assertEqual(fake.opened, [])
+
+    def test_the_time_budget_limits_the_pages(self):
+        clock = Clock()
+        runner = make_runner(clock=clock, sleep=lambda s: setattr(clock, "now", clock.now + s))
+        fake = FakeCapacityRB(clock)
+        original = fake.open_tab
+
+        def slow_open(url, selftest=None):
+            clock.now += 25.0
+            return original(url, selftest=selftest)
+        fake.open_tab = slow_open
+        runner.rb = fake
+        runner.start({"client": False})
+        run = runner._run
+        runner._capacity(run, selftest.Fixtures())
+        pages = [c for c in run.checks if c["id"].startswith("capacity.page.")]
+        self.assertLess(len(pages), 4)
+        self.assertIn("時間の上限", {c["id"]: c for c in run.checks}["capacity.summary"]["value"])
+
+    def test_the_section_is_in_the_report_text_and_between_the_sites_and_the_cleanup(self):
+        ids = [i for i, _ in selftest.SECTIONS]
+        self.assertEqual(ids[ids.index("sites") + 1], "capacity")
+        self.assertEqual(dict(selftest.SECTIONS)["capacity"], "タブの容量")
+        self.assertEqual(selftest.HARD_TIMEOUT, 360.0)
+        runner, run, _ = self.run_capacity()
+        run.state = "done"
+        text = runner._report_text(run, False)
+        self.assertIn("## タブの容量", text)
+        self.assertIn("capacity.summary", text)
+        self.assertIn("推奨タブ枚数", text)
