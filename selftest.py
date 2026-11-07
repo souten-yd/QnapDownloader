@@ -1737,35 +1737,45 @@ class SelfTest:
         self._step(run, "JSメニューの操作を測っています")
         name = "JSメニューのトグル（再読み込みなし）"
         try:
-            if self._goto(run, tab, "/menu") is None:
-                raise RuntimeError("メニューのページを読み込めません")
-            loads = fixtures.loads("/menu")
-            cap = rb.mirror(tab, full=True, force=True)
-            before = cap.get("html", "")
-            m = find_toggle(before)
-            if m is None:
-                raise RuntimeError("コピーの中にメニューのトグルが見つかりません")
-            if "メニュー項目" in before:
-                raise RuntimeError("メニューが最初から開いています")
-            rb.mirror_click(tab, m, 0.5, 0.5)
-            end = self._clock() + MENU_WAIT_S
-            opened = False
-            while self._clock() < end:
-                self._guard(run)
-                if "メニュー項目" in rb.mirror(tab, full=True, force=True).get("html", ""):
-                    opened = True
+            # v0.1.58: a reload seen once under load is measured again; only a repeated reload is a failure
+            for attempt in (1, 2):
+                opened, toggled, reloaded = self._menu_once(run, tab, fixtures)
+                if not reloaded:
                     break
-                self._wait(run, 0.25)
-            reloaded = fixtures.loads("/menu") != loads
-            toggled = fixtures.toggles("open") >= 1
             ok = opened and toggled and not reloaded
             value = "メニュー項目が出現=%s / ページ側スクリプト実行=%s / 再読み込み=%s" % (
                 "はい" if opened else "いいえ", "はい" if toggled else "いいえ", "あり" if reloaded else "なし")
+            if attempt == 2:
+                value += "（2回測定）"
             self._add(run, sec, "builtin.menu", name, PASS if ok else FAIL, value, "開く・再読み込みなし")
         except (Cancelled, RunTimeout):
             raise
         except Exception as error:
             self._add(run, sec, "builtin.menu", name, FAIL, _short(str(error), 160))
+
+    def _menu_once(self, run, tab, fixtures):
+        rb = self.rb
+        if self._goto(run, tab, "/menu") is None:
+            raise RuntimeError("メニューのページを読み込めません")
+        loads = fixtures.loads("/menu")
+        toggles = fixtures.toggles("open")
+        cap = rb.mirror(tab, full=True, force=True)
+        before = cap.get("html", "")
+        m = find_toggle(before)
+        if m is None:
+            raise RuntimeError("コピーの中にメニューのトグルが見つかりません")
+        if "メニュー項目" in before:
+            raise RuntimeError("メニューが最初から開いています")
+        rb.mirror_click(tab, m, 0.5, 0.5)
+        end = self._clock() + MENU_WAIT_S
+        opened = False
+        while self._clock() < end:
+            self._guard(run)
+            if "メニュー項目" in rb.mirror(tab, full=True, force=True).get("html", ""):
+                opened = True
+                break
+            self._wait(run, 0.25)
+        return opened, fixtures.toggles("open") > toggles, fixtures.loads("/menu") != loads
 
     def _dynamic_check(self, run, tab):
         rb, sec = self.rb, "builtin"

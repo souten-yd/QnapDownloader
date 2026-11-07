@@ -4457,7 +4457,8 @@ async function runMirror(tab, opts = {}) {
   } catch (e) {
     if (tab.rb !== rb || pageLeaving) return;     // v0.1.57: WebKit fails in-flight fetches ("Load failed") while the page is left
     if (e.status === 404) { remoteLost(tab); return; }
-    console.error("mirror failed:", e);
+    // a dropped connection (WebKit "Load failed", Chrome "Failed to fetch") is not a bug: logged and retried below
+    if (!(e instanceof TypeError && !e.status)) console.error("mirror failed:", e);
     dlog("render", "warn", "mirror failed", {message: String(e && e.message || e).slice(0, 120), status: e.status || 0});
     if (mirrorFailed(rb, url, false)) { mirrorFallback(tab, rb); return; }
     if (!mirrorDoc() || mirrorHost.owner !== rb) {
@@ -8833,7 +8834,8 @@ async function swipeFlick(ctx, o) {
     await swipeWaitFor(() => {
       const e2 = swipeEnv(ctx.d, "view");
       if (e2 && e2.handlers) env = e2;
-      el = env.target.querySelector ? env.target.querySelector(o.sel) : null;
+      const d0 = env.target.ownerDocument || env.target;       // the whole page, not the element under the centre
+      el = d0.querySelector ? d0.querySelector(o.sel) : null;
       return Boolean(el);
     }, 4000);
     if (!el) return "none";
