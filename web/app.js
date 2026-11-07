@@ -75,7 +75,7 @@ const DISPLAY_CHIP_TITLE = {reader: "リーダー", mirror: "ミラー", tiles: 
 // v0.1.60: this file's own version. The Hub's version (from /api/state) is compared with it: a shell cache that is
 // older than the Hub (the app was updated while the home-screen app was closed) is dropped and the page reloaded.
 // tests/test_web_shell.py checks that it equals webapp.VERSION.
-const APP_VERSION = "0.1.63";
+const APP_VERSION = "0.1.64";
 const PT_DISPLAY_LABEL = "パススルー";      // v0.1.57: not a NAS-browser display, so not in RB_DISPLAY_LABELS
 const RB_PERF_WINDOW_MS = 5000;
 const RB_STREAM_FIRST_MS = 5000;     // MJPEG only (no SSE available): first picture within this, else polling
@@ -4933,8 +4933,13 @@ async function runMirror(tab, opts = {}) {
       throw new Error("ミラーのデータが不正です");
     }
     if (data.stats.nodes === 0) {
+      // An early copy (taken at DOMContentLoaded or with the tab-open answer since v0.1.54 / v0.1.59) or a copy of a
+      // page that is still loading may be empty: look again. Only two empty copies of a loaded page mean that the
+      // page cannot be mirrored (it was switched to the fast display after one early empty copy before).
+      const settled = rb.loading !== true && data.partial !== true && !early;
+      dlog("render", "debug", "mirror empty copy", {settled, partial: data.partial === true, early: Boolean(early)});
+      if (!settled || !mirrorFailed(rb, url, false)) { scheduleMirror(tab, 1000, true); return; }
       console.error("mirror: 0 nodes", data.url);
-      mirrorFailed(rb, url, true);
       mirrorFallback(tab, rb);
       return;
     }
@@ -4994,7 +4999,10 @@ async function runMirror(tab, opts = {}) {
     // a dropped connection (WebKit "Load failed", Chrome "Failed to fetch") is not a bug: logged and retried below
     if (!(e instanceof TypeError && !e.status)) console.error("mirror failed:", e);
     dlog("render", "warn", "mirror failed", {message: String(e && e.message || e).slice(0, 120), status: e.status || 0});
-    if (mirrorFailed(rb, url, false)) { mirrorFallback(tab, rb); return; }
+    // a dropped connection says nothing about the page: it never counts toward the fallback, the copy is asked again
+    const dropped = e instanceof TypeError && !e.status;
+    if (dropped) scheduleMirror(tab, 1500, true);
+    else if (mirrorFailed(rb, url, false)) { mirrorFallback(tab, rb); return; }
     if (!mirrorDoc() || mirrorHost.owner !== rb) {
       tab.error = "ミラー表示を作れませんでした: " + (e && e.message ? e.message : String(e));
       updateRemoteView(tab);
