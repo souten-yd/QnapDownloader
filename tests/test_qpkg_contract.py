@@ -108,7 +108,7 @@ class QpkgContractTests(unittest.TestCase):
         # the listener only ever binds the loopback address
         self.assertIn('("127.0.0.1", self.requested_port)', (ROOT / "passthrough.py").read_text())
         self.assertIn("web/pt-sw.js", "web/pt-sw.js")
-        for name in ("pt-sw.js", "pt-helper.js", "pt-boot.js", "pt-download.js"):
+        for name in ("app-sw.js", "pt-sw.js", "pt-helper.js", "pt-boot.js", "pt-download.js"):
             self.assertTrue((ROOT / "web" / name).is_file())
         self.assertIn('cp -R "$ROOT/web"', (ROOT / "scripts/build-qpkg.sh").read_text())      # web/ (and so the pt-*.js files) is packaged
 

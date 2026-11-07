@@ -185,6 +185,18 @@
     }).observe(document, {childList: true, subtree: true});
   }
 
+  // ---- v0.1.60: tell the app how far the page is scrolled (it collapses / restores its bars from this). One small
+  // message per animation frame while scrolling; nothing is sent while the page is still.
+  var scrollTick = 0;
+  window.addEventListener("scroll", function () {
+    if (scrollTick || window.parent === window) return;
+    scrollTick = requestAnimationFrame(function () {
+      scrollTick = 0;
+      var el = document.scrollingElement || document.documentElement;
+      post({type: "scroll", top: Math.round(el.scrollTop), max: Math.round(el.scrollHeight - el.clientHeight)});
+    });
+  }, {passive: true});
+
   // ---- a quick sideways flick goes back / forward (the app has the history); same rules as the app's own
   var start = null, EDGE = 24;
   function scrollsSideways(node) {

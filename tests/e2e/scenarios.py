@@ -915,7 +915,8 @@ def pt_back_forward(ph):
     ph.page.locator("#navBack").tap()
     ph.wait(lambda: _pt_cur(ph) == PT_PAGE, 10, "back")
     ph.wait(lambda: ph.js("activeWebTab().index") == 0, 5, "index 0")
-    ph.page.locator("#navForward").tap()
+    ph.js("openMenu()")      # v0.1.60: → lives in the menu on a phone-width bar
+    ph.page.locator("#menu [data-action='forward']").tap()
     ph.wait(lambda: _pt_cur(ph).endswith("/ptx/page2.html"), 10, "forward")
     ph.page.locator("#navBack").tap()
     ph.wait(lambda: _pt_cur(ph) == PT_PAGE, 10, "back again")
@@ -1192,3 +1193,300 @@ def optimistic_switch(ph):
 
 
 
+
+
+# ------------------------------------------------------------------ v0.1.60: one top bar, collapse, domain, tap feedback, app shell cache
+
+NARROW = {"width": 430, "height": 873}
+MENU_ACTIONS = {"newTab", "reopen", "forward", "reload", "display:reader", "display:mirror", "display:tiles", "display:live",
+                "display:pt", "quality:speed", "quality:standard", "quality:high", "perf", "stageUrl", "bookmark", "closeTab",
+                "bookmarks", "settings", "logout"}
+
+
+def _visible(ph, selector):
+    return ph.js("(s)=>[...document.querySelectorAll(s)].filter(e=>{const r=e.getBoundingClientRect();"
+                 "const cs=getComputedStyle(e);return r.width>0&&r.height>0&&cs.visibility!=='hidden'&&cs.display!=='none'}).length", selector)
+
+
+@scenario("bar-single-row")
+def bar_single_row(ph):
+    """v0.1.60: a web tab has ONE bar (<= 64 px at 430 wide, one ⋮ menu button), no floating reload button, a status
+    banner that takes no room while there is nothing to say, and every item of the old two-row menus in the one menu."""
+    ph.page.set_viewport_size(NARROW)
+    tab = ph.open("/article.html")
+    ph.wait(lambda: "E2E テスト記事" in ph.mirror_text(), 15, "mirror content")
+    ph.page.wait_for_timeout(300)
+    bar = ph.js("(()=>{const r=document.querySelector('.toolbar').getBoundingClientRect();return {top:r.top,h:r.height}})()")
+    assert bar["h"] <= 64, "the top bar is %.0f px high" % bar["h"]
+    stage = ph.js("(()=>{const r=document.getElementById('remoteStage').getBoundingClientRect();return r.top})()")
+    assert stage <= 70, "the page starts %.0f px below the top" % stage          # was ~97 px with the second row
+    assert _visible(ph, "#menuButton, #webStatus .icon-btn, [aria-label='メニューを開く']") == 1, "more than one ⋮ menu button"
+    assert _visible(ph, "use[href='#i-more']") == 1, "more than one ⋮ icon"
+    assert ph.js("document.getElementById('webStatus').getBoundingClientRect().height") == 0, "the status row still takes space"
+    assert ph.js("document.getElementById('tileRefresh')") is None and _visible(ph, "[aria-label='再取得']") == 0, "a floating reload button is left"
+    assert _visible(ph, "#navBack") == 1 and _visible(ph, "#navForward, #navReload, #starBtn") == 0, "≤430 px keeps ← only"
+    chip = ph.js("document.getElementById('modeBtn').textContent")
+    assert chip == "ミラー", chip
+    # the chip opens the display chooser (the menu with the "表示" group)
+    ph.tap(*_centre(ph, "#modeBtn"))
+    ph.wait(lambda: not ph.js("document.getElementById('menu').hidden"), 3, "menu opened by the display chip")
+    actions = set(ph.js("[...document.querySelectorAll('#menu [data-action]')].map(e=>e.dataset.action)"))
+    assert MENU_ACTIONS <= actions, "menu items missing: %s" % sorted(MENU_ACTIONS - actions)
+    assert _visible(ph, "#menu [data-action='forward'], #menu [data-action='reload']") == 2, "→ / ⟳ not offered in the menu"
+    assert "a.example.com" in ph.js("document.getElementById('menuPage').textContent"), "page line missing from the menu"
+    ph.js("closeMenu(false)")
+    # ⋮ menu: reload from the menu reloads the page on the NAS
+    ph.js("openMenu()")
+    hits = ph.env.fx.count("/article.html")
+    ph.tap(*_centre(ph, "#menu [data-action='reload']"))
+    ph.wait(lambda: ph.env.fx.count("/article.html") > hits, 10, "reload from the menu reached the page")
+    # wide screens keep the full bar
+    ph.page.set_viewport_size({"width": 1180, "height": 820})
+    ph.page.wait_for_timeout(300)
+    assert _visible(ph, "#navBack, #navForward, #navReload, #starBtn") == 4, "wide bar lost its buttons"
+    assert ph.js("document.querySelector('.toolbar').getBoundingClientRect().height") <= 64
+
+
+def _centre(ph, selector):
+    box = ph.page.locator(selector).first.bounding_box()
+    return box["x"] + box["width"] / 2, box["y"] + box["height"] / 2
+
+
+@scenario("omnibox-domain")
+def omnibox_domain(ph):
+    """v0.1.60: the address bar shows the domain while idle (https lock, no path), the full URL when focused, and
+    the domain again after leaving it; app screens keep their qnap:// address."""
+    ph.page.set_viewport_size(NARROW)
+    ph.open("/article.html")
+    ph.wait(lambda: "E2E テスト記事" in ph.mirror_text(), 15, "mirror content")
+    value = lambda: ph.js("document.getElementById('omnibox').value")
+    assert value() == "a.example.com", value()
+    assert ph.js("document.getElementById('omniIcon').getAttribute('href')") == "#i-lock"
+    ph.tap(*_centre(ph, "#omnibox"))
+    ph.wait(lambda: ph.js("document.activeElement && document.activeElement.id") == "omnibox", 3, "omnibox focused")
+    ph.wait(lambda: value().endswith("/article.html"), 3, "full URL while editing")
+    assert value() == "https://a.example.com/article.html", value()
+    assert ph.js("(()=>{const o=document.getElementById('omnibox');return o.selectionStart===0&&o.selectionEnd===o.value.length})()"), "URL not selected"
+    ph.js("document.getElementById('omnibox').blur()")
+    assert value() == "a.example.com", value()
+    ph.js("()=>{location.hash='#/downloads'}")
+    ph.wait(lambda: value() == "qnap://downloads", 3, "qnap:// address on an app screen")
+
+
+@scenario("bar-collapse-mirror")
+def bar_collapse_mirror(ph):
+    """v0.1.60: scrolling the mirror down hides the top bar and the tab bar, scrolling up shows them, the top shows
+    them, focusing the address bar or opening the menu shows them; the size the NAS browser is told does not change."""
+    ph.page.set_viewport_size(NARROW)
+    ph.open("/long1.html")
+    ph.wait(lambda: "長いページ 1" in ph.mirror_text(), 15, "long page in mirror")
+    ph.page.wait_for_timeout(600)
+    collapsed = lambda: ph.js("document.body.classList.contains('chrome-collapsed')")
+    bar_bottom = lambda: ph.js("document.querySelector('.toolbar').getBoundingClientRect().bottom")
+    scroll = lambda y: ph.js("(y)=>{const d=mirrorDoc();mirrorScroller(d).scrollTop=y}", y)
+    assert not collapsed() and bar_bottom() > 40
+    view0 = ph.js("stageViewport()")
+    stage0 = ph.js("document.getElementById('remoteStage').clientHeight")
+    for y in (60, 140, 260, 380, 520):             # a finger drag: many small steps down
+        scroll(y)
+        ph.page.wait_for_timeout(60)
+    ph.wait(collapsed, 3, "bars collapse when the page is scrolled down")
+    ph.page.wait_for_timeout(450)
+    assert bar_bottom() <= 1, "the top bar is still on screen (bottom=%.0f)" % bar_bottom()
+    assert ph.js("document.querySelector('.mobile-bar').getBoundingClientRect().top") >= 860, "the tab bar is still on screen"
+    assert ph.js("document.getElementById('remoteStage').clientHeight") > stage0 + 40, "the page did not use the freed space"
+    assert ph.js("stageViewport()") == view0, "the NAS viewport changed with the collapse: %s vs %s" % (ph.js("stageViewport()"), view0)
+    assert ph.js("document.getElementById('remoteStage').getBoundingClientRect().top") <= 1, "page does not start at the top"
+    # scrolling up shows them again
+    for y in (500, 440, 380, 330):
+        scroll(y)
+        ph.page.wait_for_timeout(60)
+    ph.wait(lambda: not collapsed(), 3, "bars return when scrolling up")
+    ph.page.wait_for_timeout(450)
+    assert bar_bottom() > 40 and ph.js("document.querySelector('.mobile-bar').getBoundingClientRect().top") < 860
+    assert ph.js("stageViewport()") == view0
+    # collapse again, then the top of the page
+    for y in (420, 520, 640, 780):
+        scroll(y)
+        ph.page.wait_for_timeout(60)
+    ph.wait(collapsed, 3, "collapsed again")
+    scroll(0)
+    ph.wait(lambda: not collapsed(), 3, "the bars come back at the top of the page")
+    # the address bar and the menu are never hidden under a collapse
+    for y in (200, 340, 480, 620):
+        scroll(y)
+        ph.page.wait_for_timeout(60)
+    ph.wait(collapsed, 3, "collapsed (3)")
+    ph.js("openMenu()")
+    assert not collapsed(), "opening the menu must show the bar"
+    ph.js("closeMenu(false)")
+    for y in (700, 800, 900, 1000):
+        scroll(y)
+        ph.page.wait_for_timeout(60)
+    ph.wait(collapsed, 3, "collapsed (4)")
+    ph.js("focusOmnibox()")
+    assert not collapsed(), "focusing the address bar must show the bar"
+    scroll(1300); scroll(1500); scroll(1700)
+    ph.page.wait_for_timeout(500)
+    assert not collapsed(), "scrolling must not hide the bar while the address bar has focus"
+    # the PC / iPad bar never collapses
+    ph.js("document.getElementById('omnibox').blur()")
+    ph.page.set_viewport_size({"width": 1180, "height": 820})
+    ph.page.wait_for_timeout(300)
+    for y in (100, 300, 500, 700):
+        scroll(y)
+        ph.page.wait_for_timeout(60)
+    ph.page.wait_for_timeout(300)
+    assert not collapsed(), "a wide screen must keep its bar"
+
+
+@scenario("bar-collapse-reader", display="reader")
+def bar_collapse_reader(ph):
+    """v0.1.60: the same collapse for the reader display."""
+    ph.page.set_viewport_size({"width": 430, "height": 500})       # short, so that the article scrolls
+    ph.open("/article.html")
+    ph.wait(lambda: ph.js("document.querySelectorAll('#readerBody .reader-p').length") >= 3, 15, "reader paragraphs")
+    ph.page.wait_for_timeout(500)
+    scroller = "document.getElementById('readerScroll')"
+    assert ph.js("%s.scrollHeight - %s.clientHeight" % (scroller, scroller)) > 200, "the article does not scroll in this window"
+    for y in (50, 120, 200, 280):
+        ph.js("(y)=>{document.getElementById('readerScroll').scrollTop=y}", y)
+        ph.page.wait_for_timeout(60)
+    ph.wait(lambda: ph.js("document.body.classList.contains('chrome-collapsed')"), 3, "reader collapses the bars")
+    ph.page.wait_for_timeout(300)
+    for y in (240, 200, 160):
+        ph.js("(y)=>{document.getElementById('readerScroll').scrollTop=y}", y)
+        ph.page.wait_for_timeout(60)
+    ph.wait(lambda: not ph.js("document.body.classList.contains('chrome-collapsed')"), 3, "reader shows the bars again")
+
+
+@scenario("link-tap-feedback")
+def link_tap_feedback(ph):
+    """v0.1.60: a link tap in the mirror shows feedback within 100 ms (the tapped link is highlighted, the progress
+    line under the bar is on) and the old page stays until the new copy arrives; the request goes out on pointerup."""
+    ph.page.set_viewport_size(NARROW)
+    tab = ph.open("/article.html")
+    ph.wait(lambda: "E2E テスト記事" in ph.mirror_text(), 15, "mirror content")
+    ph.page.wait_for_timeout(1500)
+    ph.suppress_ios_click()
+    pt = ph.wait(lambda: ph.mirror_point("doc=>doc.querySelector('a[data-href$=\"/article2.html\"]')"), 8, "a link in the mirror")
+    ph.js("""()=>{
+      const rec = window.__fb = {};
+      const d = mirrorDoc();
+      d.addEventListener('pointerup', () => { rec.up = performance.now(); }, true);
+      const of = window.fetch;
+      window.fetch = function(u) { if (String(u).indexOf('/api/rb/navigate') >= 0 && !rec.req) rec.req = performance.now(); return of.apply(this, arguments); };
+      const iv = setInterval(() => {
+        if (!rec.up) return;
+        const dd = mirrorDoc();
+        if (!rec.line && !document.getElementById('webLoading').hidden) rec.line = performance.now();
+        if (!rec.mark && dd && dd.querySelector('.qd-tap')) { rec.mark = performance.now(); rec.oldText = dd.body.innerText.indexOf('E2E テスト記事') >= 0; }
+        if (!rec.copy && dd && dd.body.innerText.indexOf('二つ目の記事') >= 0) { rec.copy = performance.now(); clearInterval(iv); }
+      }, 2);
+    }""")
+    ph.tap(pt["x"], pt["y"])
+    ph.wait(lambda: ph.js("window.__fb.copy || 0"), 10, "the new page's copy")
+    rec = ph.js("window.__fb")
+    ph.log("tap->request %.1f ms, ->line %.1f ms, ->highlight %.1f ms, ->copy %.0f ms" % (
+        rec["req"] - rec["up"], rec["line"] - rec["up"], rec["mark"] - rec["up"], rec["copy"] - rec["up"]))
+    assert rec["req"] - rec["up"] < 50, "the navigate request was sent %.0f ms after pointerup" % (rec["req"] - rec["up"])
+    assert rec["line"] - rec["up"] < 100, "no progress line within 100 ms (%.0f ms)" % (rec["line"] - rec["up"])
+    assert rec["mark"] - rec["up"] < 100 and rec["oldText"], "the tapped link was not marked on the old page in time: %s" % rec
+    assert rec["copy"] > rec["mark"], "the page was swapped before the feedback was shown"
+    ph.wait(lambda: ph.env.nas_url(tab).endswith("/article2.html"), 10, "NAS navigated")
+
+
+@scenario("reader-link-feedback", display="reader")
+def reader_link_feedback(ph):
+    """v0.1.60: the reader marks a tapped link and starts the progress line at once; the old article stays."""
+    ph.page.set_viewport_size(NARROW)
+    tab = ph.open("/article.html")
+    ph.wait(lambda: ph.js("document.querySelectorAll('#readerBody a[data-href]').length") >= 1, 15, "reader links")
+    ph.page.wait_for_timeout(1000)
+    ph.js("""()=>{
+      const rec = window.__fb = {};
+      const a = document.querySelector('#readerBody a[data-href$="/article2.html"]');
+      a.addEventListener('click', () => { rec.up = performance.now(); }, true);
+      const iv = setInterval(() => {
+        if (!rec.up) return;
+        if (!rec.line && !document.getElementById('webLoading').hidden) rec.line = performance.now();
+        if (!rec.mark && a.classList.contains('is-tapped')) { rec.mark = performance.now(); rec.old = document.getElementById('readerBody').innerText.indexOf('E2E テスト記事') >= 0 || a.isConnected; }
+        if (rec.line && rec.mark) clearInterval(iv);
+      }, 2);
+    }""")
+    ph.tap(*_centre(ph, "#readerBody a[data-href$='/article2.html']"))
+    ph.wait(lambda: ph.js("window.__fb.line && window.__fb.mark"), 5, "reader feedback")
+    rec = ph.js("window.__fb")
+    assert rec["line"] - rec["up"] < 100 and rec["mark"] - rec["up"] < 100, rec
+    ph.wait(lambda: ph.env.nas_url(tab).endswith("/article2.html"), 10, "NAS navigated")
+
+
+def _shell_state(ph):
+    return ph.js("""async()=>{
+      const names = await caches.keys();
+      const urls = [];
+      for (const n of names) { const c = await caches.open(n); for (const r of await c.keys()) urls.push(new URL(r.url).pathname); }
+      const nav = performance.getEntriesByType('navigation')[0];
+      return {names, urls, controller: !!navigator.serviceWorker.controller, workerStart: nav ? nav.workerStart : -1};
+    }""")
+
+
+@scenario("app-shell-cache", engines=("chromium",))
+def app_shell_cache(ph):
+    """v0.1.60: the app shell is cached by a Service Worker on the app origin: the second load is served by it (no
+    /api/* or mirror document is ever stored), a version change drops the old shell and loads the new one, and
+    「アプリのキャッシュを消す」 removes the worker and the caches. (Chromium: Playwright's WebKit has no Service
+    Worker support for 127.0.0.1 that we could verify here.)"""
+    import webapp
+    ph.page.reload()
+    ph.page.wait_for_selector("#omnibox", state="attached")
+    ph.wait(lambda: ph.js("state.authed === true"), 10, "session")
+    ph.js("navigator.serviceWorker.ready.then(()=>true)")
+    ph.wait(lambda: ph.js("(async()=>{const r=await navigator.serviceWorker.getRegistration();return !!(r&&r.active)})()"), 15, "worker active")
+    version = webapp.VERSION
+    first = _shell_state(ph)
+    assert "qd-shell-" + version in first["names"], first
+    for path in ("/", "/app.js", "/style.css"):
+        assert path in first["urls"], "%s is not in the shell cache: %s" % (path, first["urls"])
+    # the second load comes out of the worker
+    ph.open("/article.html")
+    ph.wait(lambda: "E2E テスト記事" in ph.mirror_text(), 15, "mirror content (API traffic happened)")
+    ph.page.reload()
+    ph.page.wait_for_selector("#omnibox", state="attached")
+    ph.wait(lambda: ph.js("state.authed === true"), 10, "session after reload")
+    second = _shell_state(ph)
+    assert second["controller"], "the page is not controlled by the worker on the second load"
+    assert second["workerStart"] > 0, "the navigation did not go through the worker (workerStart=%s)" % second["workerStart"]
+    bad = [u for u in second["urls"] if u.startswith("/api") or "mirror" in u or u.startswith("/p/") or u.startswith("/pt")]
+    assert not bad and len(second["urls"]) <= 8, "the cache holds more than the shell: %s" % second["urls"]
+    assert second["names"] == ["qd-shell-" + version], second["names"]
+    # a stale shell: the Hub is newer than this page -> drop the cache and load the new shell (once)
+    ph.js("window.__marker = 1")
+    old = webapp.VERSION
+    webapp.VERSION = "9.9.9"
+    try:
+        ph.js("checkBootVersion('9.9.9')")
+        ph.wait(lambda: ph.js("window.__marker") is None, 15, "page reloaded for the new version")
+        ph.page.wait_for_selector("#omnibox", state="attached")
+        ph.wait(lambda: ph.js("state.authed === true"), 10, "session after the version reload")
+        ph.wait(lambda: "qd-shell-9.9.9" in _shell_state(ph)["names"], 15, "new shell cached")
+        names = _shell_state(ph)["names"]
+        assert names == ["qd-shell-9.9.9"], "old shell cache survived: %s" % names
+        assert ph.js("sessionStorage.getItem('qd.shellReload')") == "9.9.9"
+        # (once per Hub version: the same mismatch again only offers the toast, no reload loop)
+        ph.js("window.__marker = 2")
+        ph.js("checkBootVersion('9.9.9')")
+        ph.page.wait_for_timeout(1500)
+        assert ph.js("window.__marker") == 2, "reload loop"
+    finally:
+        webapp.VERSION = old
+    # 「アプリのキャッシュを消す」
+    ph.js("window.__marker = 3")
+    ph.js("navigate('#/settings/system/updates')")
+    ph.wait(lambda: _visible(ph, "#appCacheClear") == 1, 8, "the cache reset button")
+    ph.page.locator("#appCacheClear").tap()
+    ph.wait(lambda: ph.js("window.__marker") is None, 10, "page reloaded after clearing the cache")
+    ph.page.wait_for_selector("#omnibox", state="attached")
+    after = _shell_state(ph)
+    assert after["workerStart"] == 0 and not after["controller"], "the reset page was still served by the worker: %s" % after
+    ph.take_errors("Failed to load resource")

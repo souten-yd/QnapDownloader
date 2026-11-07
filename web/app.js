@@ -69,6 +69,13 @@ const RB_QUALITY_KEY = "qnapdl.rbquality.v1";
 const RB_QUALITIES = ["speed", "standard", "high"];
 const RB_QUALITY_LABELS = {speed: "速度優先", standard: "標準", high: "高画質"};
 const RB_DISPLAY_LABELS = {reader: "リーダー", mirror: "ミラー", tiles: "高速（全体表示）", live: "ライブ"};
+// v0.1.60: a short name of the display inside the omnibox (the chip opens the display chooser).
+const DISPLAY_CHIP = {reader: "リーダー", mirror: "ミラー", tiles: "高速", live: "ライブ", pt: "パス"};
+const DISPLAY_CHIP_TITLE = {reader: "リーダー", mirror: "ミラー", tiles: "高速", live: "ライブ", pt: "パススルー"};
+// v0.1.60: this file's own version. The Hub's version (from /api/state) is compared with it: a shell cache that is
+// older than the Hub (the app was updated while the home-screen app was closed) is dropped and the page reloaded.
+// tests/test_web_shell.py checks that it equals webapp.VERSION.
+const APP_VERSION = "0.1.61";
 const PT_DISPLAY_LABEL = "パススルー";      // v0.1.57: not a NAS-browser display, so not in RB_DISPLAY_LABELS
 const RB_PERF_WINDOW_MS = 5000;
 const RB_STREAM_FIRST_MS = 5000;     // MJPEG only (no SSE available): first picture within this, else polling
@@ -120,7 +127,7 @@ const state = {
   csrf: "", authed: false, shellReady: false,
   route: {view: "home"}, lastSection: "",
   tabs: [], nextTabId: 1, closed: [], lastWebTabId: null,
-  bookmarks: [], status: null, omniDisplay: "",
+  bookmarks: [], status: null, omniDisplay: "", omniShort: "",
   snapshot: null, snapshotAt: 0, downloadsPage: 0, downloadsBusy: false,
   filter: "all", query: "", downloadsFails: 0,
   dlRunning: null, expanded: new Set(),
@@ -625,6 +632,15 @@ function tabTitle(tab) {
 
 function setOmniIcon(name) { $("omniIcon").setAttribute("href", "#i-" + name); }
 
+// v0.1.60: the omnibox shows the domain (like Safari) while it is not being edited; the full URL appears on focus.
+function omniDomain(url) {
+  try {
+    const u = new URL(url);
+    if (u.protocol !== "https:" && u.protocol !== "http:") return String(url);
+    return u.host.replace(/^www\./, "") || String(url);
+  } catch (e) { return String(url); }
+}
+
 function updateChrome() {
   if (!state.authed) return;
   syncKeyBar();
@@ -649,8 +665,10 @@ function updateChrome() {
     iconName = "home";
   }
   state.omniDisplay = display;
-  if (document.activeElement !== $("omnibox")) $("omnibox").value = display;
+  state.omniShort = tab && tab.history.length ? omniDomain(display) : display;      // v0.1.60: domain only when idle
+  if (document.activeElement !== $("omnibox")) $("omnibox").value = state.omniShort;
   setOmniIcon(iconName);
+  updateModeChip(tab);
   $("navBack").disabled = !back;
   $("navForward").disabled = !forward;
   $("navReload").disabled = Boolean(tab) && !tab.history.length;
@@ -670,6 +688,80 @@ function updateChrome() {
   updateRemoteView(tab);
   updatePinnedTabs();
   updateMobileBar();
+  chromeSync();
+}
+
+
+// ---------------------------------------------------- v0.1.60: collapse the bars while reading
+// Phone width only (the PC / iPad bar stays). Scrolling the page down hides the top bar (and the bottom tab bar);
+// scrolling up, reaching the top, opening the menu or focusing the address bar shows them again, like Safari.
+// The toolbar and the tab bar move with transform only. The content area grows into the freed space in ONE layout
+// step: the content is moved with a compensating transform first and then slides, so the page never jumps and no
+// scroll position is written (writing scrollTop would stop an iOS fling). The size the NAS browser is told about
+// does not change (stageViewport subtracts chromeExtra()), so collapsing never makes the NAS re-layout.
+const CHROME_HIDE_PX = 36, CHROME_SHOW_PX = 24, CHROME_MIN_TOP = 90, CHROME_MUTE_MS = 150;
+const chrome = {collapsed: false, key: "", last: 0, down: 0, up: 0, mute: 0, h: 0, pad: 0, settle: 0};
+const chromeNarrow = typeof window.matchMedia === "function" ? window.matchMedia("(max-width: 759px)") : null;
+const chromeReduced = typeof window.matchMedia === "function" ? window.matchMedia("(prefers-reduced-motion: reduce)") : null;
+
+function chromeExtra() { return chrome.collapsed ? chrome.h + chrome.pad : 0; }
+
+function chromeCan() {
+  if (!chromeNarrow || !chromeNarrow.matches || document.body.dataset.view !== "web") return false;
+  if (document.activeElement === $("omnibox") || !$("menu").hidden || !$("tabSwitcher").hidden || !$("swipeBanner").hidden) return false;
+  const tab = activeWebTab();
+  if (!tab || !tab.history.length) return false;
+  if (tab.pt) return true;
+  const display = tab.rb ? tabDisplay(tab) : "";
+  return display === "mirror" || display === "reader" || display === "tiles";     // the live picture does not scroll here
+}
+
+function chromeSet(on, instant = false) {
+  if (chrome.collapsed === on) return;
+  const body = document.body, content = $("content"), bar = document.querySelector(".toolbar");
+  chrome.h = Math.round(bar.offsetHeight);
+  const padBefore = parseFloat(getComputedStyle(content).paddingBottom) || 0;
+  document.documentElement.style.setProperty("--bar-h", chrome.h + "px");
+  const slide = !instant && !(chromeReduced && chromeReduced.matches);
+  content.style.transition = "none";
+  if (slide) content.style.transform = "translateY(" + (on ? chrome.h : -chrome.h) + "px)";
+  body.classList.toggle("chrome-collapsed", on);
+  chrome.collapsed = on;
+  chrome.pad = on ? Math.max(0, padBefore - (parseFloat(getComputedStyle(content).paddingBottom) || 0)) : 0;
+  void content.offsetHeight;                      // the start position is laid out; now slide to the end position
+  if (slide) { content.style.transition = "transform .2s ease"; content.style.transform = ""; }
+  else { content.style.transition = ""; content.style.transform = ""; }
+  clearTimeout(chrome.settle);
+  chrome.settle = setTimeout(() => { content.style.transition = ""; content.style.transform = ""; }, 280);
+  chrome.mute = performance.now() + CHROME_MUTE_MS;       // the resize itself may move scrollTop: not a user scroll
+  chrome.down = chrome.up = 0;
+  dlog("ui", "debug", "chrome", {collapsed: on, h: chrome.h});
+}
+
+function chromeShow(instant = false) { if (chrome.collapsed) chromeSet(false, instant); }
+
+// Called from every scroller (mirror document, reader, tiles, passthrough report) with its scrollTop and the
+// largest scrollTop; `key` names the scroller so that a switch between them does not count as a scroll.
+function chromeScrolled(top, max, key) {
+  if (!chromeCan()) { chrome.last = top; chrome.key = key; chromeShow(true); return; }
+  if (key !== chrome.key) { chrome.key = key; chrome.last = top; chrome.down = chrome.up = 0; if (top <= 2) chromeShow(); return; }
+  const d = top - chrome.last;
+  chrome.last = top;
+  if (top <= 2) { chrome.down = chrome.up = 0; chromeShow(); return; }
+  if (performance.now() < chrome.mute) return;
+  if (Number.isFinite(max) && top > max + 1) return;              // rubber band below the page end
+  if (d > 0) {
+    chrome.up = 0; chrome.down += d;
+    if (!chrome.collapsed && chrome.down > CHROME_HIDE_PX && top > CHROME_MIN_TOP) chromeSet(true);
+  } else if (d < 0) {
+    chrome.down = 0; chrome.up -= d;
+    if (chrome.collapsed && chrome.up > CHROME_SHOW_PX) chromeSet(false);
+  }
+}
+
+// updateChrome() calls this: leaving the reading situation (other tab / display / menu / editing) shows the bars.
+function chromeSync() {
+  if (chrome.collapsed && !chromeCan()) chromeSet(false, true);
 }
 
 function updatePinnedTabs() {
@@ -722,27 +814,45 @@ function renderWebTabs() {
   updateMobileBar();
 }
 
-// One compact row per web tab (single line, ellipsis): [NASブラウザ] host ... [...]
+// v0.1.60: the second row is gone. What it showed now lives in: the mode chip inside the omnibox (NAS browser /
+// passthrough and the display), the thin progress line under the bar (loading), the menu's "このページ" line (page
+// title) and - only while there is a problem - this inline banner (load errors), which dismisses itself.
+let webStatusTimer = 0;
 function updateWebStatus(tab) {
   const box = $("webStatus");
+  const text = tab && tab.history.length && tab.error && tab.errorSeen !== tab.error
+    ? hostOf(tab.history[tab.index]) + " — 読み込めませんでした: " + tab.error : "";
+  if (box.dataset.text === text) return;
+  box.dataset.text = text;
   box.replaceChildren();
-  if (!tab || !tab.history.length) return;
-  box.appendChild(element("span", tab.pt ? "パススルー" : "NASブラウザ", "mode-badge remote"));
-  const host = hostOf(tab.history[tab.index]);
-  let text = host;
-  if (tab.rb && tab.rb.title) text = tab.rb.title;
-  if (tab.pt && tab.ptTitle) text = tab.ptTitle;
-  if (tab.error) text = host + " — 読み込めませんでした: " + tab.error;
+  clearTimeout(webStatusTimer);
+  if (!text) return;
+  box.setAttribute("role", "status");
   const label = element("span", text, "web-status-text");
   label.title = tab.current || text;
   box.appendChild(label);
-  const more = element("button", undefined, "icon-btn small");
-  more.type = "button";
-  more.title = "メニュー";
-  more.setAttribute("aria-label", "メニューを開く");
-  more.appendChild(icon("more"));
-  more.addEventListener("click", event => { event.stopPropagation(); openMenu(); });
-  box.appendChild(more);
+  const close = element("button", undefined, "icon-btn small");
+  close.type = "button";
+  close.setAttribute("aria-label", "閉じる");
+  close.appendChild(icon("x"));
+  const dismiss = () => { tab.errorSeen = tab.error; updateWebStatus(tab); };
+  close.addEventListener("click", dismiss);
+  box.appendChild(close);
+  webStatusTimer = setTimeout(dismiss, 8000);
+}
+
+// v0.1.60: the display chip in the omnibox.
+function updateModeChip(tab) {
+  const chip = $("modeBtn");
+  const on = Boolean(tab && tab.history.length);
+  chip.hidden = !on;
+  if (!on) return;
+  const display = tab.pt ? "pt" : tab.rb ? tabDisplay(tab) : "tiles";
+  chip.textContent = DISPLAY_CHIP[display] || "?";
+  chip.classList.toggle("is-pt", display === "pt");
+  const where = tab.pt ? "パススルー" : "NASブラウザ";
+  chip.title = "表示方法を選ぶ（" + where + " · " + (DISPLAY_CHIP_TITLE[display] || display) + "）";
+  chip.setAttribute("aria-label", chip.title);
 }
 
 // ------------------------------------------------------------- status/home
@@ -760,11 +870,52 @@ async function loadHome(force = false) {
 // loaded. Offer a reload; never reload automatically here.
 function checkBootVersion(version) {
   if (typeof version !== "string" || !version) return;
-  if (!state.bootVersion) { state.bootVersion = version; return; }
+  if (!state.bootVersion) state.bootVersion = APP_VERSION;      // v0.1.60: this file's version, not the first one the Hub reports
   if (version === state.bootVersion || state.updateWatching) return;
+  // v0.1.60: this page came out of the app-shell cache and is older than the Hub: drop the cache and load the new
+  // one now (once per Hub version, so a Hub whose files disagree with each other cannot cause a reload loop).
+  if (shellServedFromCache() && readSession(SHELL_RELOAD_KEY) !== version) {
+    writeSession(SHELL_RELOAD_KEY, version);
+    reloadFresh();
+    return;
+  }
   stickyToast("stale", "Hubがv" + version + "に更新されています。再読み込みしてください" +
     "（再読み込み後に再ログインが必要です）", "info",
-    [{label: "再読み込み", run: () => location.reload()}]);
+    [{label: "再読み込み", run: reloadFresh}]);
+}
+
+// ---- v0.1.60: app shell cache (Service Worker /app-sw.js, secure contexts only: https / localhost) ----
+const SHELL_RELOAD_KEY = "qd.shellReload";
+function swSupported() { return "serviceWorker" in navigator && window.isSecureContext === true; }
+function shellServedFromCache() {
+  try { return swSupported() && Boolean(navigator.serviceWorker.controller); } catch (e) { return false; }
+}
+async function registerShell() {
+  if (!swSupported()) return;
+  try {
+    await navigator.serviceWorker.register("/app-sw.js", {scope: "/", updateViaCache: "none"});
+  } catch (e) {
+    dlog("ui", "warn", "app shell worker not registered", {error: String(e && e.message || e).slice(0, 80)});
+  }
+}
+// Unregisters this origin's worker and deletes its shell caches (never the API: nothing else is ever cached).
+async function dropShellCache() {
+  try {
+    if (swSupported()) {
+      const regs = await navigator.serviceWorker.getRegistrations();
+      await Promise.all(regs.map(r => r.unregister()));
+    }
+  } catch (e) { /* nothing to drop */ }
+  try {
+    if (window.caches) {
+      const names = await caches.keys();
+      await Promise.all(names.filter(n => n.indexOf("qd-shell-") === 0).map(n => caches.delete(n)));
+    }
+  } catch (e) { /* nothing to drop */ }
+}
+async function reloadFresh() {
+  await dropShellCache();
+  location.reload();
 }
 
 function setCheck(rowId, done) {
@@ -1521,7 +1672,7 @@ function applyRemoteMeta(tab, f) {
   if (Number.isFinite(f.popups) && f.popups !== rb.popups) { rb.popups = f.popups; changed = true; }
   if (f.blocked && f.blocked !== rb.blocked) toast(String(f.blocked), "error");
   rb.blocked = f.blocked || null;
-  tab.loading = loading;
+  tab.loading = loading || Date.now() < (rb.tapUntil || 0);      // v0.1.60: a tap's progress line is not hidden early
   if (Number.isFinite(f.intercepts) && f.intercepts > rb.icptSeen) {
     fetchIntercepts(tab).catch(() => {});
   }
@@ -1601,7 +1752,7 @@ function chalGoLive(tab) {
 // The stage is the viewer's CSS viewport for the remote page.
 function stageViewport() {
   const stage = $("remoteStage");
-  const width = Math.round(stage.clientWidth), height = Math.round(stage.clientHeight);
+  const width = Math.round(stage.clientWidth), height = Math.round(stage.clientHeight) - chromeExtra();   // v0.1.60: not the collapsed size
   if (width < RB_STAGE_MIN_PX || height < RB_STAGE_MIN_PX) return null;
   const dpr = Math.min(3, Math.max(1, Number(window.devicePixelRatio) || 1));
   return {width: Math.min(1600, Math.max(320, width)), height: Math.min(2400, Math.max(320, height)),
@@ -2062,7 +2213,6 @@ function updateRemoteView(tab) {
   setShown("readerScroll", reader);
   setShown("mirrorWrap", mirror && (mirrorHost.owner === tab.rb || tab.rb.mirrorBusy));
   syncReaderProgress();
-  setShown("tileRefresh", tiles || reader || mirror);
   if (tiles) mountTiles(tab);
   if (reader) mountReader(tab);
   syncSnapProgress();
@@ -2926,6 +3076,14 @@ function wirePull(scroller, onRefresh, view = scroller, top = () => scroller.scr
 
 function wireTiles() {
   const scroller = $("tileScroll");
+  let chromeTick = 0;      // v0.1.60: the fast display scrolls natively: it drives the bar collapse too
+  scroller.addEventListener("scroll", () => {
+    if (chromeTick) return;
+    chromeTick = requestAnimationFrame(() => {
+      chromeTick = 0;
+      chromeScrolled(scroller.scrollTop, scroller.scrollHeight - scroller.clientHeight, "tiles");
+    });
+  }, {passive: true});
   const press = {id: null, x0: 0, y0: 0, t0: 0, moved: false};
   const fast = () => {
     const tab = remoteTab();
@@ -2976,13 +3134,7 @@ function wireTiles() {
     const tab = fast();
     if (tab) perform(() => takeSnapshot(tab, {force: true, keepScroll: true}));
   });
-  $("tileRefresh").addEventListener("click", () => {
-    const tab = remoteTab();
-    if (!tab) return;
-    if (tabDisplay(tab) === "reader") perform(() => runReader(tab, {keepScroll: true}));
-    else if (tabDisplay(tab) === "mirror") perform(() => runMirror(tab, {force: true, immediate: true}));
-    else if (fast()) perform(() => takeSnapshot(tab, {force: true, keepScroll: true}));
-  });
+  // v0.1.60: the floating re-capture button is gone (pull down at the top, or ⟳ in the bar / menu).
   if (typeof ResizeObserver === "function") {
     new ResizeObserver(() => {
       const tab = remoteTab();
@@ -4244,6 +4396,7 @@ async function readerNavigate(tab, href) {
     firstDone(tab, rb, r.first ? {kind: "reader", first: r.first} : null);
   } catch (e) {
     firstDone(tab, rb, null);
+    rb.tapUntil = 0; tab.loading = Boolean(rb.loading); syncLoadingBars(tab);       // v0.1.60
     if (e.status === 404) remoteLost(tab);
     else throw e;
   }
@@ -4262,6 +4415,7 @@ function wireReader() {
     scrollTick = requestAnimationFrame(() => {
       scrollTick = 0;
       updateReaderProgress();
+      chromeScrolled(scroller.scrollTop, scroller.scrollHeight - scroller.clientHeight, "reader");     // v0.1.60
       if (readerHost.owner && body.childElementCount) readerRememberTop(readerHost.owner, scroller.scrollTop);
     });
   }, {passive: true});
@@ -4311,7 +4465,10 @@ function wireReader() {
     event.preventDefault();
     if (press.fired) { press.fired = false; return; }       // the long press already started a probe
     const tab = remoteTab();
-    if (tab && tabDisplay(tab) === "reader") perform(() => readerNavigate(tab, a.dataset.href));
+    if (tab && tabDisplay(tab) === "reader") {
+      tapFeedback(tab, a, "is-tapped");              // v0.1.60
+      perform(() => readerNavigate(tab, a.dataset.href));
+    }
   };
   body.addEventListener("click", open);
   body.addEventListener("keydown", event => { if (event.key === "Enter") open(event); });
@@ -4579,6 +4736,7 @@ async function runMirror(tab, opts = {}) {
       wireMirrorDoc(doc);
       mirrorScroller(doc).scrollTop = keep || mirrorPosTop(rb, url);
       mirrorHost.owner = rb; mirrorHost.pageUrl = url; mirrorHost.last = null;
+      chromeScrolled(mirrorScroller(doc).scrollTop, Infinity, "mirror");        // v0.1.60: a new page starts at the top: bars back
       $("mirrorWrap").style.visibility = "";
       applied = performance.now() - t0;
       tlWatchMirror(rb, doc);
@@ -4731,6 +4889,33 @@ async function mirrorLoop(tab, gen) {
 }
 
 // A tap on a link: the NAS browser goes there (the Hub validates the address); the loop captures the new page.
+// v0.1.60: instant feedback for a link tap (mirror and reader), before anything has come back: the tapped element is
+// highlighted, the thin progress line under the bar starts, and the current page stays as it is until the new copy
+// replaces it. The loading flag is held for a moment so a status report that still says "not loading" cannot hide it.
+const TAP_HOLD_MS = 1500;
+function syncLoadingBars(tab) {
+  if (activeWebTab() !== tab) return;
+  setShown("webLoading", Boolean(tab.loading));
+  setShown("remoteLoading", Boolean(tab.loading));
+}
+
+function tapFeedback(tab, el, cls) {
+  if (el && el.classList) {
+    el.classList.add(cls);
+    setTimeout(() => { try { el.classList.remove(cls); } catch (e) { /* the page was replaced */ } }, 4000);
+  }
+  const rb = tab && tab.rb;
+  if (!rb) return;
+  rb.tapUntil = Date.now() + TAP_HOLD_MS;
+  tab.loading = true;
+  syncLoadingBars(tab);
+  setTimeout(() => {
+    if (!tab.rb || tab.rb !== rb || Date.now() < rb.tapUntil) return;
+    tab.loading = Boolean(rb.loading);
+    syncLoadingBars(tab);
+  }, TAP_HOLD_MS + 50);
+}
+
 async function mirrorNavigate(tab, href) {
   const rb = tab && tab.rb;
   if (!rb) return;
@@ -4741,6 +4926,7 @@ async function mirrorNavigate(tab, href) {
     firstDone(tab, rb, r.first ? {kind: "mirror", first: r.first} : null);
   } catch (e) {
     firstDone(tab, rb, null);
+    rb.tapUntil = 0; tab.loading = Boolean(rb.loading); syncLoadingBars(tab);       // v0.1.60: the tap failed: no progress line
     if (e.status === 404) remoteLost(tab);
     else throw e;
   }
@@ -4878,6 +5064,7 @@ function wireMirrorDoc(doc) {
     const toggle = mirrorClosest(event.target, MIRROR_TOGGLE);
     const link = mirrorClosest(event.target, "[data-href]");
     if (link && !(toggle && (link.contains(toggle) || toggle.contains(link)))) {
+      tapFeedback(tab, link, "qd-tap");              // v0.1.60: before the request, same task as the tap
       perform(() => mirrorNavigate(tab, link.getAttribute("data-href")));
       return;
     }
@@ -4893,6 +5080,7 @@ function wireMirrorDoc(doc) {
       scrollTick = 0;
       const owner = mirrorHost.owner;
       if (owner) mirrorRememberTop(owner, mirrorHost.pageUrl, mirrorScroller(doc).scrollTop);
+      if (tabNow()) { const sc = mirrorScroller(doc); chromeScrolled(sc.scrollTop, sc.scrollHeight - sc.clientHeight, "mirror"); }   // v0.1.60
     });
   }, {passive: true});
   const touching = on => () => {
@@ -5541,7 +5729,7 @@ async function openWebUrl(value) {
 // reached through its own `tailscale serve` port); a Service Worker there sends every request through the NAS. The
 // app only talks to the frame by postMessage with an exact origin and source check, and never trusts its content.
 const ptHost = {tab: null, origin: "", ready: false, seq: 0, loaded: false};
-const PT_HIDE = ["tileScroll", "readerScroll", "mirrorWrap", "remoteImg", "remoteIdle", "rbNotReady", "tileRefresh",
+const PT_HIDE = ["tileScroll", "readerScroll", "mirrorWrap", "remoteImg", "remoteIdle", "rbNotReady",
   "chalStatus", "remoteLinks", "remotePopups"];
 
 async function refreshPt() {
@@ -5745,6 +5933,9 @@ window.addEventListener("message", ev => {
   if (m.type === "hello") { ptHost.ready = true; tab.loading = false; if (activeWebTab() === tab) setShown("remoteLoading", false); }
   else if (m.type === "loading") { ptHost.ready = false; tab.loading = true; if (activeWebTab() === tab) setShown("remoteLoading", true); }
   else if (m.type === "nav") ptNav(tab, m);
+  else if (m.type === "scroll") {      // v0.1.60: the page's own scrolling collapses / restores the bars
+    if (activeWebTab() === tab && Number.isFinite(m.top) && Number.isFinite(m.max)) chromeScrolled(m.top, m.max, "pt");
+  }
   else if (m.type === "flick") {
     if (activeWebTab() === tab && (m.dir === -1 || m.dir === 1) && claimStep("flick")) perform(() => stepHistory(tab, m.dir));
   } else if (m.type === "download") perform(() => ptDownload(tab, m));
@@ -5773,7 +5964,7 @@ function wirePt() {
     renderPtSettings();
     if (on) {
       flash("パススルーをオンにしました。画面を読み込み直します");
-      setTimeout(() => location.reload(), 700);     // the app's CSP only lists origin B once enabled
+      setTimeout(reloadFresh, 700);     // the app's CSP only lists origin B once enabled (v0.1.60: the cached page has the old CSP)
     } else {
       for (const tab of state.tabs) if (tab.pt) tab.error = "";
       ptDrop();
@@ -5852,7 +6043,7 @@ async function handleOmnibox(raw) {
   toast("URLを入力してください（検索エンジンは未対応）", "error");
 }
 
-function restoreOmnibox() { $("omnibox").value = state.omniDisplay; }
+function restoreOmnibox() { $("omnibox").value = document.activeElement === $("omnibox") ? state.omniDisplay : state.omniShort; }
 
 function focusOmnibox() {
   const box = $("omnibox");
@@ -5880,6 +6071,17 @@ function configureMenu() {
     menu.querySelector("[data-action='" + action + "']").disabled = !usable;
   }
   menu.querySelector("[data-action='reopen']").disabled = state.closed.length === 0;
+  // v0.1.60: the second row's page title, and the actions that no longer have a button in the narrow bar
+  const page = $("menuPage");
+  const title = tab && (tab.pt ? tab.ptTitle : tab.rb && tab.rb.title) || "";
+  page.hidden = !(web && (title || tab.current));
+  page.textContent = web ? (title ? title + " · " : "") + hostOf(tab.current || tab.history[tab.index] || "") : "";
+  $("menuForward").disabled = !(tab && (tab.rb || tab.pt));
+  $("menuReload").disabled = !(tab && tab.history.length);
+  const marked = Boolean(tab && tab.current && state.bookmarks.some(b => b.url === tab.current));
+  const mark = menu.querySelector("[data-action='bookmark']");
+  mark.textContent = marked ? "★ ブックマーク済み" : "ブックマークに追加";
+  mark.classList.toggle("menu-item-on", marked);
   menu.querySelectorAll("[data-scope='remote']").forEach(n => { n.hidden = !web; });
   const display = tab && tab.pt ? "pt" : tab && tab.rb ? tabDisplay(tab) : "tiles";
   const ptOk = state.pt === null || ptAvailable() || Boolean(tab && tab.pt);       // unknown yet: not greyed out       // v0.1.57: the choice is greyed out with the reason as its tooltip
@@ -5897,6 +6099,7 @@ function configureMenu() {
 }
 
 function openMenu() {
+  chromeShow(true);
   if (state.pt === null) refreshPt().then(() => { if (!$("menu").hidden) configureMenu(); });   // v0.1.57: first use only
   configureMenu();
   $("menu").hidden = false;
@@ -5916,6 +6119,8 @@ async function menuAction(action) {
   else if (action === "stageUrl" && tab) await stageTabUrl(tab);
   else if (action === "bookmark" && tab) await bookmarkTab(tab);
   else if (action === "closeTab" && tab) closeTab(tab.id);
+  else if (action === "forward" && tab) await stepHistory(tab, 1);       // v0.1.60: no ⟶ / ⟳ button in the narrow bar
+  else if (action === "reload" && tab) await reloadTab(tab);
   else if (action === "bookmarks") navigate("#/settings/browser/bookmarks");
   else if (action === "settings") navigate(settingsHash());
   else if (action === "logout") await logout();
@@ -7545,14 +7750,14 @@ async function watchForUpdate(before) {
     await delay(UPDATE_POLL_MS);
     const version = await fetchHealthVersion();
     if (version && before && version !== before) {
-      location.reload();
+      reloadFresh();           // v0.1.60: the cached shell is the old version: drop it first
       return;
     }
   }
   state.updateWatching = false;
   stickyToast("update", "更新の完了を確認できませんでした。Hubの更新ログを確認し、手動で再読み込みしてください" +
     "（再読み込み後に再ログインが必要です）", "error",
-    [{label: "再読み込み", run: () => location.reload()}]);
+    [{label: "再読み込み", run: reloadFresh}]);
 }
 
 // ------------------------------------------------------------ session / boot
@@ -7728,6 +7933,18 @@ function onTabstripKeydown(event) {
   tabs[(at + step + tabs.length) % tabs.length].focus();
 }
 
+// v0.1.60: the bar collapse helpers and the cache reset button.
+function wireChrome() {
+  $("chromePeek").addEventListener("click", () => chromeShow());
+  if (chromeNarrow && chromeNarrow.addEventListener) chromeNarrow.addEventListener("change", () => chromeShow(true));
+  $("appCacheClear").addEventListener("click", () => perform(async () => {
+    $("appCacheStatus").textContent = "消しています…";
+    await dropShellCache();
+    $("appCacheStatus").textContent = "消しました。再読み込みします…";
+    setTimeout(() => location.reload(), 300);
+  }));
+}
+
 function wireShell() {
   window.addEventListener("hashchange", onHashChange);
   window.addEventListener("popstate", onPopState);
@@ -7743,7 +7960,7 @@ function wireShell() {
   });
   document.addEventListener("keydown", onKeydown);
   document.addEventListener("click", event => {
-    if (!$("menu").hidden && !event.target.closest(".menu-wrap")) closeMenu(false);
+    if (!$("menu").hidden && !event.target.closest(".menu-wrap, #modeBtn")) closeMenu(false);
   });
   $("tabstrip").addEventListener("keydown", onTabstripKeydown);
   $("newTab").addEventListener("click", createBlankTab);
@@ -7771,7 +7988,21 @@ function wireShell() {
     $("omnibox").blur();
     perform(() => handleOmnibox(text));
   });
-  $("omnibox").addEventListener("focus", () => $("omnibox").select());
+  // v0.1.60: focus shows (and selects) the full URL; leaving the field shows the domain again.
+  $("omnibox").addEventListener("focus", () => {
+    const box = $("omnibox");
+    chromeShow(true);
+    if (box.value === state.omniShort) box.value = state.omniDisplay;
+    box.select();
+    requestAnimationFrame(() => { if (document.activeElement === box) box.select(); });   // iOS places the caret after focus
+  });
+  $("omnibox").addEventListener("blur", () => { $("omnibox").value = state.omniShort; });
+  $("modeBtn").addEventListener("click", () => {      // v0.1.60: the display chooser is the "表示" group of the menu
+    if (!$("menu").hidden) { closeMenu(false); return; }
+    openMenu();
+    const on = $("menu").querySelector("[data-display][aria-checked='true']:not([hidden])");
+    if (on) on.focus();
+  });
   $("omnibox").addEventListener("paste", event => {
     // A single-line input flattens newlines; inspect the clipboard ourselves.
     const text = event.clipboardData ? event.clipboardData.getData("text") : "";
@@ -10473,5 +10704,8 @@ document.addEventListener("DOMContentLoaded", () => {
   wireDownloads();
   wireLinks();
   paintShellEarly();
+  wireChrome();
   go();
+  // v0.1.60: after the first paint, never before it
+  window.addEventListener("load", () => setTimeout(registerShell, 300));
 });

@@ -928,7 +928,7 @@ eq(JSON.parse(store[RB_LIVE_PREF_KEY]), {t: "sse", mjpegAt: 5}, "merge");
     # ---- v0.1.28: fast full-page display ------------------------------------
     def test_v0128_tiles_are_lazy_and_released(self):
         css = (WEB / "style.css").read_text(encoding="utf-8")
-        for ident in ("tileScroll", "tileRefresh", "snapProgress"):
+        for ident in ("tileScroll", "snapProgress"):
             self.assertIn('id="%s"' % ident, self.html)
         self.assertRegex(self.html, r'id="tileScroll"[^>]*\bhidden\b')
         # load near / release far: tiles (2) and, since v0.1.30, reader images (2)
@@ -1366,6 +1366,79 @@ now = 800; assert.ok(claimStep("pop"), "later it is a new gesture");
         self.assertIn("filter(t => !t.diag)", self.js)                    # saveTabs
         self.assertIn("tab.diag.stubClose", self.js)                       # the pull never closes a real tab
 
+
+
+class AppShellCacheStaticTests(unittest.TestCase):
+    """v0.1.60: the app-shell Service Worker caches the static shell only, never the API or anything authenticated."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.sw = (WEB / "app-sw.js").read_text(encoding="utf-8")
+        cls.js = (WEB / "app.js").read_text(encoding="utf-8")
+
+    def test_shell_list_is_static_files_only(self):
+        shell = re.search(r"var SHELL = \[(.*?)\];", self.sw, re.S).group(1)
+        paths = re.findall(r'"([^"]+)"', shell)
+        self.assertEqual(paths, ["/", "/app.js", "/style.css", "/icon.svg", "/apple-touch-icon.png", "/icon-192.png"])
+        self.assertNotIn("/api", shell)
+
+    def test_worker_handles_only_get_same_origin_shell_requests(self):
+        match = re.search(r"function shellPath\(request\) \{.*?\n\}\n", self.sw, re.S).group(0)
+        for token in ('request.method !== "GET"', "url.origin !== self.location.origin", "SHELL_SET[url.pathname]"):
+            self.assertIn(token, match)
+        handler = re.search(r'addEventListener\("fetch".*', self.sw, re.S).group(0)
+        self.assertIn("if (!path) return;", handler)          # anything else goes to the network untouched
+        self.assertNotIn("/api", self.sw.replace("/api/*", ""))
+        self.assertNotIn("mirror/", self.sw)
+
+    def test_cache_is_keyed_by_version_and_old_ones_are_deleted(self):
+        self.assertIn('var CACHE = "qd-shell-" + VERSION;', self.sw)
+        self.assertIn("__QD_VERSION__", self.sw)
+        self.assertIn("caches.delete(n)", self.sw)
+
+    def test_app_version_matches_hub_version(self):
+        import sys
+        sys.path.insert(0, str(WEB.parent))
+        import webapp
+        self.assertEqual(re.search(r'const APP_VERSION = "([^"]+)"', self.js).group(1), webapp.VERSION)
+
+    def test_app_registers_only_the_app_worker_and_can_reset(self):
+        self.assertEqual(self.js.count('register("/app-sw.js"'), 1)
+        self.assertNotIn("pt-sw", self.js)
+        self.assertIn('id="appCacheClear"', (WEB / "index.html").read_text(encoding="utf-8"))
+        self.assertIn("async function dropShellCache()", self.js)
+        self.assertIn("window.isSecureContext === true", self.js)       # plain http: no worker, as before
+
+
+class TopBarStaticTests(unittest.TestCase):
+    """v0.1.60: one top bar, no floating reload button, collapse on scroll."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.js = (WEB / "app.js").read_text(encoding="utf-8")
+        cls.html = (WEB / "index.html").read_text(encoding="utf-8")
+        cls.css = (WEB / "style.css").read_text(encoding="utf-8")
+
+    def test_no_floating_reload_and_one_menu(self):
+        self.assertNotIn("tileRefresh", self.html + self.js + self.css)
+        self.assertNotIn("tile-refresh", self.css)
+        self.assertEqual(self.html.count('id="menu"'), 1)
+        self.assertNotIn("メニューを開く", self.js)                  # the status row's second ⋮ is gone
+        for action in ("forward", "reload"):
+            self.assertIn('data-action="%s"' % action, self.html)
+
+    def test_collapse_uses_transform_and_never_writes_scrolltop(self):
+        block = re.search(r"function chromeSet\(.*?\n\}\n", self.js, re.S).group(0)
+        self.assertNotIn("scrollTop =", block)
+        self.assertIn("chrome-collapsed", self.css)
+        self.assertIn("translateY(-100%)", self.css)
+        self.assertIn("prefers-reduced-motion", self.css)
+        self.assertIn("chromeExtra()", re.search(r"function stageViewport\(\) \{.*?\n\}\n", self.js, re.S).group(0))
+
+    def test_passthrough_helper_reports_scroll(self):
+        helper = (WEB / "pt-helper.js").read_text(encoding="utf-8")
+        self.assertIn('type: "scroll"', helper)
+        self.assertIn('m.type === "scroll"', self.js)
 
 if __name__ == "__main__":
     unittest.main()

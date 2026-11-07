@@ -13,7 +13,7 @@ sh -n qpkg/shared/python3-path
 bash -n scripts/build-qpkg.sh
 if command -v node >/dev/null 2>&1; then
   node --check web/app.js
-  for js in web/pt-sw.js web/pt-helper.js web/pt-boot.js web/pt-download.js; do node --check "$js"; done
+  for js in web/app-sw.js web/pt-sw.js web/pt-helper.js web/pt-boot.js web/pt-download.js; do node --check "$js"; done
 else
   echo "node missing: web/app.js syntax validation is required before merging" >&2
   exit 1
