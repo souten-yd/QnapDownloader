@@ -1706,6 +1706,19 @@ class ProbeTests(BrowserBase):
         self.assertTrue(expression["params"]["expression"].endswith("(10.0,10.0,28)"))
         self.assertIn("closest('a[href]')", expression["params"]["expression"])
 
+    def test_selftest_probe_answers_the_virtual_site_from_ram(self):
+        # v0.1.66: a probe started by the self-test tab pauses the virtual site's requests too (else the hidden page
+        # asked the real network for selftest.example.com and found nothing on a NAS)
+        self.script(lambda emit: emit("Fetch.requestPaused", {
+            "requestId": "rp1", "resourceType": "Document", "request": {"url": self.HOSTER}}))
+        tab = self.rb._tabs["b1"]
+        tab.fixture = lambda url: (200, "text/html", b"<p>x</p>")
+        self.rb._run_probe(tab, rb.SELFTEST_ORIGIN + "/go/1")
+        fetch = [m for m in self.ws.sent if m.get("sessionId") == "SESSION2" and m["method"] == "Fetch.enable"][0]
+        self.assertIn({"urlPattern": rb.SELFTEST_ORIGIN + "/*"}, fetch["params"]["patterns"])
+        for p in rb.FETCH_PATTERNS:
+            self.assertIn(dict(p), fetch["params"]["patterns"])
+
     def test_ad_blocking_follows_the_origin_tab_site_exception(self):
         rules = FakeRules()
         rules.rules["example.com"] = rule("example.com", block_ads=False)

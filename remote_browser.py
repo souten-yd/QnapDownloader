@@ -1324,6 +1324,13 @@ class RemoteBrowser:
             if cached[2] is not None:
                 raise cached[2]
             return cached[1]
+        # v0.1.66: the cgroup (a file read) gives the same numbers; `docker stats` samples for ~1.5 s of CPU on the
+        # Celeron and ran every few seconds (memory guard, probes, status) although the cgroup was readable.
+        cheap = self._cgroup_stats()
+        if cheap is not None:
+            with self._lock:
+                self._stats_cache = (now, cheap, None)
+            return cheap
         try:
             value, error = self.runtime.stats(cr.BROWSER_NAME), None
         except cr.ContainerError:
@@ -1334,6 +1341,21 @@ class RemoteBrowser:
         if error is not None:
             raise error
         return value
+
+    def _cgroup_stats(self):
+        """v0.1.66: {used_bytes, limit_bytes, percent} of the browser container from its cgroup, or None."""
+        limit = self._browser_limit_bytes()
+        if not limit:
+            return None
+        try:
+            paths = diskio.container_cgroup_paths(self.runtime, cr.BROWSER_NAME, self._cgroup_root, self._proc_root)
+            found = rb_resident.read_cgroup_memory(paths) if paths else None
+        except Exception:
+            found = None
+        if not found or not isinstance(found.get("used_bytes"), (int, float)):
+            return None
+        used = int(found["used_bytes"])
+        return {"used_bytes": used, "limit_bytes": limit, "percent": used * 100.0 / limit}
 
     def _cached_stats(self, max_age=STATS_STALE_MAX):
         """The last successful `docker stats` result if it is at most `max_age` old, else None.
@@ -5280,8 +5302,13 @@ class RemoteBrowser:
                 probe.session = session
                 self._probe_sessions[session] = probe
             self._call("Page.enable", session=session)
-            self._call("Fetch.enable", {"patterns": [dict(p) for p in FETCH_PATTERNS]},
-                       session=session)
+            patterns = [dict(p) for p in FETCH_PATTERNS]
+            if probe.fixture is not None:
+                # v0.1.66: the self-test's virtual site is answered from RAM in the probe page too. Without this
+                # pattern the hidden page asked the real network for selftest.example.com (which does not exist), so
+                # every self-test probe ended without links on a NAS (the test harness resolves the name locally).
+                patterns.append({"urlPattern": SELFTEST_ORIGIN + "/*"})
+            self._call("Fetch.enable", {"patterns": patterns}, session=session)
             if self._ads_wanted(tab.page_host):
                 try:
                     for method, params in self._ads_commands(True):

@@ -75,7 +75,7 @@ const DISPLAY_CHIP_TITLE = {reader: "リーダー", mirror: "ミラー", tiles: 
 // v0.1.60: this file's own version. The Hub's version (from /api/state) is compared with it: a shell cache that is
 // older than the Hub (the app was updated while the home-screen app was closed) is dropped and the page reloaded.
 // tests/test_web_shell.py checks that it equals webapp.VERSION.
-const APP_VERSION = "0.1.65";
+const APP_VERSION = "0.1.66";
 const PT_DISPLAY_LABEL = "パススルー";      // v0.1.57: not a NAS-browser display, so not in RB_DISPLAY_LABELS
 const RB_PERF_WINDOW_MS = 5000;
 const RB_STREAM_FIRST_MS = 5000;     // MJPEG only (no SSE available): first picture within this, else polling
@@ -5461,6 +5461,32 @@ function announceProbes(tab, jobs) {
     + (failed[0].error || "不明") + "）。一覧から再試行できます", "error");
   if (done.length) flash("リンク解析が終わりました（" + parts.join("・") + "）");
   if (review.length || failed.length) { probeUi.open = true; probeUi.tabId = tab.rb.id; renderProbeSheet(); }
+  if (review.length) probeAutosendFallback(tab, review.map(j => j.id));
+}
+
+// v0.1.66: the Hub sends finished results to JD2 by itself (probe_autosend). If one is still unsent a moment later (JD2
+// was busy, or the Hub's attempt failed), this phone sends it, as before the queue; the Hub skips links already sent.
+const PROBE_FALLBACK_MS = 4000;
+function probeAutosendFallback(tab, ids) {
+  const rb = tab && tab.rb;
+  if (!rb || !ids.length) return;
+  setTimeout(() => perform(async () => {
+    if (tab.rb !== rb || !(state.settings && state.settings.probe_autosend !== false) || !jd2CanSend()) return;
+    const data = await api("/api/rb/probe/jobs?tab=" + encodeURIComponent(rb.id));
+    const still = (data.jobs || []).filter(j => ids.includes(j.id) && j.state === "done" && j.links.length && !(j.sent && !j.sent.error));
+    let sent = 0, error = "";
+    for (const job of still) {
+      const r = await api("/api/rb/probe/send", {tab: rb.id, job: job.id});
+      sent += r.sent || 0;
+      if (r.error && !error) error = r.error;
+    }
+    if (still.length) {
+      dlog("rb", "info", "probe autosend fallback", {jobs: still.length, sent, error: error.slice(0, 80)});
+      if (error) toast("JD2へ送れませんでした: " + error, "error");
+      else if (sent) flash("リンク解析の結果をJD2へ送りました（" + sent + "件）");
+      await loadProbeJobs(tab);
+    }
+  }), PROBE_FALLBACK_MS);
 }
 
 const PROBE_STATE_LABEL = {queued: "待機", running: "解析中", done: "完了", failed: "失敗", cancelled: "取り消し"};
