@@ -4455,7 +4455,7 @@ async function runMirror(tab, opts = {}) {
     if (tab.error) tab.error = "";
     updateRemoteView(tab);
   } catch (e) {
-    if (tab.rb !== rb) return;
+    if (tab.rb !== rb || pageLeaving) return;     // v0.1.57: WebKit fails in-flight fetches ("Load failed") while the page is left
     if (e.status === 404) { remoteLost(tab); return; }
     console.error("mirror failed:", e);
     dlog("render", "warn", "mirror failed", {message: String(e && e.message || e).slice(0, 120), status: e.status || 0});
@@ -5536,6 +5536,12 @@ async function ptDownload(tab, m) {
   }
   ptCommand("download-result", {id, text}, true);    // the download page has no helper, so no "ready"
 }
+
+// v0.1.57: set when the app page is being left (reload, navigation), so aborted fetches are not reported as failures.
+var pageLeaving = false;
+window.addEventListener("beforeunload", () => { pageLeaving = true; });
+window.addEventListener("pagehide", () => { pageLeaving = true; });
+window.addEventListener("pageshow", ev => { if (ev.persisted) pageLeaving = false; });
 
 window.addEventListener("message", ev => {
   const frame = $("ptFrame");
