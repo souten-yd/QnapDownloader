@@ -610,6 +610,22 @@ class Phone:
     def tap(self, x, y):
         self.page.touchscreen.tap(x, y)
 
+    # -- v0.1.63: mouse / keyboard input (desktop and iPad-with-keyboard scenarios)
+    def click(self, x, y, button="left"):
+        self.page.mouse.click(x, y, button=button)
+
+    def press(self, combo):
+        self.page.keyboard.press(combo)
+
+    def require_touch(self):
+        """iPad scenarios: the engine's touch emulation must report a coarse primary pointer (the layout follows it)."""
+        if not self.js("matchMedia('(pointer: coarse)').matches"):
+            raise Skip("this engine's touch emulation does not report (pointer: coarse)")
+
+    def require_mouse(self):
+        if not self.js("matchMedia('(pointer: fine)').matches"):
+            raise Skip("this engine does not report (pointer: fine) for the desktop context")
+
     def cdp_touch(self, points):
         """points: [(x, y, wait_ms), ...]; one finger, touchStart..touchEnd (Chromium only)."""
         if self.engine != "chromium":
