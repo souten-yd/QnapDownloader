@@ -39,7 +39,7 @@ import updater
 import webauthn
 import ws_hub
 
-VERSION = "0.1.68"
+VERSION = "0.1.69"
 PORT = 17864
 ROOT = Path(__file__).resolve().parent
 FILES = {"/": ("web/index.html", "text/html; charset=utf-8"),
