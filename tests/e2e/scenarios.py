@@ -52,6 +52,18 @@ def display_reader(ph):
             15, "reader image loaded")
 
 
+@scenario("mirror-late-content", display="mirror")
+def mirror_late_content(ph):
+    """A page that is empty at DOMContentLoaded and draws its content a moment later stays in the mirror display
+    (an early empty copy switched it to the fast display with 「このページはミラー表示に対応していない」)."""
+    ph.open("/late.html")
+    ph.wait(lambda: "E2E 後から描くページ" in ph.mirror_text(), 15, "late content in the mirror")
+    ph.page.wait_for_timeout(500)
+    assert ph.display() == "mirror", "switched to %s" % ph.display()
+    toasts = ph.page.eval_on_selector_all("#notice .toast", "els=>els.map(e=>e.dataset.message||e.textContent)")
+    assert not any("ミラー表示に対応していない" in t for t in toasts), toasts
+
+
 @scenario("display-mirror", display="mirror")
 def display_mirror(ph):
     ph.open("/article.html")
