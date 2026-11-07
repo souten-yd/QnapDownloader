@@ -42,7 +42,7 @@ jobs:
             exit 1
           fi
           gh release create v0.1.57-rc1 dist/QnapDownloader_0.1.57_x86_64.qpkg dist/SHA256SUMS \
-            --repo "${{ github.repository }}" --target "4c6a0da04b3e4a6d8fd230f2d04b7788b05bbeb1" \
+            --repo "${{ github.repository }}" --target "220c996ec27ad4d0e9b4b7b446e390433ba9dbb4" \
             --title "QnapDownloader v0.1.57-rc1: Passthrough display" \
             --prerelease \
             --notes "Experimental QNAP x86_64 build. New passthrough display (off by default): the page runs in the iPhone's own Safari engine while every request goes out from the NAS. Needs: tailscale serve --bg --https=8443 http://127.0.0.1:17865. Cloudflare checks, WebSockets and some logins may not work there; use the NAS browser for those."
