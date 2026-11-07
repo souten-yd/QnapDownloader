@@ -8407,6 +8407,9 @@ function pageScrollsSideways(doc) {
     return view.getComputedStyle(doc.documentElement).overflowX !== "hidden" && view.getComputedStyle(doc.body).overflowX !== "hidden";
   } catch (e) { return false; }
 }
+// The last wheel decisions (RAM only, small): read by the E2E scenarios when a trackpad check fails.
+const wheelLog = [];
+function wheelNote(entry) { wheelLog.push(entry); if (wheelLog.length > 24) wheelLog.shift(); }
 function onWheelSwipe(event, doc, target = event.target) {
   if (event.ctrlKey || event.metaKey || event.defaultPrevented || !state.authed) return;
   const now = performance.now();
@@ -8415,7 +8418,15 @@ function onWheelSwipe(event, doc, target = event.target) {
   if (Math.abs(dx) < 1 || Math.abs(dx) < 1.5 * Math.abs(dy)) { wheelSwipe.sum = 0; return; }
   if (now - wheelSwipe.at > WHEEL_GAP_MS || Math.sign(dx) !== Math.sign(wheelSwipe.sum)) wheelSwipe.sum = 0;
   wheelSwipe.at = now;
-  if (!stepTab() || hScroller(target) || pageScrollsSideways(doc || document)) { wheelSwipe.sum = 0; return; }
+  // The page that would move is the one on screen: in the mirror display that is the mirror page, whichever
+  // document the engine handed the wheel to (WebKit and Chromium differ for a wheel over a frame).
+  let shown = null;
+  try { const t = stepTab(); shown = t && tabDisplay(t) === "mirror" ? mirrorDoc() : null; } catch (e) { shown = null; }
+  const sideways = pageScrollsSideways(doc || document) || Boolean(shown && pageScrollsSideways(shown));
+  const scroller = Boolean(hScroller(target));
+  wheelNote({doc: doc === document ? "app" : "frame", tgt: target && (target.id || target.nodeName), dx: Math.round(dx),
+             sideways, scroller, sum: Math.round(wheelSwipe.sum)});
+  if (!stepTab() || scroller || sideways) { wheelSwipe.sum = 0; return; }
   wheelSwipe.sum += dx;
   if (Math.abs(wheelSwipe.sum) < WHEEL_SWIPE_PX) return;
   const dir = wheelSwipe.sum < 0 ? -1 : 1;           // fingers to the right = deltaX < 0 = back
