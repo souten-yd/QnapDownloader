@@ -337,6 +337,29 @@ class LifecycleTests(BrowserBase):
         self.assertIn("最大3枚", str(ctx.exception))
         self.assertEqual(len(self.ws.calls("Target.createTarget")), 3)
 
+    def test_at_the_cap_tabs_nobody_polled_are_closed_to_make_room(self):
+        # v0.1.60: a tab whose opener lost the answer is nobody's; at the cap the idle ones go, oldest first
+        for i in range(3):
+            self.open("https://example.com/%d" % i)
+            self.clock.now += 1
+        self.clock.now += rb.ORPHAN_IDLE
+        with self.rb._lock:
+            self.rb._tabs["b3"].last_poll = self.clock.now      # b3 is in use
+        self.open("https://example.com/4")
+        ids = [t["id"] for t in self.rb.status()["tabs"]]
+        self.assertNotIn("b1", ids)
+        self.assertIn("b2", ids)
+        self.assertIn("b3", ids)
+        self.assertEqual(len(ids), 3)
+
+    def test_at_the_cap_tabs_in_use_are_never_closed(self):
+        for i in range(3):
+            self.open("https://example.com/%d" % i)
+        self.clock.now += rb.ORPHAN_IDLE - 1
+        with self.assertRaises(rb.BrowserError):
+            self.open("https://example.com/4")
+        self.assertEqual(len(self.rb.status()["tabs"]), 3)
+
     def test_memory_guard_refuses_before_starting_anything(self):
         self.set_mem(2 * 1024 * 1024 - 1)
         with self.assertRaises(rb.BrowserError) as ctx:

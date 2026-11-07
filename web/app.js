@@ -1231,7 +1231,16 @@ async function openRemote(tab, value, commit, opts = {}) {
       }
     }
     if (!tab.rb) {
-      reply = await api("/api/rb/tabs", body);
+      // v0.1.60: a dropped answer (WebKit "Load failed") is asked once more with the same nonce, so the NAS
+      // answers with the tab it already made instead of opening another one nobody would close.
+      body.nonce = rbNonce();
+      try {
+        reply = await api("/api/rb/tabs", body);
+      } catch (e) {
+        if (!(e instanceof TypeError) || e.status) throw e;
+        if (token !== tab.token || !state.tabs.includes(tab)) return;
+        reply = await api("/api/rb/tabs", body);
+      }
       madeAt = performance.now();
       if (token !== tab.token || !state.tabs.includes(tab)) {
         api("/api/rb/tabs/close", {id: reply.id}).catch(() => {});
@@ -1260,6 +1269,12 @@ async function openRemote(tab, value, commit, opts = {}) {
   swrDrop("rb-status");
   refreshAfterTabChange();
   if (tab.rb.seed) applySeed(tab);        // a loop that was already running takes the first copy now
+}
+
+function rbNonce() {
+  const bytes = new Uint8Array(12);
+  try { crypto.getRandomValues(bytes); } catch (e) { for (let i = 0; i < bytes.length; i++) bytes[i] = Math.random() * 256 | 0; }
+  return Array.from(bytes, b => b.toString(16).padStart(2, "0")).join("");
 }
 
 // v0.1.59: the request that carried (or should have carried) the first copy is over. With a copy: use it. Without

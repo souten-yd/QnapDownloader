@@ -38,7 +38,7 @@ import ttlcache
 import updater
 import webauthn
 
-VERSION = "0.1.59"
+VERSION = "0.1.60"
 PORT = 17864
 ROOT = Path(__file__).resolve().parent
 FILES = {"/": ("web/index.html", "text/html; charset=utf-8"),
@@ -475,6 +475,30 @@ def passkey_rp_name_ok(name):
     configured = os.environ.get("DOWNLOADER_ALLOWED_HOSTS", "")
     return ("." in name and LABEL.fullmatch(name.split(".")[0]) is not None and
             name in {item.strip().lower() for item in configured.split(",") if item.strip()})
+
+
+def rb_open_once(server, nonce, opener):
+    """v0.1.60: open_tab, at most once per nonce (remembered OPEN_NONCE_TTL s, RAM only)."""
+    if not nonce:
+        return opener()
+    lock = server.__dict__.setdefault("rb_nonce_lock", threading.Lock())
+    with lock:
+        seen = server.__dict__.setdefault("rb_nonces", {})
+        now = time.monotonic()
+        for key in [k for k, (_, at) in seen.items() if now - at > remote_browser.OPEN_NONCE_TTL]:
+            del seen[key]
+        known = seen.get(nonce)
+    if known is not None:
+        tab_id = known[0]
+        try:
+            server.rb._tab(tab_id)       # still open
+            return {"id": tab_id, "again": True}
+        except Exception:
+            pass
+    created = opener()
+    with lock:
+        server.rb_nonces[nonce] = (created["id"], time.monotonic())
+    return created
 
 
 def server_pt(server):
@@ -1648,7 +1672,15 @@ class Handler(BaseHTTPRequestHandler):
                 checked = browser_safety.validate(body.get("url"))
                 self.reject_hub_origin(checked)
                 first = self.first_kind(body)
-                created = self.server.rb.open_tab(checked, view=body.get("view"))
+                nonce = body.get("nonce")
+                if nonce is not None and (not isinstance(nonce, str) or not 8 <= len(nonce) <= 64 or
+                                          not nonce.replace("-", "").replace("_", "").isalnum()):
+                    raise ValueError("nonceが不正です")
+                # v0.1.60: the phone repeats a tab-open whose answer it lost with the same nonce; the tab made
+                # the first time is answered again instead of a second one (which nobody would ever close).
+                created = rb_open_once(self.server, nonce, lambda: self.server.rb.open_tab(checked, view=body.get("view")))
+                if created.get("again"):
+                    created = dict(created, url=checked)
                 if first:
                     # v0.1.59: the first copy / extraction and the tab metadata ride on this answer
                     created = dict(created, first=self.server.rb.wait_first(created["id"], first))
