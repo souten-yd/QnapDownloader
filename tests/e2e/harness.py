@@ -142,6 +142,7 @@ class FixtureServer:
         self.hits = Counter()          # path -> GET count (a reload shows up here)
         self.times = {}                # path -> monotonic time of the last GET
         self.beacons = []              # (monotonic, event, detail) from the pages' own scripts
+        self.pt_seen = []              # v0.1.57: (Host, path, Cookie) of every /ptx/ request (what the NAS sent upstream)
         fx = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -157,6 +158,8 @@ class FixtureServer:
                     q = parse_qs(parts.query)
                     fx.beacons.append((time.monotonic(), q.get("e", [""])[0], q.get("p", [""])[0]))
                     return self.reply(204, b"", "text/plain")
+                if path.startswith("/ptx/"):
+                    return self.pt_route(path)
                 fx.hits[path] += 1
                 fx.times[path] = time.monotonic()
                 q = parse_qs(parts.query)
@@ -187,8 +190,45 @@ class FixtureServer:
                     return self.reply(404, b"not found", "text/plain")
                 return self.reply(200, file.read_bytes(), "text/html; charset=utf-8")
 
-            def reply(self, status, body, ctype):
+            def pt_route(self, path):
+                """v0.1.57: pages for the passthrough scenarios (the same server answers every fixture host name)."""
+                host, cookie = self.headers.get("Host", ""), self.headers.get("Cookie", "")
+                fx.pt_seen.append((host, path, cookie))
+                extra = []
+                if path == "/ptx/page.html":
+                    extra.append(("Set-Cookie", "ptc=A1; Path=/"))
+                    body = ("<!doctype html><html><head><meta charset='utf-8'><title>PT Fixture A</title></head><body>"
+                            "<h1 id=t>PT-FIXTURE-PAGE</h1><img id=pic width=20 height=20 src='https://b.example.net/ptx/pic.png'>"
+                            "<p><a id=l2 href='/ptx/page2.html'>next</a> <a id=lredir href='/ptx/redir'>redir</a> "
+                            "<a id=ldl href='/ptx/dl.bin'>download</a></p>"
+                            "<script src='/ptx/app.js'></script></body></html>").encode()
+                    return self.reply(200, body, "text/html; charset=utf-8", extra)
+                if path == "/ptx/page2.html":
+                    body = ("<!doctype html><html><head><meta charset='utf-8'><title>PT Fixture A2</title></head><body>"
+                            "<h1 id=t>PT-FIXTURE-PAGE-2</h1></body></html>").encode()
+                    return self.reply(200, body, "text/html; charset=utf-8")
+                if path == "/ptx/app.js":
+                    js = ("document.documentElement.setAttribute('data-pt-js','1');"
+                          "fetch('/ptx/echo').then(r=>r.text()).then(t=>document.documentElement.setAttribute('data-pt-echo-a',t));"
+                          "fetch('https://b.example.net/ptx/echo').then(r=>r.text()).then(t=>document.documentElement.setAttribute('data-pt-echo-b',t))"
+                          ".catch(e=>document.documentElement.setAttribute('data-pt-echo-b','ERR '+e));")
+                    return self.reply(200, js.encode(), "application/javascript")
+                if path == "/ptx/echo":
+                    return self.reply(200, ("host=%s;cookie=%s" % (host, cookie)).encode(), "text/plain; charset=utf-8",
+                                      [("Access-Control-Allow-Origin", "*")])
+                if path == "/ptx/pic.png":
+                    return self.reply(200, make_png(4, 4, "3366aa"), "image/png")
+                if path == "/ptx/redir":
+                    return self.reply(302, b"", "text/plain", [("Location", "/ptx/page2.html")])
+                if path == "/ptx/dl.bin":
+                    return self.reply(200, b"x" * 2048, "application/octet-stream",
+                                      [("Content-Disposition", 'attachment; filename="e2e.bin"')])
+                return self.reply(404, b"not found", "text/plain")
+
+            def reply(self, status, body, ctype, extra=()):
                 self.send_response(status)
+                for name, value in extra:
+                    self.send_header(name, value)
                 self.send_header("Content-Type", ctype)
                 self.send_header("Content-Length", str(len(body)))
                 self.send_header("Cache-Control", "no-store")
@@ -287,6 +327,12 @@ class Env:
         server.engine = engine_supervisor.EngineManager(root, self.store)
         server.jd2 = jd2_control.JD2Controller(server.engine.adapter)
         server.secure_cookies = False
+        # TEST ONLY (v0.1.57): passthrough on http://localhost:<listener port>, upstream = the fixture server. These plain
+        # attributes are never set by main() or the start scripts (the QPKG contract test checks that).
+        server.pt_port = 0
+        server.pt_test_host = "localhost"
+        server.pt_test_upstream = {h: ("127.0.0.1", self.fx.port) for h in ("a.example.com", "b.example.net")}
+        server.pt_tls_context = ssl.create_default_context(cafile=str(self.tmp / "cert.pem"))
         # TEST ONLY (same as the hidden --test-passkey-host flag): the passkey scenario uses http://localhost.
         server.passkey_test_hosts = frozenset(["localhost"])
         ctx = root / "ctx"
@@ -344,6 +390,15 @@ class Env:
         """Between scenarios: close every NAS tab and forget the fixture counters."""
         self.blocked.clear()
         self.stream_hits.clear()
+        try:                           # v0.1.57: every scenario starts with the passthrough off and no sessions
+            import webapp
+            self.store.set_option("pt_enabled", False)
+            manager = webapp.server_pt(self.server)
+            manager.sync()
+            manager.state.revoke_all()
+            del self.fx.pt_seen[:]
+        except Exception:
+            pass
         self.fx.hits.clear()
         self.fx.times.clear()
         del self.fx.beacons[:]

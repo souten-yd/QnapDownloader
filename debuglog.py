@@ -11,7 +11,7 @@ import threading
 import time
 from collections import deque
 
-CATEGORIES = ("ui", "render", "net", "rb", "jd2", "engine", "disk", "http", "app")
+CATEGORIES = ("ui", "render", "net", "rb", "jd2", "engine", "disk", "http", "app", "pt")
 LEVELS = ("debug", "info", "warn", "error")
 MAX_ENTRIES = 5000
 MAX_BYTES = 2 * 1024 * 1024

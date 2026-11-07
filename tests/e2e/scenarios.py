@@ -805,3 +805,220 @@ def downloads_header_layout(ph):
     ph.js("()=>{location.hash='#/settings/jd2'}")
     ph.wait(lambda: ph.js("!!$('autoClearLinks')"), 8, "settings")
     assert ph.js("()=>$('autoClearLinks').checked===false&&$('autoClearDownloads').checked===false")
+
+
+# ------------------------------------------------------------------ passthrough display (v0.1.57)
+# The app runs on http://localhost:P and the passthrough listener ("origin B") on http://localhost:Q: the same site
+# (as in production, where both are the same *.ts.net name on two ports) and a secure context, which Service Workers
+# need. The upstream "sites" are the fixture server (https, a.example.com / b.example.net). WebKit was not available
+# where these were written: they are kept engine-neutral, but the WebKit run is unverified.
+
+PT_PAGE = "https://a.example.com/ptx/page.html"
+
+
+def _pt_local(ph, enable=True):
+    """Turn the passthrough on (Settings API) and open the app on http://localhost:P, logged in."""
+    page = ph.page
+    if enable:
+        res = ph.post("/api/settings/options", {"pt_enabled": True})
+        assert res["status"] == 200, res
+    local = ph.env.url.replace("127.0.0.1", "localhost")
+    page.goto(local)
+    ph.wait(lambda: page.locator("#password").is_visible() or ph.js("state.authed === true"), 15, "login form on localhost")
+    if page.locator("#password").is_visible():
+        page.fill("#password", PASSWORD)
+        page.click("#loginButton")
+    ph.wait(lambda: ph.js("state.authed === true"), 10, "login on localhost")
+    ph.csrf = ph.js("fetch('/api/session').then(r=>r.json()).then(j=>j.csrf)")
+    ph.js("refreshPt()")                  # the app asks for the status lazily (menu, settings, restored pt tab)
+    if enable:
+        ph.wait(lambda: ph.js("ptAvailable()"), 10, "passthrough available in the app")
+    return ph.js("state.pt && state.pt.origin")
+
+
+def _pt_frame(ph, timeout=15):
+    """The Playwright Frame of the passthrough iframe (origin B)."""
+    origin = ph.js("state.pt.origin")
+
+    def find():
+        for fr in ph.page.frames:
+            if fr.url.startswith(origin + "/p/"):
+                return fr
+        return None
+    return ph.wait(find, timeout, "passthrough frame under /p/")
+
+
+def _pt_open(ph, url=PT_PAGE):
+    """A passthrough tab at `url` (created the way the menu does it: history + tab.pt)."""
+    ph.js("""(u)=>{const tab=createTab();pushHistory(tab,u);tab.current=u;tab.pt=true;saveTabs();navigate('#/tab/'+tab.id)}""", url)
+    ph.wait(lambda: ph.js("(()=>{const t=activeWebTab();return !!(t&&t.pt&&t.history.length)})()"), 5, "passthrough tab active")
+    fr = _pt_frame(ph)
+    ph.wait(lambda: fr.locator("#t").count() > 0, 15, "page rendered in the frame")
+    return fr
+
+
+def _pt_cur(ph):
+    return ph.js("(()=>{const t=activeWebTab();return t?t.current:''})()")
+
+
+@scenario("pt-settings-ping")
+def pt_settings_ping(ph):
+    """The Settings switch turns the listener on (the app reloads for its CSP), and 接続を確認 reaches origin B."""
+    ph.js("()=>{location.hash='#/settings/browser/pt'}")
+    ph.wait(lambda: ph.page.locator("#ptEnabled").count() > 0, 8, "pt settings")
+    assert ph.js("state.settings.pt_enabled === false"), "off by default"
+    assert "tailscale serve --bg --https=8443 http://127.0.0.1:17865" in ph.js("$('ptCmd').textContent")
+    ph.js("()=>{window.__beforeReload=1}")
+    ph.page.locator("label[for=ptEnabled]").tap()
+    ph.wait(lambda: ph.js("window.__beforeReload === undefined") and ph.js("state.pt && !!state.pt.origin"),
+            15, "switch on and the app reloaded")
+    ph.js("()=>{location.hash='#/settings/browser/pt'}")
+    ph.page.locator("#ptCheck").tap()
+    ph.wait(lambda: "接続できました" in ph.js("$('ptCheckResult').textContent"), 10, "ping ok")
+    # the app's CSP names origin B only now
+    csp = ph.js("fetch(location.href).then(r=>r.headers.get('content-security-policy'))")
+    assert ph.js("state.pt.origin") in csp, csp
+
+
+@scenario("pt-open-page")
+def pt_open_page(ph):
+    """A page is drawn in the frame; the Service Worker controls it; a second host's image comes through /p/."""
+    _pt_local(ph)
+    fr = _pt_open(ph)
+    assert fr.locator("#t").inner_text() == "PT-FIXTURE-PAGE"
+    ph.wait(lambda: fr.evaluate("!!navigator.serviceWorker.controller"), 5, "frame controlled by the Service Worker")
+    ph.wait(lambda: fr.evaluate("document.documentElement.getAttribute('data-pt-js')") == "1", 5, "site script ran")
+    ph.wait(lambda: fr.evaluate("(()=>{const i=document.getElementById('pic');return i.complete&&i.naturalWidth>0})()"), 10,
+            "second-host image loaded")
+    assert any(h == "b.example.net" and p == "/ptx/pic.png" for h, p, _c in ph.env.fx.pt_seen), ph.env.fx.pt_seen
+    ph.wait(lambda: _pt_cur(ph) == PT_PAGE, 5, "tab address follows the page")
+    ph.wait(lambda: ph.js("activeWebTab().ptTitle") == "PT Fixture A", 5, "tab title follows the page")
+
+
+@scenario("pt-back-forward")
+def pt_back_forward(ph):
+    """A link click inside the frame is a new history entry in the app; the toolbar back / forward step it."""
+    _pt_local(ph)
+    fr = _pt_open(ph)
+    fr.locator("#l2").tap()
+    ph.wait(lambda: _pt_cur(ph).endswith("/ptx/page2.html"), 10, "link followed")
+    ph.wait(lambda: "PT-FIXTURE-PAGE-2" in (_pt_frame(ph).locator("#t").inner_text() if _pt_frame(ph).locator("#t").count() else ""),
+            10, "second page drawn")
+    assert ph.js("activeWebTab().history.length") == 2
+    ph.page.locator("#navBack").tap()
+    ph.wait(lambda: _pt_cur(ph) == PT_PAGE, 10, "back")
+    ph.wait(lambda: ph.js("activeWebTab().index") == 0, 5, "index 0")
+    ph.page.locator("#navForward").tap()
+    ph.wait(lambda: _pt_cur(ph).endswith("/ptx/page2.html"), 10, "forward")
+    ph.page.locator("#navBack").tap()
+    ph.wait(lambda: _pt_cur(ph) == PT_PAGE, 10, "back again")
+    ph.page.locator("#navBack").tap()                # nothing earlier: a toast, the tab stays
+    ph.wait(lambda: "これより前のページはありません" in ph.js("document.getElementById('notice').innerText"), 5, "toast")
+    assert ph.js("state.route.view") == "tab"
+
+
+@scenario("pt-flick", engines=("chromium",))
+def pt_flick(ph):
+    """A sideways flick over the framed page is back / forward (the helper reports it to the app)."""
+    _pt_local(ph)
+    fr = _pt_open(ph)
+    fr.locator("#l2").tap()
+    ph.wait(lambda: _pt_cur(ph).endswith("/ptx/page2.html"), 10, "link followed")
+    ph.page.wait_for_timeout(600)
+    _flick(ph, 200)
+    ph.wait(lambda: _pt_cur(ph) == PT_PAGE, 8, "flick back (url=%s)" % _pt_cur(ph))
+    ph.page.wait_for_timeout(600)
+    _flick(ph, -200)
+    ph.wait(lambda: _pt_cur(ph).endswith("/ptx/page2.html"), 8, "flick forward (url=%s)" % _pt_cur(ph))
+
+
+@scenario("pt-redirect")
+def pt_redirect(ph):
+    """A redirect stays inside /p/ and the app's address becomes the final page."""
+    _pt_local(ph)
+    fr = _pt_open(ph)
+    fr.locator("#lredir").tap()
+    ph.wait(lambda: _pt_cur(ph) == "https://a.example.com/ptx/page2.html", 10, "final address (now %s)" % _pt_cur(ph))
+    ph.wait(lambda: _pt_frame(ph).url.startswith(ph.js("state.pt.origin") + "/p/s/a.example.com/ptx/page2.html"), 5,
+            "frame still under /p/")
+
+
+@scenario("pt-cookie-first-party")
+def pt_cookie_first_party(ph):
+    """A's cookie goes back to A on the next request, never to the other site, and never into the phone's own jar."""
+    _pt_local(ph)
+    fr = _pt_open(ph)
+    ph.wait(lambda: fr.evaluate("document.documentElement.getAttribute('data-pt-echo-a')"), 10, "first-party echo")
+    echo_a = fr.evaluate("document.documentElement.getAttribute('data-pt-echo-a')")
+    assert "host=a.example.com" in echo_a and "ptc=A1" in echo_a, echo_a
+    ph.wait(lambda: fr.evaluate("document.documentElement.getAttribute('data-pt-echo-b')"), 10, "cross-site echo")
+    echo_b = fr.evaluate("document.documentElement.getAttribute('data-pt-echo-b')")
+    assert "host=b.example.net" in echo_b and "ptc" not in echo_b, echo_b
+    assert not [c for c in ph.context.cookies() if c["name"] == "ptc"], "the site's cookie must stay on the NAS"
+    assert [c for c in ph.context.cookies() if c["name"] == "qd_pt"], "only the passthrough session cookie is set"
+
+
+@scenario("pt-download-page")
+def pt_download_page(ph):
+    """A download link shows the JD2 / save page; the JD2 button goes through the app's own confirm."""
+    _pt_local(ph)
+    ph.page.on("dialog", lambda dialog: dialog.accept())
+    fr = _pt_open(ph)
+    fr.locator("#ldl").tap()
+    ph.wait(lambda: _pt_frame(ph).locator("#jd2").count() > 0, 10, "download page")
+    dl = _pt_frame(ph)
+    assert "e2e.bin" in dl.locator("body").inner_text()
+    dl.locator("#jd2").tap()
+    ph.wait(lambda: "追加したリンクに入れました" in _pt_frame(ph).locator("#msg").inner_text(), 10, "staged through the app")
+    links = ph.js("fetch('/api/links').then(r=>r.json())")
+    assert "ptx/dl.bin" in str(links), links
+
+
+@scenario("pt-off-refuses")
+def pt_off_refuses(ph):
+    """Turning the switch off stops the listener: origin B no longer answers."""
+    import urllib.error
+    import urllib.request
+    _pt_local(ph)
+    origin = ph.js("state.pt.origin")
+    with urllib.request.urlopen(origin + "/pt/ping", timeout=5) as res:
+        assert res.status == 200
+    assert ph.post("/api/settings/options", {"pt_enabled": False})["status"] == 200
+
+    def refused():
+        try:
+            urllib.request.urlopen(origin + "/pt/ping", timeout=2)
+            return False
+        except (urllib.error.URLError, OSError):
+            return True
+    ph.wait(refused, 8, "listener stopped")
+    try:
+        urllib.request.urlopen(ph.env.url.replace("127.0.0.1", "localhost") + "pt/ping", timeout=3)
+        raise AssertionError("the Hub's own port must not serve passthrough routes")
+    except urllib.error.HTTPError as exc:
+        assert exc.code in (401, 403, 404), exc.code
+
+
+@scenario("pt-menu-switch")
+def pt_menu_switch(ph):
+    """メニュー › パススルー moves the page from the NAS browser into the frame (the NAS tab is closed); another
+    display moves it back."""
+    ph.setting("pt_enabled", False)
+    ph.js("()=>{location.hash='#/home'}")
+    tab = ph.open("/article.html")
+    ph.js("refreshPt()")
+    ph.wait(lambda: ph.js("state.pt !== null"), 5, "status loaded")
+    ph.js("()=>{configureMenu()}")
+    assert ph.js("$('menuPt').disabled === true"), "greyed out while the setting is off"
+    _pt_local(ph)
+    tab = ph.open("/article.html")
+    ph.js("()=>{configureMenu()}")
+    assert ph.js("$('menuPt').disabled === false")
+    ph.js("()=>{setUserDisplay(activeWebTab(),'pt')}")
+    ph.wait(lambda: ph.js("(()=>{const t=activeWebTab();return !!(t&&t.pt&&!t.rb)})()"), 8, "moved to passthrough")
+    ph.wait(lambda: tab not in ph.env.tabs(), 8, "NAS tab closed")
+    fr = _pt_frame(ph)
+    ph.wait(lambda: fr.locator("h1").count() > 0, 15, "article drawn by the phone")
+    ph.js("()=>{setUserDisplay(activeWebTab(),'mirror')}")
+    ph.wait(lambda: ph.js("(()=>{const t=activeWebTab();return !!(t&&!t.pt&&t.rb)})()"), 15, "back on the NAS browser")
+    ph.take_errors("/api/rb/mirror")          # a mirror request in flight while its NAS tab was closed (400)
