@@ -2,7 +2,7 @@
 """First-load benchmark (v0.1.54): tap -> content visible on the phone, median of N runs.
 
     python3 tests/e2e/bench_firstload.py --runs 3 [--display mirror|reader] [--cdp-delay-ms 40] [--stats-delay 1.5]
-        [--path "/firstload.html?nodes=3000"] [--setting rb_spare_tab=false ...] [--label name]
+        [--path "/firstload.html?nodes=3000"] [--setting rb_spare_tab=false ...] [--label name] [--rtt-ms 100]
 
 Everything is measured from the phone page itself (a 20 ms poller inside the page), so the same script runs on any
 revision of the app: copy it, tests/e2e/harness.py and tests/fake_docker.py into an older checkout to get the "before".
@@ -10,6 +10,8 @@ revision of the app: copy it, tests/e2e/harness.py and tests/fake_docker.py into
   --cdp-delay-ms  one-way delay added to every CDP message from the NAS browser (a Celeron answers in tens of ms)
   --stats-delay   seconds `docker stats --no-stream` takes (it samples for 1-2 s on a NAS)
   --origin-delay  fixture resources take this long (the fixture's `delay` query default is 150 ms)
+  --rtt-ms        v0.1.59: latency added to every request of the PHONE (CDP Network.emulateNetworkConditions), e.g. 100
+                  for 4G; the result also lists the /api/ requests made before the text was on screen (`reqs`)
 
 Output: one line per run and the medians; `--json` prints the result as JSON.
 """
@@ -82,7 +84,7 @@ OBSERVER = """(display) => {
         imgs = Array.from(document.querySelectorAll('#readerBody img.reader-img'));
       }
     } catch (e) { /* mid navigation */ }
-    if (b.t0 && b.text === null && text.indexOf('E2E') >= 0) b.text = now;
+    if (b.t0 && b.text === null && text.indexOf('E2E') >= 0) { b.text = now; try { window.__benchSeen(); } catch (e) { /* old harness */ } }
     if (b.t0 && b.text !== null && b.hero === null) {
       const first = imgs[0];
       if (first && first.complete && first.naturalWidth > 0) b.hero = now;
@@ -98,16 +100,33 @@ OBSERVER = """(display) => {
 }"""
 
 
-def one_run(env, browser, ctx_kw, display, path, settings, timeout):
+PASSIVE = ("/api/state", "/api/debug/log", "/api/rb/firstload", "/api/rb/mirror/res", "/api/rb/mirror/release",
+           "/api/rb/snapshot/release", "/api/rb/reader/img")
+
+
+def one_run(env, browser, ctx_kw, display, path, settings, timeout, rtt_ms=0.0):
     import harness
     env.reset_tabs()
     context = browser.new_context(**ctx_kw)
     page = context.new_page()
     ph = harness.Phone(env, page, context, "chromium", env.tmp, "bench")
+    requests, seen = [], []
+
+    def on_request(request):
+        if "/api/" in request.url:
+            requests.append("/api/" + request.url.split("/api/", 1)[1].split("?", 1)[0])
+    page.on("request", on_request)
+    page.expose_function("__benchSeen", lambda: seen.append(len(requests)))
     try:
         ph.start(display)
         for key, value in settings.items():
             ph.setting(key, value)
+        if rtt_ms:
+            cdp = context.new_cdp_session(page)
+            cdp.send("Network.enable")
+            cdp.send("Network.emulateNetworkConditions", {"offline": False, "latency": rtt_ms,
+                                                          "downloadThroughput": -1, "uploadThroughput": -1})
+        del requests[:]
         page.evaluate(OBSERVER, display)
         omni = page.locator("#omnibox").first
         omni.click()
@@ -135,6 +154,9 @@ def one_run(env, browser, ctx_kw, display, path, settings, timeout):
                 tl = None
         result["timeline"] = tl
         result["spare"] = spare
+        counted = requests[:seen[0]] if seen else list(requests)
+        result["reqs"] = [r for r in counted if r not in PASSIVE]
+        result["nreqs"] = len(result["reqs"])
         return result
     finally:
         context.close()
@@ -147,6 +169,7 @@ def main(argv=None):
     ap.add_argument("--path", default="/firstload.html")
     ap.add_argument("--cdp-delay-ms", type=float, default=0.0)
     ap.add_argument("--stats-delay", type=float, default=0.0)
+    ap.add_argument("--rtt-ms", type=float, default=0.0)
     ap.add_argument("--setting", action="append", default=[], help="key=value (true/false/text) applied after login")
     ap.add_argument("--label", default="")
     ap.add_argument("--json", action="store_true")
@@ -177,9 +200,9 @@ def main(argv=None):
             except Exception:
                 browser = p.chromium.launch(executable_path=env.nas_chrome_path)
             # warm-up: the first run starts the NAS browser and logs in; it is not counted
-            one_run(env, browser, ctx_kw, args.display, args.path, settings, args.timeout)
+            one_run(env, browser, ctx_kw, args.display, args.path, settings, args.timeout, args.rtt_ms)
             for _ in range(args.runs):
-                runs.append(one_run(env, browser, ctx_kw, args.display, args.path, settings, args.timeout))
+                runs.append(one_run(env, browser, ctx_kw, args.display, args.path, settings, args.timeout, args.rtt_ms))
             browser.close()
     finally:
         env.close()
@@ -189,7 +212,9 @@ def main(argv=None):
         return round(statistics.median(values)) if values else None
     summary = {"label": args.label, "display": args.display, "runs": len(runs), "cdp_delay_ms": args.cdp_delay_ms,
                "stats_delay": args.stats_delay,
-               "median_ms": {k: med(k) for k in ("tabsMs", "tabsAt", "text", "hero", "full")},
+               "rtt_ms": args.rtt_ms,
+               "median_ms": {k: med(k) for k in ("tabsMs", "tabsAt", "text", "hero", "full", "nreqs")},
+               "requests": [r.get("reqs") for r in runs],
                "each": [{k: (round(r[k]) if r.get(k) is not None else None) for k in ("tabsMs", "tabsAt", "text", "hero", "full")}
                         for r in runs],
                "spare": [r.get("spare") for r in runs],
@@ -202,6 +227,7 @@ def main(argv=None):
         for i, row in enumerate(summary["each"]):
             print("run %d: %s" % (i + 1, row))
         print("median:", summary["median_ms"])
+        print("requests before the text:", summary["requests"][0] if summary["requests"] else None)
         print("spare tab ready at start:", summary["spare"])
         for tl in summary["timeline"]:
             if tl:

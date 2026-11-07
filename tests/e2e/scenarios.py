@@ -410,7 +410,7 @@ def selftest(ph):
     ph.wait(lambda: ph.js("!!(selftestUi.snap&&selftestUi.snap.state==='running')"), 10, "run started")
     # while it runs the progress list is shown and cancel is offered
     assert ph.js("!document.getElementById('selftestProgress').hidden")
-    ph.wait(lambda: ph.js("selftestUi.snap&&selftestUi.snap.state") == "done", 250, "self-test finished")
+    ph.wait(lambda: ph.js("selftestUi.snap&&selftestUi.snap.state") == "done", 320, "self-test finished")
     snap = ph.js("selftestUi.snap")
     checks = {c["id"]: c for c in snap["checks"]}
     builtin = [c for c in snap["checks"] if c["section"] == "builtin"]
@@ -428,6 +428,12 @@ def selftest(ph):
     live = checks["client.live"]
     assert live["status"] != "fail" and "経路:" in live["value"], live
     ph.notes.append("live: " + live["value"][:60])
+    # v0.1.59: 「操作の応答」: route switches, switch feedback, idle traffic and the request count of opening a page
+    response = {c["id"]: c for c in snap["checks"] if c["section"] == "response"}
+    assert set(response) == {"client.route", "client.toggle", "client.idle", "client.open_rtt"}, list(response)
+    for cid, check in response.items():
+        assert check["status"] == "pass", "response check %s: %s %s" % (cid, check["status"], check["value"])
+    ph.notes.append("response: " + " | ".join(response[c]["value"][:48] for c in sorted(response)))
     events = checks["client.mirror_events"]
     assert events["status"] == "pass", "mirror taps did not reach the app's listeners here: %s" % events
     sites = [c for c in snap["checks"] if c["section"] == "sites"]
@@ -442,7 +448,7 @@ def selftest(ph):
     ph.wait(lambda: len(ph.js("selftestUi.text")) > 500, 10, "report text")
     text = ph.js("selftestUi.text")
     for needle in ("== QnapDownloader 自己テスト", "app: v" + ph.env.version, "[NAS] cpu=", "[Phone] ua=", "viewport=",
-                   "## 環境", "## 内蔵テストページ", "## この端末", "## 実サイト", "## 後片付け", "builtin.reader", "client.mirror_events",
+                   "## 環境", "## 内蔵テストページ", "## この端末", "## 操作の応答", "## 実サイト", "## 後片付け", "builtin.reader", "client.mirror_events",
                    "value:", "threshold:", "## debug log (last 50 lines", "[Source] cgroup=", "[Live] transport=", "env.cgroup",
                    "client.secure"):
         assert needle in text, "report lacks %r" % needle
@@ -767,6 +773,7 @@ def first_load(ph):
     assert result["blocked"] >= 1, "no ad/tracker request was blocked: %s" % result
     assert result["load_ms"] is None or result["load_ms"] >= stages["parse"]["ms"], result
     assert result["line"] and "接続・遷移" in result["line"], result.get("line")
+    assert isinstance(result.get("rtts"), int) and result["rtts"] <= 3, "requests until the first paint: %s" % result.get("rtts")
     assert ph.env.rb._tabs[tab].mirror_partials >= 1, "the first copy was not a partial (above the fold) copy"
     ph.wait(lambda: not (ph.env.rb._tabs[tab].mirror_cache or {}).get("partial", True), 15,
             "the full copy replaced the partial one")
@@ -1022,3 +1029,166 @@ def pt_menu_switch(ph):
     ph.js("()=>{setUserDisplay(activeWebTab(),'mirror')}")
     ph.wait(lambda: ph.js("(()=>{const t=activeWebTab();return !!(t&&!t.pt&&t.rb)})()"), 15, "back on the NAS browser")
     ph.take_errors("/api/rb/mirror")          # a mirror request in flight while its NAS tab was closed (400)
+
+
+
+
+# ------------------------------------------------------------------ v0.1.59: request budgets and optimistic UI
+# Requests that do not count towards "tap -> first content": the long-poll of the state, the debug log, the report of
+# the first-load line, the page's own images/fonts and releases of the display that was left.
+BUDGET_PASSIVE = ("/api/state", "/api/debug/log", "/api/rb/firstload", "/api/rb/mirror/res", "/api/rb/mirror/release",
+                  "/api/rb/snapshot/release", "/api/rb/reader/img")
+
+
+class ApiCounter:
+    """Collects the /api/ requests (method + path) the phone page makes; `budget()` leaves out the passive ones."""
+
+    def __init__(self, page):
+        self.items = []
+        self.states = []          # times (monotonic) at which a /api/state answer arrived
+        self.seen = []            # counter.mark() at the moment a watched text appeared on the phone
+        self.page = page
+        page.on("request", self._request)
+        page.on("response", self._response)
+        page.expose_function("__qdSeen", lambda: self.seen.append(self.mark()))
+
+    def watch(self, kind, needle):
+        """A 10 ms poller inside the page calls back the moment `needle` is in the mirror copy / reader text."""
+        self.seen.clear()
+        self.page.evaluate("""([kind, needle]) => {
+          const tick = () => {
+            let text = '';
+            try { text = kind === 'mirror' ? (mirrorDoc() ? mirrorDoc().body.innerText : '') : document.getElementById('readerBody').innerText; }
+            catch (e) { /* mid navigation */ }
+            if (text.indexOf(needle) >= 0) { window.__qdSeen(); return; }
+            setTimeout(tick, 10);
+          };
+          tick();
+        }""", [kind, needle])
+
+    def _request(self, request):
+        url = request.url
+        if "/api/" not in url:
+            return
+        path = "/api/" + url.split("/api/", 1)[1].split("?", 1)[0]
+        self.items.append((request.method, path))
+
+    def _response(self, response):
+        if response.url.split("?", 1)[0].endswith("/api/state"):
+            self.states.append(time.monotonic())
+
+    def mark(self):
+        return len(self.items)
+
+    def budget(self, since=0, until=None):
+        return [item for item in self.items[since:until] if item[1] not in BUDGET_PASSIVE]
+
+
+@scenario("budget-open-mirror", display="mirror")
+def budget_open_mirror(ph):
+    """v0.1.59: opening a page from the address bar needs at most 3 HTTP requests before its text is on the phone
+    (tab creation with validation, viewport and the first copy inline; then the copy document)."""
+    counter = ApiCounter(ph.page)
+    since = counter.mark()
+    counter.watch("mirror", "E2E テスト記事")
+    started = time.monotonic()
+    ph.open("/article.html")
+    ph.wait(lambda: counter.seen, 15, "mirror text", interval=0.02)
+    elapsed = time.monotonic() - started
+    used = counter.budget(since, counter.seen[0])      # only what was asked before the text was there
+    ph.log("requests before the text: %s (%.2fs)" % (used, elapsed))
+    assert len(used) <= 3, "opening a page took %d requests: %s" % (len(used), used)
+    assert not any(path == "/api/browser/validate" for _, path in used), "validation is part of the tabs request: %s" % used
+    ph.wait(lambda: ph.js("(()=>{const t=activeWebTab();return !!(t&&t.rb&&t.rb.tl&&t.rb.tl.result)})()"), 20, "first-load result")
+    assert ph.js("activeWebTab().rb.tl.result.rtts") is not None, "the request count did not reach the speed line"
+    assert "往復" in ph.js("activeWebTab().rb.tl.result.line")
+    # following a link in an open tab: the new page's copy also comes with the navigation answer
+    pt = ph.wait(lambda: ph.mirror_point("doc=>doc.querySelector('a[data-href$=\"/article2.html\"]')"), 8, "a link in the mirror")
+    ph.suppress_ios_click()
+    since = counter.mark()
+    counter.watch("mirror", "二つ目の記事")
+    ph.tap(pt["x"], pt["y"])
+    ph.wait(lambda: counter.seen, 10, "second page", interval=0.02)
+    # (the metadata long-poll that is always outstanding is re-issued as the page loads: not a step of this chain)
+    used = [i for i in counter.budget(since, counter.seen[0]) if i[1] != "/api/rb/meta"]
+    ph.log("link tap requests before the text: %s" % (used,))
+    assert len(used) <= 3, "a link tap took %d requests: %s" % (len(used), used)
+
+
+@scenario("budget-open-reader", display="reader")
+def budget_open_reader(ph):
+    """v0.1.59: the same for the reader display (tab creation answers with the extracted text)."""
+    counter = ApiCounter(ph.page)
+    since = counter.mark()
+    counter.watch("reader", "E2E テスト記事")
+    ph.open("/article.html")
+    ph.wait(lambda: counter.seen, 15, "reader text", interval=0.02)
+    used = counter.budget(since, counter.seen[0])
+    ph.log("requests before the text: %s" % (used,))
+    assert len(used) <= 3, "opening a page in the reader took %d requests: %s" % (len(used), used)
+    assert not any(path in ("/api/browser/validate", "/api/rb/viewport", "/api/rb/reader") for _, path in used), used
+
+
+@scenario("budget-idle-state", engines=("chromium", "webkit"))
+def budget_idle_state(ph):
+    """v0.1.59: with nothing happening, the Downloads view makes at most one /api/state answer in 10 s (memory
+    figures, uptimes and counters used to wake the long-poll every ~2 s)."""
+    counter = ApiCounter(ph.page)
+    ph.env.shake(True)                          # free memory and the container's memory figure change every 0.3 s
+    try:
+        ph.js("()=>{location.hash='#/downloads'}")
+        ph.wait(lambda: ph.js("!!document.querySelector('#view-downloads:not([hidden]) h1')"), 8, "downloads view")
+        ph.page.wait_for_timeout(2500)          # the first answers after the view change settle
+        start = time.monotonic()
+        before = len(counter.states)
+        ph.page.wait_for_timeout(10000)
+    finally:
+        ph.env.shake(False)
+    answers = [t for t in counter.states[before:] if t >= start]
+    others = [i for i in counter.items if i[1] != "/api/state"]
+    ph.log("state answers in 10 s: %d; other requests so far: %d" % (len(answers), len(others)))
+    assert len(answers) <= 1, "/api/state answered %d times in 10 s while idle" % len(answers)
+
+
+@scenario("optimistic-switch", engines=("chromium", "webkit"))
+def optimistic_switch(ph):
+    """v0.1.59: a settings switch changes on the phone before the Hub has answered; a failed save puts it back
+    and says why."""
+    ph.js("()=>{location.hash='#/settings/browser'}")
+    ph.wait(lambda: ph.js("!!document.querySelector('#view-settings:not([hidden])') && !!document.getElementById('rbLinkBoxes')"),
+            8, "browser settings")
+    ph.page.wait_for_timeout(500)
+    held = []
+    ph.page.route("**/api/settings/options", lambda route: held.append(route))
+    start = ph.js("document.getElementById('rbLinkBoxes').checked")
+    key_start = ph.js("state.settings.rb_link_boxes === true")
+    ph.page.locator("label.switch[for=rbLinkBoxes]").scroll_into_view_if_needed()
+    ph.page.locator("label.switch[for=rbLinkBoxes]").tap()
+    ph.page.wait_for_timeout(200)
+    assert held, "the save request was not sent"
+    now = ph.js("({checked: document.getElementById('rbLinkBoxes').checked, setting: state.settings.rb_link_boxes === true,"
+                " busy: document.getElementById('rbLinkBoxes').getAttribute('aria-busy')})")
+    assert now["checked"] != start and now["setting"] != key_start, "the switch did not change before the reply: %s" % now
+    assert now["busy"] == "true", "no busy mark while saving: %s" % now
+    ph.page.wait_for_timeout(1300)              # the reply is held for 1.5 s in total
+    held.pop().continue_()
+    ph.wait(lambda: ph.js("document.getElementById('rbLinkBoxes').getAttribute('aria-busy') !== 'true'"), 5, "saved")
+    assert ph.js("document.getElementById('rbLinkBoxes').checked") != start
+    # a failing save: the switch changes at once, then goes back, with an error toast
+    ph.page.unroute("**/api/settings/options")
+    ph.page.route("**/api/settings/options", lambda route: held.append(route))
+    was = ph.js("document.getElementById('rbLinkBoxes').checked")
+    ph.page.locator("label.switch[for=rbLinkBoxes]").tap()
+    ph.page.wait_for_timeout(200)
+    assert held and ph.js("document.getElementById('rbLinkBoxes').checked") != was, "no change before the failing reply"
+    held.pop().fulfill(status=500, content_type="application/json", body='{"error": "保存できません（テスト）"}')
+    ph.wait(lambda: ph.js("document.getElementById('rbLinkBoxes').checked") == was, 5, "the switch went back")
+    assert ph.js("(state.settings.rb_link_boxes === true) === document.getElementById('rbLinkBoxes').checked"), "state and switch differ"
+    ph.wait(lambda: ph.page.eval_on_selector_all("#notice .toast.error", "els=>els.length") >= 1, 5, "error toast")
+    ph.take_errors("status of 500")
+    ph.page.unroute("**/api/settings/options")
+    # put the setting back the way it was
+    ph.setting("rb_link_boxes", start)
+
+
+

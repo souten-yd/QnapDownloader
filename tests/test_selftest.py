@@ -240,6 +240,56 @@ class ClientEvaluateTests(unittest.TestCase):
         self.assertIsNone(selftest.live_transport({"mjpeg": False}))
         self.assertIn("ストリーム", selftest.HINTS["client.live:polling"])
 
+    def test_v0159_response_checks(self):
+        ev = self.ev
+        # route switches: local, so a slow one is a warning
+        self.assertEqual(ev(id="client.route", ok=True, ms=60, n=4)["status"], PASS)
+        self.assertEqual(ev(id="client.route", ok=True, ms=400, n=4)["status"], WARN)
+        self.assertEqual(ev(id="client.route", ok=True, ms=2500, n=4)["status"], FAIL)
+        self.assertEqual(ev(id="client.route", ok=False)["status"], FAIL)
+        # a settings switch must look changed before the reply
+        self.assertEqual(ev(id="client.toggle", ok=True, ms=30, n=300)["status"], PASS)
+        self.assertEqual(ev(id="client.toggle", ok=True, ms=150, n=300)["status"], WARN)
+        self.assertEqual(ev(id="client.toggle", ok=True, ms=900, n=300)["status"], FAIL)
+        self.assertEqual(ev(id="client.toggle", ok=False, ms=1)["status"], FAIL)
+        # idle: <= 3 state answers in 30 s passes
+        self.assertEqual(ev(id="client.idle", ok=True, ms=30000, state=1, total=2)["status"], PASS)
+        self.assertEqual(ev(id="client.idle", ok=True, ms=30000, state=3, total=5)["status"], PASS)
+        self.assertEqual(ev(id="client.idle", ok=True, ms=30000, state=4, total=5)["status"], WARN)
+        self.assertEqual(ev(id="client.idle", ok=True, ms=30000, state=2, total=40)["status"], WARN)
+        self.assertEqual(ev(id="client.idle", ok=True, ms=30000, state=15, total=15)["status"], FAIL)
+        self.assertEqual(ev(id="client.idle", ok=False)["status"], FAIL)
+        self.assertIn("3", ev(id="client.idle", ok=True, ms=30000, state=1, total=2)["threshold"])
+        self.assertIn("30 秒間", ev(id="client.idle", ok=True, ms=30014, state=1, total=2)["value"])
+        # opening a page: <= 3 requests
+        self.assertEqual(ev(id="client.open_rtt", ok=True, n=2, ms=900)["status"], PASS)
+        self.assertEqual(ev(id="client.open_rtt", ok=True, n=3, ms=900)["status"], PASS)
+        self.assertEqual(ev(id="client.open_rtt", ok=True, n=5, ms=900)["status"], WARN)
+        self.assertEqual(ev(id="client.open_rtt", ok=True, n=6, ms=900)["status"], FAIL)
+        for cid in selftest.RESPONSE_IDS:
+            self.assertIn(cid, selftest.HINTS)
+            self.assertIn(cid, selftest.CLIENT_NAMES)
+
+    def test_v0159_response_checks_get_their_own_section(self):
+        runner = make_runner()
+        runner.start({"client": False})
+        run = runner._run
+        with runner._cv:
+            run.state, run.phase, run.client = "running", "client", "pending"
+        payload = good_payload(run.id)
+        payload["checks"] += [{"id": "client.route", "ok": True, "ms": 50, "n": 4},
+                              {"id": "client.idle", "ok": True, "ms": 30000, "state": 9, "total": 12}]
+        runner.submit_client(payload)
+        sections = {c["id"]: c["section"] for c in run.checks}
+        self.assertEqual(sections["client.route"], "response")
+        self.assertEqual(sections["client.idle"], "response")
+        self.assertEqual(sections["client.rtt"], "client")
+        text = runner.report(run.id)["text"]
+        self.assertIn("## 操作の応答", text)
+        self.assertIn("[FAIL] client.idle", text)
+        with self.assertRaises(ValueError):
+            selftest.validate_client(good_payload(run.id, checks=[{"id": "client.idle", "state": "x"}]))
+
     def test_clipboard_and_secure_context(self):
         self.assertEqual(self.ev(id="client.clipboard", ok=True, flags={"api": False})["status"], PASS)
         self.assertIn("copyコマンド", self.ev(id="client.clipboard", ok=True, flags={"api": False})["value"])
@@ -365,7 +415,7 @@ class StateMachineTests(unittest.TestCase):
         snap = runner.status()
         self.assertEqual(snap["state"], "timeout")
         self.assertEqual(snap["checks"][-1]["id"], "run.timeout")
-        self.assertEqual(selftest.HARD_TIMEOUT, 240.0)
+        self.assertEqual(selftest.HARD_TIMEOUT, 300.0)
 
     def test_stuck_worker_is_reaped_by_status(self):
         clock = Clock()

@@ -354,9 +354,33 @@ class Env:
         self._wrap_streams(webapp)
         server.updates = self_update.UpdateManager(root, webapp.ROOT, webapp.VERSION, "x86_64", self.port)
         self.rb = server.rb
+        self._meminfo_path, self._shake = mem, None
         self.version = webapp.VERSION
         threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.1}, daemon=True).start()
         self.url = "http://127.0.0.1:%d/" % self.port
+
+    def shake(self, on=True, period=0.3):
+        """v0.1.59: makes what changes on a real NAS change here too: free memory (/proc/meminfo) and the container's
+        `docker stats` figure every `period` s. With the state hub's stable signature this must not wake /api/state."""
+        if not on:
+            if self._shake is not None:
+                self._shake.set()
+                self._shake = None
+            return
+        if self._shake is not None:
+            return
+        stop = self._shake = threading.Event()
+
+        def run():
+            n = 0
+            while not stop.wait(period):
+                n += 1
+                try:
+                    self._meminfo_path.write_text("MemTotal: 16000000 kB\nMemAvailable: %d kB\n" % (9000000 - (n * 7919) % 400000))
+                    self.fake_docker.stats_out = "%dMiB / 2GiB|%.2f%%" % (500 + n % 40, 24.0 + (n % 17) / 3.0)
+                except OSError:
+                    pass
+        threading.Thread(target=run, daemon=True).start()
 
     def _wrap_streams(self, webapp):
         """Scenarios can make a live transport 'buffered by a proxy': the request is accepted and the response
@@ -414,6 +438,7 @@ class Env:
         return tab.url if tab else ""
 
     def close(self):
+        self.shake(False)
         for fn in (lambda: self.rb.shutdown(), lambda: self.server.shutdown(), lambda: self.server.server_close(),
                    lambda: self.store.close(), lambda: self.fx.close()):
             try:

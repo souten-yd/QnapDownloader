@@ -151,6 +151,9 @@ label{display:block;margin:12px 0;color:var(--muted);font-size:13px}
 .switch input:checked+.switch-track{background:var(--accent)}
 .switch input:checked+.switch-track::after{transform:translateX(16px)}
 .switch input:focus-visible+.switch-track{outline:2px solid var(--focus);outline-offset:2px}
+/* v0.1.59: a saving switch already shows its new state; it only dims a little until the Hub has confirmed it */
+.switch.is-saving .switch-track,.is-saving>select,.set-row.is-saving .set-label{opacity:.65}
+.switch.is-saving .switch-track{transition:background .15s,opacity .15s}
 .pager{justify-content:center}
 
 /* ---- settings ---- */
