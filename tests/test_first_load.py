@@ -143,10 +143,12 @@ class SpareTests(BrowserBase):
         self.assertNotIn(spare["target"], [t.target_id for t in self.rb._tabs.values()])
 
     def test_adopt_navigates_without_creating_a_target(self):
-        self.make_spare()
+        spare = self.make_spare()
         created = len(self.ws.calls("Target.createTarget"))
         tab = self.open("https://example.com/x")
-        self.assertEqual(len(self.ws.calls("Target.createTarget")), created)
+        # the opened tab IS the former spare; a refill may already have made the next blank one (CI timing)
+        self.assertEqual(self.rb._tabs[tab["id"]].target_id, spare["target"])
+        self.assertLessEqual(len(self.ws.calls("Target.createTarget")), created + 1)
         navigate = self.ws.calls("Page.navigate")[-1]
         self.assertEqual(navigate["params"]["url"], "https://example.com/x")
         self.assertIn(tab["id"], self.rb._tabs)
