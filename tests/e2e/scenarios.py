@@ -732,7 +732,7 @@ def swipe_diagnostic(ph):
     steps = ("edge_back", "flick_right", "back_first", "flick_left", "slow_move", "edge_start", "forward", "pull_cancel", "pull_close",
              "pull_omnibox", "hscroll", "pop_stay")
     for mode in ("mirror", "reader", "tiles"):
-        assert "swipe.%s.display" % mode in rows, sorted(rows)
+        assert "swipe.%s.display" % mode in rows, "%s\n%s" % (sorted(rows), "\n".join("%s %s %s" % (k, v["status"], v["value"][:300]) for k, v in sorted(rows.items())))
         for step in steps:
             row = rows.get("swipe.%s.%s" % (mode, step))
             if step == "pop_stay" and mode != "tiles":
