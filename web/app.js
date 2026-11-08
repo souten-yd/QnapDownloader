@@ -75,7 +75,7 @@ const DISPLAY_CHIP_TITLE = {reader: "リーダー", mirror: "ミラー", tiles: 
 // v0.1.60: this file's own version. The Hub's version (from /api/state) is compared with it: a shell cache that is
 // older than the Hub (the app was updated while the home-screen app was closed) is dropped and the page reloaded.
 // tests/test_web_shell.py checks that it equals webapp.VERSION.
-const APP_VERSION = "0.1.72";
+const APP_VERSION = "0.1.73";
 const PT_DISPLAY_LABEL = "パススルー";      // v0.1.57: not a NAS-browser display, so not in RB_DISPLAY_LABELS
 const RB_PERF_WINDOW_MS = 5000;
 const RB_STREAM_FIRST_MS = 5000;     // MJPEG as the last stream (v0.1.68: after WebSocket and SSE): first picture within this, else polling
@@ -2870,8 +2870,10 @@ function perfText(tab = remoteTab()) {
   }
   if (display === "mirror") {
     const m = p.mirror || {};
-    return "ミラー · 要素 " + (m.nodes || 0) + " · HTML " + kb(m.htmlBytes || 0) + " · CSS " + kb(m.cssBytes || 0) +
+    const head = "ミラー · 要素 " + (m.nodes || 0) + " · HTML " + kb(m.htmlBytes || 0) + " · CSS " + kb(m.cssBytes || 0) +
       " · 画像 " + (m.images || 0) + " · 取得 " + Math.round(m.ms || 0) + " ms";
+    const lines = mirrorDiagLines(rb);
+    return lines.length ? head + "\n" + lines.join("\n") : head;
   }
   if (display === "reader") {
     const blocks = rb.reader && rb.reader.data ? rb.reader.data.blocks : [];
@@ -2894,6 +2896,43 @@ function perfText(tab = remoteTab()) {
   const wait = recent.length ? recent.reduce((sum, x) => sum + x.latency, 0) / recent.length : 0;
   return "ライブ(ポーリング" + (p.fallback ? ": " + p.fallback : "") + ")・" + quality + " · " + fps.toFixed(1) + " fps · " + kb(bytes) +
     "/枚 · 応答 " + Math.round(wait) + " ms";
+}
+
+// v0.1.73: the mirror's detailed figures (speed line and self-test report)
+function mirrorDiagSummary(rb) {
+  const d = rb && rb.mirrorDiag;
+  if (!d) return null;
+  let doc = null;
+  try { doc = mirrorHost.owner === rb ? mirrorDoc() : null; } catch (e) { doc = null; }
+  const res = doc ? mirrorResEntries(doc) : {total: 0, tokens: 0, refetch: 0, cached: 0, kb: 0, slowest: 0};
+  let pending = 0;
+  if (doc) for (const img of Array.from(doc.images || [])) if (!img.complete) pending++;
+  return {copies: d.copies, fresh: d.fresh, morphs: d.morphs, skipped: d.skipped, docs: d.docs,
+    refetch: d.refetchBefore + res.refetch, res, pending, last: d.last, patch: d.patch || null, srv: d.srv};
+}
+
+function mirrorDiagLines(rb) {
+  const s = mirrorDiagSummary(rb);
+  if (!s || !s.last) return [];
+  const l = s.last, p = l.patch || s.patch;
+  const out = [];
+  out.push("複製 " + (l.cap === null ? "?" : l.cap) + " ms（ページ内 " + (l.js === null ? "?" : l.js) + " ms）· 受信 " +
+    (l.early ? "同送" : l.api + " ms") + " · " + (l.load ? "読込 " + l.load + " ms" : "反映 " + l.apply + " ms") +
+    (l.partial ? " · 上部のみ" : "") + (l.reused ? " · 再利用" : ""));
+  if (p) {
+    out.push("差分: 保持 " + p.kept + " · 追加 " + p.added + " · 削除 " + p.removed + " · 属性 " + p.attrs + " · 文字 " + p.text +
+      (p.css ? " · CSS更新" : "") + (p.fallback ? " · 全置換" : ""));
+  }
+  out.push("コピー " + s.copies + "回（文書 " + s.docs + " · 差分 " + s.morphs + " · 変化なし " + s.skipped + "）");
+  const r = s.res;
+  out.push("端末: 画像要求 " + r.total + "（" + r.tokens + "種）· キャッシュ " + r.cached + " · 再取得 " + s.refetch +
+    " · 未完了 " + s.pending + " · " + r.kb + " KB · 最長 " + r.slowest + " ms");
+  const v = s.srv;
+  if (v) {
+    out.push("Hub: 配信 " + (v.served || 0) + " · 保持から " + (v.hub_hits || 0) + " · 取得 " + (v.fetched || 0) +
+      "（" + (v.fetch_ms || 0) + " ms）· 304 " + (v.not_modified || 0) + " · 失敗 " + (v.failed || 0) + " · " + (v.kb || 0) + " KB");
+  }
+  return out;
 }
 
 function renderPerf() {
@@ -4984,37 +5023,142 @@ function mirrorAnchorOf(doc) {
   return null;
 }
 
-function mirrorCopyAttrs(from, to) {
-  for (const a of Array.from(to.attributes)) to.removeAttribute(a.name);
+// v0.1.73: only the attributes that differ are written (an <img> whose src stays is never asked again)
+function mirrorCopyAttrs(from, to, st = null) {
+  for (const a of Array.from(to.attributes)) {
+    if (!from.hasAttribute(a.name)) { to.removeAttribute(a.name); if (st) st.attrs++; }
+  }
   for (const a of Array.from(from.attributes)) {
+    if (to.getAttribute(a.name) === a.value) continue;
     try {
       to.setAttribute(a.name, a.value);
+      if (st) st.attrs++;
     } catch (e) { /* not a valid name here */ }
   }
 }
 
-// Replaces the page content of the iframe with a newer capture, keeping the reading position.
+// v0.1.73: brings the shown children of `cur` in line with the new copy `next`, keeping every element that is
+// still there (matched by its data-m id, else by position and tag) and every text that did not change. The
+// whole body was replaced before: every image was a new element (decoded and painted again, refetched when
+// its URL changed) and the page flickered on each copy.
+function mirrorPatchChildren(doc, cur, next, st) {
+  const want = Array.from(next.childNodes);
+  const ids = new Set();
+  for (const n of want) if (n.nodeType === 1 && n.hasAttribute("data-m")) ids.add(n.getAttribute("data-m"));
+  const byId = new Map();
+  for (const n of Array.from(cur.childNodes)) {
+    if (n.nodeType !== 1 || !n.hasAttribute("data-m")) continue;
+    const id = n.getAttribute("data-m");
+    if (ids.has(id) && !byId.has(id)) byId.set(id, n);
+    else { cur.removeChild(n); st.removed++; }        // gone from the page: out before the walk
+  }
+  let ref = cur.firstChild;
+  for (const nn of want) {
+    let match = null;
+    if (nn.nodeType === 1) {
+      const id = nn.hasAttribute("data-m") ? nn.getAttribute("data-m") : null;
+      if (id !== null) {
+        const c = byId.get(id);
+        if (c && c.nodeName === nn.nodeName) { match = c; byId.delete(id); }
+      } else if (ref && ref.nodeType === 1 && !ref.hasAttribute("data-m") && ref.nodeName === nn.nodeName) {
+        match = ref;
+      }
+    } else if (ref && ref.nodeType === nn.nodeType && ref.nodeType !== 1) {
+      match = ref;
+    }
+    if (!match) {
+      cur.insertBefore(doc.importNode(nn, true), ref);
+      st.added++;
+      continue;
+    }
+    if (match === ref) ref = ref.nextSibling;
+    else { cur.insertBefore(match, ref); st.moved++; }
+    if (match.nodeType === 1) {
+      st.kept++;
+      mirrorCopyAttrs(nn, match, st);
+      const tag = match.nodeName;
+      if (tag === "STYLE" || tag === "TEXTAREA" || tag === "TITLE") {
+        if (match.textContent !== nn.textContent) { match.textContent = nn.textContent; st.text++; }
+      } else {
+        mirrorPatchChildren(doc, match, nn, st);
+      }
+    } else if (match.nodeValue !== nn.nodeValue) {
+      match.nodeValue = nn.nodeValue;
+      st.text++;
+    }
+  }
+  while (ref) {
+    const after = ref.nextSibling;
+    cur.removeChild(ref);
+    st.removed++;
+    ref = after;
+  }
+}
+
+// Replaces the page content of the iframe with a newer capture, keeping the reading position. Answers what
+// was kept and changed (v0.1.73 diagnostics).
 function mirrorMorph(doc, data, startTop = null) {
   const scroller = mirrorScroller(doc);
   const before = scroller.scrollTop;
   const anchor = startTop === null ? mirrorAnchorOf(doc) : null;
+  const st = {kept: 0, added: 0, removed: 0, moved: 0, attrs: 0, text: 0, css: false};
   const sheet = doc.getElementById("mirrorCss");
-  if (sheet.textContent !== data.css) sheet.textContent = data.css;
+  if (sheet.textContent !== data.css) { sheet.textContent = data.css; st.css = true; }
   // parsed by the iframe's own DOMParser so the iframe's policy (inline styles allowed), not the app's, applies
   const parsed = new (doc.defaultView.DOMParser)().parseFromString(
     "<!doctype html><html" + data.html_attrs + "><body" + data.body_attrs + ">" + data.html + "</body></html>",
     "text/html");
-  mirrorCopyAttrs(parsed.documentElement, doc.documentElement);
-  mirrorCopyAttrs(parsed.body, doc.body);
-  const frag = doc.createDocumentFragment();
-  for (const node of Array.from(parsed.body.childNodes)) frag.appendChild(doc.importNode(node, true));
-  doc.body.replaceChildren(frag);
+  mirrorCopyAttrs(parsed.documentElement, doc.documentElement, st);
+  mirrorCopyAttrs(parsed.body, doc.body, st);
+  try {
+    mirrorPatchChildren(doc, doc.body, parsed.body, st);
+  } catch (e) {
+    // never leave a half-patched page: the plain swap of before
+    const frag = doc.createDocumentFragment();
+    for (const node of Array.from(parsed.body.childNodes)) frag.appendChild(doc.importNode(node, true));
+    doc.body.replaceChildren(frag);
+    st.fallback = true;
+    dlog("render", "warn", "mirror patch failed", {message: String(e && e.message || e).slice(0, 120)});
+  }
   let top = startTop === null ? before : startTop;
   if (anchor) {
     const again = doc.querySelector('[data-m="' + CSS.escape(anchor.id) + '"]');
     if (again) top = scroller.scrollTop + (again.getBoundingClientRect().top - anchor.top);
   }
-  scroller.scrollTop = top;
+  if (scroller.scrollTop !== top) scroller.scrollTop = top;
+  return st;
+}
+
+// v0.1.73 diagnostics: the Hub resources this mirror document asked for (Resource Timing of the iframe). A token
+// asked more than once is a refetch: the phone loaded the same image again.
+function mirrorResEntries(doc) {
+  const out = {total: 0, tokens: 0, refetch: 0, cached: 0, kb: 0, slowest: 0};
+  let entries = [];
+  try { entries = doc.defaultView.performance.getEntriesByType("resource"); } catch (e) { return out; }
+  const seen = new Map();
+  for (const e of entries) {
+    if (!/\/api\/rb\/mirror\/res\?/.test(e.name)) continue;
+    const m = /[?&]r=([0-9a-f]+)/.exec(e.name);
+    if (!m) continue;
+    out.total++;
+    seen.set(m[1], (seen.get(m[1]) || 0) + 1);
+    if (e.transferSize === 0 && e.decodedBodySize > 0) out.cached++;
+    out.kb += (e.transferSize || 0) / 1024;
+    out.slowest = Math.max(out.slowest, e.duration || 0);
+  }
+  out.tokens = seen.size;
+  for (const n of seen.values()) out.refetch += Math.max(0, n - 1);
+  out.kb = Math.round(out.kb);
+  out.slowest = Math.round(out.slowest);
+  return out;
+}
+
+function mirrorDiagFor(rb, url) {
+  if (!rb.mirrorDiag || rb.mirrorDiag.url !== url) {
+    rb.mirrorDiag = {url, copies: 0, fresh: 0, morphs: 0, skipped: 0, docs: 0, refetchBefore: 0, last: null, patch: null,
+      srv: null};
+  }
+  return rb.mirrorDiag;
 }
 
 function mirrorFailed(rb, url, empty) {
@@ -5067,12 +5211,18 @@ async function runMirror(tab, opts = {}) {
       mirrorFallback(tab, rb);
       return;
     }
-    let applied = 0;
+    let applied = 0, loadMs = 0, patch = null;
+    const diag = mirrorDiagFor(rb, url);
     if (fresh) {
       if (typeof data.doc !== "string" || !MIRROR_DOC_RE.test(data.doc)) throw new Error("ミラーのデータが不正です");
       const keep = rb.mirror && rb.mirror.pageUrl === url ? mirrorPosTop(rb, url) : 0;
       const t0 = performance.now();
+      if (doc0 && mirrorHost.owner === rb && rb.mirror && rb.mirror.pageUrl === url) {
+        diag.refetchBefore += mirrorResEntries(doc0).refetch;   // the old document's counts go with it
+      }
       await mirrorLoadDoc(data.doc, mirrorHost.owner !== rb);
+      loadMs = performance.now() - t0;
+      diag.docs++;
       if (tab.rb !== rb || tabDisplay(tab) !== "mirror") return;
       const doc = mirrorDoc();
       wireMirrorDoc(doc);
@@ -5095,14 +5245,25 @@ async function runMirror(tab, opts = {}) {
       const pageChanged = Boolean(rb.mirror && data.url && noHash(data.url) !== noHash(rb.mirror.url));
       if (!last || last.html !== data.html || last.css !== data.css || last.ha !== data.html_attrs || last.ba !== data.body_attrs) {
         const t0 = performance.now();
-        mirrorMorph(doc0, data, pageChanged ? mirrorPosTop(rb, url) : null);
+        patch = mirrorMorph(doc0, data, pageChanged ? mirrorPosTop(rb, url) : null);
         if (pageChanged) mirrorHost.pageUrl = url;
         applied = performance.now() - t0;
-        dlog("render", "debug", "mirror morph", {ms: Math.round(applied), rev: data.rev});
+        diag.morphs++;
+        diag.patch = patch;
+        dlog("render", "debug", "mirror morph", {ms: Math.round(applied), rev: data.rev, kept: patch.kept,
+          added: patch.added, removed: patch.removed, attrs: patch.attrs, text: patch.text});
+      } else {
+        diag.skipped++;
       }
       mirrorHost.last = {html: data.html, css: data.css, ha: data.html_attrs, ba: data.body_attrs};
     }
     const st = data.stats;
+    diag.copies++;
+    if (fresh) diag.fresh++;
+    diag.srv = data.diag && typeof data.diag === "object" ? data.diag : diag.srv;
+    diag.last = {api: early ? 0 : Math.round(elapsed), early: Boolean(early), load: Math.round(loadMs),
+      apply: Math.round(applied), partial: data.partial === true, reused: data.reused === true,
+      cap: Number.isFinite(st.ms) ? st.ms : null, js: Number.isFinite(st.js_ms) ? st.js_ms : null, patch};
     rb.mirror = {rev: data.rev, pageUrl: url, url: data.url, title: data.title, truncated: data.truncated === true};
     rb.mirrorAt = Date.now();
     rb.mirrorMs = Math.min(elapsed, 8000);
@@ -10514,6 +10675,14 @@ function wireSelftest() {
   }));
   $("selftestCopy").addEventListener("click", () => perform(selftestCopy));
   $("selftestIncludeUrls").addEventListener("change", () => { if (selftestUi.snap && selftestUi.snap.state !== "running") selftestPrefetch(); });
+  // v0.1.73: real site addresses are hidden in the results by default (remembered on this device)
+  $("selftestHideSites").checked = readLocal(SELFTEST_HIDE_KEY) !== "0";
+  selftestHideSync();
+  $("selftestHideSites").addEventListener("change", () => {
+    writeLocal(SELFTEST_HIDE_KEY, $("selftestHideSites").checked ? "1" : "0");
+    selftestHideSync();
+    if (selftestUi.snap) renderSelftestResult(selftestUi.snap);
+  });
   $("selftestSave").addEventListener("click", () => perform(selftestSave));
 }
 
@@ -10586,6 +10755,41 @@ async function selftestWatch() {
   }
 }
 
+const SELFTEST_HIDE_KEY = "qd.selftestHideSites";
+
+function selftestHide() { return $("selftestHideSites").checked; }
+
+// the URL switch has no meaning while the addresses are hidden
+function selftestHideSync() {
+  const hide = selftestHide();
+  $("selftestIncludeUrls").disabled = hide;
+  if (hide) $("selftestIncludeUrls").checked = false;
+}
+
+// v0.1.73: the same rewriting as the Hub's report (selftest.site_masker) for what this screen shows
+function selftestMasker(hosts) {
+  if (!selftestHide()) return text => text;
+  const labels = (hosts || []).map((h, i) => [String(h || "").toLowerCase().replace(/^www\./, ""), "サイト" + (i + 1)])
+    .filter(p => p[0]).sort((a, b) => b[0].length - a[0].length);
+  const esc = t => t.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const bare = labels.map(([h, label]) => [new RegExp("(^|[^\\w.-])(?:[\\w-]+\\.)*" + esc(h) + "(?![\\w-])", "gi"), label]);
+  const labelOf = host => {
+    for (const [h, label] of labels) if (host === h || host.endsWith("." + h)) return label;
+    return null;
+  };
+  return text => {
+    if (typeof text !== "string" || !text) return text;
+    let out = text.replace(/(?:https?|wss?):\/\/[^\s"'<>|]+/gi, url => {
+      let host = "";
+      try { host = new URL(url).hostname.toLowerCase(); } catch (e) { host = ""; }
+      if (/^(?:localhost|[0-9.]+|\[[0-9a-f:.]+\])$/i.test(host)) return url;
+      return labelOf(host) || "（URL非表示）";
+    });
+    for (const [re, label] of bare) out = out.replace(re, (m, lead) => lead + label);
+    return out;
+  };
+}
+
 function selftestSecondsText(ms) { return Math.round((ms || 0) / 100) / 10 + "秒"; }
 
 function renderSelftest(snap) {
@@ -10627,6 +10831,7 @@ function renderSelftestResult(snap) {
   if (!running) selftestPrefetch();
   const wrap = $("selftestTables");
   const nodes = [];
+  const mask = selftestMasker(snap.sites);
   for (const sec of snap.sections || []) {
     const rows = snap.checks.filter(c => c.section === sec.id);
     if (!rows.length) continue;
@@ -10639,10 +10844,10 @@ function renderSelftestResult(snap) {
       mark.setAttribute("aria-label", SELFTEST_STATUS_LABEL[c.status] || c.status);
       tr.appendChild(mark);
       const cell = element("td", undefined, "selftest-cell");
-      cell.appendChild(element("div", c.name, "selftest-name"));
-      if (c.value) cell.appendChild(element("div", c.value, "selftest-val"));
-      if (c.threshold) cell.appendChild(element("div", "基準: " + c.threshold, "selftest-th"));
-      if (c.hint) cell.appendChild(element("div", "改善のヒント: " + c.hint, "selftest-hint"));
+      cell.appendChild(element("div", mask(c.name), "selftest-name"));
+      if (c.value) cell.appendChild(element("div", mask(c.value), "selftest-val"));
+      if (c.threshold) cell.appendChild(element("div", "基準: " + mask(c.threshold), "selftest-th"));
+      if (c.hint) cell.appendChild(element("div", "改善のヒント: " + mask(c.hint), "selftest-hint"));
       tr.appendChild(cell);
       body.appendChild(tr);
     }
@@ -10676,8 +10881,9 @@ function renderSelftestHistory(items) {
 async function selftestReport() {
   const id = selftestUi.snap && selftestUi.snap.run_id;
   if (!id) throw new Error("結果がありません");
-  const urls = $("selftestIncludeUrls").checked ? "1" : "0";
-  return api("/api/selftest/report?id=" + encodeURIComponent(id) + "&urls=" + urls);
+  const hide = selftestHide();
+  const urls = !hide && $("selftestIncludeUrls").checked ? "1" : "0";
+  return api("/api/selftest/report?id=" + encodeURIComponent(id) + "&urls=" + urls + "&hide=" + (hide ? "1" : "0"));
 }
 
 // Copies the report. The text is prefetched when the run ends (selftestPrefetch), so the tap copies it at once,
@@ -10710,7 +10916,7 @@ async function selftestCopy() {
 
 function selftestCacheKey() {
   const id = selftestUi.snap && selftestUi.snap.run_id;
-  return id ? id + "|" + ($("selftestIncludeUrls").checked ? "1" : "0") : "";
+  return id ? id + "|" + ($("selftestIncludeUrls").checked ? "1" : "0") + "|" + (selftestHide() ? "h" : "") : "";
 }
 
 async function selftestPrefetch() {
@@ -10833,6 +11039,7 @@ async function selftestClient(snap) {
     });
     await step("client.mirror_events", () => selftestMirrorEvents(created));
     await step("client.mirror_morph", () => selftestMirrorMorph(tab, created));
+    await step("client.mirror_reuse", () => selftestMirrorReuse(tab, created));
     await step("client.tiles", () => selftestTilesStep(tab, created));
     await step("client.live", () => selftestLiveStep(tab, holder));
     // v0.1.59: 「操作の応答」 - how the app itself responds on this phone (about 40 s in all)
@@ -10858,7 +11065,7 @@ async function selftestClient(snap) {
 
 const CLIENT_STEP_LABEL = {"client.route": "画面の切り替え", "client.toggle": "スイッチの反応", "client.idle": "待機中の通信（30秒）",
   "client.open_rtt": "ページを開く通信回数", "client.rtt": "Hubとの通信", "client.reader": "リーダー表示", "client.mirror_load": "ミラーの読み込み",
-  "client.mirror_events": "ミラー内のタップ", "client.mirror_morph": "ミラーの差し替え", "client.tiles": "高速表示",
+  "client.mirror_events": "ミラー内のタップ", "client.mirror_morph": "ミラーの差し替え", "client.mirror_reuse": "ミラーの画像の再利用", "client.tiles": "高速表示",
   "client.live": "ライブ表示（WebSocket・SSE・MJPEG・ポーリング）"};
 
 // ---- v0.1.59: 「操作の応答」 ----
@@ -11045,6 +11252,33 @@ async function selftestMirrorMorph(tab, created) {
   mirrorMorph(doc, data, null);
   const ms = Math.round((performance.now() - t0) * 10) / 10;
   return {ok: doc.body.childNodes.length > 0, ms};
+}
+
+// v0.1.73: two more copies of the same page must keep every image (the same element, never asked again)
+async function selftestMirrorReuse(tab, created) {
+  const doc = created.frame && created.frame.contentDocument;
+  if (!doc || !doc.body) throw new Error("ミラーのページがありません");
+  await selftestWaitFor(() => Array.from(doc.images).every(img => img.complete), 4000);
+  const before = Array.from(doc.images);
+  const res0 = mirrorResEntries(doc);
+  let kept = 0, added = 0, ms = 0;
+  for (let i = 0; i < 2; i++) {
+    await delay(800);                         // the Hub's resource prefetch of the first copy is done meanwhile
+    const data = await api("/api/rb/mirror", {tab, full: true, force: true});
+    if (mirrorUnsafe(data)) throw new Error("安全でないミラーのデータを受け取りました");
+    const t0 = performance.now();
+    const st = mirrorMorph(doc, data, null);
+    ms = Math.max(ms, performance.now() - t0);
+    kept += st.kept; added += st.added;
+  }
+  await delay(600);
+  const after = new Set(Array.from(doc.images));
+  const same = before.filter(img => after.has(img)).length;
+  const res = mirrorResEntries(doc);
+  const refetch = res.refetch - res0.refetch;
+  return {ok: before.length > 0 && same === before.length && refetch === 0, ms: Math.round(ms * 10) / 10,
+    n: refetch, imgs: before.length, same, kept, added, res: res.total,
+    note: before.length ? "" : "画像がありません"};
 }
 
 async function selftestTilesStep(tab, created) {

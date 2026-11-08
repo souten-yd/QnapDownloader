@@ -159,6 +159,7 @@ HINTS = {
     "client.mirror_events": "この端末のブラウザでミラー内のタップ（pointer/click）がアプリに届きません。iPhone WebKitの既知の問題です。この結果を必ず開発者へ送ってください。",
     "client.mirror_events:click": "ミラー内のclickが届きません（pointerは届いています）。通常の操作には影響しませんが、開発者へ知らせてください。",
     "client.mirror_morph": "ミラーの差し替えが遅いです。重いページでは高速表示やリーダー表示が向いています。",
+    "client.mirror_reuse": "ミラーのコピーを更新したときに画像を読み込み直しています。この結果を開発者へ送ってください。",
     "client.tiles": "高速表示のタイルの表示が遅いです。Hubへの通信速度を確認し、画質を速度優先にしてください。",
     "client.live": "ライブ表示のフレームが届きません。経路（プロキシ）がストリームを溜め込んでいる可能性があります。この結果を開発者へ送ってください。",
     "client.live:polling": "ストリーム（WebSocket・SSE・MJPEG）がこの端末へ届かず、静止画ポーリング（5fps未満）で動いています。経由しているプロキシがストリームを溜め込んでいる、またはWebSocketを通していない可能性があります。画質を速度優先にし、この結果を開発者へ送ってください。",
@@ -202,6 +203,7 @@ CLIENT_NAMES = {
     "client.mirror_load": "ミラー表示の読み込み",
     "client.mirror_events": "ミラー内のタップ（pointer/click）",
     "client.mirror_morph": "ミラーの差し替え",
+    "client.mirror_reuse": "ミラーの画像の再利用（コピーを更新しても読み込み直さない）",
     "client.tiles": "高速表示（タイル）",
     "client.live": "ライブ表示の受信",
     "client.route": "画面の切り替え時間",
@@ -210,9 +212,12 @@ CLIENT_NAMES = {
     "client.open_rtt": "ページを開くまでの通信回数",
     "client.error": "端末側のエラー",
 }
+MIRROR_RES_URL = re.compile(r"/api/rb/mirror/res\?[^\"'\s)<>]+")
+RES_TOKEN = re.compile(r"[?&](?:amp;)?r=([0-9a-f]+)")
 CLIENT_ID = re.compile(r"client\.[a-z_]{1,24}\Z")
 RUN_ID = re.compile(r"[A-Za-z0-9_-]{8,40}\Z")
-NUM_KEYS = ("ms", "n", "kb", "fps", "fps_ws", "fps_mjpeg", "fps_sse", "fps_poll", "state", "total")
+NUM_KEYS = ("ms", "n", "kb", "fps", "fps_ws", "fps_mjpeg", "fps_sse", "fps_poll", "state", "total",
+            "imgs", "same", "kept", "added", "res")
 
 
 def remote_browser_origin():
@@ -555,6 +560,16 @@ def client_evaluate(item):
         status = FAIL if item.get("ok") is not True else rate(ms, CLIENT_MORPH_WARN_MS)
         value = "%s ms" % _fmt(ms)
         threshold = "<= %d ms" % CLIENT_MORPH_WARN_MS
+    elif cid == "client.mirror_reuse":
+        # v0.1.73: the same image elements after two more copies, and no image asked twice
+        imgs, same, refetch = item.get("imgs"), item.get("same"), n
+        if not _num(imgs) or imgs <= 0:
+            status = SKIP
+        elif item.get("ok") is not True:
+            status = FAIL if _num(refetch) and refetch > 0 else WARN
+        value = "画像 %s/%s 枚を保持 · 再取得 %s 件 · 差分 保持 %s / 追加 %s · 反映 最大 %s ms" % (
+            _fmt(same), _fmt(imgs), _fmt(refetch), _fmt(item.get("kept")), _fmt(item.get("added")), _fmt(ms))
+        threshold = "すべての画像を保持し、再取得 0 件"
     elif cid == "client.tiles":
         if item.get("ok") is not True:
             status = FAIL
@@ -1235,14 +1250,20 @@ class SelfTest:
             run = self._find(run_id)
             return None if run is None else self._snapshot(run, full=True)
 
-    def report(self, run_id, include_urls=False):
-        """{text, data} for a run (the newest when run_id is None)."""
+    def report(self, run_id, include_urls=False, hide_sites=False):
+        """{text, data} for a run (the newest when run_id is None). `hide_sites` (v0.1.73) writes the real sites
+        as サイト1, サイト2 … and leaves out every other site address (URLs are never included then)."""
         with self._cv:
             run = self._find(run_id)
             if run is None:
                 return None
-            return {"text": self._report_text(run, include_urls is True),
-                    "data": self._snapshot(run, full=True, urls=include_urls is True)}
+            urls = include_urls is True and hide_sites is not True
+            text = self._report_text(run, urls)
+            data = self._snapshot(run, full=True, urls=urls)
+        if hide_sites is True:
+            mask = site_masker(data.get("sites") or [])
+            text, data = mask(text), mask(data)
+        return {"text": text, "data": data}
 
     def submit_client(self, payload):
         """The phone's measurements (validated by validate_client); only while the run waits for them."""
@@ -1848,6 +1869,7 @@ class SelfTest:
                           stats.get("images", "?")),
                       "ノード >= %d、<= %d ms、<= %d KB" % (MIRROR_MIN_NODES, MIRROR_WARN_MS, MIRROR_BIG_KB),
                       variant=variant)
+            self._mirror_stable(run, tab, sec, cap)
             doc = rb.mirror_document(tab, cap["rev"])
             bad = unsafe_markup(doc)
             self._add(run, sec, "builtin.mirror_safe", "ミラー出力の安全性（script・on*属性なし）",
@@ -1888,6 +1910,29 @@ class SelfTest:
         threshold = " / ".join("%s <= %.1fs" % (r["label"], r["warn_ms"] / 1000.0) for r in rows)
         self._add(run, section, cid, name, status if status != "skip" else SKIP, rb_firstload.line(data), threshold,
                   hint_key=hint_key, variant=variant, extra=extra)
+
+    def _mirror_stable(self, run, tab, sec, first):
+        """v0.1.73: a later copy of the same page names every image by the same URL (the phone keeps it). The
+        URL gained the content hash once the Hub held the image, so each image was loaded twice."""
+        cid, name = "builtin.mirror_stable", "ミラーの画像URLがコピー間で同じ"
+        try:
+            self._wait(run, 1.0)                     # the Hub's prefetch of the first copy's images
+            again = self.rb.mirror(tab, full=True, force=True)
+            urls = lambda cap: set(MIRROR_RES_URL.findall(cap.get("html") or "") +
+                                   MIRROR_RES_URL.findall(cap.get("css") or ""))
+            a, b = urls(first), urls(again)
+            by_token = lambda paths: {RES_TOKEN.search(p).group(1): p for p in paths if RES_TOKEN.search(p)}
+            ta, tb = by_token(a), by_token(b)
+            changed = sum(1 for t in ta if t in tb and ta[t] != tb[t])
+            diag = again.get("diag") or {}
+            detail = "画像 %d 件中 URL が変わったもの %d 件 · Hub 取得 %s / 保持から %s / 配信 %s" % (
+                len(ta), changed, diag.get("fetched", "?"), diag.get("hub_hits", "?"), diag.get("served", "?"))
+            status = SKIP if not ta else (FAIL if changed else PASS)
+            self._add(run, sec, cid, name, status, detail, "変わったもの 0 件")
+        except (Cancelled, RunTimeout):
+            raise
+        except Exception as error:
+            self._add(run, sec, cid, name, WARN, _short(str(error), 160))
 
     def _menu_check(self, run, tab, fixtures):
         rb, sec = self.rb, "builtin"
@@ -2693,7 +2738,8 @@ class SelfTest:
                 "viewport": {"width": run.options["viewport"][0], "height": run.options["viewport"][1],
                              "dpr": run.options["viewport"][2]},
                 "swipe_kind": run.swipe["kind"] if run.swipe else None,
-                "client": run.client, "history": [self._summary(r) for r in reversed(self._history)]}
+                "client": run.client, "history": [self._summary(r) for r in reversed(self._history)],
+                "sites": [u["host"] for u in run.options.get("urls") or [] if u.get("host")]}
         if full:
             data["info"] = dict(run.info)
             data["device"] = dict(run.device) if run.device else None
@@ -2772,6 +2818,55 @@ def format_log(entry):
     if data:
         text += " " + json.dumps(data, ensure_ascii=False, separators=(",", ":"))
     return _short(text, 300)
+
+
+_ANY_URL = re.compile(r"(?:https?|wss?)://[^\s\"'<>|]+", re.I)
+_LOCAL_HOST = re.compile(r"\A(?:localhost|[0-9.]+|\[[0-9a-f:.]+\])\Z", re.I)
+
+
+def site_masker(hosts):
+    """v0.1.73: a function that rewrites strings (also inside lists / dicts) so no real site address is left: the
+    self-test's own sites become サイト1, サイト2 … and any other non-local URL becomes （URL非表示）."""
+    labels = []
+    for index, host in enumerate(hosts, 1):
+        host = (host or "").lower()
+        if host:
+            bare = host[4:] if host.startswith("www.") else host
+            labels.append((bare, "サイト%d" % index))
+    labels.sort(key=lambda pair: -len(pair[0]))
+    bare_re = [(re.compile(r"(?<![\w.-])(?:[\w-]+\.)*" + re.escape(h) + r"(?![\w-])", re.I), label)
+               for h, label in labels]
+
+    def label_of(host):
+        host = (host or "").lower()
+        for h, label in labels:
+            if host == h or host.endswith("." + h):
+                return label
+        return None
+
+    def url_sub(match):
+        url = match.group(0)
+        host = _host(url)
+        if _LOCAL_HOST.match(host or "x"):
+            return url
+        return label_of(host) or "（URL非表示）"
+
+    def text(value):
+        value = _ANY_URL.sub(url_sub, value)
+        for pattern, label in bare_re:
+            value = pattern.sub(label, value)
+        return value
+
+    def walk(value):
+        if isinstance(value, str):
+            return text(value)
+        if isinstance(value, list):
+            return [walk(v) for v in value]
+        if isinstance(value, dict):
+            return {k: (["サイト%d" % i for i in range(1, len(v) + 1)] if k == "sites" and isinstance(v, list)
+                        else walk(v)) for k, v in value.items()}
+        return value
+    return walk
 
 
 def _host(url):

@@ -39,7 +39,7 @@ import updater
 import webauthn
 import ws_hub
 
-VERSION = "0.1.72"
+VERSION = "0.1.73"
 PORT = 17864
 ROOT = Path(__file__).resolve().parent
 FILES = {"/": ("web/index.html", "text/html; charset=utf-8"),
@@ -1125,7 +1125,8 @@ class Handler(BaseHTTPRequestHandler):
                 ident = query.get("id", [None])[0]
                 if ident is not None and not selftest.RUN_ID.match(ident):
                     raise ValueError("idが不正です")
-                report = server_selftest(self.server).report(ident, query.get("urls", ["0"])[0] == "1")
+                report = server_selftest(self.server).report(ident, query.get("urls", ["0"])[0] == "1",
+                                                            hide_sites=query.get("hide", ["0"])[0] == "1")
                 if report is None:
                     return self.reject("この結果は見つかりません（HubのRAMには直近5件だけ残ります）", 404)
                 return self.send_data(200, report)
@@ -1327,9 +1328,11 @@ class Handler(BaseHTTPRequestHandler):
                 # the phone keeps them for a day; without it they are revalidated by ETag after five minutes
                 known = self.server.rb.mirror_resource_etag(tab_id, token)
                 if known and ('"%s"' % known) in (self.headers.get("If-None-Match") or ""):
+                    self.server.rb.mirror_count(tab_id, "not_modified")
                     return self.send_data(304, b"", "application/octet-stream", extra={
                         "ETag": '"%s"' % known, "Cache-Control": "private, max-age=300"})
                 data, mime = self.server.rb.mirror_resource(tab_id, token)
+                self.server.rb.mirror_count(tab_id, "served")
                 chash = rb_mirror.content_hash(data)
                 svg = mime == "image/svg+xml"
                 immutable = query.get("h", [""])[0] == chash

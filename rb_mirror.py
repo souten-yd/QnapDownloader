@@ -150,6 +150,20 @@ def stable_token(url, kind):
     return hashlib.sha256(("%s\0%s" % (kind, url)).encode("utf-8", "replace")).hexdigest()[:16]
 
 
+def new_diag():
+    """Counters of one page's mirror copies and resources (v0.1.73 diagnostics); RAM only, reset on navigation."""
+    return {"copies": 0, "partial_copies": 0, "served": 0, "hub_hits": 0, "fetched": 0, "failed": 0,
+            "not_modified": 0, "bytes": 0, "fetch_ms": 0, "last": None}
+
+
+def diag_public(diag):
+    out = {k: v for k, v in diag.items() if k != "last"}
+    out["kb"] = out.pop("bytes", 0) // 1024
+    if diag.get("last"):
+        out["last"] = dict(diag["last"])
+    return out
+
+
 def content_hash(data):
     return hashlib.sha1(data).hexdigest()[:12]
 
@@ -218,6 +232,22 @@ class TokenMap:
     def get(self, token):
         with self._lock:
             return self._by_token.get(token)
+
+    def path_of(self, token, make):
+        """The resource path given out for `token`: made once by `make()`, then the same in every copy of the
+        page (v0.1.73) so the phone never sees one image under two URLs."""
+        with self._lock:
+            entry = self._by_token.get(token)
+            if entry is not None and entry.get("path"):
+                return entry["path"]
+        path = make()
+        with self._lock:
+            entry = self._by_token.get(token)
+            if entry is None:
+                return path
+            if not entry.get("path"):
+                entry["path"] = path
+            return entry["path"]
 
     def ordered(self):
         """[(token, kind)] of the URL references in registration order (HTML images come first, then CSS)."""

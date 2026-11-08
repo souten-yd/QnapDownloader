@@ -466,6 +466,33 @@ class StableResourceTests(unittest.TestCase):
         self.assertRegex(hashed, r"&h=[0-9a-f]{12}\Z")
         self.assertEqual(rb_mirror.res_path("b1", token, "../../x"), plain)
 
+    def test_path_of_keeps_the_first_form_given_out(self):
+        # v0.1.73: the second copy must not add "&h=" to a URL the phone already has (it reloaded every image)
+        tokens = rb_mirror.TokenMap()
+        token = tokens.register("https://a.example/x.png", "img")
+        first = tokens.path_of(token, lambda: rb_mirror.res_path("b1", token))
+        later = tokens.path_of(token, lambda: rb_mirror.res_path("b1", token, rb_mirror.content_hash(b"abc")))
+        self.assertEqual(first, later)
+        self.assertNotIn("&h=", later)
+        tokens.clear()                                   # a new page may get the hashed form
+        token = tokens.register("https://a.example/x.png", "img")
+        self.assertIn("&h=", tokens.path_of(token, lambda: rb_mirror.res_path("b1", token, rb_mirror.content_hash(b"abc"))))
+
+    def test_path_of_unknown_token_is_not_remembered(self):
+        tokens = rb_mirror.TokenMap()
+        self.assertEqual(tokens.path_of("deadbeef", lambda: "/x"), "/x")
+        self.assertIsNone(tokens.get("deadbeef"))
+
+    def test_diag_public_is_plain_numbers(self):
+        diag = rb_mirror.new_diag()
+        diag["bytes"] = 4096
+        diag["last"] = {"ms": 5}
+        out = rb_mirror.diag_public(diag)
+        self.assertEqual(out["kb"], 4)
+        self.assertNotIn("bytes", out)
+        self.assertEqual(out["last"], {"ms": 5})
+        self.assertIsNot(out["last"], diag["last"])
+
     def test_cache_is_shared_between_tabs_and_expires(self):
         clock = FakeClock()
         cache = rb_mirror.ResourceCache(ttl=10, clock=clock)
