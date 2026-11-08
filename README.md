@@ -3,7 +3,7 @@
 QNAP NAS 上で JDownloader 2 を動かし、iPhone・iPad・PC のブラウザから操作するための QPKG アプリです。リンクの受け取り、NAS 上のブラウザでのページ閲覧と長押しによるリンク解析、ダウンロードの管理を 1 つの画面にまとめています。
 
 - 対象: QNAP TS-253Be（x86_64）/ QTS 5.x
-- 状態: 実験版（RC）。各版の内容は [CHANGELOG.md](CHANGELOG.md) を参照してください。
+- 状態: 正式版（v0.1.73〜）。新機能は先に RC 版として公開します。各版の内容は [CHANGELOG.md](CHANGELOG.md) を参照してください。
 
 ## 主な機能
 
