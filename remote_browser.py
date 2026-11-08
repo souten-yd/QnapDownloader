@@ -80,6 +80,7 @@ FETCH_PATTERNS = tuple({"urlPattern": pattern, "resourceType": "Document"} for p
 SELFTEST_ORIGIN = "https://selftest.example.com"
 SELFTEST_TABS = 1              # self-test tabs open at once (they do not count against the tab limit)
 SELFTEST_CAPACITY_TABS = 24    # v0.1.65: ... except the 「タブの容量」 measurement, which keeps several pages open
+FIRST_CHALLENGE_BUDGET = 0.4   # v0.1.72: the longest wait for the page-side check before the first copy
 ORPHAN_IDLE = 90.0             # v0.1.60: at the tab cap, a tab nobody polled for this long is closed to make room
 OPEN_NONCE_TTL = 120.0         # v0.1.60: a repeated tab-open request with the same nonce returns the same tab
 INTERCEPT_CAP = 20             # events kept per tab (RAM only)
@@ -2637,7 +2638,9 @@ class RemoteBrowser:
                         self._cv.wait(min(remaining, 0.5))
                     else:
                         tl = None
-                if tl is not None and self._challenge(tab):
+                # v0.1.72: only the cheap title/URL heuristic (and an answer already known) here: asking the page
+                # itself right after DOMContentLoaded waits behind its scripts (1.3 s on a real site before the copy)
+                if tl is not None and self._challenge(tab, budget=FIRST_CHALLENGE_BUDGET):
                     # v0.1.65: a Cloudflare (or similar) check page is not the page: no first copy of it; the phone
                     # waits for the real page as it does for any check
                     debuglog.log("render", "info", "first copy skipped (check page)", {"tab": tab.id, "kind": kind})
@@ -2651,7 +2654,21 @@ class RemoteBrowser:
                                                                                      "error": str(error)[:120]})
             finally:
                 self._first_waiters.release()
-        return {"meta": self.page_meta(tab.id, wait=0), kind: data}
+        meta = self.page_meta(tab.id, wait=0, quick=True)
+        if not meta.get("challenge"):
+            # v0.1.72: the page-side check runs after the answer; a check page found that way wakes the meta poll
+            self._spawn(lambda: self._late_challenge_check(tab))
+        return {"meta": meta, kind: data}
+
+    def _late_challenge_check(self, tab):
+        try:
+            found = self._challenge(tab)
+        except Exception:
+            return
+        if found:
+            with self._lock:
+                tab.rev += 1
+                self._cv.notify_all()
 
     # ------------------------------------------------------------ first-load timeline (v0.1.54)
     @staticmethod
@@ -3624,8 +3641,11 @@ class RemoteBrowser:
             out.append(box)
         return out
 
-    def _challenge(self, tab):
-        """Title/URL heuristic OR the page-side check (cached up to CHALLENGE_CHECK_INTERVAL)."""
+    def _challenge(self, tab, budget=None):
+        """Title/URL heuristic OR the page-side check (cached up to CHALLENGE_CHECK_INTERVAL).
+
+        v0.1.72: `budget` (seconds) bounds the wait for the page's answer; no answer in time counts as "no check" and is
+        not cached (a busy page right after DOMContentLoaded answers late; a check page answers at once)."""
         if looks_like_challenge(tab.url, tab.title):
             return True
         if not tab.session:
@@ -3642,9 +3662,13 @@ class RemoteBrowser:
         try:
             value = (self._call("Runtime.evaluate", {
                 "expression": CHALLENGE_JS, "returnByValue": True, "timeout": 1500},
-                session=tab.session, timeout=PROBE_CDP_TIMEOUT).get("result") or {}).get("value")
+                session=tab.session, timeout=budget or PROBE_CDP_TIMEOUT).get("result") or {}).get("value")
             found = value is True
         except BrowserError:
+            if budget is not None:
+                with self._lock:
+                    tab.challenge_at = None          # not answered in time: ask again later (the late check)
+                return False
             found = False
         with self._lock:
             tab.page_challenge = found
@@ -3850,7 +3874,7 @@ class RemoteBrowser:
                 self._cv.wait(min(remaining, 0.25))
         return started
 
-    def page_meta(self, ident, rev=None, wait=META_WAIT_MAX, links=False, vp=None, fresh=False, pr=None):
+    def page_meta(self, ident, rev=None, wait=META_WAIT_MAX, links=False, vp=None, fresh=False, pr=None, quick=False):
         """Long-poll of tab metadata (no screencast): returns when `rev` is out of date.
 
         With `links` the visible viewport's link map is added (live display); `vp` is the map
@@ -3885,7 +3909,10 @@ class RemoteBrowser:
             }
         result["probes"] = self.probes.summary(tab.id)
         result["fps"] = self.stream_fps(tab) if tab.streams else 0.0
-        result["challenge"] = self._challenge(tab)
+        # v0.1.72: `quick` (the answer that carries the first copy) uses only the title/URL heuristic and what is already
+        # known; the next metadata poll asks the page itself
+        result["challenge"] = (looks_like_challenge(tab.url, tab.title) or bool(tab.page_challenge)) if quick \
+            else self._challenge(tab)
         if links:
             result["viewport_links"] = self._viewport_links(tab, vp, fresh)
         self._touch()
