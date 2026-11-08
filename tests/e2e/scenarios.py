@@ -1325,7 +1325,9 @@ def pt_via_nas(ph):
     ph.wait(lambda: set(ph.env.tabs()) - before, 15, "a NAS tab for the check")
     ph.wait(lambda: "確認が終わったら" in ph.js("document.getElementById('notice').innerText"), 5, "hint toast")
     # the user passes the check in the NAS browser (here: /ptn/clear sets the HttpOnly cookie), then goes back and reloads
-    ph.open("https://a.example.com/ptn/clear")
+    # (opened on the Hub side: through the app the host is remembered as passthrough and the tab would be turned into a
+    # passthrough tab a moment later, taking the route with it)
+    ph.env.rb.open_tab("https://a.example.com/ptn/clear")
     ph.wait(lambda: any(c is not None for _h, _p, c, _d in _ptn_seen(ph, "/ptn/clear")), 10, "cookie set in the NAS browser")
     ph.page.wait_for_timeout(500)
     ph.js("(id)=>{navigate('#/tab/'+id)}", pt_tab)
