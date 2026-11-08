@@ -1287,6 +1287,82 @@ def pt_menu_switch(ph):
     ph.take_errors("/api/rb/mirror")          # a mirror request in flight while its NAS tab was closed (400)
 
 
+# ------------------------------------------------------------------ passthrough via the NAS browser (v0.1.74)
+PTN_PAGE = "https://a.example.com/ptn/page.html"
+
+
+def _ptn_seen(ph, path, host=None):
+    return [(h, p, c, d) for h, p, c, d in ph.env.fx.ptn_seen if p == path and (host is None or h == host)]
+
+
+def _pt_open_any(ph, url):
+    """A passthrough tab at `url`; returns the frame once it exists (the page may be a check page, so no element is awaited)."""
+    ph.js("""(u)=>{const tab=createTab();pushHistory(tab,u);tab.current=u;tab.pt=true;saveTabs();navigate('#/tab/'+tab.id)}""", url)
+    ph.wait(lambda: ph.js("(()=>{const t=activeWebTab();return !!(t&&t.pt&&t.history.length)})()"), 5, "passthrough tab active")
+    return _pt_frame(ph)
+
+
+@scenario("pt-via-nas", engines=("chromium",))
+def pt_via_nas(ph):
+    """A site listed as 「NASブラウザ経由」: its requests leave through the NAS Chrome (its cookie jar), a bot check shows the
+    app's own page, passing the check in a NAS tab and reloading draws the page, and a site not in the list stays direct."""
+    ph.open("/article.html")                    # the NAS browser has to be running (a normal tab starts it)
+    _pt_local(ph)
+    # not in the list yet: the Hub's own client fetches it and meets the fake check (no cookie)
+    fr = _pt_open_any(ph, PTN_PAGE)
+    ph.wait(lambda: fr.locator("#cf").count() > 0, 15, "the fixture's check page, fetched directly")
+    assert not [c for _h, _p, c, _d in _ptn_seen(ph, "/ptn/page.html") if "qd_clear" in c]
+    # 「このサイトはNASブラウザ経由」 in the menu puts the site on the list and reloads
+    pt_tab = ph.js("activeWebTab().id")
+    ph.js("ptNasToggle(activeWebTab())")
+    ph.wait(lambda: "a.example.com" in ph.js("state.settings.pt_nas_sites"), 8, "site listed")
+    ph.wait(lambda: _pt_frame(ph).locator("#check").count() > 0, 25, "the app's own check page (the NAS browser meets the check too)")
+    fr = _pt_frame(ph)
+    assert "このサイトの確認が必要です" in fr.locator("body").inner_text()
+    # 「NASブラウザで確認する」 opens the site in a normal NAS tab
+    before = set(ph.env.tabs())
+    fr.locator("#check").tap()
+    ph.wait(lambda: set(ph.env.tabs()) - before, 15, "a NAS tab for the check")
+    ph.wait(lambda: "確認が終わったら" in ph.js("document.getElementById('notice').innerText"), 5, "hint toast")
+    # the user passes the check in the NAS browser (here: /ptn/clear sets the HttpOnly cookie), then goes back and reloads
+    # (opened on the Hub side: through the app the host is remembered as passthrough and the tab would be turned into a
+    # passthrough tab a moment later, taking the route with it)
+    ph.env.rb.open_tab("https://a.example.com/ptn/clear")
+    ph.wait(lambda: any(c is not None for _h, _p, c, _d in _ptn_seen(ph, "/ptn/clear")), 10, "cookie set in the NAS browser")
+    ph.page.wait_for_timeout(500)
+    ph.js("(id)=>{navigate('#/tab/'+id)}", pt_tab)
+    ph.wait(lambda: _pt_frame(ph).locator("#again, #t").count() > 0, 15, "back on the passthrough tab")
+    if _pt_frame(ph).locator("#again").count():      # still the check page (the frame was kept): 「確認が終わったので再読み込み」
+        _pt_frame(ph).locator("#again").tap()
+    ph.wait(lambda: _pt_frame(ph).locator("#t").count() > 0, 30, "page drawn after the check")
+    fr = _pt_frame(ph)
+    assert fr.locator("#t").inner_text() == "PTN-PAGE"
+    ph.wait(lambda: fr.evaluate("document.documentElement.getAttribute('data-ptn-js')") == "1", 10, "site script ran")
+    # a sub-resource on a sibling host went through Chrome and carried its HttpOnly cookie
+    ph.wait(lambda: fr.evaluate("(()=>{const i=document.getElementById('pic');return i.complete&&i.naturalWidth>0})()"), 15,
+            "image from the sibling host")
+    pics = _ptn_seen(ph, "/ptn/pic.png", "img.example.com")
+    assert pics and all("qd_clear=1" in c for _h, _p, c, _d in pics), pics
+    assert any(d == "document" and "qd_clear=1" in c for _h, _p, c, d in _ptn_seen(ph, "/ptn/page.html", "a.example.com")), \
+        "the document was loaded by Chrome (a navigation with the cookie)"
+    # a form post round-trips through the same tab
+    fr.locator("#submit").tap()
+    ph.wait(lambda: _pt_frame(ph).locator("#posted").count() > 0, 15, "post answered")
+    assert "PTN-POSTED a=1" in _pt_frame(ph).locator("#posted").inner_text()
+    assert ph.env.fx.ptn_posts and "qd_clear=1" in ph.env.fx.ptn_posts[-1][1] and ph.env.fx.ptn_posts[-1][2] == "a=1", \
+        ph.env.fx.ptn_posts
+    # the hidden fetcher tab exists, and is not one of the user's NAS tabs
+    assert ph.env.rb.pt_fetchers(), "a fetcher tab exists"
+    assert all(t["id"] in ph.env.tabs() for t in ph.env.rb.status()["tabs"])
+    assert len(ph.env.rb.status()["tabs"]) == len(ph.env.rb._tabs), "no fetcher tab among the listed tabs"
+    # taken off the list the site goes direct again (the fixture sees no cookie: the Hub's jar and Chrome's are separate)
+    ph.setting("pt_nas_sites", [])
+    ph.js("(u)=>ptLoad(activeWebTab(),u)", PTN_PAGE)          # the frame sits on the post's answer, so load the page itself
+    ph.wait(lambda: _pt_frame(ph).locator("#cf").count() > 0, 20, "direct again: the fake check")
+    ph.take_errors("/api/rb/")
+    ph.take_errors("/p/s/a.example.com/ptn/page.html")        # the fixture's fake check answers 403
+
+
 
 
 # ------------------------------------------------------------------ v0.1.59: request budgets and optimistic UI

@@ -144,6 +144,8 @@ class FixtureServer:
         self.times = {}                # path -> monotonic time of the last GET
         self.beacons = []              # (monotonic, event, detail) from the pages' own scripts
         self.pt_seen = []              # v0.1.57: (Host, path, Cookie) of every /ptx/ request (what the NAS sent upstream)
+        self.ptn_seen = []             # v0.1.74: (Host, path, Cookie, Sec-Fetch-Dest) of every /ptn/ request (the via-NAS fixture)
+        self.ptn_posts = []            # v0.1.74: (Host, Cookie, body) of every POST to /ptn/post
         fx = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -161,6 +163,8 @@ class FixtureServer:
                     return self.reply(204, b"", "text/plain")
                 if path.startswith("/ptx/"):
                     return self.pt_route(path)
+                if path.startswith("/ptn/"):
+                    return self.ptn_route(path)
                 fx.hits[path] += 1
                 fx.times[path] = time.monotonic()
                 q = parse_qs(parts.query)
@@ -199,6 +203,49 @@ class FixtureServer:
                 if "/" in name or not file.is_file() or file.suffix != ".html":
                     return self.reply(404, b"not found", "text/plain")
                 return self.reply(200, file.read_bytes(), "text/html; charset=utf-8")
+
+            def do_POST(self):
+                parts = urlsplit(self.path)
+                size = int(self.headers.get("Content-Length", "0") or 0)
+                data = self.rfile.read(size) if size else b""
+                if parts.path != "/ptn/post":
+                    return self.reply(404, b"not found", "text/plain")
+                host, cookie = self.headers.get("Host", ""), self.headers.get("Cookie", "")
+                fx.ptn_seen.append((host, parts.path, cookie, self.headers.get("Sec-Fetch-Dest", "")))
+                fx.ptn_posts.append((host, cookie, data.decode("utf-8", "replace")))
+                body = ("<!doctype html><html><head><meta charset='utf-8'><title>PTN Posted</title></head><body>"
+                        "<h1 id=posted>PTN-POSTED %s</h1></body></html>" % data.decode("utf-8", "replace")).encode()
+                return self.reply(200, body, "text/html; charset=utf-8")
+
+            def ptn_route(self, path):
+                """v0.1.74: a site behind a fake Cloudflare check. A document request without the HttpOnly cookie qd_clear=1
+                (set by /ptn/clear, which stands in for the user passing the check in the NAS browser) gets a 403 page titled
+                "Just a moment..."; with it, the real page (an image on a sibling host, a script, a form that posts)."""
+                host, cookie = self.headers.get("Host", ""), self.headers.get("Cookie", "")
+                fx.ptn_seen.append((host, path, cookie, self.headers.get("Sec-Fetch-Dest", "")))
+                cleared = "qd_clear=1" in cookie
+                if path == "/ptn/clear":
+                    return self.reply(200, b"cleared", "text/plain",
+                                      [("Set-Cookie", "qd_clear=1; Domain=example.com; Path=/; HttpOnly; Secure; SameSite=None")])
+                if path == "/ptn/page.html":
+                    if not cleared:
+                        body = (b"<!doctype html><html><head><meta charset='utf-8'><title>Just a moment...</title></head>"
+                                b"<body><h1 id=cf>Just a moment...</h1></body></html>")
+                        return self.reply(403, body, "text/html; charset=utf-8", [("cf-mitigated", "challenge")])
+                    body = ("<!doctype html><html><head><meta charset='utf-8'><title>PTN Fixture</title></head><body>"
+                            "<h1 id=t>PTN-PAGE</h1><img id=pic width=20 height=20 src='https://img.example.com/ptn/pic.png'>"
+                            "<form id=f method=post action='/ptn/post'><input name=a value=1>"
+                            "<button type=submit id=submit>send</button></form>"
+                            "<script src='/ptn/app.js'></script></body></html>").encode()
+                    return self.reply(200, body, "text/html; charset=utf-8")
+                if path == "/ptn/app.js":
+                    return self.reply(200, b"document.documentElement.setAttribute('data-ptn-js','1');", "application/javascript")
+                if path == "/ptn/pic.png":
+                    return self.reply(200, make_png(4, 4, "3366aa") if cleared else b"", "image/png" if cleared else "text/plain")
+                if path == "/ptn/who":
+                    return self.reply(200, ("<!doctype html><html><body><p id=who>host=%s;cookie=%s</p></body></html>" % (host, cookie)).encode(),
+                                      "text/html; charset=utf-8")
+                return self.reply(404, b"not found", "text/plain")
 
             def pt_route(self, path):
                 """v0.1.57: pages for the passthrough scenarios (the same server answers every fixture host name)."""
@@ -492,7 +539,7 @@ class Env:
         # attributes are never set by main() or the start scripts (the QPKG contract test checks that).
         server.pt_port = 0
         server.pt_test_host = "localhost"
-        server.pt_test_upstream = {h: ("127.0.0.1", self.fx.port) for h in ("a.example.com", "b.example.net")}
+        server.pt_test_upstream = {h: ("127.0.0.1", self.fx.port) for h in ("a.example.com", "b.example.net", "img.example.com")}
         server.pt_tls_context = ssl.create_default_context(cafile=str(self.tmp / "cert.pem"))
         # TEST ONLY (same as the hidden --test-passkey-host flag): the passkey scenario uses http://localhost.
         server.passkey_test_hosts = frozenset(["localhost"])
@@ -621,10 +668,15 @@ class Env:
         try:                           # v0.1.57: every scenario starts with the passthrough off and no sessions
             import webapp
             self.store.set_option("pt_enabled", False)
+            self.store.set_option("pt_nas_sites", [])        # v0.1.74
             manager = webapp.server_pt(self.server)
             manager.sync()
+            manager.forget_sites()
             manager.state.revoke_all()
             del self.fx.pt_seen[:]
+            del self.fx.ptn_seen[:]
+            del self.fx.ptn_posts[:]
+            self.rb._pt_close_all("scenario end")
         except Exception:
             pass
         self.fx.hits.clear()

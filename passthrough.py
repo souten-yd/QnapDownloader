@@ -28,7 +28,8 @@ ROOT = Path(__file__).resolve().parent
 COOKIE = "qd_pt"
 MAX_CONNECTIONS = 64
 STATIC = {"/pt-sw.js": "pt-sw.js", "/pt/helper.js": "pt-helper.js", "/pt/boot.js": "pt-boot.js",
-          "/pt/download.js": "pt-download.js"}
+          "/pt/download.js": "pt-download.js", "/pt/challenge.js": "pt-challenge.js"}
+NAS_SITES_TTL = 2.0              # v0.1.74: how long the option pt_nas_sites is remembered between requests
 _STATIC_CACHE = {}
 LOG_GATE = 1.0
 
@@ -101,7 +102,8 @@ class PassthroughManager:
         self.thread = None
         self.lock = threading.Lock()
         self.log_gate = {}
-        self.stats = {"requests": 0, "blocked": 0, "errors": 0, "bytes": 0}
+        self.stats = {"requests": 0, "blocked": 0, "errors": 0, "bytes": 0, "nas": 0}
+        self._nas_sites = None           # (time, [host names]) of the option pt_nas_sites
 
     # -- lifecycle
     def sync(self):
@@ -153,6 +155,35 @@ class PassthroughManager:
                 "port": self.bound_port or self.requested_port, "public_port": self.public_port,
                 "requests": self.stats["requests"], "blocked": self.stats["blocked"],
                 "sessions": len(self.state.sessions)}
+
+    # -- sites that go through the NAS browser (v0.1.74)
+    def nas_sites(self):
+        """The host names of the option pt_nas_sites (read at most every NAS_SITES_TTL seconds)."""
+        now = time.monotonic()
+        cached = self._nas_sites
+        if cached is not None and now - cached[0] < NAS_SITES_TTL:
+            return cached[1]
+        try:
+            raw = self.store.settings().get("pt_nas_sites")
+        except Exception:
+            raw = None
+        sites = [h for h in raw if isinstance(h, str)] if isinstance(raw, list) else []
+        self._nas_sites = (now, sites)
+        return sites
+
+    def forget_sites(self):
+        """The option changed: the next request reads it again."""
+        self._nas_sites = None
+
+    def via_nas(self, host):
+        return pt_core.nas_site_match(host, self.nas_sites())
+
+    def guard_url(self, url):
+        """The SSRF guard for a URL the NAS browser is about to load: the same checks as a direct request (public
+        http(s) host, ports 80 / 443, every resolved address public). Raises on refusal. remote_browser calls this for
+        every request of a fetcher tab, redirect hops included."""
+        target = pt_core.parse_target(url)
+        self.client.addresses(target)
 
     # -- logging (category "pt"; one entry per key per second)
     def log(self, level, message, data=None, key=None):
@@ -367,7 +398,8 @@ class PtHandler(BaseHTTPRequestHandler):
         started = time.monotonic()
         head = method == "HEAD"
         https_up = target.scheme == "https"
-        cookie = session.jar.header_for(target.host, target.path, https_up) if first_party else ""
+        via_nas = mgr.via_nas(target.host)       # v0.1.74: the NAS browser owns the cookies of these sites
+        cookie = session.jar.header_for(target.host, target.path, https_up) if first_party and not via_nas else ""
         if referer is None:
             referer = pt_core.real_referer(self.headers.get("Referer", ""), target)
         incoming = [(k, v) for k, v in self.headers.items()]
@@ -376,7 +408,14 @@ class PtHandler(BaseHTTPRequestHandler):
             len(body) if body is not None else (0 if method in ("POST", "PUT", "PATCH") else None), method)
         mgr.stats["requests"] += 1
         try:
-            resp = mgr.client.open(method, target, upstream_headers, body)
+            if via_nas:
+                mgr.stats["nas"] += 1
+                resp = self.nas_open(method, target, upstream_headers, body, nav, dest)
+            else:
+                resp = mgr.client.open(method, target, upstream_headers, body)
+        except pt_proxy.NasChallenge as exc:
+            mgr.log("info", "nas check page", {"host": target.host}, key="chal:" + target.host)
+            return self.challenge_page(exc.url, session.app_origin, head)
         except (pt_core.Blocked, pt_core.ResolveError) as exc:
             blocked = isinstance(exc, pt_core.Blocked)
             mgr.stats["blocked" if blocked else "errors"] += 1
@@ -389,7 +428,32 @@ class PtHandler(BaseHTTPRequestHandler):
             mgr.log("warn", "upstream error", {"host": target.host, "status": exc.status}, key="err:" + target.host)
             return self.error_page(exc.status, "接続できません", str(exc), head)
         with resp:
-            self.answer(resp, method, target, session, nav, first_party, dest, started, force_stream, referer)
+            self.answer(resp, method, target, session, nav, first_party and not via_nas, dest, started, force_stream, referer)
+
+    def nas_open(self, method, target, headers, body, nav, dest):
+        """v0.1.74: the request goes through the NAS browser (see remote_browser.pt_fetch). The SSRF guard runs HERE, before
+        anything reaches Chromium; the browser applies it again to every request it makes itself (redirect hops, the page's
+        own loads)."""
+        hook = self.mgr.hooks.get("nas_fetch")
+        if hook is None:
+            raise pt_proxy.UpstreamError("NASブラウザが起動していません", 503)
+        self.mgr.client.addresses(target)
+        return hook(method, target, headers, body, nav, dest=dest)
+
+    def challenge_page(self, url, app_origin, head=False):
+        """v0.1.74: the page the frame shows when the site asks for a bot check the NAS browser has not passed yet."""
+        body = page("このサイトの確認が必要です", (
+            "<h1>このサイトの確認が必要です</h1>"
+            "<p>このサイトはCloudflareなどの確認を求めています。NASブラウザで一度確認を済ませると、このパススルーでも開けるようになります。</p>"
+            "<button type=\"button\" id=\"check\" class=\"btn\">NASブラウザで確認する</button>"
+            "<button type=\"button\" id=\"again\" class=\"btn q\">確認が終わったので再読み込み</button>"
+            "<p id=\"msg\" class=\"m\" role=\"status\"></p>"
+            "<p class=\"m\">%s</p>"
+            "<script src=\"/pt/challenge.js\" data-app=\"%s\"></script>" % (
+                html.escape(urlsplit(url).hostname or ""), html.escape(app_origin or "", quote=True))))
+        self.reply(200, body, extra=(("Content-Security-Policy", "default-src 'none'; script-src 'self'; "
+                                      "style-src 'unsafe-inline'; frame-ancestors %s" % (app_origin or "'none'")),
+                                     ("Referrer-Policy", "no-referrer")), head=head)
 
     def answer(self, resp, method, target, session, nav, first_party, dest, started, force_stream, referer):
         mgr, state = self.mgr, self.mgr.state
@@ -570,4 +634,25 @@ def run_selftest(mgr):
         out.append(("pt.error", "パススルーの確認", "fail", "%s: %s" % (type(error).__name__, str(error)[:100]), ""))
     finally:
         mgr.state.sessions.pop(pt_core._digest(token), None)
+    out.extend(_nas_selftest(mgr))
     return out
+
+
+def _nas_selftest(mgr):
+    """v0.1.74: one more row, 「NASブラウザ経由の通信」: a page, a request made by that page and a check page, through a hidden
+    tab of the NAS browser on the self-test's virtual site (RAM only, no network). SKIP while the NAS browser is not running."""
+    hook = mgr.hooks.get("nas_selftest")
+    name = "NASブラウザ経由の通信"
+    if hook is None:
+        return [("pt.nas", name, "skip", "NASブラウザを使えません", "")]
+    try:
+        steps = hook()
+    except Exception as error:
+        return [("pt.nas", name, "fail", "%s: %s" % (type(error).__name__, str(error)[:100]), "ページ・リクエスト・確認ページ")]
+    if steps is None:
+        return [("pt.nas", name, "skip", "NASブラウザが起動していません", "")]
+    labels = {"document": "ページ", "request": "リクエスト", "check": "確認ページの判定"}
+    bad = ["%s（%s）" % (labels.get(step, step), detail) for step, ok, detail in steps if not ok]
+    if bad:
+        return [("pt.nas", name, "fail", "失敗: " + " / ".join(bad), "ページ・リクエスト・確認ページ")]
+    return [("pt.nas", name, "pass", "ページ %s ・リクエスト %s" % (steps[0][2], steps[1][2]), "ページ・リクエスト・確認ページ")]

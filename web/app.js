@@ -75,7 +75,7 @@ const DISPLAY_CHIP_TITLE = {reader: "リーダー", mirror: "ミラー", tiles: 
 // v0.1.60: this file's own version. The Hub's version (from /api/state) is compared with it: a shell cache that is
 // older than the Hub (the app was updated while the home-screen app was closed) is dropped and the page reloaded.
 // tests/test_web_shell.py checks that it equals webapp.VERSION.
-const APP_VERSION = "0.1.73";
+const APP_VERSION = "0.1.74";
 const PT_DISPLAY_LABEL = "パススルー";      // v0.1.57: not a NAS-browser display, so not in RB_DISPLAY_LABELS
 const RB_PERF_WINDOW_MS = 5000;
 const RB_STREAM_FIRST_MS = 5000;     // MJPEG as the last stream (v0.1.68: after WebSocket and SSE): first picture within this, else polling
@@ -6684,6 +6684,8 @@ window.addEventListener("message", ev => {
   } else if (m.type === "shortcut") {       // v0.1.63: Ctrl/Cmd+L, Ctrl/Cmd+R, F5 inside the frame
     if (activeWebTab() === tab && (m.name === "omnibox" || m.name === "reload")) runShortcut(m.name, false);
   } else if (m.type === "download") perform(() => ptDownload(tab, m));
+  else if (m.type === "nas-check") perform(() => ptNasCheck(tab));         // v0.1.74: the challenge page's buttons
+  else if (m.type === "reload") perform(() => ptReload(tab));
 });
 
 // ---- settings
@@ -6697,6 +6699,84 @@ function renderPtSettings() {
   else if (p && p.listening) line = "待ち受け中（127.0.0.1:17865）。" + (p.origin ? "" : ptReason());
   else line = (p && p.error) || "待ち受けを開始しています…";
   $("ptState").textContent = line;
+  renderPtNas();
+}
+
+// v0.1.74: sites whose passthrough requests leave through the NAS browser (option pt_nas_sites). The Hub matches by site,
+// so a listed host covers its subdomains; the list is at most PT_NAS_MAX long.
+const PT_NAS_MAX = 50;
+
+function ptNasSites() {
+  const list = state.settings && state.settings.pt_nas_sites;
+  return Array.isArray(list) ? list.filter(h => typeof h === "string") : [];
+}
+
+// "example.com", "https://www.example.com/a?b" -> "www.example.com" (lower-case, punycode), or "" when it is no host name.
+function ptNasHost(value) {
+  let text = String(value || "").trim();
+  if (!text || /\s/.test(text)) return "";
+  if (!/^[a-z][a-z0-9+.-]*:\/\//i.test(text)) text = "https://" + text;
+  try {
+    const host = new URL(text).hostname.toLowerCase().replace(/\.$/, "");
+    return /^[a-z0-9.-]+$/.test(host) && host.includes(".") && !/^[\d.]+$/.test(host) ? host : "";
+  } catch (e) { return ""; }
+}
+
+function ptNasListed(host) {
+  const key = siteKey(host);
+  return Boolean(key) && ptNasSites().some(h => siteKey(h) === key);
+}
+
+async function ptNasSave(list) {
+  await saveOption("pt_nas_sites", list);
+  renderPtNas();
+  const tab = activeWebTab();
+  if (tab && tab.pt) updateChrome();
+}
+
+function renderPtNas() {
+  const box = $("ptNasList");
+  if (!box) return;
+  const hosts = ptNasSites();
+  if (!hosts.length) { box.replaceChildren(element("p", "登録したサイトはありません", "empty-state")); return; }
+  box.replaceChildren(...hosts.map(host => {
+    const row = element("div", undefined, "item");
+    row.appendChild(element("span", host));
+    const off = element("button", "削除", "btn small");
+    off.type = "button";
+    off.setAttribute("aria-label", host + " を削除");
+    off.addEventListener("click", () => perform(() => ptNasSave(ptNasSites().filter(h => h !== host))));
+    row.appendChild(off);
+    return row;
+  }));
+}
+
+// 「このサイトはNASブラウザ経由」 in the display menu (passthrough tabs): the site of the page shown now.
+function ptNasToggle(tab) {
+  const host = hostOf(tab.current || tab.history[tab.index] || "");
+  if (!host || !/\./.test(host)) return;
+  return perform(async () => {
+    const list = ptNasSites();
+    if (ptNasListed(host)) {
+      const key = siteKey(host);
+      await ptNasSave(list.filter(h => siteKey(h) !== key));
+      flash("このサイトはNASブラウザ経由をやめました（" + key + "）");
+    } else {
+      if (list.length >= PT_NAS_MAX) { toast("登録できるのは" + PT_NAS_MAX + "件までです", "error"); return; }
+      await ptNasSave(list.concat([host]));
+      flash("このサイトをNASブラウザ経由にしました（" + siteKey(host) + "）。読み込み直します");
+      await ptReload(tab);
+    }
+  });
+}
+
+// The challenge page of a via-NAS site asks to open the site in the NAS browser: the user passes the check there once.
+// The address is the tab's own (never one the frame names), shown with the NAS browser's usual display.
+async function ptNasCheck(tab) {
+  const url = tab.current || tab.history[tab.index] || "";
+  if (!/^https:\/\/[^\s]+$/i.test(url) || url.length > 2048) { ptCommand("challenge-result", {text: "このアドレスは開けません"}, true); return; }
+  flash("確認が終わったら、パススルーのタブに戻って再読み込みしてください");
+  await openInFreshTab(url);
 }
 
 function wirePt() {
@@ -6719,6 +6799,18 @@ function wirePt() {
     }
   }));
   $("ptCmdCopy").addEventListener("click", () => copyText($("ptCmd").textContent));
+  $("ptNasForm").addEventListener("submit", ev => {
+    ev.preventDefault();
+    perform(async () => {
+      const host = ptNasHost($("ptNasInput").value);
+      if (!host) throw new Error("ホスト名（例: example.com）かURLを入力してください");
+      const list = ptNasSites();
+      if (ptNasListed(host)) throw new Error("すでに登録されています");
+      if (list.length >= PT_NAS_MAX) throw new Error("登録できるのは" + PT_NAS_MAX + "件までです");
+      await ptNasSave(list.concat([host]));
+      $("ptNasInput").value = "";
+    });
+  });
   $("ptCheck").addEventListener("click", () => perform(async () => {
     await refreshPt();
     renderPtSettings();
@@ -6832,6 +6924,12 @@ function configureMenu() {
   const ptOk = state.pt === null || ptAvailable() || Boolean(tab && tab.pt);       // unknown yet: not greyed out       // v0.1.57: the choice is greyed out with the reason as its tooltip
   $("menuPt").disabled = !ptOk;
   $("menuPt").title = ptOk ? "" : ptReason();
+  // v0.1.74: the NAS-browser route is chosen per site, from a passthrough tab
+  const nasHost = tab && tab.pt ? hostOf(tab.current || tab.history[tab.index] || "") : "";
+  const nasItem = $("menuPtNas");
+  nasItem.hidden = !(web && nasHost && /\./.test(nasHost));
+  nasItem.setAttribute("aria-checked", String(Boolean(nasHost) && ptNasListed(nasHost)));
+  nasItem.classList.toggle("menu-item-on", Boolean(nasHost) && ptNasListed(nasHost));
   // Picture quality only matters for the fast and live displays (v0.1.36).
   menu.querySelectorAll("[data-scope='quality']").forEach(n => { n.hidden = !web || display === "reader" || display === "mirror" || display === "pt"; });
   menu.querySelectorAll("[data-quality]").forEach(n => {
@@ -6867,6 +6965,7 @@ async function menuAction(action) {
   else if (action.startsWith("quality:")) setRbQuality(action.slice(8));
   else if (action.startsWith("display:")) setUserDisplay(tab, action.slice(8));
   else if (action === "perf") setPerf(!state.rbPerf);
+  else if (action === "ptNas" && tab && tab.pt) ptNasToggle(tab);        // v0.1.74
   else if (action === "forgetSite" && tab) forgetSiteDisplay(tab);
   else if (action === "probeList" && tab) await openProbeSheet(tab);          // v0.1.65
   else if (action === "stageUrl" && tab) await stageTabUrl(tab);
@@ -11553,6 +11652,7 @@ const OPTION_CONTROL = {
   pt_enabled: "ptEnabled", rb_resident: "rbResident", block_ads: "blockAds", rb_default_mode: "rbDefaultMode",
   rb_max_tabs: "rbMaxTabs", rb_spare_tab: "rbSpareTab", home_recent: "homeRecentOn", rb_no_webfonts: "rbNoWebfonts", rb_link_boxes: "rbLinkBoxes", probe_autosend: "probeAutosend",
   auto_clear_links: "autoClearLinks", auto_clear_downloads: "autoClearDownloads", auto_clear_missing: "autoClearMissing", send_autostart: "sendAutostart",
+  pt_nas_sites: "ptNasAdd",
 };
 
 // Marks a control (and its switch label) as saving; returns the function that clears the mark.
