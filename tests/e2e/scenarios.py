@@ -754,8 +754,14 @@ def swipe_diagnostic(ph):
     assert rows["swipe.mirror.edge_back"]["status"] == "pass", rows["swipe.mirror.edge_back"]
     assert rows["swipe.mirror.flick_right"]["status"] == "pass", rows["swipe.mirror.flick_right"]
     assert rows["swipe.mirror.pull_close"]["status"] == "pass", rows["swipe.mirror.pull_close"]
-    for step in ("pull_omnibox", "hscroll"):                       # v0.1.55
-        assert rows["swipe.mirror.%s" % step]["status"] == "pass", rows["swipe.mirror.%s" % step]
+    assert rows["swipe.mirror.pull_omnibox"]["status"] == "pass", rows["swipe.mirror.pull_omnibox"]   # v0.1.55
+    # v0.1.73: the table step agrees with the per-step rule above: on a busy runner its synthetic input may not reach
+    # the decision (skip / warn "判定ログなし"); it must never navigate or count as a flick (flick-on-scroller checks
+    # the behaviour itself)
+    hs = rows["swipe.mirror.hscroll"]
+    assert hs["status"] == "pass" or ("B→B" in hs["value"] and "フリック受理 0" in hs["value"]), hs
+    if hs["status"] != "pass":
+        ph.notes.append("hscroll %s: %s" % (hs["status"], hs["hint"] or hs["value"])[:160])
     assert rows["swipe.tiles.pop_stay"]["status"] == "pass", rows["swipe.tiles.pop_stay"]
     _after_swipe(ph, before)
     ph.page.click("#selftestCopy")
