@@ -2048,6 +2048,9 @@ def site_display_pt(ph):
     _pt_local(ph)
     ph.js("()=>{localStorage.removeItem('qnapdl.hostmodes.v1')}")
     ph.open("/article.html")
+    # the first mirror copy is shown before the switch: a switch in the middle of loading the mirror document made
+    # WebKit report the dropped load (frame-ancestors / sandboxed frame) as console errors (v0.1.73 CI)
+    ph.wait(lambda: "E2E テスト記事" in ph.mirror_text(), 15, "mirror shown before the switch")
     ph.js("()=>{setUserDisplay(activeWebTab(),'pt')}")
     ph.wait(lambda: ph.js("(()=>{const t=activeWebTab();return !!(t&&t.pt&&!t.rb)})()"), 8, "passthrough chosen")
     assert ph.js("JSON.parse(localStorage.getItem('qnapdl.hostmodes.v1'))") == [["example.com", "remote-pt"]]
