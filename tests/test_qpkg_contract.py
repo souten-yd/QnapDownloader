@@ -81,7 +81,7 @@ class QpkgContractTests(unittest.TestCase):
         script = (ROOT / "scripts/build-qpkg.sh").read_text()
         for name in ("webapp.py", "webauthn.py", "ttlcache.py", "state_hub.py", "diskio.py", "debuglog.py", "storage.py", "durability.py",
                      "updater.py", "self_update.py", "jd2_policy.py",
-                     "jd2_control.py", "jd2_local.py", "engine_components.py", "engine_supervisor.py", "container_runtime.py", "jd2_transfer.py", "jd2_downloads.py", "jd2_accounts.py", "runtime_diagnostics.py", "rapidgator_extract.py", "browser_safety.py", "rb_blocklist.py", "rb_firstload.py", "rb_probe_queue.py", "rb_resident.py", "rb_mirror.py", "remote_browser.py", "ws_hub.py", "selftest.py", "pt_core.py", "pt_proxy.py", "passthrough.py", "downloader_pid.py", "python3-path", "downloader-diagnose"):
+                     "jd2_control.py", "jd2_local.py", "engine_components.py", "engine_supervisor.py", "container_runtime.py", "jd2_transfer.py", "jd2_downloads.py", "jd2_accounts.py", "runtime_diagnostics.py", "rapidgator_extract.py", "browser_safety.py", "rb_blocklist.py", "rb_firstload.py", "rb_probe_queue.py", "rb_ptfetch.py", "rb_resident.py", "rb_mirror.py", "remote_browser.py", "ws_hub.py", "selftest.py", "pt_core.py", "pt_proxy.py", "passthrough.py", "downloader_pid.py", "python3-path", "downloader-diagnose"):
             with self.subTest(name=name):
                 self.assertIn(name, script)
         self.assertIn('cp -R "$ROOT/web"', script)
@@ -108,7 +108,7 @@ class QpkgContractTests(unittest.TestCase):
         # the listener only ever binds the loopback address
         self.assertIn('("127.0.0.1", self.requested_port)', (ROOT / "passthrough.py").read_text())
         self.assertIn("web/pt-sw.js", "web/pt-sw.js")
-        for name in ("app-sw.js", "pt-sw.js", "pt-helper.js", "pt-boot.js", "pt-download.js"):
+        for name in ("app-sw.js", "pt-sw.js", "pt-helper.js", "pt-boot.js", "pt-download.js", "pt-challenge.js"):
             self.assertTrue((ROOT / "web" / name).is_file())
         self.assertIn('cp -R "$ROOT/web"', (ROOT / "scripts/build-qpkg.sh").read_text())      # web/ (and so the pt-*.js files) is packaged
 

@@ -31,7 +31,7 @@ python3 tests/e2e/run.py --engines chromium,webkit --out /tmp/e2e
   わざと起こすエラー（CSPのブロック等）は `ph.take_errors(...)` で取り除く。
 
 ### シナリオ一覧
-pt-settings-ping・pt-open-page・pt-back-forward・pt-flick（Chromiumのみ）・pt-redirect・pt-cookie-first-party・pt-download-page・pt-off-refuses・pt-menu-switch（v0.1.57 パススルー: アプリを http://localhost:P、待ち受け（オリジンB）を http://localhost:Q で動かし、上流はフィクスチャのhttpsサーバー。テスト専用の上流指定は `server.pt_test_*` 属性で、本番の起動経路では設定されない。WebKitは未検証）/
+pt-settings-ping・pt-open-page・pt-back-forward・pt-flick（Chromiumのみ）・pt-redirect・pt-cookie-first-party・pt-download-page・pt-off-refuses・pt-menu-switch・pt-via-nas（Chromiumのみ。v0.1.74 NASブラウザ経由）（v0.1.57 パススルー: アプリを http://localhost:P、待ち受け（オリジンB）を http://localhost:Q で動かし、上流はフィクスチャのhttpsサーバー。テスト専用の上流指定は `server.pt_test_*` 属性で、本番の起動経路では設定されない。WebKitは未検証）/
 settings-routes / display-reader・mirror・tiles・live / mirror-tap-link（クリックを止めたiOS相当のタップ・遷移後スクロール0）/
 mirror-menu-toggle（`href="#"` と自ページ宛の2種類のトグルが再読み込みにならない）/ mirror-dynamic / mirror-security（CSP・スクリプト不実行）/
 reader-cards（ラベル・サイズあり/なし、ページ送りチップ）/ gesture-flick-mirror・tiles、gesture-close-tab（Chromiumのみ: CDPタッチが必要）/

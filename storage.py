@@ -46,12 +46,17 @@ DEFAULTS = {
     "rb_max_tabs": 3,
     # v0.1.65: the browse home's 「最近見たページ」 (kept on each device only). OFF: not shown and nothing recorded.
     "home_recent": True,
+    # v0.1.74: sites whose passthrough requests leave through the NAS browser's own network stack (host names, at most
+    # PT_NAS_SITES_MAX; matched by site, so subdomains are included). For checks (Cloudflare) the Hub's own client cannot pass.
+    "pt_nas_sites": [],
 }
 BOOL_OPTIONS = ("send_autostart", "block_ads", "probe_autosend", "rb_link_boxes", "rb_resident",
                 "rb_spare_tab", "rb_no_webfonts", "auto_clear_links", "auto_clear_downloads", "auto_clear_missing", "pt_enabled",
                 "home_recent")
 ENUM_OPTIONS = {"rb_default_mode": ("reader", "mirror", "fast", "live")}
 INT_OPTIONS = {"pt_public_port": (1, 65535), "rb_max_tabs": (1, 20)}
+HOST_LIST_OPTIONS = ("pt_nas_sites",)          # v0.1.74: lists of lower-case DNS host names
+PT_NAS_SITES_MAX = 50
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY,value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS accounts(id INTEGER PRIMARY KEY CHECK(id=1),
@@ -197,6 +202,8 @@ class Store:
         if key in ENUM_OPTIONS:
             if not isinstance(value, str) or value not in ENUM_OPTIONS[key]:
                 raise ValueError("設定の項目または値が不正です")
+        elif key in HOST_LIST_OPTIONS:
+            value = self.valid_host_list(value)
         elif key in INT_OPTIONS:
             low, high = INT_OPTIONS[key]
             if type(value) is not int or not low <= value <= high:
@@ -227,6 +234,26 @@ class Store:
                 any(HOST_LABEL.match(label) is None for label in labels)):
             raise ValueError("ホスト名はDNS名（例: example.com）で指定してください")
         return host
+
+    @classmethod
+    def valid_host_list(cls, value):
+        """v0.1.74: a list of at most PT_NAS_SITES_MAX DNS host names -> the same names, lower-case, punycoded, without
+        duplicates (order kept). Anything else raises ValueError."""
+        if type(value) is not list or len(value) > PT_NAS_SITES_MAX:
+            raise ValueError("サイトは%d件までのリストで指定してください" % PT_NAS_SITES_MAX)
+        out = []
+        for item in value:
+            if not isinstance(item, str) or len(item) > 253:
+                raise ValueError("ホスト名が不正です")
+            text = item.strip().lower().rstrip(".")
+            try:
+                text = text.encode("idna").decode("ascii")
+            except UnicodeError:
+                raise ValueError("ホスト名が不正です") from None
+            host = cls.valid_host(text)
+            if host not in out:
+                out.append(host)
+        return out
 
     def _rules_map(self):
         with self._guard:

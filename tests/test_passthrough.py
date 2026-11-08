@@ -1661,7 +1661,8 @@ class RunSelftestTests(ListenerCase):
     def test_all_server_side_checks_pass_and_the_session_is_removed(self):
         before = len(self.mgr.state.sessions)
         rows = passthrough.run_selftest(self.mgr)
-        self.assertEqual([r[2] for r in rows], ["pass"] * 5, rows)
+        self.assertEqual([r[2] for r in rows], ["pass"] * 5 + ["skip"], rows)      # v0.1.74: the NAS-browser row skips without a browser
+        self.assertEqual(rows[-1][0], "pt.nas")
         self.assertEqual(len(self.mgr.state.sessions), before)
         self.assertEqual(self.up.seen, [])
 

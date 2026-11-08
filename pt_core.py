@@ -629,6 +629,34 @@ def rewrite_response_headers(items, target, b_origin, page_origin):
     return out, cookies, failed
 
 
+def nas_site_match(host, sites):
+    """v0.1.74: True when `host` belongs to one of the listed sites (the entry's site, subdomains included)."""
+    site = site_of(host)
+    for entry in sites or ():
+        try:
+            if site_of(normalize_host(entry)) == site:
+                return True
+        except TargetError:
+            continue
+    return False
+
+
+NAS_BODY_HEADERS = frozenset(("content-encoding", "content-length", "transfer-encoding"))
+
+
+def nas_response_headers(items, keep_length=False):
+    """v0.1.74: headers of an answer read through the NAS browser. DevTools hands over the body already DECODED, so the
+    encoding and framing headers of the wire no longer describe it and are dropped (`keep_length`: an empty-bodied
+    answer that stands for a big download keeps the real Content-Length for the download page's size)."""
+    out = []
+    for name, value in items:
+        lowered = name.lower()
+        if lowered in NAS_BODY_HEADERS and not (keep_length and lowered == "content-length"):
+            continue
+        out.append((name, value))
+    return out
+
+
 def html_csp(app_origin):
     """CSP header added to proxied HTML: only the app may frame it, forms and frames stay on origin B."""
     ancestors = app_origin or "'none'"

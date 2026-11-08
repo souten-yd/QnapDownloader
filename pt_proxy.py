@@ -34,6 +34,14 @@ class UpstreamError(Exception):
         self.status = status
 
 
+class NasChallenge(Exception):
+    """v0.1.74: the NAS browser met a bot check (Cloudflare) for `url`: it must be done once in the NAS browser."""
+
+    def __init__(self, url):
+        super().__init__("このサイトの確認が必要です")
+        self.url = url
+
+
 class _Pinned(http.client.HTTPConnection):
     def __init__(self, host, port, ip, timeout):
         super().__init__(host, port, timeout=timeout)

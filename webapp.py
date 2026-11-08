@@ -39,7 +39,7 @@ import updater
 import webauthn
 import ws_hub
 
-VERSION = "0.1.73"
+VERSION = "0.1.74"
 PORT = 17864
 ROOT = Path(__file__).resolve().parent
 FILES = {"/": ("web/index.html", "text/html; charset=utf-8"),
@@ -569,13 +569,20 @@ def server_pt(server):
         with SESSION_LOCK:
             manager = getattr(server, "pt", None)
             if manager is None:
+                hooks = {"request_is_https": request_is_https, "loopback_peer": loopback_peer,
+                         "tailscale_name": tailscale_name}
+                browser = getattr(server, "rb", None)
+                if browser is not None:
+                    # v0.1.74: sites listed as 「NASブラウザ経由」 send their requests through the NAS browser
+                    hooks["nas_fetch"] = browser.pt_fetch
+                    hooks["nas_selftest"] = browser.pt_selftest
                 manager = server.pt = passthrough.PassthroughManager(
-                    server.store, VERSION,
-                    {"request_is_https": request_is_https, "loopback_peer": loopback_peer,
-                     "tailscale_name": tailscale_name},
+                    server.store, VERSION, hooks,
                     port=getattr(server, "pt_port", passthrough.PORT),
                     test_upstream=getattr(server, "pt_test_upstream", None),
                     tls_context=getattr(server, "pt_tls_context", None))
+                if browser is not None:
+                    browser.pt_guard = manager.guard_url        # the SSRF guard for every request a fetcher tab makes
                 manager.sync()
     return manager
 
@@ -1730,7 +1737,8 @@ class Handler(BaseHTTPRequestHandler):
                     raise ValueError("フォルダに書き込み権限がありません")
                 return self.send_data(200, self.store.set_download_dir(str(chosen)))
             if path == "/api/settings/options":
-                options = storage.BOOL_OPTIONS + tuple(storage.ENUM_OPTIONS) + tuple(storage.INT_OPTIONS)
+                options = (storage.BOOL_OPTIONS + tuple(storage.ENUM_OPTIONS) + tuple(storage.INT_OPTIONS) +
+                           storage.HOST_LIST_OPTIONS)
                 known = [key for key in options if key in body]
                 if not known or set(body) - set(options):
                     raise ValueError("変更できる設定項目を指定してください")
@@ -1738,6 +1746,10 @@ class Handler(BaseHTTPRequestHandler):
                     self.store.set_option(key, body[key])
                 if "pt_enabled" in known or "pt_public_port" in known:
                     server_pt(self.server).sync()        # v0.1.57: the listener follows the switch at once
+                if "pt_nas_sites" in known:
+                    server_pt(self.server).forget_sites()        # v0.1.74: the new list counts from the next request
+                    if getattr(self.server, "rb", None) is not None:
+                        self.server.rb.pt_sites_changed(self.store.settings().get("pt_nas_sites"))
                 if "rb_max_tabs" in known:
                     self.server.rb.forget_settings_cache()      # v0.1.65: the new tab limit counts from the next open
                 if "rb_resident" in known:

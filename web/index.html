@@ -130,6 +130,7 @@
        <button type="button" role="menuitemradio" data-action="quality:high" data-quality="high">高画質</button>
       </div>
       <button type="button" role="menuitemcheckbox" data-action="perf" data-scope="remote" id="menuPerf" class="menu-toggle">速度表示<span class="menu-check" aria-hidden="true"></span></button>
+      <button type="button" role="menuitemcheckbox" data-action="ptNas" id="menuPtNas" class="menu-toggle" hidden>このサイトはNASブラウザ経由<span class="menu-check" aria-hidden="true"></span></button>
       <button type="button" role="menuitem" data-action="forgetSite" data-scope="remote" id="menuForgetSite" hidden>このサイトの表示を忘れる</button>
       <button type="button" role="menuitem" data-action="probeList" data-scope="remote" id="menuProbes" hidden>リンク解析の一覧</button>
       <hr>
@@ -584,12 +585,23 @@
         <button type="button" id="ptClear" class="btn quiet">パススルーのCookieを消す</button>
        </div>
        <p id="ptCheckResult" class="set-text muted" role="status"></p>
+       <h3 class="sub-h">NASブラウザ経由で通信するサイト</h3>
+       <div class="set-row">
+        <div class="set-main"><span class="set-label">NASブラウザ経由で通信するサイト</span>
+         <span class="set-desc"><span class="set-text">Cloudflareなどの確認が通らないサイト向け</span>
+          <details class="hint"><summary aria-label="詳しい説明">ⓘ</summary><p>Cloudflareなどの確認が通らないサイト向け。そのサイトの通信をNASのブラウザから出します。確認はNASブラウザの表示で一度済ませてください。ホスト名を入れると、そのサブドメインも対象です。ページはこれまでどおりiPhoneで描画されます。</p></details></span></div>
+       </div>
+       <form id="ptNasForm" class="inline-form">
+        <input id="ptNasInput" maxlength="300" placeholder="example.com またはURL" aria-label="サイトのホスト名またはURL" autocapitalize="off" autocorrect="off" spellcheck="false">
+        <button type="submit" id="ptNasAdd" class="btn primary">追加</button>
+       </form>
+       <div id="ptNasList" class="items"></div>
        <details class="fold">
         <summary>制限と注意</summary>
         <ul class="guide">
          <li>閲覧するすべてのサイトが同じオリジンを共有します。悪意のあるサイトは他のサイトのlocalStorageやJSが設定したCookieを読める場合があります。信用できないサイトには向きません。</li>
          <li>CookieはNASのHubがサイトごとに保持します（メモリのみ。再起動やログアウトで消えます）。</li>
-         <li>WebSocket・WebRTC・サイト独自のService Workerは使えません。Cloudflareなどの確認が通らないサイトはNASブラウザを使ってください。</li>
+         <li>WebSocket・WebRTC・サイト独自のService Workerは使えません。Cloudflareなどの確認が通らないサイトは、上の「NASブラウザ経由で通信するサイト」に入れるか、NASブラウザを使ってください。</li>
          <li>別オリジンのiframe（動画・CAPTCHA）は表示されません。</li>
          <li>詳しくは docs/passthrough.md を参照してください。</li>
         </ul>

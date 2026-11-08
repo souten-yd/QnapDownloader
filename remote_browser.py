@@ -27,11 +27,14 @@ import browser_safety
 import container_runtime as cr
 import debuglog
 import diskio
+import pt_core
+import pt_proxy
 import rapidgator_extract
 import rb_blocklist
 import rb_firstload
 import rb_mirror
 import rb_probe_queue
+import rb_ptfetch
 import rb_resident
 
 MAX_TABS = 3                   # v0.1.65: the default of the option rb_max_tabs (1..MAX_TABS_LIMIT); see RemoteBrowser.max_tabs()
@@ -52,7 +55,8 @@ FRAME_WAIT_MAX = 10.0
 MIN_FRAME_INTERVAL = 0.1       # at most 10 frames per second
 START_TIMEOUT = 45.0
 CDP_TIMEOUT = 15.0
-WS_MAX_MESSAGE = 8 * 1024 * 1024
+# v0.1.74: 24 MiB (was 8): a passthrough body of up to rb_ptfetch.RESPONSE_CAP (16 MiB) comes back base64 in one message
+WS_MAX_MESSAGE = 24 * 1024 * 1024
 WS_MAX_SEND = 1024 * 1024
 FRAME_MAX_CHARS = 6 * 1024 * 1024
 LINK_CAP = 5000
@@ -1249,6 +1253,17 @@ class RemoteBrowser:
         self._spare_pending = False
         self._first_waiters = threading.BoundedSemaphore(FIRST_WAITERS_MAX)   # v0.1.59
         self._last_view = None     # (width, height, dpr, quality mode) of the newest viewport the phone set
+        # v0.1.74: hidden fetcher tabs of the passthrough sites that go via the NAS browser (see pt_fetch). `pt_guard(url)`
+        # (set by the Hub) raises when a URL must not be reached; without it no fetcher tab is ever opened.
+        self.pt_guard = None
+        self._pt_fetchers = {}     # site -> rb_ptfetch.Fetcher (not in self._tabs: not a user tab, not in any list)
+        self._pt_by_session = {}   # CDP session id -> Fetcher
+        self._pt_targets = {}      # target id -> Fetcher
+        self._pt_lock = threading.Lock()
+        self._pt_sems = {}         # site -> BoundedSemaphore (requests in flight)
+        self._pt_big = threading.BoundedSemaphore(2)      # big bodies in memory at once
+        self._pt_verdicts = {}     # host:port -> (allowed, expiry) of the guard's answers
+        self._pt_keep = rb_ptfetch.KeepStore(clock)
 
     @staticmethod
     def _spawn_thread(fn):
@@ -1757,6 +1772,15 @@ class RemoteBrowser:
             self._probe_popups.clear()
             self._spare = None
             self._spare_pending = False
+            for fetcher in list(self._pt_fetchers.values()):     # v0.1.74: the container is gone with its fetcher tabs
+                with fetcher.cond:
+                    fetcher.closing = True
+                    fetcher.cond.notify_all()
+            self._pt_fetchers.clear()
+            self._pt_by_session.clear()
+            self._pt_targets.clear()
+            self._pt_verdicts.clear()
+            self._pt_keep.clear()
             self._mirror_res.clear()
             self._anchor = None
             self._state = "stopped"
@@ -1852,7 +1876,7 @@ class RemoteBrowser:
         with self._lock:
             conn = self._conn
             resident = self._resident
-            idle_tabs = (not self._tabs and now - self._no_tabs_since >= NO_TAB_IDLE
+            idle_tabs = (not self._tabs and not self._pt_fetchers and now - self._no_tabs_since >= NO_TAB_IDLE
                          and not resident)
             idle_view = now - self._last_activity >= NO_VIEWER_IDLE
             lost = conn is None or conn.closed
@@ -1887,6 +1911,7 @@ class RemoteBrowser:
         for tab in expired:
             self._stop_screencast(tab)
         self._spare_tick(now)
+        self._pt_expire(now)
         if resident:
             self._tick_idle_sample(now)
 
@@ -2015,6 +2040,7 @@ class RemoteBrowser:
         for tab in tabs:
             self._drop_tab(tab, close=True)
         self._spare_close("viewer idle")
+        self._pt_close_all("viewer idle")
 
     # ---- memory trimming and figures
     def _after_start_trim(self):
@@ -2324,6 +2350,618 @@ class RemoteBrowser:
         if view is not None:
             return {"id": tab.id, "url": checked, "view": tab.viewport is not None}   # v0.1.59: was the size applied?
         return {"id": tab.id, "url": checked}
+
+    # ------------------------------------------------------------ passthrough via the NAS browser (v0.1.74)
+    # A site the user listed under 「NASブラウザ経由」 has its passthrough requests sent through a hidden "fetcher" tab of
+    # this browser instead of the Hub's own HTTP client: same IP, TLS fingerprint, user agent and cookie jar as the NAS
+    # browser, so a Cloudflare clearance obtained once in a normal tab applies. Fetcher tabs live outside self._tabs (not
+    # in any list, not counted against the tab limit) and every request they make passes the Hub's SSRF guard (pt_guard).
+    def pt_fetch(self, method, target, headers, body, nav, dest="", site=None, fixture=None):
+        """One passthrough request through the fetcher tab of the target's site. `target` is a pt_core.Target the Hub's
+        guard has already accepted, `headers` the upstream header list, `nav` a document load, `dest` the Sec-Fetch-Dest
+        of the phone's request. Returns a pt_proxy.Response (body in memory, already decoded); raises
+        pt_proxy.UpstreamError, pt_proxy.NasChallenge (a bot check must be done in the NAS browser) or pt_core.Blocked.
+        (`site` and `fixture` are for the self-test only: its own fetcher tab, answered from RAM under SELFTEST_ORIGIN.)"""
+        method = (method or "GET").upper()
+        with self._lock:
+            running = self._state == "running" and self._conn is not None
+        if not running:
+            raise pt_proxy.UpstreamError("NASブラウザが起動していません", 503)
+        if self.pt_guard is None:
+            raise pt_proxy.UpstreamError("NASブラウザ経由を使えません", 503)
+        if body is not None and len(body) > rb_ptfetch.POST_BODY_MAX:
+            raise pt_proxy.UpstreamError("NASブラウザ経由では送れません（送信データが大きすぎます）", 413)
+        site = site or pt_core.site_of(target.host)
+        slot = self._pt_sems.setdefault(site, threading.BoundedSemaphore(rb_ptfetch.PER_SITE_MAX))
+        if not slot.acquire(timeout=rb_ptfetch.SLOT_WAIT):
+            raise pt_proxy.UpstreamError("同時接続数の上限です。しばらくしてからもう一度", 503)
+        started = time.monotonic()
+        status, size = "error", 0
+        try:
+            self._touch()
+            fetcher = self._pt_fetcher(site, fixture)
+            try:
+                if nav and method == "GET":
+                    resp = self._pt_navigate(fetcher, target)
+                else:
+                    resp = self._pt_request(fetcher, method, target, headers, body, dest)
+            finally:
+                fetcher.last_used = self._clock()
+            status, size = resp.status, len(resp._body or b"")
+            return resp
+        except pt_proxy.NasChallenge:
+            status = "challenge"
+            raise
+        finally:
+            slot.release()
+            if debuglog.LOG._enabled:
+                debuglog.log("pt", "debug", "nas fetch", {
+                    "host": target.host, "method": method, "nav": bool(nav), "status": status,
+                    "ms": int((time.monotonic() - started) * 1000), "bytes": size})
+
+    def _pt_fetcher(self, site, fixture=None):
+        """The fetcher tab of `site` (opened on first use; at most FETCHER_MAX, the least recently used one makes room)."""
+        with self._pt_lock:
+            fetcher = self._pt_fetchers.get(site)
+            if fetcher is not None and not fetcher.closing:
+                fetcher.last_used = self._clock()
+                return fetcher
+            while len(self._pt_fetchers) >= rb_ptfetch.FETCHER_MAX:
+                oldest = min(self._pt_fetchers.values(), key=lambda f: f.last_used)
+                self._pt_close(oldest, "least recently used")
+            return self._pt_create(site, fixture)
+
+    def _pt_create(self, site, fixture=None):
+        reason = self._guard_reason()
+        if reason:
+            self.log("passthrough fetcher tab not opened: %s" % reason)
+            raise pt_proxy.UpstreamError("NASのメモリが不足しています", 503)
+        target = session = None
+        fetcher = None
+        try:
+            created = self._call("Target.createTarget", {
+                "url": "about:blank", "newWindow": True, "width": WINDOW_SIZE[0], "height": WINDOW_SIZE[1]})
+            target = created.get("targetId")
+            if not isinstance(target, str) or not TARGET_ID.match(target):
+                target = None
+                raise BrowserError("タブを作成できません")
+            fetcher = rb_ptfetch.Fetcher(site, self._clock())
+            fetcher.fixture = fixture
+            fetcher.target_id = target
+            self._pt_targets[target] = fetcher
+            session = self._call("Target.attachToTarget", {"targetId": target, "flatten": True}).get("sessionId")
+            if not isinstance(session, str) or not session:
+                raise BrowserError("タブに接続できません")
+            fetcher.session = session
+            self._pt_by_session[session] = fetcher
+            # v0.1.74: Network is enabled (tiny buffers: bodies come from the Fetch domain) because Fetch's networkId, which
+            # ties a redirect hop and a response to its request, only exists while it is on.
+            commands = [("Page.enable", None),
+                        ("Network.enable", {"maxTotalBufferSize": 1024 * 1024, "maxResourceBufferSize": 256 * 1024}),
+                        ("Page.setBypassCSP", {"enabled": True}),
+                        ("Fetch.enable", {"patterns": [{"urlPattern": "*", "requestStage": "Request"},
+                                                       {"urlPattern": "*", "requestStage": "Response"}]}),
+                        ("Emulation.setFocusEmulationEnabled", {"enabled": True}),
+                        ("Emulation.setEmulatedMedia", REDUCED_MOTION)]
+            for (name, _), (_, error) in zip(commands, self._call_many(commands, session)):
+                if error is not None and name in ("Page.enable", "Network.enable", "Fetch.enable"):
+                    raise BrowserError("%s: %s" % (name, error))      # without Fetch.enable the guard cannot work
+        except BrowserError as error:
+            self.log("passthrough fetcher tab: %s" % error)
+            if fetcher is not None:
+                self._pt_close(fetcher, "setup failed")
+            elif target is not None:
+                try:
+                    self._call("Target.closeTarget", {"targetId": target}, timeout=5.0)
+                except BrowserError:
+                    pass
+            raise pt_proxy.UpstreamError("NASブラウザのタブを準備できません", 502) from None
+        self._pt_fetchers[site] = fetcher
+        debuglog.log("pt", "info", "fetcher tab open", {"site": site})
+        return fetcher
+
+    def _pt_close(self, fetcher, why, close=True):
+        if self._pt_fetchers.get(fetcher.site) is fetcher:
+            self._pt_fetchers.pop(fetcher.site, None)
+        self._pt_by_session.pop(fetcher.session, None)
+        self._pt_targets.pop(fetcher.target_id, None)
+        with fetcher.cond:
+            fetcher.closing = True
+            fetcher.cond.notify_all()
+        debuglog.log("pt", "info", "fetcher tab close", {"site": fetcher.site, "why": why})
+        if close and fetcher.target_id:
+            try:
+                self._call("Target.closeTarget", {"targetId": fetcher.target_id}, timeout=5.0)
+            except BrowserError:
+                pass
+
+    def _pt_close_all(self, why):
+        for fetcher in list(self._pt_fetchers.values()):
+            self._pt_close(fetcher, why)
+
+    def _pt_expire(self, now):
+        """Housekeeping (monitor thread): close fetcher tabs nobody used for FETCHER_IDLE seconds."""
+        for fetcher in list(self._pt_fetchers.values()):
+            if now - fetcher.last_used >= rb_ptfetch.FETCHER_IDLE and fetcher.inflight == 0 and not fetcher.navigating:
+                self._pt_close(fetcher, "idle")
+
+    def pt_fetchers(self):
+        """[(site, url)] of the open fetcher tabs (tests and the self-test)."""
+        return [(f.site, f.url) for f in list(self._pt_fetchers.values())]
+
+    def pt_sites_changed(self, hosts):
+        """The Hub's list of via-NAS sites changed: the fetcher tabs of sites that left it are closed (memory) and the
+        remembered guard answers are dropped."""
+        self._pt_verdicts.clear()
+        keep = set()
+        for host in hosts or ():
+            if isinstance(host, str):
+                keep.add(pt_core.site_of(host.lower()))
+        for fetcher in list(self._pt_fetchers.values()):
+            if fetcher.site not in keep and fetcher.fixture is None:
+                self._pt_close(fetcher, "site removed")
+
+    # -- events (CDP reader thread: never waits for an answer)
+    def _pt_event(self, fetcher, method, params, conn):
+        if method == "Fetch.requestPaused":
+            if "responseStatusCode" in params or "responseErrorReason" in params:
+                self._pt_response(fetcher, params, conn)
+            else:
+                self._pt_paused(fetcher, params, conn)
+            return
+        if method == "Page.javascriptDialogOpening":
+            if conn is not None:
+                try:
+                    conn.send_nowait("Page.handleJavaScriptDialog", {"accept": False}, session=fetcher.session)
+                except CDPError:
+                    pass
+            return
+        with fetcher.cond:
+            if method == "Page.domContentEventFired":
+                fetcher.dcl += 1
+            elif method == "Page.frameNavigated":
+                frame = params.get("frame") if isinstance(params.get("frame"), dict) else {}
+                if not frame.get("parentId") and isinstance(frame.get("url"), str):
+                    fetcher.url = frame["url"][:2048] if frame["url"].startswith(("http://", "https://")) else fetcher.url
+            else:
+                return
+            fetcher.cond.notify_all()
+
+    def _pt_paused(self, fetcher, params, conn):
+        """A request of the fetcher tab is paused before it goes out: the Hub's guard decides (a redirect hop included);
+        the tab's own images, media, fonts and styles are not loaded at all (memory)."""
+        request_id = params.get("requestId")
+        request = params.get("request") if isinstance(params.get("request"), dict) else {}
+        url = request.get("url") if isinstance(request.get("url"), str) else ""
+        if conn is None or not isinstance(request_id, str):
+            return
+        session = fetcher.session
+        scheme = url.split(":", 1)[0].lower()
+        if scheme not in ("http", "https"):
+            self._pt_answer(conn, session, request_id, True)         # data:, blob:, about: never reach a network
+            return
+        own, net, kind = None, params.get("networkId"), params.get("resourceType")
+        if isinstance(net, str) and kind in rb_ptfetch.OWN_TYPES:
+            with fetcher.cond:
+                own = fetcher.by_net.get(net)
+                if own is None and not params.get("redirectedRequestId"):
+                    key, verb = rb_ptfetch.url_key(url), request.get("method")
+                    for job in fetcher.jobs:
+                        if job.net is None and job.key == key and job.method == verb:
+                            job.net = net
+                            fetcher.by_net[net] = job
+                            own = job
+                            break
+        if fetcher.fixture is not None and url.startswith(SELFTEST_ORIGIN + "/"):
+            self._serve_fixture(fetcher.fixture, session, request_id, url, conn)       # the self-test's virtual site
+            return
+        if own is None and kind in rb_ptfetch.SKIP_TYPES:
+            self._pt_answer(conn, session, request_id, False, "BlockedByClient")
+            return
+        try:
+            parts = urlsplit(url)
+            hostport = "%s:%s" % ((parts.hostname or "").lower(), parts.port or (80 if scheme == "http" else 443))
+        except ValueError:
+            self._pt_answer(conn, session, request_id, False)
+            return
+        cached = self._pt_verdicts.get(hostport)
+        if cached is not None and cached[1] > time.monotonic():
+            self._pt_answer(conn, session, request_id, cached[0], fetcher=fetcher, job=own)
+            return
+        self._spawn(lambda: self._pt_judge(fetcher, request_id, url, hostport, conn, own))
+
+    def _pt_response(self, fetcher, params, conn):
+        """A response of the fetcher tab is paused. For one of our own requests, or the document of the tab's navigation, the
+        body is taken here as raw bytes (decoded from its Content-Encoding, no charset conversion, whatever CORS or the
+        cache headers say); every other response goes on untouched."""
+        request_id, net, kind = params.get("requestId"), params.get("networkId"), params.get("resourceType")
+        if conn is None or not isinstance(request_id, str):
+            return
+        session = fetcher.session
+        request = params.get("request") if isinstance(params.get("request"), dict) else {}
+        with fetcher.cond:
+            job = fetcher.by_net.get(net) if isinstance(net, str) else None
+            is_doc = job is None and kind == "Document" and params.get("frameId") == fetcher.target_id
+        if job is None and not is_doc:
+            self._pt_release(conn, session, request_id, True)
+            return
+        headers = [(h["name"], h["value"]) for h in (params.get("responseHeaders") or [])
+                   if isinstance(h, dict) and isinstance(h.get("name"), str) and isinstance(h.get("value"), str)]
+        code = params.get("responseStatusCode")
+        if isinstance(code, int) and 300 <= code < 400 and code != 304 and rb_ptfetch.header_of(headers, "location"):
+            self._pt_release(conn, session, request_id, True)         # a redirect hop: the next request is guarded again
+            return
+        url = str(request.get("url") or "")[:4096]
+        text = str(params.get("responseStatusText") or "")[:80]
+        error = str(params.get("responseErrorReason") or "") if not isinstance(code, int) else ""
+        self._spawn(lambda: self._pt_read(fetcher, conn, request_id, job, is_doc, code, text, headers, url, error))
+
+    def _pt_read(self, fetcher, conn, request_id, job, is_doc, code, text, headers, url, error):
+        body, want = b"", not error
+        length = rb_ptfetch.content_length(headers)
+        download = False
+        if job is not None:
+            want = want and job.method != "HEAD" and code not in (204, 205, 304) and not 100 <= code < 200
+        else:
+            ctype = rb_ptfetch.header_of(headers, "content-type")
+            download = rb_ptfetch.is_attachment(headers) or (
+                length > rb_ptfetch.DOWNLOAD_SIZE and not pt_core.viewable_type(ctype) and not pt_core.is_html(ctype))
+            want = want and not download
+        if want and length > rb_ptfetch.RESPONSE_CAP:
+            error, want = "toobig", False
+        if want:
+            big = length > rb_ptfetch.BIG_BODY
+            if big:
+                self._pt_big.acquire()
+            try:
+                got = self._call("Fetch.getResponseBody", {"requestId": request_id}, session=fetcher.session, timeout=20.0)
+                data = got.get("body") if isinstance(got.get("body"), str) else ""
+                body = base64.b64decode(data) if got.get("base64Encoded") is True else data.encode("utf-8")
+            except (BrowserError, ValueError) as failure:
+                self.log("passthrough body not readable: %s" % failure)
+                error = "unreadable"
+            finally:
+                if big:
+                    self._pt_big.release()
+            if len(body) > rb_ptfetch.RESPONSE_CAP:
+                error, body = "toobig", b""
+        with fetcher.cond:
+            if job is not None:
+                job.status, job.reason, job.headers, job.url, job.body = code, text, headers, url, body
+                job.error, job.finished = error, True
+            else:
+                doc = rb_ptfetch.Doc()
+                doc.net, doc.status, doc.reason, doc.headers, doc.url = request_id, code, text, headers, url
+                doc.body, doc.download, doc.failed, doc.finished, doc.at = body, download, error, True, time.monotonic()
+                fetcher.doc = doc
+            fetcher.cond.notify_all()
+        # our own request is over (the page does not need its answer); the navigation's document goes on to the page
+        self._pt_release(conn, fetcher.session, request_id, job is None and not error)
+
+    @staticmethod
+    def _pt_release(conn, session, request_id, proceed):
+        try:
+            if proceed:
+                conn.send_nowait("Fetch.continueResponse", {"requestId": request_id}, session=session)
+            else:
+                conn.send_nowait("Fetch.failRequest", {"requestId": request_id, "errorReason": "Aborted"}, session=session)
+        except CDPError:
+            pass
+
+    def _pt_judge(self, fetcher, request_id, url, hostport, conn, job):
+        try:
+            self.pt_guard(url)
+            allowed = True
+        except Exception:
+            allowed = False
+        if len(self._pt_verdicts) >= rb_ptfetch.VERDICT_MAX:
+            self._pt_verdicts.clear()
+        self._pt_verdicts[hostport] = (allowed, time.monotonic() + (
+            rb_ptfetch.VERDICT_OK_TTL if allowed else rb_ptfetch.VERDICT_BLOCKED_TTL))
+        self._pt_answer(conn, fetcher.session, request_id, allowed, fetcher=fetcher, job=job)
+
+    def _pt_answer(self, conn, session, request_id, allowed, reason="AccessDenied", fetcher=None, job=None):
+        if not allowed and fetcher is not None:
+            with fetcher.cond:
+                fetcher.denied += 1
+                if job is not None:
+                    job.denied = True
+                fetcher.cond.notify_all()
+            debuglog.log("pt", "warn", "fetcher request refused by the guard", {"site": fetcher.site})
+        try:
+            if allowed:
+                conn.send_nowait("Fetch.continueRequest", {"requestId": request_id}, session=session)
+            else:
+                conn.send_nowait("Fetch.failRequest", {"requestId": request_id, "errorReason": reason}, session=session)
+        except CDPError:
+            pass
+
+    # -- navigations (a document request: the tab itself loads the page, what Cloudflare expects)
+    def _pt_navigate(self, fetcher, target):
+        key = rb_ptfetch.url_key(target.url)
+        kept = self._pt_keep.take(key)
+        if kept is not None:
+            return pt_proxy.Response(kept[0], kept[1], kept[2], body=kept[3])
+        doc, challenge = self._pt_load(fetcher, target.url, True)
+        fetcher.challenge = challenge
+        if challenge:
+            fetcher.challenge_at = time.monotonic()
+            raise pt_proxy.NasChallenge(target.url)
+        headers = pt_core.nas_response_headers(doc.headers, keep_length=doc.download)
+        final = doc.url or target.url
+        final_key = rb_ptfetch.url_key(final)
+        if final_key is not None and final_key != key and not doc.download:
+            self._pt_keep.put(final_key, (doc.status, doc.reason, headers, doc.body))
+            return pt_proxy.Response(302, "Found", [("Location", final), ("Cache-Control", "no-store"),
+                                                    ("Content-Length", "0")], body=b"")
+        return pt_proxy.Response(doc.status, doc.reason, headers, body=doc.body)
+
+    def _pt_load(self, fetcher, url, want_body):
+        """Navigates the fetcher tab to `url` (one navigation at a time; requests in flight finish first) and returns
+        (Doc with its body, on a check page)."""
+        start = time.monotonic()
+        with fetcher.cond:
+            while fetcher.navigating and not fetcher.closing:
+                if time.monotonic() - start > rb_ptfetch.SLOT_WAIT:
+                    raise pt_proxy.UpstreamError("同時接続数の上限です。しばらくしてからもう一度", 503)
+                fetcher.cond.wait(0.25)
+            if fetcher.closing:
+                raise pt_proxy.UpstreamError("NASブラウザのタブが閉じられました", 502)
+            fetcher.navigating = True
+            fetcher.cond.wait_for(lambda: fetcher.inflight == 0 or fetcher.closing, 5.0)
+            fetcher.doc = None
+            dcl0, denied0 = fetcher.dcl, fetcher.denied
+        try:
+            return self._pt_load_now(fetcher, url, want_body, dcl0, denied0)
+        finally:
+            with fetcher.cond:
+                fetcher.navigating = False
+                fetcher.warmed = True
+                fetcher.cond.notify_all()
+
+    def _pt_load_now(self, fetcher, url, want_body, dcl0, denied0):
+        try:
+            result = self._call("Page.navigate", {"url": url}, session=fetcher.session, timeout=rb_ptfetch.NAV_TIMEOUT)
+        except BrowserTimeout:
+            raise pt_proxy.UpstreamError("接続がタイムアウトしました", 504) from None
+        except BrowserError:
+            raise pt_proxy.UpstreamError("接続できません", 502) from None
+        error = str(result.get("errorText") or "")
+        is_download = result.get("isDownload") is True
+        if error and not is_download:
+            raise self._pt_error(fetcher, error, denied0)
+        deadline = time.monotonic() + rb_ptfetch.NAV_TIMEOUT
+        with fetcher.cond:
+            while True:
+                doc = fetcher.doc
+                if fetcher.closing:
+                    raise pt_proxy.UpstreamError("NASブラウザのタブが閉じられました", 502)
+                if doc is not None and (doc.download or doc.failed or (doc.finished and (
+                        is_download or fetcher.dcl > dcl0 or time.monotonic() - doc.at >= 3.0))):
+                    break
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                fetcher.cond.wait(min(remaining, 0.25))
+            doc = fetcher.doc
+        if doc is None or not (doc.download or doc.failed or doc.finished):
+            if doc is None and fetcher.denied > denied0:
+                raise pt_core.Blocked("接続先が許可されていません")
+            raise pt_proxy.UpstreamError("接続がタイムアウトしました", 504)
+        if doc.failed and not (doc.download or is_download):
+            raise self._pt_error(fetcher, doc.failed, denied0)
+        challenge = False if (doc.download or doc.failed) else self._pt_challenge(fetcher, doc)
+        try:
+            self._call("Page.stopLoading", session=fetcher.session, timeout=5.0)      # the tab does not need the rest
+        except BrowserError:
+            pass
+        return doc, challenge
+
+    def _pt_error(self, fetcher, text, denied0):
+        if fetcher.denied > denied0 or "BLOCKED_BY_CLIENT" in text or "ACCESS_DENIED" in text:
+            return pt_core.Blocked("接続先が許可されていません")
+        if text == "toobig":
+            return pt_proxy.UpstreamError("大きすぎます", 502)
+        if text == "unreadable":
+            return pt_proxy.UpstreamError("応答を読み取れません", 502)
+        if "NAME_NOT_RESOLVED" in text:
+            return pt_proxy.UpstreamError("名前を解決できません", 502)
+        if "CERT" in text:
+            return pt_proxy.UpstreamError("証明書を確認できません", 502)
+        if "TIMED_OUT" in text:
+            return pt_proxy.UpstreamError("接続がタイムアウトしました", 504)
+        return pt_proxy.UpstreamError("接続できません", 502)
+
+    def _pt_eval(self, fetcher, expression, timeout=PROBE_CDP_TIMEOUT):
+        try:
+            result = self._call("Runtime.evaluate", {"expression": expression, "returnByValue": True, "timeout": 1500},
+                                session=fetcher.session, timeout=timeout)
+        except BrowserError:
+            return None
+        return (result.get("result") or {}).get("value")
+
+    def _pt_challenge(self, fetcher, doc):
+        """True while the fetcher tab shows a bot check: Cloudflare's own marker header, the title / address, or (on a
+        403 / 503 only) the page-side check."""
+        if rb_ptfetch.header_of(doc.headers, "cf-mitigated").lower() == "challenge":
+            return True
+        title = self._pt_eval(fetcher, "document.title")
+        if looks_like_challenge(doc.url or fetcher.url, title if isinstance(title, str) else ""):
+            return True
+        return doc.status in (403, 503) and self._pt_eval(fetcher, CHALLENGE_JS) is True
+
+    # -- other requests (sub-resources, XHR, form posts): a fetch() in the tab, answered from DevTools' view of it
+    def _pt_request(self, fetcher, method, target, headers, body, dest):
+        if fetcher.challenge:
+            self._pt_recheck(fetcher, target)
+        post = method not in ("GET", "HEAD")
+        if not fetcher.warmed or (post and fetcher.origin != target.origin):
+            self._pt_warm(fetcher, target, raise_errors=post)
+        start = time.monotonic()
+        with fetcher.cond:
+            while fetcher.navigating and not fetcher.closing:
+                if time.monotonic() - start > rb_ptfetch.SLOT_WAIT:
+                    raise pt_proxy.UpstreamError("同時接続数の上限です。しばらくしてからもう一度", 503)
+                fetcher.cond.wait(0.25)
+            if fetcher.closing:
+                raise pt_proxy.UpstreamError("NASブラウザのタブが閉じられました", 502)
+            fetcher.inflight += 1
+            fetcher.job_seq += 1
+            job = rb_ptfetch.Job(fetcher.job_seq, method, rb_ptfetch.url_key(target.url))
+            fetcher.jobs.append(job)
+            origin = fetcher.origin
+        try:
+            return self._pt_run(fetcher, job, method, target, headers, body, dest, origin)
+        finally:
+            with fetcher.cond:
+                fetcher.inflight -= 1
+                if job in fetcher.jobs:
+                    fetcher.jobs.remove(job)
+                if job.net is not None:
+                    fetcher.by_net.pop(job.net, None)
+                fetcher.cond.notify_all()
+
+    def _pt_warm(self, fetcher, target, raise_errors):
+        """Takes the tab to the target's site once (cookie context, same-origin requests for posts). A check page found
+        there ends the request with NasChallenge; any other failure only matters to a post."""
+        root = "%s://%s/" % (target.scheme, target.hostport)
+        try:
+            _doc, challenge = self._pt_load(fetcher, root, False)
+        except (pt_proxy.UpstreamError, pt_core.Blocked):
+            if raise_errors:
+                raise
+            return
+        fetcher.challenge = challenge
+        if challenge:
+            fetcher.challenge_at = time.monotonic()
+            raise pt_proxy.NasChallenge(target.url)
+
+    def _pt_recheck(self, fetcher, target):
+        """The tab was on a check page: the user may have solved it in another tab since (the cookie is shared). Look
+        again, at most every CHALLENGE_RELOAD_GAP seconds."""
+        if time.monotonic() - fetcher.challenge_at < rb_ptfetch.CHALLENGE_RELOAD_GAP:
+            raise pt_proxy.NasChallenge(target.url)
+        fetcher.challenge_at = time.monotonic()
+        self._pt_warm(fetcher, target, raise_errors=True)
+        if fetcher.challenge:
+            raise pt_proxy.NasChallenge(target.url)
+
+    def _pt_run(self, fetcher, job, method, target, headers, body, dest, origin):
+        post = method not in ("GET", "HEAD")
+        wanted = rb_ptfetch.request_headers(headers, True)
+        custom = any(name not in rb_ptfetch.SIMPLE_HEADERS for name in wanted)
+        mode = "cors" if post else rb_ptfetch.request_mode(dest, origin == target.origin, custom)
+        if mode == "no-cors":
+            wanted = {k: v for k, v in wanted.items() if k in rb_ptfetch.SIMPLE_HEADERS}
+        referrer = ""
+        for name, value in headers:
+            if name.lower() == "referer" and origin:
+                ref = urlsplit(value)
+                if "%s://%s" % (ref.scheme, ref.netloc) == origin:
+                    referrer = value
+        script = rb_ptfetch.fetch_script(job.id, target.url, method, wanted,
+                                         base64.b64encode(body).decode("ascii") if body else None, mode, referrer)
+        deadline = time.monotonic() + rb_ptfetch.FETCH_TIMEOUT
+        value = None
+        for attempt in (0, 1):
+            try:
+                result = self._call("Runtime.evaluate", {"expression": script, "awaitPromise": True, "returnByValue": True},
+                                    session=fetcher.session, timeout=rb_ptfetch.FETCH_TIMEOUT)
+                value = (result.get("result") or {}).get("value")
+                break
+            except BrowserTimeout:
+                raise pt_proxy.UpstreamError("接続がタイムアウトしました", 504) from None
+            except BrowserError:
+                if attempt or fetcher.closing:
+                    raise pt_proxy.UpstreamError("NASブラウザのタブに送れません", 502) from None
+                time.sleep(0.3)         # the page was replaced under us (a script of the site navigated): once more
+        with fetcher.cond:
+            fetcher.cond.wait_for(lambda: job.finished or bool(job.error) or fetcher.closing,
+                                  max(0.1, deadline - time.monotonic()))
+            finished, error, status = job.finished, job.error, job.status
+        if not finished:
+            try:
+                self._call("Runtime.evaluate", {"expression": rb_ptfetch.abort_script(job.id)},
+                           session=fetcher.session, timeout=5.0)
+            except BrowserError:
+                pass
+        if job.denied:
+            raise pt_core.Blocked("接続先が許可されていません")
+        if status is None:
+            self.log("passthrough fetch without an answer: %s / %s" % (str(value)[:60], error))
+            if error or (isinstance(value, str) and value.startswith("err:")):
+                if post:
+                    raise pt_proxy.UpstreamError("NASブラウザ経由では送れません", 502)
+                raise self._pt_error(fetcher, error, 10 ** 9)
+            raise pt_proxy.UpstreamError("接続がタイムアウトしました", 504)
+        if error:
+            raise self._pt_error(fetcher, error, 10 ** 9)
+        final = job.url or target.url
+        if post and rb_ptfetch.url_key(final) != rb_ptfetch.url_key(target.url):
+            return pt_proxy.Response(303, "See Other", [("Location", final), ("Cache-Control", "no-store"),
+                                                         ("Content-Length", "0")], body=b"")
+        return pt_proxy.Response(status, job.reason, pt_core.nas_response_headers(job.headers), body=job.body or b"")
+
+    def pt_selftest(self):
+        """v0.1.74: the self-test's check of the NAS-browser route, on the self-test's virtual site (answered from RAM, no
+        network): [(step, ok, detail)] for a document load, a request made by that page and a check page. It uses its own
+        fetcher tab, closed afterwards. None while the browser is not running."""
+        with self._lock:
+            running = self._state == "running" and self._conn is not None
+        if not running or self.pt_guard is None:
+            return None
+        page = b"<!doctype html><html><head><title>PT-NAS-TITLE</title></head><body><p>pt-nas-page</p></body></html>"
+
+        def fixture(url):
+            path = urlsplit(url).path
+            if path == "/pt/page":
+                return 200, "text/html; charset=utf-8", page
+            if path == "/pt/echo":
+                return 200, "text/plain; charset=utf-8", b"pt-nas-echo"
+            if path == "/pt/check":
+                return 200, "text/html; charset=utf-8", b"<html><head><title>Just a moment...</title></head></html>"
+            return None
+
+        def target(path):
+            return pt_core.Target("https", urlsplit(SELFTEST_ORIGIN).hostname, 0, path, "")
+
+        site, out = "(selftest)", []
+
+        def step(name, run):
+            began = time.monotonic()
+            try:
+                ok, detail = run()
+            except pt_proxy.NasChallenge:
+                ok, detail = False, "確認ページと判定されました"
+            except (pt_proxy.UpstreamError, pt_core.Blocked, BrowserError, ValueError) as error:
+                ok, detail = False, str(error)[:80]
+            out.append((name, ok, detail if not ok else "%d ms" % int((time.monotonic() - began) * 1000)))
+
+        def document():
+            resp = self.pt_fetch("GET", target("/pt/page"), [], None, True, site=site, fixture=fixture)
+            return resp.status == 200 and b"pt-nas-page" in (resp._body or b""), "HTTP %d" % resp.status
+
+        def request():
+            resp = self.pt_fetch("GET", target("/pt/echo"), [("Accept", "*/*")], None, False, dest="script", site=site,
+                                 fixture=fixture)
+            return resp.status == 200 and (resp._body or b"") == b"pt-nas-echo", "HTTP %d" % resp.status
+
+        def check():
+            try:
+                self.pt_fetch("GET", target("/pt/check"), [], None, True, site=site, fixture=fixture)
+            except pt_proxy.NasChallenge:
+                return True, ""
+            return False, "確認ページを見分けられません"
+
+        try:
+            step("document", document)
+            step("request", request)
+            step("check", check)
+        finally:
+            fetcher = self._pt_fetchers.get(site)
+            if fetcher is not None:
+                self._pt_close(fetcher, "self-test done")
+        return out
 
     # ------------------------------------------------------------ spare tab (v0.1.54)
     def _spare_enabled(self):
@@ -2909,6 +3547,10 @@ class RemoteBrowser:
         method = message.get("method")
         params = message.get("params") if isinstance(message.get("params"), dict) else {}
         conn = self._conn
+        fetcher = self._pt_by_session.get(message.get("sessionId")) if message.get("sessionId") else None
+        if fetcher is not None:
+            self._pt_event(fetcher, method, params, conn)      # v0.1.74: a hidden passthrough fetcher tab
+            return
         if method == "Page.screencastFrame":
             self._on_frame(message.get("sessionId"), params, conn)
         elif method in ("Target.targetCreated", "Target.targetInfoChanged"):
@@ -2924,6 +3566,9 @@ class RemoteBrowser:
                     self._spare = None
             if tab is not None:
                 self._drop_tab(tab, close=False)
+            gone = self._pt_targets.get(params.get("targetId"))
+            if gone is not None:
+                self._pt_close(gone, "target gone", close=False)
         elif method in ("Page.frameStartedLoading", "Page.frameStoppedLoading",
                         "Page.loadEventFired", "Page.domContentEventFired", "Network.requestWillBeSent"):
             probe = self._probe_sessions.get(message.get("sessionId"))
@@ -3147,8 +3792,8 @@ class RemoteBrowser:
             return
         frame_id = params.get("frameId")
         if isinstance(frame_id, str) and (frame_id in self._probe_targets or
-                                          frame_id in self._probe_popups):
-            return      # a probe never reports downloads to a tab
+                                          frame_id in self._probe_popups or frame_id in self._pt_targets):
+            return      # a probe (or a passthrough fetcher tab) never reports downloads to a tab
         with self._cv:
             tab = self._find_by_target(frame_id) if isinstance(frame_id, str) else None
             if tab is None and self._tabs:
