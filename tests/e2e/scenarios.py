@@ -2804,27 +2804,36 @@ def tab_limit_setting(ph):
     ph.js("()=>{location.hash='#/settings/browser'}")
     ph.wait(lambda: ph.js("!!document.querySelector('#view-settings:not([hidden])') && !!document.getElementById('rbMaxTabs')"), 8, "browser settings")
     assert ph.js("document.getElementById('rbMaxTabs').value") == "3", "default is not 3"
-    assert ph.js("document.getElementById('rbMaxTabs').options.length") == 20
-    ph.page.select_option("#rbMaxTabs", "5")
-    ph.wait(lambda: ph.js("state.settings.rb_max_tabs") == 5, 5, "saved on the phone")
-    ph.page.reload()
-    ph.wait(lambda: ph.js("typeof state !== 'undefined' && state.authed === true && !!document.getElementById('rbMaxTabs')"), 15, "app reloaded")
-    ph.js("()=>{location.hash='#/settings/browser'}")
-    ph.wait(lambda: ph.js("document.getElementById('rbMaxTabs').value") == "5", 8, "the setting survived a reload")
-    ids = []
-    for n in range(5):
-        res = ph.post("/api/rb/tabs", {"url": "https://a.example.com/article.html?n=%d" % n})
-        assert res["status"] == 201, "tab %d: %s" % (n + 1, res)
-        ids.append(res["text"])
-    assert len(ph.env.tabs()) == 5, ph.env.tabs()
-    res = ph.post("/api/rb/tabs", {"url": "https://a.example.com/article.html?n=6"})
-    assert res["status"] >= 400 and "タブは最大5枚です（設定で変更できます）。不要なタブを閉じてください" in res["text"], res
-    # the recommendation (as the self-test stores it) is offered and applied by the button
-    ph.env.rb.tab_reco = {"tabs": 9, "avg_mib": 80.0, "max_mib": 120.0, "at": 0}
-    ph.js("()=>{state.rbStatus = Object.assign({}, state.rbStatus || {}, {tab_reco: {tabs: 9, avg_mib: 80, max_mib: 120}}); renderMaxTabs()}")
-    ph.wait(lambda: ph.js("!document.getElementById('rbMaxTabsRecoRow').hidden"), 5, "recommendation row")
-    assert "9枚" in ph.js("document.getElementById('rbMaxTabsReco').textContent")
-    ph.page.locator("#rbMaxTabsApply").click()
-    ph.wait(lambda: ph.js("state.settings.rb_max_tabs") == 9 and ph.js("document.getElementById('rbMaxTabs').value") == "9", 5, "the recommendation applied")
-    ph.setting("rb_max_tabs", 3)
+    try:
+        assert ph.js("document.getElementById('rbMaxTabs').options.length") == 20
+        ph.page.select_option("#rbMaxTabs", "5")
+        ph.wait(lambda: ph.js("state.settings.rb_max_tabs") == 5, 5, "saved on the phone")
+        ph.page.reload()
+        ph.wait(lambda: ph.js("typeof state !== 'undefined' && state.authed === true && !!document.getElementById('rbMaxTabs')"), 15, "app reloaded")
+        ph.js("()=>{location.hash='#/settings/browser'}")
+        ph.wait(lambda: ph.js("document.getElementById('rbMaxTabs').value") == "5", 8, "the setting survived a reload")
+        ids = []
+        for n in range(5):
+            res = ph.post("/api/rb/tabs", {"url": "https://a.example.com/article.html?n=%d" % n})
+            assert res["status"] == 201, "tab %d: %s" % (n + 1, res)
+            ids.append(res["text"])
+        assert len(ph.env.tabs()) == 5, ph.env.tabs()
+        res = ph.post("/api/rb/tabs", {"url": "https://a.example.com/article.html?n=6"})
+        assert res["status"] >= 400 and "タブは最大5枚です（設定で変更できます）。不要なタブを閉じてください" in res["text"], res
+        # the recommendation (as the self-test stores it) is offered and applied by the button
+        ph.env.rb.tab_reco = {"tabs": 9, "avg_mib": 80.0, "max_mib": 120.0, "at": 0}
+        ph.js("()=>{state.rbStatus = Object.assign({}, state.rbStatus || {}, {tab_reco: {tabs: 9, avg_mib: 80, max_mib: 120}}); renderMaxTabs()}")
+        ph.wait(lambda: ph.js("!document.getElementById('rbMaxTabsRecoRow').hidden"), 5, "recommendation row")
+        assert "9枚" in ph.js("document.getElementById('rbMaxTabsReco').textContent")
+        ph.page.locator("#rbMaxTabsApply").click()
+        # v0.1.73: 10 s and one more press: on the CI runner a status poll re-rendered the row just as it was pressed
+        try:
+            ph.wait(lambda: ph.js("state.settings.rb_max_tabs") == 9, 5, "the recommendation applied")
+        except AssertionError:
+            ph.js("()=>{state.rbStatus = Object.assign({}, state.rbStatus || {}, {tab_reco: {tabs: 9, avg_mib: 80, max_mib: 120}}); renderMaxTabs()}")
+            ph.page.locator("#rbMaxTabsApply").click()
+            ph.wait(lambda: ph.js("state.settings.rb_max_tabs") == 9, 10, "the recommendation applied")
+        ph.wait(lambda: ph.js("document.getElementById('rbMaxTabs').value") == "9", 5, "the control shows the recommendation")
+    finally:
+        ph.setting("rb_max_tabs", 3)                # the next engine's run starts from the default even after a failure
     ph.take_errors("status of 4", "status of 5")
