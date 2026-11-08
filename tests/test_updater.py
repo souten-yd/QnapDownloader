@@ -63,6 +63,29 @@ class UpdaterTests(unittest.TestCase):
                           return_value=io.BytesIO(json.dumps(choices).encode())):
             self.assertIsNone(updater.latest("1.2.5","x86_64","rc"))
 
+    def test_release_list_is_asked_again_after_a_github_5xx(self):
+        # v0.1.75: a passing 504 from GitHub no longer fails the update check at once
+        import urllib.error
+        gateway = urllib.error.HTTPError(updater.API_RC, 504, "Gateway Time-out", None, None)
+        waits = []
+        with patch.object(updater, "_sleep", waits.append), \
+                patch.object(updater.urllib.request, "urlopen",
+                             side_effect=[gateway, io.BytesIO(b"[]")]) as call:
+            self.assertIsNone(updater.latest("1.2.3", "x86_64", "rc"))
+        self.assertEqual(call.call_count, 2)
+        self.assertEqual(waits, [updater.METADATA_RETRY_WAIT])
+        with patch.object(updater, "_sleep", lambda s: None), \
+                patch.object(updater.urllib.request, "urlopen", side_effect=[gateway] * 3) as call:
+            with self.assertRaises(urllib.error.HTTPError):
+                updater.latest("1.2.3", "x86_64", "rc")
+        self.assertEqual(call.call_count, updater.METADATA_ATTEMPTS)
+        forbidden = urllib.error.HTTPError(updater.API_RC, 403, "rate limited", None, None)
+        with patch.object(updater, "_sleep", lambda s: None), \
+                patch.object(updater.urllib.request, "urlopen", side_effect=[forbidden]) as call:
+            with self.assertRaises(urllib.error.HTTPError):
+                updater.latest("1.2.3", "x86_64", "rc")
+        self.assertEqual(call.call_count, 1)                 # a 4xx is not retried
+
     def test_rc_channel_never_uses_stable_latest_or_ignores_integrity(self):
         asset={**self.asset(), "browser_download_url":
               f"https://github.com/{updater.REPO}/releases/download/v1.2.3-rc1/QnapDownloader_1.2.3_x86_64.qpkg",

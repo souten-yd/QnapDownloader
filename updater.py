@@ -16,6 +16,9 @@ import urllib.request
 REPO = "souten-yd/QnapDownloader"
 API = f"https://api.github.com/repos/{REPO}/releases/latest"
 API_RC = f"https://api.github.com/repos/{REPO}/releases?per_page=30"
+METADATA_ATTEMPTS = 3          # v0.1.75: the release list is asked again after a GitHub 5xx / a dropped connection
+METADATA_RETRY_WAIT = 2.0      # seconds, times the attempt number
+_sleep = time.sleep
 RELEASE_BYTES_MAX = 4 * 1024 * 1024
 VERSION = re.compile(r"^v?(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-rc([1-9]\d*))?$")
 ARCH = re.compile(r"^[A-Za-z0-9_-]+$")
@@ -71,17 +74,25 @@ def latest(current, arch, channel="stable"):
     request = urllib.request.Request(address, headers={
         "Accept": "application/vnd.github+json",
         "User-Agent": "QnapDownloader-updater/0.1"})
-    try:
-        with urllib.request.urlopen(request, timeout=15) as response:
-            content = response.read(RELEASE_BYTES_MAX + 1)
-            if len(content) > RELEASE_BYTES_MAX:
-                raise ValueError("GitHub release metadata exceeds size limit")
-            releases = json.loads(content)
-    except urllib.error.HTTPError as error:
-        # Only /releases/latest returns 404 when there is no stable release.
-        if channel == "stable" and error.code == 404:
-            return None
-        raise
+    for attempt in range(METADATA_ATTEMPTS):
+        try:
+            with urllib.request.urlopen(request, timeout=15) as response:
+                content = response.read(RELEASE_BYTES_MAX + 1)
+                if len(content) > RELEASE_BYTES_MAX:
+                    raise ValueError("GitHub release metadata exceeds size limit")
+                releases = json.loads(content)
+            break
+        except urllib.error.HTTPError as error:
+            # Only /releases/latest returns 404 when there is no stable release.
+            if channel == "stable" and error.code == 404:
+                return None
+            # v0.1.75: GitHub answers a passing 502/503/504 now and then; ask again after a short wait
+            if error.code < 500 or attempt + 1 >= METADATA_ATTEMPTS:
+                raise
+        except (urllib.error.URLError, TimeoutError, ConnectionError):
+            if attempt + 1 >= METADATA_ATTEMPTS:
+                raise
+        _sleep(METADATA_RETRY_WAIT * (attempt + 1))
     if channel == "stable":
         if not isinstance(releases, dict):
             raise ValueError("invalid stable GitHub release response")
