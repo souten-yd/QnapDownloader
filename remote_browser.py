@@ -1093,6 +1093,7 @@ class Tab:
         self.mirror_ctx = None     # execution context id of the isolated world
         self.mirror_frame = None   # main frame id
         self.mirror_tokens = rb_mirror.TokenMap()
+        self.mirror_diag = rb_mirror.new_diag()   # v0.1.73: counters of this page's copies / resources
         self.mirror_cache = None   # newest capture (dict) with its rev
         self.mirror_doc = None     # (rev, document text) built on demand
         self.mirror_sheets = {}    # stylesheet URL -> CSS agent id
@@ -4362,6 +4363,7 @@ class RemoteBrowser:
         tab.mirror_tree = None
         tab.mirror_sheets.clear()
         tab.mirror_tokens.clear()
+        tab.mirror_diag = rb_mirror.new_diag()
         tab.mirror_sheet_cache.clear()
         tab.mirror_css_text.clear()
         tab.mirror_prefetch = 0
@@ -4570,8 +4572,11 @@ class RemoteBrowser:
                 token = tab.mirror_tokens.register(url, kind)
                 if not token:
                     return None
-                # a resource the Hub already holds gets its content hash into the URL: the phone may keep it
-                path = rb_mirror.res_path(tab.id, token, self._mirror_res.known_hash(token))
+                # a resource the Hub already holds gets its content hash into the URL: the phone may keep it.
+                # v0.1.73: the first form given out is kept for the page's life — a URL that gained "&h=" on the
+                # next copy was a new URL to the phone, so every image was fetched (and shown) again
+                path = tab.mirror_tokens.path_of(
+                    token, lambda: rb_mirror.res_path(tab.id, token, self._mirror_res.known_hash(token)))
                 if kind == "font" and len(fonts_seen) < rb_mirror.PRELOAD_FONTS:
                     fonts_seen.append(path)
                 return path
@@ -4598,6 +4603,12 @@ class RemoteBrowser:
             capture["js_ms"] = js_ms
             capture["resources"] = len(tab.mirror_tokens)
             capture["ms"] = int((time.monotonic() - started) * 1000)
+            diag = tab.mirror_diag
+            diag["copies"] += 1
+            diag["partial_copies"] += 1 if capture["partial"] else 0
+            diag["last"] = {"ms": capture["ms"], "js_ms": js_ms, "build_ms": max(0, capture["ms"] - js_ms),
+                            "nodes": capture["nodes"], "html_kb": capture["html_bytes"] // 1024,
+                            "css_kb": capture["css_bytes"] // 1024, "partial": capture["partial"]}
             with self._lock:
                 if self._tabs.get(tab.id) is not tab:
                     raise TabGone("このタブはすでに閉じられています")
@@ -4625,7 +4636,8 @@ class RemoteBrowser:
             "stats": {"nodes": capture["nodes"], "html_bytes": capture["html_bytes"],
                       "css_bytes": capture["css_bytes"], "res": capture["resources"],
                       "images": capture["images"], "links": capture["links"], "ms": capture["ms"],
-                      "placeholders": capture["placeholders"]},
+                      "js_ms": capture.get("js_ms", 0), "placeholders": capture["placeholders"]},
+            "diag": rb_mirror.diag_public(tab.mirror_diag),
         }
         if full:
             result.update(html=capture["html"], css=capture["css"], html_attrs=capture["html_attrs"],
@@ -4857,6 +4869,16 @@ class RemoteBrowser:
             return None
         return self._mirror_res.known_hash(token)
 
+    def mirror_count(self, ident, key):
+        """Counts a resource answer the Hub gave without the bytes (v0.1.73 diagnostics: "not_modified")."""
+        try:
+            tab = self._tab(ident)
+        except BrowserError:
+            return
+        diag = tab.mirror_diag
+        if key in diag and isinstance(diag[key], int):
+            diag[key] += 1
+
     def mirror_resource(self, ident, token):
         """(bytes, mime type) of a mirror resource, read through the NAS browser and cached in RAM."""
         tab = self._tab(ident)
@@ -4865,8 +4887,11 @@ class RemoteBrowser:
         entry = tab.mirror_tokens.get(token)
         if entry is None:
             raise MirrorGone("このリソースは見つかりません。読み込み直してください")
+        diag = tab.mirror_diag
         hit = self._mirror_res.get(tab.id, token)
         if hit is not None:
+            diag["hub_hits"] += 1
+            diag["bytes"] += len(hit[0])
             return hit
         self._touch()
         kind = entry["kind"]
@@ -4898,8 +4923,15 @@ class RemoteBrowser:
                     tab.mirror_flight.pop(token, None)
                 event.set()
         except rb_mirror.ResourceRefused as error:
+            diag["failed"] += 1
             debuglog.log("render", "debug", "mirror resource refused", {"tab": tab.id, "kind": kind})
             raise ImageRefused(str(error)) from None
+        except Exception:
+            diag["failed"] += 1
+            raise
+        diag["fetched"] += 1
+        diag["bytes"] += len(data)
+        diag["fetch_ms"] += int((time.monotonic() - started) * 1000)
         debuglog.log("render", "debug", "mirror resource", {
             "tab": tab.id, "kind": kind, "kb": len(data) // 1024, "ms": int((time.monotonic() - started) * 1000)})
         return data, mime

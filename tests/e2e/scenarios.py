@@ -74,6 +74,32 @@ def display_mirror(ph):
     assert ph.js("getComputedStyle(document.getElementById('mirrorWrap')).display") != "none"
 
 
+@scenario("mirror-images-kept", display="mirror")
+def mirror_images_kept(ph):
+    """v0.1.73: later copies of the page keep the shown image elements and never ask for an image again (the
+    image URL gained the content hash on the second copy and the whole body was rebuilt, so images reloaded)."""
+    ph.open("/article.html")
+    ph.wait(lambda: "E2E テスト記事" in ph.mirror_text(), 15, "mirror content")
+    ph.wait(lambda: ph.js("(()=>{const d=mirrorDoc();return !!d&&d.images.length>0&&"
+                          "Array.from(d.images).every(i=>i.complete)})()"), 15, "mirror images loaded")
+    ph.page.wait_for_timeout(1500)            # the Hub's prefetch and the follow-up full copy
+    before = ph.js("(()=>{const d=mirrorDoc();window.__qdImgs=Array.from(d.images);return window.__qdImgs.length})()")
+    res0 = ph.js("mirrorResEntries(mirrorDoc())")
+    for _ in range(2):
+        ph.js("(()=>{runMirror(remoteTab(),{immediate:true,force:true,quiet:true});return 1})()")
+        ph.page.wait_for_timeout(1200)
+    same = ph.js("(()=>{const d=mirrorDoc();const s=new Set(Array.from(d.images));"
+                 "return window.__qdImgs.filter(i=>s.has(i)).length})()")
+    res = ph.js("mirrorResEntries(mirrorDoc())")
+    summary = ph.js("mirrorDiagSummary(remoteTab().rb)")
+    ph.notes.append("imgs %d kept %d res %s diag %s" % (before, same, res, summary and summary.get("last")))
+    assert same == before, "image elements replaced: %d of %d kept" % (same, before)
+    assert res["refetch"] == res0["refetch"] == 0, "images asked again: %s -> %s" % (res0, res)
+    perf = ph.js("(()=>{setPerf(true);return perfText()})()")
+    assert "コピー " in perf and "端末: 画像要求" in perf and "Hub: 配信" in perf, "%s / %s" % (perf, ph.js(
+        "(()=>{const rb=remoteTab().rb;return JSON.stringify({d:rb.mirrorDiag||null,lines:mirrorDiagLines(rb)})})()"))
+
+
 @scenario("display-tiles", display="fast")
 def display_tiles(ph):
     ph.open("/article.html")
@@ -590,13 +616,13 @@ def selftest(ph):
     assert len(builtin) >= 10, "built-in checks: %s" % [c["id"] for c in builtin]
     bad = [(c["id"], c["status"], c["value"]) for c in builtin if c["status"] == "fail"]
     assert not bad, "failed built-in checks: %s" % bad
-    for cid in ("builtin.reader", "builtin.mirror", "builtin.mirror_safe", "builtin.menu", "builtin.tiles", "builtin.fps"):
+    for cid in ("builtin.reader", "builtin.mirror", "builtin.mirror_safe", "builtin.mirror_stable", "builtin.menu", "builtin.tiles", "builtin.fps"):
         assert cid in checks, "missing check " + cid
     client = [c for c in snap["checks"] if c["section"] == "client"]
     assert snap["client"] == "received" and len(client) >= 8, "client section: %s" % [(c["id"], c["status"]) for c in client]
     bad = [(c["id"], c["status"], c["value"]) for c in client if c["status"] == "fail"]
     assert not bad, "failed client checks (this browser): %s" % bad
-    for cid in ("client.live", "client.secure", "client.clipboard", "env.cgroup"):
+    for cid in ("client.live", "client.secure", "client.clipboard", "client.mirror_reuse", "env.cgroup"):
         assert cid in checks, "missing check " + cid
     live = checks["client.live"]
     assert live["status"] != "fail" and "経路:" in live["value"], live
@@ -604,6 +630,17 @@ def selftest(ph):
     # report line names the WebSocket first
     assert live["status"] == "pass" and live["value"].startswith("経路: WebSocket / "), live
     assert "[Live] transport=websocket" in ph.js("fetch('/api/selftest/report').then(r=>r.json()).then(j=>j.text)"), "report header"
+    # v0.1.73: the real site's address is hidden by default (screen and report); the switch shows it again
+    host = BASE.split("://", 1)[1].split("/")[0].split(":")[0]
+    assert ph.js("document.getElementById('selftestHideSites').checked"), "hide switch is on by default"
+    shown = ph.js("document.getElementById('selftestTables').innerText")
+    hidden = ph.js("selftestReport().then(r=>r.text)")
+    assert host not in shown and "サイト1" in shown, "screen shows the site address"
+    assert host not in hidden and "サイト1" in hidden, "report shows the site address"
+    ph.page.click("label[for=selftestHideSites]")
+    ph.wait(lambda: host in ph.js("document.getElementById('selftestTables').innerText"), 5, "address shown again")
+    assert host in ph.js("selftestReport().then(r=>r.text)")
+    ph.page.click("label[for=selftestHideSites]")
     ph.notes.append("builtin.fps " + checks["builtin.fps"]["value"][:30])
     ph.notes.append("live: " + live["value"][:60])
     # v0.1.59: 「操作の応答」: route switches, switch feedback, idle traffic and the request count of opening a page
@@ -650,7 +687,9 @@ def selftest(ph):
                    "value:", "threshold:", "## debug log (last 50 lines", "[Source] cgroup=", "[Live] transport=", "env.cgroup",
                    "client.secure"):
         assert needle in text, "report lacks %r" % needle
-    assert "a.example.com" in text and "/article.html" not in text, "real-site URLs must be reduced to the host by default"
+    # v0.1.73: by default the real site is サイト1 and no address of it is left
+    assert "a.example.com" not in text and "/article.html" not in text and "サイト1" in text, \
+        "real-site addresses must be hidden by default"
     # v0.1.52: the report also holds the automatic swipe section with its timelines
     assert text.count("\n") < 1200, "report too long: %d lines" % text.count("\n")
     # a second click while idle starts a new run only after this one is over; cancel is hidden now

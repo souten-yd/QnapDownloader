@@ -204,6 +204,29 @@ class ClientEvaluateTests(unittest.TestCase):
         self.assertEqual(self.ev(id="client.tiles", ok=True, ms=100, n=3)["status"], PASS)
         self.assertEqual(self.ev(id="client.bogus")["status"], FAIL)
 
+    def test_site_masker_hides_real_sites(self):
+        import selftest as st
+        mask = st.site_masker(["www.example.com", "news.foo.jp"])
+        out = mask("実サイト1（www.example.com） https://www.example.com/a?b=1 cdn.example.com "
+                   "https://other.net/x http://127.0.0.1:3000/a news.foo.jp/x notexample.com")
+        for leaked in ("example.com/", "www.example.com", "other.net", "foo.jp"):
+            self.assertNotIn(leaked, out)
+        self.assertIn("サイト1", out)
+        self.assertIn("サイト2/x", out)
+        self.assertIn("（URL非表示）", out)
+        self.assertIn("http://127.0.0.1:3000/a", out)          # the Hub's own fixtures stay readable
+        self.assertIn("notexample.com", out)
+        self.assertEqual(mask({"sites": ["a", "b"], "x": [{"v": "news.foo.jp"}], "n": 3}),
+                         {"sites": ["サイト1", "サイト2"], "x": [{"v": "サイト2"}], "n": 3})
+
+    def test_mirror_reuse(self):
+        ok = self.ev(id="client.mirror_reuse", ok=True, ms=3, n=0, imgs=3, same=3, kept=40, added=0)
+        self.assertEqual(ok["status"], PASS)
+        self.assertIn("3/3", ok["value"])
+        self.assertEqual(self.ev(id="client.mirror_reuse", ok=False, n=2, imgs=3, same=3)["status"], FAIL)
+        self.assertEqual(self.ev(id="client.mirror_reuse", ok=False, n=0, imgs=3, same=1)["status"], WARN)
+        self.assertEqual(self.ev(id="client.mirror_reuse", ok=False, n=0, imgs=0, same=0)["status"], "skip")
+
     def test_mirror_events_is_the_iphone_failure(self):
         bad = self.ev(id="client.mirror_events", flags={"pointer": False, "click": False})
         self.assertEqual(bad["status"], FAIL)
