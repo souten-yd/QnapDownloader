@@ -72,12 +72,27 @@ class FirstInlineTests(BrowserBase):
         tab = self.rb.open_tab("https://example.com/a")
         self.navigated()
         self.dcl()
-        with mock.patch.object(self.rb, "_challenge", return_value=True), \
-                mock.patch.object(self.rb, "mirror") as mirror:
+        self.rb._tabs[tab["id"]].title = "Just a moment..."
+        with mock.patch.object(self.rb, "mirror") as mirror:
             out = self.rb.wait_first(tab["id"], "mirror", timeout=2)
         mirror.assert_not_called()
         self.assertIsNone(out["mirror"])
         self.assertIn("rev", out["meta"])
+
+    def test_wait_first_bounds_the_page_side_check(self):
+        # v0.1.72: the check before the first copy waits at most FIRST_CHALLENGE_BUDGET for the page's answer
+        tab = self.rb.open_tab("https://example.com/a")
+        self.navigated()
+        self.dcl()
+        budgets = []
+        real = self.rb._challenge
+        def spy(t, budget=None):
+            budgets.append(budget)
+            return False
+        with mock.patch.object(self.rb, "_challenge", side_effect=spy), \
+                mock.patch.object(self.rb, "mirror", return_value={"html": "<p>x</p>", "partial": False}):
+            self.rb.wait_first(tab["id"], "mirror", timeout=2)
+        self.assertIn(rb.FIRST_CHALLENGE_BUDGET, budgets)
 
     def test_wait_first_reader(self):
         tab = self.rb.open_tab("https://example.com/a")
