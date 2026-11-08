@@ -42,7 +42,7 @@ jobs:
             exit 1
           fi
           gh release create v0.1.73-rc1 dist/QnapDownloader_0.1.73_x86_64.qpkg dist/SHA256SUMS \
-            --repo "${{ github.repository }}" --target "224bb8b95ed2df76bedce6c724ad20951a2995fa" \
+            --repo "${{ github.repository }}" --target "3a09ab2ac387711cf54f050b50d19be1ec8fb1cc" \
             --title "QnapDownloader v0.1.73-rc1: Mirror image reuse and diagnostics" \
             --prerelease \
             --notes "Experimental QNAP x86_64 build. Mirror images are no longer loaded again after the first display; copies are applied as a diff; mirror diagnostics in the speed line; self-test results hide real site addresses by default."
