@@ -228,3 +228,23 @@ class ClientSourceTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class StaleDocumentTests(BrowserBase):
+    """v0.1.73: the document of a copy that a newer copy of the same page replaced is served as the newer one."""
+
+    def test_older_rev_gets_the_newest_copy_and_a_newer_rev_is_gone(self):
+        tab_id = self.rb.open_tab("https://example.com/a")["id"]
+        tab = self.rb._tab(tab_id)
+        capture = {"rev": 5, "css": "", "html": "<p>x</p>", "html_attrs": "", "body_attrs": "", "preload": ""}
+        with self.rb._lock:
+            tab.mirror_cache, tab.mirror_doc = capture, None
+        text = self.rb.mirror_document(tab_id, 3)
+        self.assertIn("<p>x</p>", text)
+        self.assertEqual(tab.mirror_doc[0], 5)
+        with self.assertRaises(rb.MirrorGone):
+            self.rb.mirror_document(tab_id, 6)
+        with self.rb._lock:
+            tab.mirror_cache = None
+        with self.assertRaises(rb.MirrorGone):
+            self.rb.mirror_document(tab_id, 5)
