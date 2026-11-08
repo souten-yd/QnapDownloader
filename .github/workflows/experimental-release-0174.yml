@@ -1,0 +1,48 @@
+name: Publish QnapDownloader v0.1.74-rc1 via NAS browser
+on:
+  push:
+    branches: [release/experimental-0.1.74-rc1]
+permissions:
+  contents: write
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Full unit, web, shell and safety verification
+        run: bash scripts/verify.sh
+      - name: Phone end-to-end suite (Chrome + WebKit)
+        run: |
+          python3 -m pip install --disable-pip-version-check playwright==1.63.0
+          python3 -m playwright install --with-deps chromium webkit
+          bash scripts/e2e.sh --engines chromium,webkit --require-engines --out "$GITHUB_WORKSPACE/e2e-artifacts" --nas-chrome "$(command -v google-chrome || true)"
+      - name: Install QDK 2.5.3 and build-only dependencies
+        run: |
+          curl -fLSs --retry 2 https://github.com/qnap-dev/QDK/releases/download/v2.5.3/qdk_2.5.3_amd64.deb -o /tmp/qdk.deb
+          sudo apt-get update -qq
+          sudo apt-get install -y /tmp/qdk.deb rsync
+          python3 -m pip install --disable-pip-version-check 'cairosvg==2.8.2' 'pillow>=10,<13'
+      - name: Build and checksum x86_64 QPKG
+        run: |
+          bash scripts/build-qpkg.sh x86_64 dist
+          (cd dist && sha256sum QnapDownloader_0.1.74_x86_64.qpkg > SHA256SUMS && sha256sum -c SHA256SUMS)
+      - name: Publish as prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view v0.1.74-rc1 >/dev/null 2>&1; then
+            echo 'Existing tag; refusing to overwrite'
+            exit 1
+          fi
+          gh release create v0.1.74-rc1 dist/QnapDownloader_0.1.74_x86_64.qpkg dist/SHA256SUMS \
+            --repo "${{ github.repository }}" --target "dc0bf61b472bdfbd7dfd849abf097ff0917da7e7" \
+            --title "QnapDownloader v0.1.74-rc1: Passthrough via the NAS browser" \
+            --prerelease \
+            --notes "Experimental QNAP x86_64 build. Passthrough sites can be set to send their requests through the NAS browser, so a Cloudflare check passed once in the NAS browser also works in passthrough."
