@@ -4992,7 +4992,15 @@ function mirrorLoadDoc(docUrl, cover) {
     };
     // v0.1.70: a load event of another document (an earlier copy, about:blank during a quick back) is not ours:
     // keep waiting for this copy (until the timeout) instead of failing at once
-    const onLoad = () => { if (mirrorDoc()) finish(true); };
+    // v0.1.73: our own document that came back without the copy (the Hub answered an error) fails at once instead of
+    // after the whole timeout
+    const onLoad = () => {
+      if (mirrorDoc()) { finish(true); return; }
+      try {
+        const here = mf.contentWindow.location.href;
+        if (here === new URL(docUrl, location.href).href) finish(false);
+      } catch (e) { /* not readable: keep waiting */ }
+    };
     const timer = setTimeout(() => finish(false), MIRROR_LOAD_TIMEOUT_MS);
     mf.addEventListener("load", onLoad);
     // v0.1.50: replace, never add, the frame's history entry. A new src adds an entry to the

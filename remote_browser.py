@@ -4651,8 +4651,12 @@ class RemoteBrowser:
             raise BrowserError("revが不正です")
         with self._lock:
             capture, doc = tab.mirror_cache, tab.mirror_doc
-        if capture is None or capture["rev"] != rev:
+        # v0.1.73: a newer copy of the same page (taken between the answer and this request) is served instead of
+        # "gone": the frame loaded the error page and waited for the whole load timeout, so the display stalled.
+        # A navigation clears the capture, so this is never another page.
+        if capture is None or capture["rev"] < rev:
             raise MirrorGone("この表示は古くなりました。再取得します")
+        rev = capture["rev"]
         if doc is not None and doc[0] == rev:
             return doc[1]
         text = rb_mirror.build_document(capture["css"], capture["html"], capture["html_attrs"],
